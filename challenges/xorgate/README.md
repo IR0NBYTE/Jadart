@@ -40,6 +40,9 @@ the arithmetic over it without ever telling you what was in it.
 
 Flag format is `IR0NBYTE{...}`. Work it out before you open `app/lib/main.dart`.
 
+A full walkthrough, command by command, is written up here:
+<https://github.com/IR0NBYTE/IronByte-Blog/blob/main/posts/flutter-reverse-engineering/02-xorgate-walkthrough.md>
+
 ## Rebuilding it
 
 ```bash
