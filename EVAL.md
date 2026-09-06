@@ -172,8 +172,11 @@ corpus `get:hashCode` is corroborated by 127 distinct defining classes, `toStrin
 Flutter widget lifecycle, each at its own offset. A name is emitted only with >= 2 agreeing
 classes, and an offset claimed by two names is dropped.
 
-Measured (clean build, 3000 code ranges, 0 exceptions): 209 selectors recovered; of the
-dispatch sites whose offset is recovered, 40.2% get a source name. `findRenderObject` lifts to
+Measured (clean build, 0 exceptions): 168 selectors recovered; of the 1108 dispatch sites
+whose offset is recovered, 318 get a source name (28.7%). It was 209 and 40.2% until the
+vote was required to be untied: `Counter.most_common` had been breaking a tie by insertion
+order, so 144 names rested on which candidate happened to be counted first. Those now stay
+`sel_0x<off>`, which is the honest rendering. `findRenderObject` lifts to
 `x0 = this.renderObject; return x0;`, matching the upstream
 `RenderObject? findRenderObject() => renderObject;`. Property selectors render as accessors
 (`x0 = this.renderObject;`) rather than calls.

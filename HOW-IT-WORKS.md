@@ -295,7 +295,7 @@ to a source name.
 
 ```
 $ jadart selectors libapp.so
-// 209 virtual-dispatch selectors recovered
+// 168 virtual-dispatch selectors recovered
 
   _childrenInPaintOrder@153319124   selector_offset=9      call-site imm=-4087
   _createNode@182492240             selector_offset=63     call-site imm=-4033
