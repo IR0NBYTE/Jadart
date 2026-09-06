@@ -1,5 +1,6 @@
 # jadart
 
+[![tests](https://github.com/IR0NBYTE/jadart/actions/workflows/tests.yml/badge.svg)](https://github.com/IR0NBYTE/jadart/actions/workflows/tests.yml)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
 [![tests: 191 passing](https://img.shields.io/badge/tests-191%20passing-brightgreen.svg)](#tests)
