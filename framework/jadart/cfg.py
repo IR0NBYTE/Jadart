@@ -195,9 +195,15 @@ def _shifted(parts):
     if len(tail) == 2 and tail[0] in _CFG_SHIFT:
         amt = tail[1].lstrip("#")
         try:
-            amt = str(int(amt, 0))
+            n = int(amt, 0)
         except ValueError:
             return None
+        # An arm64 shift amount is 0..63. Anything else is not an encoding capstone can
+        # produce, so it means the operand was not what it looked like; print nothing
+        # rather than a shift that cannot happen.
+        if not 0 <= n < 64:
+            return None
+        amt = str(n)
         # Parenthesised: `x9 + x10 << 1` re-parses as `(x9 + x10) << 1` in Dart, which
         # is not what the machine did.
         return f"({parts[0]} {_CFG_SHIFT[tail[0]]} {amt})"

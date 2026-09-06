@@ -62,6 +62,16 @@ class Elf:
             e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 0x2E)
             shdr, sym_fmt, sym_size = "<IIIIIIIIII", "<IIIBBH", 16
         self._sym_fmt, self._sym_size = sym_fmt, sym_size
+        self._segments = self._program_headers()
+        # A fully stripped .so can carry no section headers at all, and reading the
+        # shstrtab index off an empty list raised "list index out of range" from inside
+        # open_container. That made the magic-scan fallback in parse_libapp unreachable
+        # for exactly the input it exists to handle. There is nothing to name here, so
+        # the reader carries on with no sections and no symbols, and va_to_offset uses
+        # the program headers instead.
+        if e_shnum == 0 or e_shstrndx >= e_shnum:
+            self.sections, self._symtabs, self.symbols = [], [], {}
+            return
         # raw section headers first (names resolved after we have the shstrtab)
         raw = []
         for i in range(e_shnum):
@@ -124,11 +134,42 @@ class Elf:
                 if nm and nm not in self.symbols:
                     self.symbols[nm] = Symbol(nm, st_value, st_size)
 
+    def _program_headers(self) -> list:
+        """(vaddr, memsz, offset, filesz) for every PT_LOAD segment.
+
+        Sections are a linker convenience and a stripped file may have none; the program
+        headers are what the loader itself uses, so they are the reliable way to map a
+        virtual address back to a file offset.
+        """
+        d = self.data
+        try:
+            if self.bits == 64:
+                (e_phoff,) = struct.unpack_from("<Q", d, 0x20)
+                e_phentsize, e_phnum = struct.unpack_from("<HH", d, 0x36)
+                fmt, va_i, off_i, fsz_i, msz_i = "<IIQQQQQQ", 3, 2, 5, 6
+            else:
+                (e_phoff,) = struct.unpack_from("<I", d, 0x1C)
+                e_phentsize, e_phnum = struct.unpack_from("<HH", d, 0x2A)
+                fmt, va_i, off_i, fsz_i, msz_i = "<IIIIIIII", 2, 1, 4, 5
+            out = []
+            for i in range(e_phnum):
+                f = struct.unpack_from(fmt, d, e_phoff + i * e_phentsize)
+                if f[0] == 1:                       # PT_LOAD
+                    out.append((f[va_i], f[msz_i], f[off_i], f[fsz_i]))
+            return out
+        except (struct.error, IndexError, OverflowError, ValueError):
+            return []
+
     def va_to_offset(self, va: int) -> int:
         for s in self.sections:
             if s.sh_type != SHT_NOBITS and s.addr <= va < s.addr + s.size:
                 return va - s.addr + s.offset
-        raise ContainerError(f"VA 0x{va:x} not in any loadable section")
+        for vaddr, memsz, off, filesz in self._segments:
+            if vaddr <= va < vaddr + memsz:
+                delta = va - vaddr
+                if delta < filesz:
+                    return off + delta
+        raise ContainerError(f"VA 0x{va:x} not in any loadable section or segment")
 
     def symbol_bytes(self, name: str) -> bytes:
         # ContainerError, not KeyError. Three callers reach this outside open_container's

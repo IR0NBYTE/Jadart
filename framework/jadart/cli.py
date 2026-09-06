@@ -588,7 +588,9 @@ def _xrefs_to_function(args, image, fr) -> int | None:
     from .callgraph import callers_of
     try:
         ranges = named_ranges(image, fr, args.pattern)
-    except Exception:
+    except JadartError:
+        # The pattern names nothing this binary can offer. A bug in named_ranges is a
+        # different thing and belongs in main's internal-error path, not silently in None.
         return None
     if not ranges:
         return None
@@ -724,10 +726,11 @@ def cmd_ffi(args) -> int:
                                      arity=arity, selectors=selectors,
                                      arch=getattr(image, "arch", None),
                                      fields=layout.for_function(cr.owner_ref))
-            except Exception:
-                # Tier 3 declines on a target it has no register model for. The pool and
-                # xref halves still hold, so the library is reported without its symbols
-                # rather than the whole command failing.
+            except JadartError:
+                # Tier 3 declines on a target it has no register model for (UnsupportedArch
+                # is a JadartError). The pool and xref halves still hold, so the library is
+                # reported without its symbols rather than the whole command failing. Any
+                # OTHER exception is a defect and goes to main's internal-error path.
                 body = []
             keep = [ln.strip() for ln in body if lit.search(ln)]
             bodies[pc] = {"name": pc_to_name.get(pc), "size": cr.size,
