@@ -5,12 +5,11 @@
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
 [![tests: 193](https://img.shields.io/badge/tests-193-brightgreen.svg)](#tests)
 
-**A decompiler for Flutter apps.** Give it a stripped `libapp.so` or an iOS `App` binary
-and get back a class tree, method bodies as pseudo-Dart, the string pool, embedded data
-tables, and the source names of virtual calls.
+**jadx for Flutter.** Point it at an APK and get back a class tree, method bodies as
+pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
 
 It is for reverse engineers, security reviewers, and anyone auditing a shipped Flutter app
-who has hit the wall where every other tool stops at ARM64 assembly.
+who has hit the wall where most tools stop at ARM64 assembly.
 
 Flutter compiles Dart ahead of time. There is no bytecode and no reflection metadata, so
 teams ship banking, fintech, health and identity logic on the assumption that AOT hides it.
@@ -160,11 +159,13 @@ jadart xrefs app.apk "some literal"        # who references it
 jadart export app.apk out/                 # the whole browsable tree on disk
 ```
 
-It takes an APK, an IPA, a directory or a bare `.so` / `.dylib`. You do not unzip anything
-first. `-j` gives JSON on any command, errors included, so a caller never parses stderr.
+It takes an APK, a directory or a bare `libapp.so`. You do not unzip anything first, and
+iOS builds work the same way (see [platform support](#platform-and-version-support)).
+
+`-j` gives JSON on any command, errors included, so a caller never parses stderr.
 Exit code is `0` on success, `1` when nothing in the binary matched what you asked for
-or an acceptance gate failed, and `2` when the input will not parse or the command line
-is wrong.
+or an acceptance gate failed, `2` when the input will not parse or the command line is
+wrong, and `3` when jadart itself has a bug, which is never your file's fault.
 
 Full walkthroughs: [docs/usage.md](docs/usage.md). Per-command help: `jadart <cmd> --help`.
 

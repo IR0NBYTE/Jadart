@@ -53,7 +53,9 @@ There is no bounty. Credit in the release notes if you want it.
   unknown format version, an unsupported target, or a non-Flutter file. If the message is
   wrong or unhelpful, that is a normal bug. Please file it as one.
 - **Crashes with a clean error message and a documented exit code.** Exit `1` means the
-  thing you asked for is not in that binary; exit `2` means it will not parse.
+  thing you asked for is not in that binary; exit `2` means it will not parse. Exit `3`
+  is a bug in jadart and worth reporting, but as a normal issue rather than privately:
+  it says the failure was not the input's doing.
 - **That the tool works.** Recovering a class tree and method bodies from a shipped app is
   the intended function, not a vulnerability.
 - Findings in `capstone`, which is an optional dependency. Report those upstream.
