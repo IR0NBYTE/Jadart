@@ -2400,6 +2400,8 @@ class Lifter:
             k = s[0]
             if k in ("asm", "loop", "goto", "label"):
                 return s[1]
+            if k == "exit":
+                return None
             if k == "if":
                 return self._entry_block(s[2], cont) if s[2] else cont
             if k in ("break", "continue"):
@@ -2647,6 +2649,14 @@ class Lifter:
                 if self._leaves_loop(s[1]):
                     out.extend(self._carry_out(st, pad, True))
                 out.append(pad + f"goto L_0x{s[1]:x};")
+                falls = alive = False
+            elif kind == "exit":
+                # A branch out of this function. It is not a local label, and it does not
+                # fall through: leaving it unsaid ended the body with no explanation, or
+                # let the carried state run on into a block control never reaches from
+                # here. 997 sites on the clean fixture did exactly that.
+                out.append(pad + (f"goto sub_0x{s[1]:x};" if s[1] >= 0
+                                  else "goto <unresolved>;"))
                 falls = alive = False
         return out, falls
 

@@ -199,11 +199,32 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None) -> list:
     # The alloc pass reads each string's (length, is_two_byte); the fill pass reads the same
     # header again before the bytes. This pins the alloc->fill boundary to the byte: a
     # one-byte slip makes the very first string's length disagree.
-    s_lengths = [cl.lengths for cl in by_name.get("StringCid", []) if cl.lengths]
-    total = sum(len(x) for x in s_lengths)
-    gates.append(_g("G4 string alloc/fill lengths", "A", total > 0, total,
-                    f"{total} strings pinned by the fill walk"
-                    if total else "", skipped="" if total else "no String cluster"))
+    # This compared nothing until it was measured: the pass condition was `total > 0`,
+    # where total counted only what ALLOC had recorded, so the gate reported thousands of
+    # checks it never made and FAIL was unreachable. The fill walk now keeps the pairs it
+    # read (fillwalk.FillResult.string_lengths) and they are compared elementwise here.
+    total, bad = 0, []
+    for cl in by_name.get("StringCid", []):
+        alloc = cl.lengths or []
+        fill = getattr(fr, "string_lengths", {}).get(cl.index)
+        if fill is None:
+            continue
+        if len(alloc) != len(fill):
+            bad.append(f"cluster {cl.index}: alloc has {len(alloc)} strings, "
+                       f"fill read {len(fill)}")
+            total += min(len(alloc), len(fill))
+            continue
+        total += len(alloc)
+        for i, (a, f) in enumerate(zip(alloc, fill)):
+            if tuple(a) != tuple(f):
+                bad.append(f"cluster {cl.index} string {i}: alloc {tuple(a)} != fill "
+                           f"{tuple(f)}")
+                break
+    gates.append(_g("G4 string alloc/fill lengths", "A", total > 0 and not bad, total,
+                    f"{total} strings agree on (length, is_two_byte) in both passes"
+                    if total and not bad else
+                    (f"{len(bad)} disagreements; first: {bad[0]}" if bad else ""),
+                    skipped="" if total else "no String cluster read by the fill pass"))
 
     # G4b: the same pinning for RO-data strings
     # Uncompressed targets have no stream-based String cluster, so G4 can't run and the

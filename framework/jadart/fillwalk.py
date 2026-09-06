@@ -111,6 +111,11 @@ class FillResult:
     # ties the two passes together without needing an external oracle.
     func_code_index: dict = field(default_factory=dict)   # function ref -> code_index
     class_sizes: dict = field(default_factory=dict)       # class_id -> (inst_size, next_fo)
+    #: cluster index -> the (length, is_two_byte) pairs the FILL pass read, in order. The
+    #: ALLOC pass read the same pairs into Cluster.lengths, so the two are independently
+    #: recorded encodings of one value and G4 compares them elementwise. Without this the
+    #: gate could only count what alloc had, which is why it could not fail.
+    string_lengths: dict = field(default_factory=dict)
     # Which library each class came from. This is the only general way to tell application
     # code from framework code: it is recorded in the snapshot, so it needs no reference
     # binary and no hardcoded list of "framework" packages.
@@ -150,6 +155,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     If `oracle` {cluster_index: end_offset} is given, asserts each cluster's end
     position matches (byte-exact validation)."""
     strings: dict = {}
+    string_lengths: dict = {}
     arrays: dict = {}
     functions: list = []
     fields: list = []
@@ -180,12 +186,15 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
             if cl.name in ("StringCid", "OneByteStringCid", "TwoByteStringCid"):
                 _rodata_strings(st.data, cl, strings, epoch.cid_table, arch)
         elif cl.name == "StringCid":
+            seen_lengths = []
             for i in range(n):
                 enc = st.read_unsigned()
                 length, two = enc >> 1, (enc & 1)
+                seen_lengths.append((length, two))
                 raw = st.read_bytes(length * 2 if two else length)
                 strings[cl.start_ref + i] = (raw.decode("utf-16-le", "replace") if two
                                              else raw.decode("latin-1"))
+            string_lengths[cl.index] = seen_lengths
         elif name in _NONE:
             pass
         elif name == "DoubleCid":
@@ -275,6 +284,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       classes=classes, types=types, codes=codes, pool=pool, end_pos=st.pos,
                       code_first_ref=code_first, func_code_index=func_code_index,
                       class_sizes=class_sizes, class_unboxed=class_unboxed,
+                      string_lengths=string_lengths,
                       class_library=class_library,
                       library_urls={r: (strings.get(u) or strings.get(n) or '')
                                    for r, n, u in libraries},

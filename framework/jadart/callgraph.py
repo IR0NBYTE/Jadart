@@ -124,7 +124,13 @@ def selector_targets(image, fr, offsets, extra_names: dict = None) -> dict:
         named = Counter(nm for _pc, nm in cand if nm)
         if not named:
             continue                            # nothing to vote with: leave unresolved
-        winner, _n = named.most_common(1)[0]
+        top = named.most_common(2)
+        # Same rule as dispatch.build_selector_map: a tie is not a winner. most_common
+        # settles one by insertion order, which would attribute the call site to whichever
+        # name happened to be counted first.
+        if len(top) > 1 and top[1][1] == top[0][1]:
+            continue
+        winner, _n = top[0]
         hits = {pc for pc, nm in cand if nm == winner}
         if hits:
             out[off] = hits

@@ -1587,6 +1587,24 @@ def test_acceptance_gates_detect_a_wrong_grammar():
     hdr2.instr_table_len += 1
     assert "G8" in failing(clusters, fr, hdr2)
 
+    # the alloc and fill passes disagreeing about one string's length, which is what a
+    # one-byte slip at the alloc/fill boundary produces. G4 could not fail at all until
+    # this was measured: its pass condition was `total > 0`, where total counted the
+    # lengths ALLOC had recorded and nothing ever compared them to what FILL read. So the
+    # gate reported thousands of checks it was not making, and the CI verdict leaned on it.
+    fr3 = copy.copy(fr)
+    fr3.string_lengths = {k: list(v) for k, v in fr.string_lengths.items()}
+    for idx, pairs in fr3.string_lengths.items():
+        if pairs:
+            pairs[0] = (pairs[0][0] + 1, pairs[0][1])
+            break
+    assert "G4" in failing(clusters, fr3, hdr)
+
+    # and the counts disagreeing, which is the other half of the same slip
+    fr4 = copy.copy(fr)
+    fr4.string_lengths = {k: list(v)[:-1] for k, v in fr.string_lengths.items() if v}
+    assert "G4" in failing(clusters, fr4, hdr)
+
 
 def test_cid_table_matches_the_epoch():
     # The cid table must come from the SAME SDK release as the binaries being parsed. It was

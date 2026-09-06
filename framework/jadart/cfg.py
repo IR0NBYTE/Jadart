@@ -64,6 +64,12 @@ class Block:
     succ: list = field(default_factory=list)   # successor block addrs, ordered
     term: str = ""              # terminator mnemonic
     cond: str = ""              # readable branch condition (for cond terminators)
+    #: Where a branch out of this function goes, when it has one. A `b` or a conditional
+    #: whose target is outside [lo, hi) has no successor block to point at, and dropping
+    #: it left the reader with a body that simply stopped, or ran on into whatever block
+    #: the structurer happened to place next: 997 such sites on the clean fixture.
+    #: Recording the address lets the renderer say `goto sub_0x...` instead of nothing.
+    exit_target: int = -1
 
 
 _NEG = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<="}
@@ -147,22 +153,55 @@ def _cond_text(prev_cmp, mn, op) -> str:
         _a, pm, po, _n = prev_cmp
         parts = [_tok(p) for p in po.split(",")]
         if pm in ("cmp", "fcmp", "fcmpe") and len(parts) >= 2:
-            lhs, rhs = parts[0], parts[1]
+            lhs = parts[0]
+            rhs = parts[1] if len(parts) == 2 else _shifted(parts[1:])
+            if rhs is None:
+                return "?"
         elif pm in ("subs", "negs") and len(parts) >= 3:
             # `subs xD, xA, xB` sets exactly the flags `cmp xA, xB` sets; xD is the
             # destination, and reading it as the left operand compared the wrong register
             # entirely. Naming the two sources is both exact and shorter than the
             # `(xA - xB) rel 0` form it replaces.
-            lhs, rhs = parts[1], parts[2]
+            rhs2 = parts[2] if len(parts) == 3 else _shifted(parts[2:])
+            if rhs2 is None:
+                return "?"
+            lhs, rhs = parts[1], rhs2
         elif pm == "cmn" and len(parts) >= 2:
             lhs, rhs = f"({parts[0]} + {parts[1]})", "0"
         elif pm == "adds" and len(parts) >= 3:
-            lhs, rhs = f"({parts[1]} + {parts[2]})", "0"
+            b = parts[2] if len(parts) == 3 else _shifted(parts[2:])
+            if b is None:
+                return "?"
+            lhs, rhs = f"({parts[1]} + {b})", "0"
         elif pm in _LOGICAL_FLAGS and cc in _Z_N_ONLY:
             a, b = (parts[0], parts[1]) if pm == "tst" else (
                 (parts[1], parts[2]) if len(parts) >= 3 else (parts[0], parts[-1]))
             lhs, rhs = f"({a} & {'~' if pm == 'bics' else ''}{b})", "0"
     return f"{lhs} {rel} {rhs}"
+
+
+#: `cmp x0, x1, lsl #3` compares x0 against x1<<3, and dropping the third operand made
+#: the rendered predicate name the wrong value: 134 sites on the clean fixture. Rendering
+#: it keeps the comparison true to the instruction; a modifier with no spelling here
+#: returns None so the caller falls back to `?` rather than printing a half-read compare.
+_CFG_SHIFT = {"lsl": "<<", "lsr": ">>>", "asr": ">>"}
+
+
+def _shifted(parts):
+    """`['x1', 'lsl #3']` -> `x1 << 3`. None when the modifier is not a plain shift."""
+    if len(parts) < 2:
+        return parts[0] if parts else "?"
+    tail = parts[1].strip().lower().split()
+    if len(tail) == 2 and tail[0] in _CFG_SHIFT:
+        amt = tail[1].lstrip("#")
+        try:
+            amt = str(int(amt, 0))
+        except ValueError:
+            return None
+        # Parenthesised: `x9 + x10 << 1` re-parses as `(x9 + x10) << 1` in Dart, which
+        # is not what the machine did.
+        return f"({parts[0]} {_CFG_SHIFT[tail[0]]} {amt})"
+    return None
 
 
 def build_cfg(dis) -> tuple[dict, int]:
@@ -199,7 +238,14 @@ def build_cfg(dis) -> tuple[dict, int]:
                 blk.succ = []
             elif mn == "b":
                 t = _target(op)
-                blk.succ = [t] if (t is not None and lo <= t < hi) else []
+                if t is not None and lo <= t < hi:
+                    blk.succ = [t]
+                else:
+                    # Leaves the function. No successor, but it does NOT fall through
+                    # either, and the terminator has to be rendered or the trail ends
+                    # silently. `exit_target` is what gets printed.
+                    blk.succ = []
+                    blk.exit_target = t if t is not None else -1
             elif _is_cond(mn):
                 t = _target(op)
                 ft = end if end < hi else None
@@ -208,6 +254,11 @@ def build_cfg(dis) -> tuple[dict, int]:
                 blk.succ = []
                 if t is not None and lo <= t < hi:
                     blk.succ.append(t)      # taken
+                elif ft is not None:
+                    # The taken arm leaves the function. succ would then hold only the
+                    # fallthrough, and emit_cond reads succ[0] as the TAKEN arm, so the
+                    # rendered `if` ran its body exactly when the branch was NOT taken.
+                    blk.exit_target = t if t is not None else -1
                 if ft is not None:
                     blk.succ.append(ft)     # fallthrough
             else:
@@ -443,6 +494,13 @@ def structure(blocks, entry):
 
     def emit_cond(cur, stop, ctx, cont):
         blk = blocks[cur]
+        if blk.exit_target >= 0:
+            # The taken arm leaves the function, so succ holds only the fallthrough. Read
+            # positionally that fallthrough looked like the TAKEN arm and the rendered
+            # `if` ran its body exactly when the branch was not taken.
+            ft = blk.succ[0] if blk.succ else None
+            stmts = [("asm", cur), ("if", blk.cond, [("exit", blk.exit_target)], [])]
+            return stmts, ft
         taken = blk.succ[0] if len(blk.succ) >= 1 else None
         ft = blk.succ[1] if len(blk.succ) >= 2 else None
         merge = merge_point(cur, ctx)
@@ -528,6 +586,11 @@ def structure(blocks, entry):
                 cur = merge
                 continue
             out.append(("asm", cur))
+            if blk.exit_target >= 0 and not blk.succ:
+                # A `b` leaving the function. Saying so is the whole point: without it the
+                # body just stopped, or the walk continued into an unrelated block.
+                out.append(("exit", blk.exit_target))
+                break
             cur = blk.succ[0] if blk.succ else None
         return out
 
@@ -625,4 +688,9 @@ def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None) -> list:
             out.append(f"{pad}continue;")
         elif s[0] == "goto":
             out.append(f"{pad}goto L_0x{s[1]:x};")
+        elif s[0] == "exit":
+            # Outside this function, so not a local label: name it the way the rest of the
+            # output names an address it has no name for.
+            out.append(f"{pad}goto sub_0x{s[1]:x};" if s[1] >= 0
+                       else f"{pad}goto <unresolved>;")
     return out

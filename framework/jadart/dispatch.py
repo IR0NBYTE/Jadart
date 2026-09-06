@@ -140,6 +140,13 @@ def _slot_names(fr, image) -> dict:
     return out
 
 
+#: How many names the last build_selector_map call dropped because their top two
+#: candidate offsets tied. Read by `jadart selectors` so a name that is missing has a
+#: stated reason rather than looking like the recovery quietly got worse. Module state
+#: because the return type is the public contract and stays a plain dict.
+LAST_AMBIGUOUS = 0
+
+
 def build_selector_map(entries: list, fr, image,
                        min_agree: int = MIN_AGREEING_CLASSES) -> dict:
     """selector_offset -> selector name.
@@ -148,7 +155,10 @@ def build_selector_map(entries: list, fr, image,
     candidate `row - owner_class_id`; the defining class's own row gives the true
     offset, so the value that the most defining classes agree on wins. Names backed by
     fewer than `min_agree` classes, and offsets claimed by more than one name, are
-    dropped rather than guessed."""
+    dropped rather than guessed. So is a name whose own top two candidates tie, because
+    a tie is not agreement: Counter.most_common would break it by insertion order."""
+    global LAST_AMBIGUOUS
+    LAST_AMBIGUOUS = 0
     slot_name = _slot_names(fr, image)
     class_cid = {ref: cid & 0xFFFFFFFF for ref, _n, cid, _s in fr.classes}
 
@@ -175,9 +185,18 @@ def build_selector_map(entries: list, fr, image,
         for k in rows.get(slot, ()):
             votes[nm][k - cid] += 1
 
-    best = {}
+    best, ambiguous = {}, 0
     for nm, cnt in votes.items():
-        off, n = cnt.most_common(1)[0]
+        top = cnt.most_common(2)
+        off, n = top[0]
+        # A tie is not agreement. Counter.most_common breaks one by insertion order, which
+        # is a coin flip dressed as a result: on the clean corpus 46 of 246 accepted names
+        # had a tied top vote, and each printed at its call sites as a real method name.
+        # `contains` had offsets 0 and 2 with three votes each. Dropping the name leaves
+        # `sel_0x<off>`, which is the honest rendering and what the reader can act on.
+        if len(top) > 1 and top[1][1] == n:
+            ambiguous += 1
+            continue
         if n >= min_agree:
             best[nm] = (off, n)
 
@@ -191,6 +210,9 @@ def build_selector_map(entries: list, fr, image,
     for off, (nm, _n) in claimed.items():
         if nm is not None:
             out[off] = nm
+    # Surfaced rather than swallowed: `selectors` reports it, so a drop in naming has a
+    # visible cause instead of looking like the recovery got worse.
+    LAST_AMBIGUOUS = ambiguous
     return out
 
 
