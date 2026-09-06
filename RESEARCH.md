@@ -63,7 +63,7 @@ Measured + source-confirmed facts (see FINDINGS.md and DESIGN.md):
    github.com/caverav/flutterdec) emits `.dartpseudo` from an ARM64 snapshot. What is
    still true is narrower and worth stating precisely: flutterdec's own name backend
    produces `sub_<addr>` placeholders and it takes real names from r2flutter or from a
-   Blutter dump. jadart recovers names, the class tree and virtual-call selectors from
+   Blutter dump. Jadart recovers names, the class tree and virtual-call selectors from
    the snapshot itself, in one self-contained tool with no external symbol source and no
    SDK build. Claim that, not the vacated one.
 2. Version brittleness. Blutter recompiles the SDK; unflutter hand-writes each format. A
@@ -168,11 +168,11 @@ Measured + source-confirmed facts (see FINDINGS.md and DESIGN.md):
 - Phase 1 IN PROGRESS: EVAL.md holds the tool-comparison table + failure taxonomy; the
   unflutter baseline is measured. The Blutter and multi-version rows are open work, listed
   under Pending in EVAL.md.
-- Phase 2 M1 DONE: framework/ (jadart) is a dependency-free, byte-exact, fail-loud snapshot
+- Phase 2 M1 DONE: framework/ (Jadart) is a dependency-free, byte-exact, fail-loud snapshot
   core. Validated against the Dart 3.12.2 build (exact version hash, the base-objects
   invariant, sane cid decode, fail-loud on unknown epoch). This already fixes unflutter's
   silent-fallback failure mode.
-- Phase 2 M2 DONE (WP-1a/1b, WP-2): jadart now walks the ENTIRE alloc pass over all 356
+- Phase 2 M2 DONE (WP-1a/1b, WP-2): Jadart now walks the ENTIRE alloc pass over all 356
   isolate clusters and recovers names. The alloc walk lands exactly on num_objects (54145
   clean, 30969 obf) (a byte-exact self-check across every cluster) then reads the canonical
   String cluster's fill to recover the interned identifier pool. FluBench name recall:
@@ -189,7 +189,7 @@ Measured + source-confirmed facts (see FINDINGS.md and DESIGN.md):
   fail loud. This is exactly the per-format-epoch overlay DESIGN.md section 7 proposed.
 - Docs: FINDINGS.md (measurements), DESIGN.md (format + parser design + tiers, source-cited),
   EVAL.md (Phase 1 eval), framework/README.md.
-- Phase 2 M3 DONE (WP-1c/1d, WP-3-partial, WP-4): jadart now walks the ENTIRE fill pass and
+- Phase 2 M3 DONE (WP-1c/1d, WP-3-partial, WP-4): Jadart now walks the ENTIRE fill pass and
   emits a Tier 0 skeleton. The fill walk consumes all 356 clusters' fill data byte-exactly
   (validated against unflutter's --debug-fill per-cluster offsets: it lands on the roots at
   0x0e0394 for clean), recovering the full object graph: 9013 strings, 7892 functions (with
@@ -206,14 +206,14 @@ Measured + source-confirmed facts (see FINDINGS.md and DESIGN.md):
   type_class_id resolution: FluBenchApp extends StatelessWidget, RenderBox extends RenderObject)
   and member kinds (constructors/getters/setters vs methods, from the Function kind_tag). Fields
   are mostly tree-shaken by AOT into offsets (332 Field objects survive), a real recovery limit.
-- Phase 3 Tier 1 STARTED (WP-3): jadart now maps each recovered Function to its Code object's
+- Phase 3 Tier 1 STARTED (WP-3): Jadart now maps each recovered Function to its Code object's
   byte range in the instructions image (via the InstructionsTable rodata) and disassembles it
   with capstone (arm64), annotating direct BL call targets with the recovered callee names.
   Proof: benchWithdraw disassembles to exactly its source (`if (amount > balance) return false;
   balance -= amount; return true;` as ldur/cmp/b.le/ret + sub/stur/ret), and benchRunAll's calls
   resolve to `-> benchCheckSecret`, `-> benchComputeChecksum`, `-> benchWithdraw`, `-> writeln`,
   etc. - a recovered, named call graph. `jadart --disasm <func>` prints it. 18 tests pass. This
-  is the "beats every current tool" step: unflutter et al. stop at raw `bl #offset`; jadart names
+  is the "beats every current tool" step: unflutter et al. stop at raw `bl #offset`; Jadart names
   the callee. ObjectPool loads are also annotated now: `ldr xN, [x27, #off]` -> pool entry off//8
   -> the referenced String/Function, e.g. `ldr x1, [x27, #0x810]  ; = "charCodes"` and
   `; = "Invalid MIME type"` in benchRunAll (contextually exact). So a method reads as annotated
@@ -223,7 +223,7 @@ Measured + source-confirmed facts (see FINDINGS.md and DESIGN.md):
   Example (FluBenchApp.build): `class FluBenchApp extends StatelessWidget { build() { L0: bl ->
   ThemeData.; ldr x1,[x27,#..] = "FluBench"; ... = "applyElevationOverlayColor"; L1: ... } }` -
   control-flow labels, named calls, named string constants, all in one navigable view. 20 tests pass.
-  jadart now runs end to end: stripped libapp.so -> object graph -> Tier 0 skeleton -> Tier 1
+  Jadart now runs end to end: stripped libapp.so -> object graph -> Tier 0 skeleton -> Tier 1
   annotated bodies -> a JADX-style per-class decompile view. This is the MVP of the project vision.
 - Phase 3 Tier 2 STARTED (control-flow reconstruction): a CFG builder (basic blocks + edges) plus a
   post-dominator-based structuring pass recover if/else and while-loops from the disassembly and

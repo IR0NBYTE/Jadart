@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jadart"
+name = "Jadart"
 dynamic = ["version"]
 description = "A decompiler for Flutter/Dart AOT snapshots: class tree, pseudo-Dart bodies, and virtual-call names out of a stripped libapp.so"
 readme = "README.md"
@@ -39,10 +39,10 @@ dependencies = []
 # build fails on a type error two levels away.
 
 [project.urls]
-Homepage = "https://github.com/IR0NBYTE/jadart"
-Repository = "https://github.com/IR0NBYTE/jadart"
-Issues = "https://github.com/IR0NBYTE/jadart/issues"
-Changelog = "https://github.com/IR0NBYTE/jadart/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/IR0NBYTE/Jadart"
+Repository = "https://github.com/IR0NBYTE/Jadart"
+Issues = "https://github.com/IR0NBYTE/Jadart/issues"
+Changelog = "https://github.com/IR0NBYTE/Jadart/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 disasm = ["capstone>=5.0"]

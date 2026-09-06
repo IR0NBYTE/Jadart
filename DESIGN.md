@@ -276,7 +276,7 @@ of the same release, where the same library code carries its names.
 
 **Where the adaptation improves on a direct port.** Ghidra masks constant operands because
 it has no way to say what a constant means. A Dart AOT function reaches its constants
-through the object pool (`ldr xN, [x27, #off]`), and jadart already resolves that offset to
+through the object pool (`ldr xN, [x27, #off]`), and Jadart already resolves that offset to
 the string or function it names. So where Ghidra keeps a masked immediate, this keeps the
 *resolved referent*: `[PP:"time of request: "]`. String literals are untouched by
 obfuscation, which makes them the strongest available signal on precisely the builds with
@@ -417,7 +417,7 @@ overwritten, and 56 reload sites were reading one.
 WHAT IS LEFT IS MOSTLY AN HONEST REFUSAL, and the largest single band of it is the entry
 argument: 17,492 lines (38.5%) whose only bare registers are the ones the Dart AOT calling
 convention passes arguments in, plus 5,020 more reading the incoming STACK argument area.
-Ghidra would print `param_1` and Hex-Rays `a1` for those. jadart does not, and the reason
+Ghidra would print `param_1` and Hex-Rays `a1` for those. Jadart does not, and the reason
 is a fact about the format rather than a policy: AOT does not serialize positional
 parameter names (the same tree-shaking that empties `offset_in_words_to_field`), so `arg1`
 would be a POSITION dressed as a name. `entry_arity` does prove the count, so the option is

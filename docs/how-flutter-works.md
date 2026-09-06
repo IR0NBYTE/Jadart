@@ -5,7 +5,7 @@ No prior Dart knowledge assumed. By the end you should know what got compiled, w
 survived, what was thrown away, and why the usual reverse engineering tools stop where
 they do.
 
-The follow-on page, [HOW-IT-WORKS.md](../HOW-IT-WORKS.md), covers what jadart does about
+The follow-on page, [HOW-IT-WORKS.md](../HOW-IT-WORKS.md), covers what Jadart does about
 each obstacle.
 
 ---
@@ -150,7 +150,7 @@ releases. A snapshot records a **version hash** identifying which VM wrote it, a
 a 3.12 snapshot with a 3.0 grammar does not fail cleanly. It produces a complete,
 confident, entirely fictional object graph.
 
-That is why jadart keys everything on the version hash and refuses to parse a release it
+That is why Jadart keys everything on the version hash and refuses to parse a release it
 does not have a registered grammar for. A wrong answer here is far worse than no answer,
 because nothing downstream looks broken.
 
@@ -266,6 +266,7 @@ flowchart LR
 - **Use the tool:** [../README.md](../README.md), then [usage.md](usage.md).
 - **The pipeline in detail:** [../HOW-IT-WORKS.md](../HOW-IT-WORKS.md).
 - **The format itself, cited to dart-lang/sdk:** [../DESIGN.md](../DESIGN.md).
+- **Working with a coding agent:** [../SKILL.md](../SKILL.md) is a portable Flutter RE skill
   whose central rule is the one this page keeps circling: report the gaps, never fill them.
 
 A deeper companion covering the engine internals and the Android intersection, with a

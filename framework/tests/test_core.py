@@ -1855,7 +1855,7 @@ def test_the_version_is_declared_once_and_the_changelog_agrees():
     assert "[project.urls]" in live, live
     for ln in live:
         if "github.com" in ln:
-            assert "github.com/IR0NBYTE/jadart" in ln, ln
+            assert "github.com/IR0NBYTE/Jadart" in ln, ln
 
     changelog = open(os.path.join(ROOT, "CHANGELOG.md")).read()
     assert changelog.startswith("# Changelog"), changelog[:80]
@@ -3550,6 +3550,41 @@ def test_the_two_right_shifts_are_told_apart():
     assert body("add", "x0, x1, x2, lsr #3") == "return x1 + (x2 >>> 3);", \
         body("add", "x0, x1, x2, lsr #3")
 
+
+def test_the_skill_file_names_only_commands_that_exist():
+    """SKILL.md tells an agent which command answers which question. An agent follows it
+    literally, so a name that has drifted is worse than no file at all: it sends the reader
+    somewhere that does not exist and the failure looks like the tool being broken.
+
+    The same drift already happened to the prose in this repo, where the README claimed
+    both "fifteen epochs" and "one supported epoch today". Documentation that is not
+    checked goes stale; this is the check."""
+    import os
+    import re as _re
+
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    skill = os.path.join(root, "SKILL.md")
+    if not os.path.exists(skill):
+        print("  SKIP test_the_skill_file_names_only_commands_that_exist (no SKILL.md)")
+        return
+    text = open(skill).read()
+
+    from jadart.cli import build_parser
+    parser = build_parser()
+    known = set()
+    for action in parser._actions:
+        if hasattr(action, "choices") and action.choices:
+            known |= {c for c in action.choices}
+    assert known, "could not read the command list off the parser"
+
+    named = set(_re.findall(r"`jadart (\w+)", text)) | set(
+        _re.findall(r"^jadart (\w+)", text, _re.M))
+    named -= {"install"}
+    assert named, "SKILL.md names no commands, so it cannot be routing anything"
+    unknown = sorted(named - known)
+    assert not unknown, (
+        f"SKILL.md sends an agent to commands that do not exist: {unknown}. "
+        f"Known commands: {sorted(known)}")
 
 def test_an_extending_addressing_operand_carries_its_shift():
     # `sxtw #2` scales by four exactly as `lsl #2` does (A5.1.4 spells the amount the same

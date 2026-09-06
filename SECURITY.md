@@ -2,13 +2,13 @@
 
 ## The threat model is the point
 
-jadart exists to open binaries you did not build and do not trust. A malware sample, a
+Jadart exists to open binaries you did not build and do not trust. A malware sample, a
 competitor's APK, a CTF challenge written specifically to be hostile. Every input is
 attacker-controlled by definition, and "don't open untrusted files" is not advice this tool
 can take.
 
 So the security bar is: **a crafted snapshot must never do anything worse than produce a
-clean error.** Concretely, no input should be able to make jadart
+clean error.** Concretely, no input should be able to make Jadart
 
 - execute code, or load anything the user did not point it at,
 - write outside the output directory passed to `export -o`,
@@ -49,7 +49,7 @@ There is no bounty. Credit in the release notes if you want it.
 
 ### Not in scope
 
-- **jadart refusing to parse something.** A refusal is the designed behaviour for an
+- **Jadart refusing to parse something.** A refusal is the designed behaviour for an
   unknown format version, an unsupported target, or a non-Flutter file. If the message is
   wrong or unhelpful, that is a normal bug. Please file it as one.
 - **Crashes with a clean error message and a documented exit code.** Exit `1` means the
@@ -60,13 +60,13 @@ There is no bounty. Credit in the release notes if you want it.
 
 ## An unhandled traceback is a bug worth filing
 
-If any input makes jadart print a Python traceback instead of a message, that is a defect
+If any input makes Jadart print a Python traceback instead of a message, that is a defect
 even when it is not exploitable: it means an error path was never considered, and those are
 where the exploitable ones live. A plain issue is fine for these.
 
 ## On what this tool is for
 
-jadart is for reverse engineers, security reviewers, and anyone auditing software they have
+Jadart is for reverse engineers, security reviewers, and anyone auditing software they have
 a right to audit. Whether analysing a particular binary is lawful depends on where you are
 and what you agreed to when you obtained it. That is your call to make, not something a
 README can settle for you.

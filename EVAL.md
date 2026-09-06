@@ -14,25 +14,25 @@ the tool, not the AOT optimizer (see FINDINGS.md, Phase 0).
 ## Tool comparison (on the Dart 3.12.2 arm64 corpus)
 
 The comparison below is run on one epoch so the tools are measured against the same bytes;
-jadart's own coverage is eighteen epochs and four targets, measured further down.
+Jadart's own coverage is eighteen epochs and four targets, measured further down.
 
 | tool | build | classes | functions | strings | decompiles? | offline | version-ID |
 |------|-------|---------|-----------|---------|-------------|---------|-----------|
 | unflutter | clean | 100% | 100% | 100% | no (asm) | yes | silent-fallback |
 | unflutter | obf | 0% | 0% | 100% | no (asm) | yes | silent-fallback |
-| jadart (M2) | clean | 100% | 100% | 100% | not yet | yes | fail-loud |
-| jadart (M2) | obf | 0% | 0% | 100% | not yet | yes | fail-loud |
-| jadart (M3) | clean | 100% | 100% | 100% | Tier 0 skeleton | yes | fail-loud |
-| jadart (M3) | obf | 0% | 0% | 100% | Tier 0 skeleton | yes | fail-loud |
-| jadart (T1) | clean | 100% | 100% | 100% | Tier0 + annotated asm | yes | fail-loud |
-| jadart (unified) | clean | 100% | 100% | 100% | per-class decompile view | yes | fail-loud |
-| jadart (T2) | clean | 100% | 100% | 100% | structured pseudo-Dart (if/else/loop) | yes | fail-loud |
-| jadart (T3) | clean | 100% | 100% | 100% | pseudo-Dart **expressions** (field/arith/call/return) | yes | fail-loud |
-| jadart (T3.4) | clean | 100% | 100% | 100% | expressions + **named virtual calls** (`this.renderObject`) | yes | fail-loud |
+| Jadart (M2) | clean | 100% | 100% | 100% | not yet | yes | fail-loud |
+| Jadart (M2) | obf | 0% | 0% | 100% | not yet | yes | fail-loud |
+| Jadart (M3) | clean | 100% | 100% | 100% | Tier 0 skeleton | yes | fail-loud |
+| Jadart (M3) | obf | 0% | 0% | 100% | Tier 0 skeleton | yes | fail-loud |
+| Jadart (T1) | clean | 100% | 100% | 100% | Tier0 + annotated asm | yes | fail-loud |
+| Jadart (unified) | clean | 100% | 100% | 100% | per-class decompile view | yes | fail-loud |
+| Jadart (T2) | clean | 100% | 100% | 100% | structured pseudo-Dart (if/else/loop) | yes | fail-loud |
+| Jadart (T3) | clean | 100% | 100% | 100% | pseudo-Dart **expressions** (field/arith/call/return) | yes | fail-loud |
+| Jadart (T3.4) | clean | 100% | 100% | 100% | expressions + **named virtual calls** (`this.renderObject`) | yes | fail-loud |
 | Blutter | - | pending (WP-5) | | | no (asm) | yes | per-version SDK |
 | Ghidra+scripts | - | pending | | | pseudocode (C) | yes | manual |
 
-M3 note: jadart is now the ONLY tool in this table that emits structured Dart (a Tier 0
+M3 note: Jadart is now the ONLY tool in this table that emits structured Dart (a Tier 0
 class/method skeleton), not assembly or C-pseudocode. It walks the whole fill pass
 byte-exactly and resolves the object graph, so it recovers not just a flat name list but the
 structure: `benchWithdraw` is placed inside `class BenchAccount`, 1842 named classes with
@@ -42,16 +42,16 @@ Tier 0. Reproduce (from framework/): `python3 -m jadart.cli <libapp.so> --tier0 
 Reading:
 - unflutter clean recovery is near-perfect even though it cannot positively
   identify Dart 3.12.2. Obfuscation zeroes name recovery (identifiers are
-  stripped from the snapshot; ~43% of objects removed, measured via jadart),
+  stripped from the snapshot; ~43% of objects removed, measured via Jadart),
   while string literals survive (--obfuscate does not encrypt them).
-- jadart (M2) now EQUALS unflutter's name recall (clean 100/100/100, obf 0/0/100)
+- Jadart (M2) now EQUALS unflutter's name recall (clean 100/100/100, obf 0/0/100)
   from a scratch, version-robust parser, and does it fail-loud instead of by
   silent-fallback. It walks the whole alloc pass byte-exactly (lands on num_objects)
   and reads the canonical String cluster to recover the identifier pool. Reproduce:
   `python3 flubench/score.py --truth flubench/artifacts/ground_truth.json --jadart-lib
   flubench/artifacts/clean/lib/arm64-v8a/libapp.so --label clean`.
 - Key eval finding: parsing the 3.12.2 binary against the main (3.13-dev) SDK source
-  exposed three format drifts (Closure alloc, Class alloc, cid numbering). jadart
+  exposed three format drifts (Closure alloc, Class alloc, cid numbering). Jadart
   handles them per-epoch; unflutter absorbs the same drift silently by falling back to
   its newest hand-coded profile. This is direct evidence for the version-robustness gap
   (failure taxonomy item 2) and that a per-epoch parameterization closes it.
@@ -150,7 +150,7 @@ no tool had decoded.
 **Locating the table is exact, not a search.** It is written last in the isolate stream, after
 the fill pass and the roots, so its start is not at a fixed offset and the intervening roots
 are variable-length varints. But the serializer emits the Code cluster's first ref id right
-after the table length (`Serializer::WriteDispatchTable`), and jadart already derives that same
+after the table length (`Serializer::WriteDispatchTable`), and Jadart already derives that same
 number independently from the alloc walk. Scanning the post-fill region for the position where
 the two agree pins the table exactly: on the corpus it resolves to offset `0xe086f`, length
 29190, with `first_code_id = 19341` matching the Code cluster's `start_ref = 19341`, and the
@@ -159,7 +159,7 @@ decode consumes the stream to its end.
 **The slot -> function link already existed.** Dispatch entries encode a `code_index`, and the
 same index space is used by every Function's serialized `code_index`; per
 `GetCodeAndEntryPointByIndex`, `instructions-table slot = code_index - 1` in both the discarded
-and the Code-cluster case. That is exactly the slot jadart maps to an owning function, so a
+and the Code-cluster case. That is exactly the slot Jadart maps to an owning function, so a
 table row names a concrete function rather than a bare address.
 
 **Naming, and how it self-checks.** The dispatch register points at `&array[kOriginElement]`
@@ -179,9 +179,9 @@ dispatch sites whose offset is recovered, 40.2% get a source name. `findRenderOb
 (`x0 = this.renderObject;`) rather than calls.
 
 Two honest limits, both measured rather than assumed. `--obfuscate` builds yield ~1 selector:
-the vote needs identifiers, and obfuscation removes them, so jadart keeps `sel_0x<off>` instead
+the vote needs identifiers, and obfuscation removes them, so Jadart keeps `sel_0x<off>` instead
 of inventing names. `dwarf_stack_traces_mode` builds also yield ~1: there the ELF `.symtab`
-still has the real `Class.method` names (and jadart uses them for the vote), but only 245 of
+still has the real `Class.method` names (and Jadart uses them for the vote), but only 245 of
 2175 Functions retain the snapshot `Code` -> owner-`Class` link the offset arithmetic needs, so
 there are too few anchors to corroborate. Both degrade to the Tier 3.3 rendering, never to a
 guess. Reproduce with `python3 -m jadart.cli <libapp.so> --selectors`.
@@ -197,7 +197,7 @@ args passed in V-registers are simply omitted). On FluBench, `benchRunAll` recon
 stack-convention `benchFirstOrDefault(...)` unreconstructed.
 
 Semantic runtime operations (Tier 3.2): a `bl` to a VM stub is compiler machinery, not a
-source call, so jadart renders the ones with source meaning and drops the rest. Throw stubs
+source call, so Jadart renders the ones with source meaning and drops the rest. Throw stubs
 become `throw <x0>` / `rethrow`, the shared error stubs become `throw NullCastError()` /
 `throw RangeError()` / `throw LateInitializationError()`, and allocation stubs become
 `x0 = new List()` / `new int()` / `new <Type>()`; the pure machinery (stack-overflow check,
@@ -238,7 +238,7 @@ are now recovered, see Tier 3.4 above.)
 
 ## End-to-end on a real app (dwarf_stack_traces_mode)
 
-Running jadart on a real, separate Flutter app (a "flagcheck" flag-checker, not FluBench)
+Running Jadart on a real, separate Flutter app (a "flagcheck" flag-checker, not FluBench)
 surfaced the dominant real-world configuration: a default `flutter build --release` sets
 dwarf_stack_traces_mode, which STRIPS the Dart class/method/field names out of the snapshot
 (snapshot-only recovery then yields short hash tokens like AB, Aba) and emits them instead
@@ -246,7 +246,7 @@ into the ELF .symtab / DWARF as qualified `Class.method` symbols for offline sta
 symbolication. FluBench's clean build happens to be built with no-dwarf_stack_traces_mode,
 which is why its snapshot keeps names; most shipped apps will not.
 
-jadart handles this with an ELF-symbol backfill (jadart/symbols.py): map each recovered
+Jadart handles this with an ELF-symbol backfill (jadart/symbols.py): map each recovered
 code range's pc_offset back to the covering .symtab symbol. On the real app this recovered
 9666 real function names that the snapshot no longer held, on top of the 7225 string
 literals recovered from the snapshot (which include the app's hardcoded flag), with full
@@ -267,7 +267,7 @@ PcDescriptors, CodeSourceMap and CompressedStackMaps to `RODataDeserializationCl
 `ReadFill` is empty and whose payload lives in the data image rather than the stream.
 
 Measured on this corpus: the arm64, x64 and arm32 builds of one app all carry the identical
-hash `ace654289f5abc240509fc941453ebc5`, but arm32 is `no-compressed-pointers`. jadart used to
+hash `ace654289f5abc240509fc941453ebc5`, but arm32 is `no-compressed-pointers`. Jadart used to
 resolve it to the compressed profile and walk 437 clusters with the alloc-pass self-check
 (`assigned == num_objects`) **passing**, because the ROData alloc pattern also reads exactly
 one varint per object; it only failed later, in the fill pass. That is a silent-wrongness
@@ -445,7 +445,7 @@ object header's **immutable bit moved from 6 to 7**. A canonical String cluster 
 (`BitField<..., SizeTagBits::kNextBit, 20>` in both), which is why the cid still decodes.
 
 So the three other epochs are listed in `versions.py` as **identified but unsupported**, with
-an empty grammar set. jadart reports "dart 3.11.5, identified, no validated cluster grammar"
+an empty grammar set. Jadart reports "dart 3.11.5, identified, no validated cluster grammar"
 instead of "unknown version" - more useful, and still a refusal. Supporting one is now a
 bounded task rather than an open question: derive that release's per-cluster ReadAlloc deltas
 and confirm them with `--verify` against the corpus binary that already exists.
@@ -503,7 +503,7 @@ place it, is still the correct behaviour rather than a gap to close by guessing.
 ## Failure taxonomy (the gaps a new tool must cover)
 
 1. Version-ID: silent fallback (unflutter) -> confidently-wrong output or
-   mid-parse crash (its issue #1). FIX: fail loud on unknown epoch (jadart does).
+   mid-parse crash (its issue #1). FIX: fail loud on unknown epoch (Jadart does).
 2. Version reach: unflutter hand-codes each format (caps documented at 3.10.7;
    3.11/3.12 only for exact hashes); Blutter recompiles the SDK per version.
    FIX: version-parameterized grammar with auto-generated cid/field skeletons
@@ -513,12 +513,12 @@ place it, is still the correct behaviour rather than a gap to close by guessing.
    use cross-build diffing or an offline LLM; a research bet).
 4. Decompilation: every tool stops at (annotated) assembly or Ghidra-C; none
    emit Dart or structured pseudo-Dart. This is the headline gap (C4). CLOSED by
-   jadart Tier 2 (control flow) + Tier 3 (expressions): `libapp.so` -> named
+   Jadart Tier 2 (control flow) + Tier 3 (expressions): `libapp.so` -> named
    pseudo-Dart statements. Tier 3.4 additionally names virtual calls from the
    serialized dispatch table, which not even Blutter decodes. Field names remain
    impossible (AOT strips them); that is a property of the format, not a tool gap.
 5. Scope: Blutter is Android-arm64 only; iOS is unsupported across the board. CLOSED for
-   the snapshot layer by jadart: Mach-O containers are read, and the uncompressed-pointer
+   the snapshot layer by Jadart: Mach-O containers are read, and the uncompressed-pointer
    grammar iOS uses (RODataDeserializationCluster, identifier pool in the RO data image) is
    implemented and passes 8/8 gates. The corpus objection turned out to be false, since
    Flutter 3.44.4 gen_snapshot writes App.framework itself, so a production-identical iOS
@@ -532,7 +532,7 @@ place it, is still the correct behaviour rather than a gap to close by guessing.
   Running unflutter across the corpus is also what measures its silent fallback.
 - A Ghidra-plus-scripts backend, for the pseudocode column.
 
-Each of these is scoped in [CONTRIBUTING.md](CONTRIBUTING.md) and needs no jadart internals.
+Each of these is scoped in [CONTRIBUTING.md](CONTRIBUTING.md) and needs no Jadart internals.
 
 ## How to reproduce
 

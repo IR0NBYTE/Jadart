@@ -1,10 +1,10 @@
 blank_issues_enabled: false
 contact_links:
   - name: A Dart release jadart does not know
-    url: https://github.com/IR0NBYTE/jadart/issues/new?template=unsupported_epoch.md
+    url: https://github.com/IR0NBYTE/Jadart/issues/new?template=unsupported_epoch.md
     about: >-
       Got "unknown format epoch"? That is jadart refusing to guess, not a crash.
       Open the epoch request and paste the version hash from the error.
   - name: Question, or not sure it is a bug
-    url: https://github.com/IR0NBYTE/jadart/discussions
+    url: https://github.com/IR0NBYTE/Jadart/discussions
     about: Ask in Discussions. Analysis questions are welcome there.

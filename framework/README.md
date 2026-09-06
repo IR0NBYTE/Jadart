@@ -1,11 +1,11 @@
-# jadart, tool reference
+# Jadart, tool reference
 
 This is the reference for the tool itself: every command, what each module does, and how
 to extend the parser to a new Dart release or a new target.
 
-Start at the [top-level README](https://github.com/IR0NBYTE/jadart/blob/main/README.md) for what jadart is, a before/after showcase,
-platform support and the honest limits. [DESIGN.md](https://github.com/IR0NBYTE/jadart/blob/main/DESIGN.md) is the annotated
-snapshot format, cited to dart-lang/sdk. [EVAL.md](https://github.com/IR0NBYTE/jadart/blob/main/EVAL.md) has the measurements and
+Start at the [top-level README](https://github.com/IR0NBYTE/Jadart/blob/main/README.md) for what Jadart is, a before/after showcase,
+platform support and the honest limits. [DESIGN.md](https://github.com/IR0NBYTE/Jadart/blob/main/DESIGN.md) is the annotated
+snapshot format, cited to dart-lang/sdk. [EVAL.md](https://github.com/IR0NBYTE/Jadart/blob/main/EVAL.md) has the measurements and
 the comparison against other tools.
 
 ## Commands
@@ -286,7 +286,7 @@ tightened only by the next `_kDart*` boundary symbol in that same section.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q     # 191 passing
+python3 -m pytest tests -q     # 192 passing
 ```
 
 The arm64 FluBench Dart 3.12.2 fixtures are committed, so a fresh clone runs the suite
@@ -302,7 +302,7 @@ The iOS and floating-point tests look for their `.dylib` and `.so` at fixed path
 local `jadart_e2e/` tree, and print how to build one when it isn't there. The iOS fixture
 needs no Xcode: since Flutter 3.44.4, `gen_snapshot` writes the Mach-O dylib itself.
 
-The interesting tests aren't the ones checking jadart is right on good input. They're the
+The interesting tests aren't the ones checking Jadart is right on good input. They're the
 ones checking it fails on bad input. `test_acceptance_gates_detect_a_wrong_grammar`
 perturbs a correct parse in four ways that mimic real grammar errors (a cid renumbering,
 an instance-geometry disagreement, a shifted Function fill spec, a miscounted header
@@ -324,11 +324,11 @@ Next:
   already exist, so this is bounded work rather than an open question.
 - 32-bit targets: ELF32 container plus a 32-bit word size.
 - Split snapshots and deferred loading units, which aren't in the corpus yet.
-- A navigable UI. jadart is a CLI today.
+- A navigable UI. Jadart is a CLI today.
 
 Not achievable, and measured rather than assumed: instance field *names*. See the limits
-section of the [top-level README](https://github.com/IR0NBYTE/jadart/blob/main/README.md#limits).
+section of the [top-level README](https://github.com/IR0NBYTE/Jadart/blob/main/README.md#limits).
 
 ## Licence
 
-MIT. See [LICENSE](https://github.com/IR0NBYTE/jadart/blob/main/LICENSE).
+MIT. See [LICENSE](https://github.com/IR0NBYTE/Jadart/blob/main/LICENSE).

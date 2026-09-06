@@ -1,6 +1,6 @@
 ---
 name: Unsupported Dart release
-about: jadart refused a binary with "unknown format epoch"
+about: Jadart refused a binary with "unknown format epoch"
 title: 'epoch: Dart <version> (<version hash>)'
 labels: 'epoch'
 ---

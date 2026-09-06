@@ -1,9 +1,9 @@
-# jadart
+# Jadart
 
-[![tests](https://github.com/IR0NBYTE/jadart/actions/workflows/tests.yml/badge.svg)](https://github.com/IR0NBYTE/jadart/actions/workflows/tests.yml)
+[![tests](https://github.com/IR0NBYTE/Jadart/actions/workflows/tests.yml/badge.svg)](https://github.com/IR0NBYTE/Jadart/actions/workflows/tests.yml)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 191 passing](https://img.shields.io/badge/tests-191%20passing-brightgreen.svg)](#tests)
+[![tests: 192 passing](https://img.shields.io/badge/tests-192%20passing-brightgreen.svg)](#tests)
 
 **A decompiler for Flutter apps.** Give it a stripped `libapp.so` or an iOS `App` binary
 and get back a class tree, method bodies as pseudo-Dart, the string pool, embedded data
@@ -17,7 +17,7 @@ teams ship banking, fintech, health and identity logic on the assumption that AO
 It does not. The public toolchain is simply fragmented, version-fragile, and stops at
 assembly.
 
-**The rule that shapes everything here: jadart never prints a confident guess.** An
+**The rule that shapes everything here: Jadart never prints a confident guess.** An
 instruction it does not model prints as raw arm64. A call argument it cannot reconstruct
 prints `(...)`. A field whose name is not in the binary prints `field_0x8`. A Dart release
 whose format is not registered raises a typed error instead of parsing with a grammar that
@@ -109,9 +109,9 @@ Each one shows a real property of the format:
   survive: the string `balance` is not in the binary at all. Some fields do survive with
   their offsets and those are printed by name; see [Limits](#limits) for which and how many.
 - `withdraw`'s parameter shows up as the constant `250`. The program's only call is
-  `_vault.withdraw(250)`, so that is what the compiled code contains. jadart shows you
+  `_vault.withdraw(250)`, so that is what the compiled code contains. Jadart shows you
   the compiled program, not the source you wish it were.
-- The comparison flipped: `amount > balance` compiled to `balance < 250`, and jadart
+- The comparison flipped: `amount > balance` compiled to `balance < 250`, and Jadart
   prints what the branch actually tests.
 
 ## How it fits together
@@ -139,8 +139,8 @@ to read. [HOW-IT-WORKS.md](HOW-IT-WORKS.md) then walks the whole pipeline above 
 ## Install
 
 ```bash
-git clone https://github.com/IR0NBYTE/jadart.git
-pip install './jadart/framework[disasm]'   # capstone is optional; the snapshot layer works without it
+git clone https://github.com/IR0NBYTE/Jadart.git
+pip install './Jadart/framework[disasm]'   # capstone is optional; the snapshot layer works without it
 ```
 
 Python 3.9 or newer. The snapshot layer has no dependencies at all; `[disasm]` pulls in
@@ -191,7 +191,7 @@ took obfuscated builds from 4% to 100% of the instruction image. Functions disca
 **ELF and DWARF name backfill.** A default `flutter build --release` turns on
 `dwarf_stack_traces_mode`, which strips Dart names out of the snapshot and emits them into
 the ELF `.symtab` instead. Snapshot-only recovery on such a build yields short hash tokens
-like `AB` and `Aba`. jadart maps each recovered code range back to the covering symbol. On
+like `AB` and `Aba`. Jadart maps each recovered code range back to the covering symbol. On
 a real third-party app that recovered **9666 real function names** the snapshot no longer
 held, alongside 7225 string literals and 100% disassembly coverage over 11052 ranges. This
 needs a `.so` that still has a symbol table: an unstripped build intermediate, a debug
@@ -226,7 +226,7 @@ Detail and reasoning: [docs/support.md](docs/support.md).
 ## Why "it parsed" is not evidence
 
 A snapshot parser that guesses wrong does not crash. It produces a plausible, entirely
-fictional object graph. So jadart ships byte-exact acceptance gates: `jadart verify` walks
+fictional object graph. So Jadart ships byte-exact acceptance gates: `jadart verify` walks
 the clusters and checks each one ends exactly where the format says it must, cross-checks
 recovered field offsets against the displacement the field's own implicit getter compiled
 to, and refuses rather than reports when a check cannot be understood.
@@ -240,11 +240,11 @@ radare2, is in [EVAL.md](EVAL.md).
 
 ## Limits
 
-Everything below is measured, not assumed. jadart fails loud rather than filling gaps with
+Everything below is measured, not assumed. Jadart fails loud rather than filling gaps with
 plausible output.
 
 **Original source is unrecoverable.** AOT discards the AST. The realistic target is typed,
-named pseudo-Dart, and that is what jadart aims at.
+named pseudo-Dart, and that is what Jadart aims at.
 
 **Most instance field names are gone, and a minority are not.** This page said "gone,
 permanently" until it was measured properly, and that was wrong in a way worth spelling
@@ -256,7 +256,7 @@ is unrecoverable and renders `this.field_0x8`.
 What is false is the generalisation that followed. Of those 420 `Field` objects 245 are
 INSTANCE fields, not statics, and each records its own byte offset (`Smi::New(
 Field::TargetOffsetOf(field))`, app_snapshot.cc:2238). Across the 44 cached third-party
-apps it is 36,555 instance fields of 59,160. So jadart prints the name where the snapshot
+apps it is 36,555 instance fields of 59,160. So Jadart prints the name where the snapshot
 supplies one and the receiver's class is known, and the offset everywhere else:
 
 ```
@@ -284,7 +284,7 @@ not an open question, because `verify` decides when it is right.
 
 **Obfuscation removes the app's own names permanently.** `--obfuscate` removes about 43%
 of snapshot objects, which are the identifier strings, so name recall from the binary
-drops to roughly 2% for every tool. jadart keeps 100% string-literal recall and 100%
+drops to roughly 2% for every tool. Jadart keeps 100% string-literal recall and 100%
 disassembly coverage there, and selector naming degrades to roughly 1 name because the
 corroboration vote needs identifiers to count. `dwarf_stack_traces_mode` builds also yield
 about 1 selector: the `.symtab` still has the real names, but only 245 of 2175 Functions
@@ -293,7 +293,7 @@ to the Tier 3.3 rendering, never to a guess. `--sigs` recovers the *library* hal
 loss from a reference build (see [Naming library code](docs/usage.md#naming-library-code-that-was-obfuscated-away));
 the app's own functions stay anonymous, because no reference contains them.
 
-**No UI.** jadart is a CLI. A navigable viewer is on the roadmap, not in the box.
+**No UI.** Jadart is a CLI. A navigable viewer is on the roadmap, not in the box.
 
 **Arguments and unmodelled instructions are marked, not invented.** Calls using the stack
 convention print `(...)`. Any instruction the lifter doesn't model prints as arm64. The
@@ -306,11 +306,12 @@ code ranges** across the clean build, the obfuscated build, and a real third-par
 | document | what is in it |
 |---|---|
 | [docs/how-flutter-works.md](docs/how-flutter-works.md) | how a Flutter app is built and what ships, with diagrams |
-| [HOW-IT-WORKS.md](HOW-IT-WORKS.md) | the whole jadart pipeline, end to end |
+| [HOW-IT-WORKS.md](HOW-IT-WORKS.md) | the whole Jadart pipeline, end to end |
 | [docs/usage.md](docs/usage.md) | command walkthroughs |
 | [docs/support.md](docs/support.md) | platform and version support in detail |
 | [DESIGN.md](DESIGN.md) | the annotated Dart AOT snapshot format, cited to dart-lang/sdk |
 | [EVAL.md](EVAL.md) | evaluation against existing tools, and the failure taxonomy |
+| [SKILL.md](SKILL.md) | a portable Flutter reverse-engineering skill for coding agents |
 | [CHANGELOG.md](CHANGELOG.md) | what changed, and what the version number covers |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | how to add an epoch, a grammar or a gate |
 
@@ -337,7 +338,7 @@ docs/                 usage, support, and the Flutter internals explainer
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 191 passing
+cd framework && python3 -m pytest tests -q     # 192 passing
 ```
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

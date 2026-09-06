@@ -1,6 +1,6 @@
 ---
 name: Bug report
-about: jadart crashed, refused a binary it should handle, or printed something wrong
+about: Jadart crashed, refused a binary it should handle, or printed something wrong
 title: ''
 labels: bug
 assignees: ''

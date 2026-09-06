@@ -74,7 +74,7 @@ solves it trivially (strings alone, or unflutter to locate the check).
 Four of these are answered, and the answers live in EVAL.md and framework/README.md
 rather than here: version identification across releases (fifteen format epochs keyed on
 version hash, architecture and pointer model, so a release with no registered grammar
-fails loudly instead of being guessed at), fidelity across versions jadart cannot
+fails loudly instead of being guessed at), fidelity across versions Jadart cannot
 positively ID (the acceptance gates run on 33 binaries over 13 epochs, including real
 F-Droid apps), whether annotated assembly can become readable Dart (Tier 3 does, at 23.6%
 bare registers on the clean build), and whether obfuscated builds keep their structure
@@ -141,7 +141,7 @@ value of Phase 0: establish a measurement you can trust before comparing tools.
 Next: add a Blutter backend to the scorer, sweep Dart versions (FVM), and add Tier 1+ body
 fidelity (compile-and-diff) so the benchmark grades decompilation, not just name recall.
 
-## Phase 2 (jadart parser core) baseline
+## Phase 2 (Jadart parser core) baseline
 
 Built framework/jadart, a dependency-free byte-exact snapshot parser (header, version epoch,
 counts, cluster tags), validated against the Dart 3.12.2 build (6 passing tests):
@@ -155,7 +155,7 @@ counts, cluster tags), validated against the Dart 3.12.2 build (6 passing tests)
 - Fail-loud: an unknown (hash, features) epoch raises rather than guessing. This is the
   headline correctness fix over unflutter's silent fallback.
 
-New measured finding (via jadart): obfuscation removes ~43% of snapshot objects
+New measured finding (via Jadart): obfuscation removes ~43% of snapshot objects
 (clean 54145 -> obf 30969, delta 23176) at nearly constant cluster count (356 -> 355). Those
 23k objects are the stripped name strings. This is the quantified reason name recovery drops
 to 0% under --obfuscate: the identifiers are not merely hidden, they are absent from the
@@ -163,7 +163,7 @@ binary. String literals remain (they are separate constant objects, not identifi
 
 ## Phase 2 M2 (full alloc walk + name recovery)
 
-jadart now walks the ENTIRE alloc pass and recovers names, not just counts. It lands exactly on
+Jadart now walks the ENTIRE alloc pass and recovers names, not just counts. It lands exactly on
 num_objects (54145 clean, 30969 obf), reading all 356 (clean) / 355 (obf) clusters byte-exactly,
 a strong self-check: any wrong per-cluster read pattern desyncs the varint stream and misses the
 count. It then reads the canonical String cluster's fill for the interned identifier pool.
@@ -195,7 +195,7 @@ hand-coding.
 
 ## Phase 2 M3 (full fill walk -> object graph -> Tier 0 skeleton)
 
-jadart now walks the ENTIRE fill pass, not just the first String cluster. The fill pass runs
+Jadart now walks the ENTIRE fill pass, not just the first String cluster. The fill pass runs
 every cluster's per-object field data in alloc order; the walker consumes all 356 clusters
 byte-exactly and lands on the roots at 0x0e0394 (clean), validated cluster-by-cluster against
 unflutter's `--debug-fill` per-cluster offsets. It recovers the full object graph:
@@ -217,7 +217,7 @@ Tier 0 enrichment (superclass + member kinds), all from the same fill walk:
   FluBenchPage extends StatefulWidget, StatelessWidget extends Widget, and mixin applications
   like State extends _MixinApplication0&Object&Diagnosticable come out correctly.
 - Member kinds: the Function kind_tag (last fill scalar) low 5 bits give the FunctionKind;
-  jadart labels constructors (402), getters (747), setters (145) vs plain methods (4121).
+  Jadart labels constructors (402), getters (747), setters (145) vs plain methods (4121).
 - Fields: 332 Field objects survive; most instance fields are tree-shaken by AOT into direct
   offsets (no Field object), so a trivial class like BenchAccount shows its methods but not its
   `owner`/`balance` fields. That is a real AOT recovery limit, not a parser gap.
@@ -226,7 +226,7 @@ hitTest(); globalToLocal(); ... }`.
 
 ## Phase 3 Tier 1 (instructions image + annotated disassembly)
 
-jadart now ties a recovered Function to its actual machine code and disassembles it. The Code
+Jadart now ties a recovered Function to its actual machine code and disassembles it. The Code
 fill captures each code's instructions-table index + owner Function; the InstructionsTable rodata
 (a OneByteString in the isolate data image at roundUp(header.length, 64) + instr_table_rodata_offset,
 16-byte header then {canon, length, first_entry_with_code, pad} then length x {pc_offset, stackmap}
@@ -254,7 +254,7 @@ referenced constant: in benchRunAll, `ldr x1, [x27, #0x810]  ; = "charCodes"` (n
 processing) and `ldr x1, [x27, #0x1238]  ; = "Invalid MIME type"` (next to the base64 encode /
 benchDecodeFlag), contextually exact. So a recovered method now reads as annotated arm64 with
 BOTH named call targets and named string/const references. unflutter and the others stop at raw
-`bl #offset` / `ldr [x27,#off]`; jadart names both. `jadart --disasm <func>` prints the listing.
+`bl #offset` / `ldr [x27,#off]`; Jadart names both. `jadart --disasm <func>` prints the listing.
 
 ## Phase 3 Tier 2 (control-flow reconstruction)
 

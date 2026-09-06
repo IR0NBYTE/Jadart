@@ -1,6 +1,6 @@
-# Contributing to jadart
+# Contributing to Jadart
 
-Thanks for looking. jadart decompiles Flutter / Dart AOT snapshots, so most work here is
+Thanks for looking. Jadart decompiles Flutter / Dart AOT snapshots, so most work here is
 either format work (a new Dart version, a new target) or decompiler work (better output
 from the same bytes).
 
@@ -19,7 +19,7 @@ You need python3 and nothing else for the core. Disassembly needs capstone.
 ```bash
 cd jadart/framework
 pip install -e '.[disasm]' pytest
-python3 -m pytest tests -q      # 191 tests, all must pass
+python3 -m pytest tests -q      # 192 tests, all must pass
 ```
 
 Use pytest, not `python3 tests/test_core.py`. The file still carries a script runner for
@@ -45,7 +45,7 @@ python3 -m jadart decompile path/to/libapp.so BenchAccount
 
 ## Correctness comes first
 
-Read this part before writing code. jadart exists because the other tools in this space
+Read this part before writing code. Jadart exists because the other tools in this space
 guess. Meet unflutter with a snapshot it doesn't know and it falls back to its newest
 hand-coded profile, then prints confident nonsense. Three rules follow from not doing
 that.
@@ -139,7 +139,7 @@ Check the open issues first. These come straight from the roadmap and are real:
   from a call to its target, a class tree.
 - **Blutter and Ghidra rows in EVAL.md.** Both are pending in the comparison table.
   Running them over the FluBench corpus and scoring with `flubench/score.py` closes a hole
-  in the evaluation and needs no jadart internals.
+  in the evaluation and needs no Jadart internals.
 
 Anything bigger than a weekend, open an issue first so we can agree on the approach before
 you do the work.

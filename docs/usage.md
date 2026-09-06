@@ -1,4 +1,4 @@
-# Using jadart
+# Using Jadart
 
 The command walkthroughs, moved out of the README so the landing page stays a landing
 page. `jadart <command> --help` documents any one command; this is the narrative version.
@@ -7,7 +7,7 @@ page. `jadart <command> --help` documents any one command; this is the narrative
 
 jadx separates what it decompiles from what it merely extracts. That idea is worth
 borrowing; copying the output is not. A Flutter APK holds **two** programs: `libapp.so` is
-the Dart, `classes.dex` is the Android embedding and its plugins, so jadart writes out only
+the Dart, `classes.dex` is the Android embedding and its plugins, so Jadart writes out only
 the part it makes more readable, and tells you what reads the rest.
 
 ```
@@ -89,7 +89,7 @@ took obfuscated builds from 4% to 100% of the instruction image. Functions disca
 **ELF and DWARF name backfill.** A default `flutter build --release` turns on
 `dwarf_stack_traces_mode`, which strips Dart names out of the snapshot and emits them into
 the ELF `.symtab` instead. Snapshot-only recovery on such a build yields short hash tokens
-like `AB` and `Aba`. jadart maps each recovered code range back to the covering symbol. On
+like `AB` and `Aba`. Jadart maps each recovered code range back to the covering symbol. On
 a real third-party app that recovered **9666 real function names** the snapshot no longer
 held, alongside 7225 string literals and 100% disassembly coverage over 11052 ranges. This
 needs a `.so` that still has a symbol table: an unstripped build intermediate, a debug
@@ -152,7 +152,7 @@ $ jadart xrefs libapp.so benchWithdraw
 
 Some apps put nothing interesting in Dart at all. BrunnerCTF 2025's "Brod and Co." is one:
 the flag is not in the snapshot, it is inside an 18KB `libnative.so` the app reaches over
-FFI, and the Dart half is a map to it rather than the answer. jadart already recovered
+FFI, and the Dart half is a map to it rather than the answer. Jadart already recovered
 every piece of that map, the library name from `strings`, the reading code from `xrefs`,
 the looked-up symbols from `lift`, and made the analyst assemble it. `jadart ffi` puts
 the three on one page:
@@ -180,7 +180,7 @@ only the lines carrying a literal.
 What the command does NOT claim is that anything was loaded. It classifies a pool literal
 by its **filename shape** (`.so`, `.dylib`, `.dll`, a path into a `.framework`) and
 reports which code reads it. That a `DynamicLibrary.open` was the reader is a separate
-fact, and where jadart can see it, it is visible in the lifted line rather than asserted in
+fact, and where Jadart can see it, it is visible in the lifted line rather than asserted in
 the header. A binary with no such literal is refused outright, with the reason:
 
 ```
@@ -227,7 +227,7 @@ through a resolved virtual call go from **19 to 729**.
 
 ## Naming library code that was obfuscated away
 
-On an ordinary build jadart reads **72.5%** of function names straight out of the snapshot
+On an ordinary build Jadart reads **72.5%** of function names straight out of the snapshot
 (73.9% on a second app). A `--obfuscate` build collapses that to **2.2%**, because Dart's
 obfuscator renames dart:core and the Flutter framework too: `toRadixString` and `padLeft`
 are not hidden in the file, they are absent from it. No parser recovers them.
@@ -258,7 +258,7 @@ jadart lift TheTimer.apk 0x739c8 --sigs dart33.sig
 
 **Where we do better than a direct port.** Ghidra masks constant operands because it
 cannot say what they mean. We can: an arm64 Dart function reaches its constants through
-the object pool, and jadart already resolves that offset to the string or function it
+the object pool, and Jadart already resolves that offset to the string or function it
 names. So a masked immediate becomes a *resolved referent*, `[PP:"time of request: "]`.
 String literals survive obfuscation untouched, which makes them the strongest signal
 available on exactly the builds that need it most.

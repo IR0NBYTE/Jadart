@@ -1,6 +1,6 @@
 # How it works
 
-Two questions, answered in order: what makes a Flutter app hard to read, and what jadart
+Two questions, answered in order: what makes a Flutter app hard to read, and what Jadart
 does about each obstacle. Everything quoted here is real output from the command shown,
 against binaries in this checkout.
 
@@ -136,7 +136,7 @@ which is worse.
 
 ---
 
-# Part 2. What jadart does about it
+# Part 2. What Jadart does about it
 
 ## 2.1 Identify the build, or refuse
 

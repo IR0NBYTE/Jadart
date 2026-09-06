@@ -55,7 +55,7 @@ the older lines it is finer still, since 3.0.0 and 3.0.7 diverge. A tool that as
 profile per minor version would be wrong about several of them.
 
 "Identified, no grammar" is still a deliberate state for a release nothing has been gated
-on, and jadart says so out loud rather than guessing:
+on, and Jadart says so out loud rather than guessing:
 
 ```
 jadart: epoch <name> (dart <version>) is identified but has no validated cluster
