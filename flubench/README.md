@@ -5,7 +5,7 @@ labeled construct app, so the declared class/method/function names, the string
 literals, and the call graph are exact ground truth. A tool is scored on how much
 of that it recovers from the compiled `libapp.so`.
 
-This is the harness the whole research program measures against (RESEARCH.md).
+This is the harness the recovery claims are measured against.
 Phase 0 is a single-Dart-version, single-tool (unflutter) slice; the structure is
 built to expand along every axis.
 
@@ -69,4 +69,4 @@ Prints a scorecard: clean vs obfuscated recall for classes / functions / strings
   (`--split-debug-info`), which is a second ground-truth source for scoring
   obfuscated-name recovery.
 - Corpus apps use `ndkVersion = "29.0.14206865"` to avoid the corrupt-NDK auto
-  download (see FINDINGS.md).
+  download (see ../FINDINGS.md).

@@ -8,7 +8,6 @@ flubench/artifacts/symbols/
 *.apk
 *.so
 !flubench/artifacts/*/lib/arm64-v8a/libapp.so
-!challenges/*/*.apk
 *.unflutter/
 __pycache__/
 *.pyc
@@ -40,20 +39,3 @@ framework/.sdkcache/
 flubench/corpus
 flubench/corpus/
 
-# An unpacked APK, or a decompiler's output, sitting next to the challenge it came from.
-# `git add -A` swept 632 of these in once: the whole unzipped container plus a jadx run,
-# every file of which carried the absolute path it was decompiled from. Only the four
-# files the challenge actually ships belong here.
-challenges/*/classes/
-challenges/*/classes.dex
-challenges/*/assets/
-challenges/*/res/
-challenges/*/lib/
-challenges/*/META-INF/
-challenges/*/kotlin/
-challenges/*/AndroidManifest.xml
-challenges/*/resources.arsc
-challenges/*/*.bin
-challenges/*/*.json
-challenges/*/solve.py
-challenges/*/build/

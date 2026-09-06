@@ -111,9 +111,8 @@ def check_doc_test_counts() -> list:
     and CONTRIBUTING to 59 because nothing did. Hand-maintained numbers are wrong the
     moment someone adds a test, and the reader has no way to tell.
 
-    Only the docs meant to describe the CURRENT state are checked. FINDINGS.md and
-    RESEARCH.md are dated phase logs, where "10 tests pass" is a record of that milestone
-    and correct as written.
+    Only the docs meant to describe the CURRENT state are checked. FINDINGS.md is a dated
+    phase log, where "10 tests pass" is a record of that milestone and correct as written.
     """
     tests = os.path.join(FRAMEWORK, "tests", "test_core.py")
     if not os.path.exists(tests):
