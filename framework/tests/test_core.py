@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jadart.snapshot import parse_libapp, parse_blob, UnknownEpoch  # noqa: E402
 import struct  # noqa: E402
+import jadart  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 CLEAN = os.path.join(ROOT, "flubench/artifacts/clean/lib/arm64-v8a/libapp.so")
@@ -63,9 +64,11 @@ def test_obfuscation_does_not_change_format():
 
 
 def test_fail_loud_on_unknown_epoch():
-    fake = (struct.pack("<I", 0xDCDCF5F5) + struct.pack("<q", 0)
-            + struct.pack("<q", 2) + (b"deadbeef" * 4) + b"\x00"
-            + bytes([0x80, 0x80, 0x80, 0x80, 0x80]))
+    # length has to be inside the blob: parse_blob rejects an impossible one before it
+    # ever reaches the epoch lookup, and this test is about the epoch lookup.
+    body = (b"deadbeef" * 4) + b"\x00" + bytes([0x80, 0x80, 0x80, 0x80, 0x80])
+    fake = (struct.pack("<I", 0xDCDCF5F5) + struct.pack("<q", len(body))
+            + struct.pack("<q", 2) + body)
     try:
         parse_blob(bytes(fake), "test", strict=True)
     except UnknownEpoch:
@@ -78,7 +81,7 @@ def test_truncated_snapshot_fails_loud():
     # or ValueError leaking from the stream.
     from jadart.stream import TruncatedSnapshot
     # (a) features C-string with no terminator
-    b1 = (struct.pack("<I", 0xDCDCF5F5) + struct.pack("<q", 999) + struct.pack("<q", 2)
+    b1 = (struct.pack("<I", 0xDCDCF5F5) + struct.pack("<q", 44) + struct.pack("<q", 2)
           + b"a" * 32 + b"no-null-here")
     try:
         parse_blob(b1, "isolate", strict=False)
@@ -171,7 +174,10 @@ def test_non_flutter_elf_fails_loud_not_silent():
     try:
         parse_libapp(path)
         raise AssertionError("non-Flutter ELF returned silently instead of failing loud")
-    except ValueError:
+    except jadart.InputError:
+        # The documented type, not a bare ValueError. A caller writing the `except
+        # jadart.JadartError` the package docstring promises has to be able to catch this,
+        # which is the whole point of the taxonomy.
         pass
     finally:
         os.unlink(path)

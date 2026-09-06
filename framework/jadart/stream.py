@@ -20,6 +20,12 @@ END_BYTE_MARKER = 192
 END_UNSIGNED_BYTE_MARKER = 128
 _MAX_UNSIGNED_PER_BYTE = 127
 REF_ID_MAX_BYTES = 4      # datastream.h ReadRefId: four STAGE expansions, 28 bits
+#: Reader::Read<T> is bounded by sizeof(T), and the widest value the format encodes is a
+#: uint64: ten 7-bit groups. Without the bound a run of continuation bytes accumulates an
+#: unbounded Python int, which is quadratic rather than merely wrong: 320 KB of 0x7f took
+#: 3.7s and 1.28 MB took 56.6s, so a crafted file hangs a batch scan instead of failing.
+VARINT_MAX_BYTES = 10
+_MAX_VALUE_BITS = 7 * (VARINT_MAX_BYTES - 1)
 
 
 class TruncatedSnapshot(JadartError):
@@ -67,9 +73,16 @@ class ReadStream:
                 return b - marker
             r = 0
             s = 0
+            start = pos - 1
             while b <= _MAX_UNSIGNED_PER_BYTE:
                 r |= b << s
                 s += 7
+                if s > _MAX_VALUE_BITS:
+                    self.pos = pos
+                    raise TruncatedSnapshot(
+                        f"varint did not terminate within {VARINT_MAX_BYTES} bytes at "
+                        f"offset {start}: the stream is desynced. The widest value the VM "
+                        f"encodes is a uint64, which fits in {VARINT_MAX_BYTES} groups")
                 b = data[pos]
                 pos += 1
         except IndexError:

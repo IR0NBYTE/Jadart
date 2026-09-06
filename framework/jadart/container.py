@@ -36,7 +36,7 @@ binary is the ONLY index of what the app declares as an asset.
 """
 from __future__ import annotations
 
-from .errors import JadartError
+from .errors import ContainerError, JadartError
 
 import gzip
 import json
@@ -44,14 +44,18 @@ import os
 import posixpath
 import shutil
 import zipfile
+import zlib
 
 # Anything bigger than this is not being unpacked from an untrusted container.
 MAX_MEMBER = 1_500_000_000
 MAX_TOTAL = 4_000_000_000
-
-
-class ContainerError(JadartError):
-    pass
+#: NOTICES.Z is a licence text file. Anything past this is a decompression bomb, not a
+#: licence: the whole Flutter framework's notices come to a few hundred KB.
+MAX_NOTICES = 64_000_000
+#: AssetManifest.bin nests lists and maps, and the reader recurses once per level. Flutter
+#: writes two. A crafted file nesting thousands raises RecursionError, which is neither a
+#: ContainerError nor catchable by anyone following the documented API.
+MAX_MANIFEST_DEPTH = 64
 
 
 # ── Flutter's StandardMessageCodec ──────────────────────────────────────────
@@ -70,6 +74,7 @@ class _Reader:
 
     def __init__(self, buf: bytes):
         self.b, self.i = buf, 0
+        self.depth = 0
 
     def _take(self, n: int) -> bytes:
         if n < 0 or self.i + n > len(self.b):
@@ -118,10 +123,18 @@ class _Reader:
             self._align(width)
             self._take(n * width)
             return f"<{n} x {width * 8}-bit>"
-        if t == _LIST:
-            return [self.value() for _ in range(self._size())]
-        if t == _MAP:
-            return {self._key(): self.value() for _ in range(self._size())}
+        if t in (_LIST, _MAP):
+            self.depth += 1
+            if self.depth > MAX_MANIFEST_DEPTH:
+                raise ContainerError(
+                    f"AssetManifest.bin nests past {MAX_MANIFEST_DEPTH} levels at offset "
+                    f"{self.i - 1}; refusing to recurse further.")
+            try:
+                if t == _LIST:
+                    return [self.value() for _ in range(self._size())]
+                return {self._key(): self.value() for _ in range(self._size())}
+            finally:
+                self.depth -= 1
         raise ContainerError(f"AssetManifest.bin: unknown type byte {t} at offset {self.i - 1}")
 
     def _key(self):
@@ -303,6 +316,22 @@ def unpack(container: str, outdir: str) -> dict:
         return stats
 
     total, inventory, groups = 0, [], {}
+    # Everything zipfile raises on a malformed or hostile archive is turned into a
+    # ContainerError here: BadZipFile for a broken central directory or a failed CRC,
+    # zlib.error mid-stream, NotImplementedError for a compression method it does not
+    # have, RuntimeError for an encrypted member, and OSError (FileExistsError,
+    # NotADirectoryError) when one member's name is a prefix of another's directory.
+    # None of those are catchable by a caller following the documented API.
+    try:
+        return _unpack_members(container, outdir, stats, total, inventory, groups)
+    except ContainerError:
+        raise
+    except (zipfile.BadZipFile, zlib.error, NotImplementedError, RuntimeError,
+            OSError, EOFError) as exc:
+        raise ContainerError(f"{container}: cannot read this archive: {exc}") from exc
+
+
+def _unpack_members(container, outdir, stats, total, inventory, groups):
     with zipfile.ZipFile(container) as z:
         for info in z.infolist():
             if info.filename.endswith("/"):
@@ -395,14 +424,33 @@ def _write_container_map(outdir: str, container: str, stats: dict):
 
 
 def _expand_notices(adir: str) -> int:
-    """NOTICES.Z is gzip. Unpack it and list the packages beside it."""
+    """NOTICES.Z is gzip. Unpack it and list the packages beside it.
+
+    Read through GzipFile in chunks rather than gzip.decompress, because the compressed
+    size says nothing about the expanded size: a 400 KB member of nothing but zeroes
+    expands to 419 MB, and decompress() had already built the whole bytes object before
+    anything could look at it. Measured on a crafted APK: 1.68 GB resident and 838 MB
+    written before the cap existed.
+    """
     src = os.path.join(adir, "NOTICES.Z")
     if not os.path.exists(src):
         return 0
     try:
-        with open(src, "rb") as fh:
-            text = gzip.decompress(fh.read()).decode("utf-8", "replace")
-    except Exception:
+        buf = bytearray()
+        with gzip.open(src, "rb") as gz:
+            while True:
+                chunk = gz.read(1 << 20)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_NOTICES:
+                    raise ContainerError(
+                        f"NOTICES.Z expands past {MAX_NOTICES / 1e6:.0f} MB, which no "
+                        f"licence file legitimately does. Refusing to keep decompressing.")
+        text = bytes(buf).decode("utf-8", "replace")
+    except ContainerError:
+        raise
+    except (OSError, EOFError, zlib.error, ValueError):
         return 0
     with open(os.path.join(adir, "NOTICES"), "w") as fh:
         fh.write(text)

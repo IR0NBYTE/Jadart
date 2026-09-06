@@ -14,7 +14,7 @@ header, version epoch (fail-loud), counts, and the first cluster's cid.
 """
 from __future__ import annotations
 
-from .errors import JadartError
+from .errors import InputError, JadartError, MissingSymbol
 
 import struct
 from dataclasses import dataclass
@@ -37,6 +37,7 @@ DART_MAGIC = 0xDCDCF5F5
 #: there in 3.12 and everything below it has kNone. Rather than pick one, anything past
 #: kFullAOT reports its number, which no release binary reaches.
 KIND = {0: "kFull", 1: "kFullCore", 2: "kFullJIT", 3: "kFullAOT"}
+_MAX_KIND = max(KIND)
 
 
 class UnknownEpoch(JadartError):
@@ -64,12 +65,35 @@ class SnapshotHeader:
         return KIND.get(self.kind, f"?{self.kind}")
 
 
+#: magic(4) + length(8) + kind(8) + the 32-char version hash. Anything shorter is not a
+#: header, and struct.unpack_from would raise struct.error from inside the parse.
+_MIN_HEADER = 52
+
+
 def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeader:
+    if len(blob) < _MIN_HEADER:
+        raise InputError(
+            f"{which}: {len(blob)} bytes is too short to be a snapshot header "
+            f"(needs {_MIN_HEADER})")
     magic, = struct.unpack_from("<I", blob, 0)
     if magic != DART_MAGIC:
-        raise ValueError(f"bad snapshot magic 0x{magic:08x}")
+        # InputError, not ValueError: a caller following the documented API catches
+        # JadartError, and a bare ValueError from here escaped every such clause.
+        raise InputError(
+            f"{which}: bad snapshot magic 0x{magic:08x} (expected 0x{DART_MAGIC:08x}). "
+            f"This is not a Dart AOT snapshot.")
     length, = struct.unpack_from("<q", blob, 4)
     kind, = struct.unpack_from("<q", blob, 12)
+    # Both come straight off disk and are trusted downstream: `length` locates the RO data
+    # image on uncompressed targets, so a corrupt one silently mislocates every string.
+    if not 0 < length <= len(blob):
+        raise InputError(
+            f"{which}: header declares length {length}, outside the blob "
+            f"(0 < length <= {len(blob)})")
+    if not 0 <= kind <= _MAX_KIND:
+        raise InputError(
+            f"{which}: header declares snapshot kind {kind}, which is not one of "
+            f"{sorted(KIND)}")
     version_hash = blob[20:52].decode("ascii", "replace")
 
     st = ReadStream(blob, 52)
@@ -169,7 +193,10 @@ def parse_libapp(path: str, *, strict: bool = True) -> dict[str, SnapshotHeader]
                        ("isolate", "_kDartIsolateSnapshotData")):
         try:
             blob = elf.symbol_bytes(sym)
-        except KeyError:
+        except MissingSymbol:
+            # Absent is an answer here: a stripped build has neither symbol and falls
+            # through to the magic scan below. Anything else (a symbol pointing outside
+            # the file) is corruption and propagates.
             continue
         out[which] = parse_blob(blob, which, strict=strict)
     if not out:
@@ -177,7 +204,7 @@ def parse_libapp(path: str, *, strict: bool = True) -> dict[str, SnapshotHeader]
         for i, off in enumerate(elf.find_snapshot_magic()):
             out[f"blob{i}"] = parse_blob(data[off:], f"blob{i}", strict=strict)
     if not out:
-        raise ValueError(
+        raise InputError(
             f"{path}: no Dart snapshot found (missing _kDart*SnapshotData symbols and "
             f"no snapshot magic). Not a Flutter/Dart AOT library?")
     return out

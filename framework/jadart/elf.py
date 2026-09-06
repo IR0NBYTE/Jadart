@@ -16,6 +16,8 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
+from .errors import ContainerError, MissingSymbol
+
 
 @dataclass
 class Section:
@@ -69,9 +71,21 @@ class Elf:
             raw.append((sh_name, sh_type, sh_addr, sh_offset, sh_size, sh_link, _entsize))
         shstr_off = raw[e_shstrndx][3]
 
-        def cstr(base, idx):
-            end = d.index(b"\x00", base + idx)
-            return d[base + idx:end].decode("utf-8", "replace")
+        def cstr(base, idx, limit=None):
+            # Bounded on purpose. d.index scans the whole file when the string table is
+            # not NUL-terminated (raising ValueError from the middle of a parse), and
+            # d.find returning -1 would slice to len-1 and hand back a name made of
+            # whatever followed it.
+            start = base + idx
+            if start < 0 or start >= len(d):
+                raise ContainerError(
+                    f"string table offset {start} is outside the file (len {len(d)})")
+            stop = len(d) if limit is None else min(len(d), base + limit)
+            end = d.find(b"\x00", start, stop)
+            if end < 0:
+                raise ContainerError(
+                    f"unterminated string at offset {start} in the string table")
+            return d[start:end].decode("utf-8", "replace")
 
         self.sections: list[Section] = []
         self._symtabs = []  # (offset, size, entsize, strtab_offset)
@@ -79,9 +93,19 @@ class Elf:
             name = cstr(shstr_off, sh_name)
             self.sections.append(Section(name, sh_type, sh_addr, sh_offset, sh_size))
             if sh_type in (2, 11):  # SYMTAB, DYNSYM
+                if sh_link >= len(raw):
+                    raise ContainerError(
+                        f"section {name!r} links to string table {sh_link}, which does "
+                        f"not exist ({len(raw)} sections)")
                 strtab_off = raw[sh_link][3]
-                self._symtabs.append((sh_offset, sh_size, entsize or self._sym_size,
-                                      strtab_off))
+                # entsize comes from the file. Below one entry it is not a stride, and
+                # ssize // 1 would run one iteration per byte of the table.
+                ent = entsize or self._sym_size
+                if ent < self._sym_size:
+                    raise ContainerError(
+                        f"section {name!r} declares a {ent}-byte symbol entry, smaller "
+                        f"than the {self._sym_size}-byte ELF{self.bits} symbol")
+                self._symtabs.append((sh_offset, sh_size, ent, strtab_off))
 
         self.symbols: dict[str, Symbol] = {}
         for (soff, ssize, sent, str_off) in self._symtabs:
@@ -104,14 +128,24 @@ class Elf:
         for s in self.sections:
             if s.sh_type != SHT_NOBITS and s.addr <= va < s.addr + s.size:
                 return va - s.addr + s.offset
-        raise ValueError(f"VA 0x{va:x} not in any loadable section")
+        raise ContainerError(f"VA 0x{va:x} not in any loadable section")
 
     def symbol_bytes(self, name: str) -> bytes:
+        # ContainerError, not KeyError. Three callers reach this outside open_container's
+        # own try, so a KeyError here escaped the library as an untyped failure on the
+        # commonest mistake there is: pointing the tool at libflutter.so.
         sym = self.symbols.get(name)
         if sym is None:
-            raise KeyError(name)
+            raise MissingSymbol(
+                f"no symbol {name!r} in this ELF. If this is a Flutter app, the snapshot "
+                f"is in libapp.so, not here.")
         off = self.va_to_offset(sym.value)
-        return self.data[off:off + sym.size]
+        end = off + sym.size
+        if off < 0 or end > len(self.data):
+            raise ContainerError(
+                f"symbol {name!r} spans {off}..{end}, past the end of the file "
+                f"(len {len(self.data)})")
+        return self.data[off:end]
 
     def function_symbols(self, lo_va: int, hi_va: int) -> list[Symbol]:
         """Symbols with a nonzero size whose VA falls in [lo_va, hi_va), sorted by VA.

@@ -24,7 +24,7 @@ import struct
 
 # container.py imports errors.py and the stdlib and nothing else, so this is a
 # downward edge: no cycle, and the container vocabulary stays in one place.
-from .container import ContainerError
+from .errors import ContainerError, MissingSymbol
 from dataclasses import dataclass
 
 from .elf import Symbol, DART_MAGIC
@@ -94,7 +94,7 @@ class MachO64:
                     self.sections.append(MachSection(sect, segname, addr, size, foff))
                     so += 80
             elif cmd == LC_SYMTAB:
-                symoff, nsyms, stroff, _strsize = struct.unpack_from("<IIII", d, off + 8)
+                symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", d, off + 8)
                 for i in range(nsyms):
                     base = symoff + i * 16
                     if base + 16 > len(d):
@@ -103,8 +103,14 @@ class MachO64:
                         "<IBBHQ", d, base)
                     if not n_strx or (n_type & N_TYPE) != N_SECT:
                         continue
-                    end = d.find(b"\x00", stroff + n_strx)
-                    nm = d[stroff + n_strx:end].decode("utf-8", "replace")
+                    # Bounded by the declared string-table size. Unbounded, a table with
+                    # no NUL scans the whole file, and find returning -1 sliced to len-1
+                    # and produced a name made of whatever followed the real one.
+                    start = stroff + n_strx
+                    end = d.find(b"\x00", start, min(len(d), stroff + strsize))
+                    if end < 0:
+                        continue
+                    nm = d[start:end].decode("utf-8", "replace")
                     if not nm:
                         continue
                     # Keep the name exactly as written: the snapshot blobs are spelled
@@ -135,10 +141,13 @@ class MachO64:
     def symbol_bytes(self, name: str) -> bytes:
         sym = self.symbols.get(name)
         if sym is None:
-            raise KeyError(name)
+            raise MissingSymbol(
+                f"no symbol {name!r} in this Mach-O. If this is a Flutter app, the "
+                f"snapshot is in the App binary, not here.")
         sec = self._section_of(sym.value)
         if sec is None:
-            raise ValueError(f"symbol {name} at 0x{sym.value:x} is not in a mapped section")
+            raise ContainerError(
+                f"symbol {name} at 0x{sym.value:x} is not in a mapped section")
         end = sec.addr + sec.size
         # Tighten to the next snapshot boundary symbol in the same section, but NOT to the
         # next symbol generally: that would cut the instructions image at its first
@@ -197,7 +206,8 @@ def open_container(data: bytes):
                 return MachO64(data)
     except ContainerError:
         raise
-    except (ValueError, struct.error, IndexError, KeyError) as exc:
+    except (ValueError, struct.error, IndexError, KeyError, OverflowError,
+            UnicodeDecodeError, MemoryError) as exc:
         head = data[:8].hex() if data else "<empty>"
         raise ContainerError(
             f"malformed container (leading bytes {head}): {exc}") from exc

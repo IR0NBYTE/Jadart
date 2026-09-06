@@ -38,16 +38,12 @@ Matching it means output from the two tools can be diffed directly.
 """
 from __future__ import annotations
 
-from .errors import JadartError
+from .errors import InputError, JadartError
 
 import os
 import re
 import shutil
 import zipfile
-
-
-class InputError(JadartError):
-    pass
 
 
 # Preferred first: arm64 is what jadart lifts, and what nearly every shipped app carries.

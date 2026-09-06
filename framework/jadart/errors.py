@@ -33,3 +33,32 @@ class JadartError(Exception):
     subclass, so it keeps its own type and is not swallowed by a `except JadartError` that
     was meant to skip a bad file.
     """
+
+
+class ContainerError(JadartError):
+    """A malformed or unreadable ELF, Mach-O, APK or IPA.
+
+    Lives here rather than in container.py because elf.py and macho.py raise it too, and
+    a base defined in the container module would have the readers importing sideways to
+    reach it. `jadart.ContainerError` and `jadart.container.ContainerError` are the same
+    object, so existing `except` clauses are unaffected.
+    """
+
+
+class InputError(JadartError):
+    """The path is not something jadart can work with: not a Flutter app, no snapshot in
+    it, or nothing there at all.
+
+    Also defined here rather than in export.py, because the snapshot layer needs to raise
+    it for "this file has no Dart snapshot" and cannot import the output layer to do so.
+    """
+
+
+class MissingSymbol(ContainerError):
+    """A named symbol is not in this container.
+
+    Its own class because absence is sometimes an answer rather than a failure:
+    `parse_libapp` tries the vm and isolate symbols in turn and falls back to a magic
+    scan when neither is present, and it must not confuse that with a symbol that IS
+    present but points outside the file.
+    """
