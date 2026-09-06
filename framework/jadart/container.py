@@ -46,6 +46,14 @@ import shutil
 import zipfile
 import zlib
 
+#: Every text file jadart writes is UTF-8 with LF endings, on every platform.
+#: Without the explicit encoding Python uses the locale one, and a Windows console
+#: at cp1252 aborted an export partway through on the first recovered string it
+#: could not represent. Recovered text is arbitrary bytes out of someone else's
+#: binary, so it is escaped rather than allowed to fail, and the newline is pinned
+#: so the same input exports to the same bytes wherever it runs.
+TEXT_OUT = {"encoding": "utf-8", "errors": "backslashreplace", "newline": "\n"}
+
 # Anything bigger than this is not being unpacked from an untrusted container.
 MAX_MEMBER = 1_500_000_000
 MAX_TOTAL = 4_000_000_000
@@ -419,7 +427,7 @@ def _write_container_map(outdir: str, container: str, stats: dict):
     if len(stats["abis"]) > 1:
         out.append(f"\nABIs present: {', '.join(stats['abis'])}. They carry the same Dart "
                    f"compiled for\ndifferent targets; jadart read the arm64 one.\n")
-    with open(os.path.join(outdir, "container.txt"), "w") as fh:
+    with open(os.path.join(outdir, "container.txt"), "w", **TEXT_OUT) as fh:
         fh.writelines(out)
 
 
@@ -452,10 +460,10 @@ def _expand_notices(adir: str) -> int:
         raise
     except (OSError, EOFError, zlib.error, ValueError):
         return 0
-    with open(os.path.join(adir, "NOTICES"), "w") as fh:
+    with open(os.path.join(adir, "NOTICES"), "w", **TEXT_OUT) as fh:
         fh.write(text)
     names = notice_packages(text)
-    with open(os.path.join(adir, "dependencies.txt"), "w") as fh:
+    with open(os.path.join(adir, "dependencies.txt"), "w", **TEXT_OUT) as fh:
         fh.write(f"# {len(names)} packages named in NOTICES: everything this build links.\n")
         fh.write("# Decompressed from NOTICES.Z, which ships gzipped and unreadable.\n\n")
         for n in names:
@@ -481,7 +489,7 @@ def _expand_manifest(adir: str) -> int:
     except ContainerError:
         return 0
     out = os.path.join(adir, "AssetManifest.decoded.json")
-    with open(out, "w") as fh:
+    with open(out, "w", **TEXT_OUT) as fh:
         json.dump(data, fh, indent=2, sort_keys=True, default=str)
         fh.write("\n")
     return len(data) if isinstance(data, dict) else 0
@@ -491,7 +499,7 @@ def _write_inventory(outdir: str, inventory: list):
     """One line per asset: what it is, how big, and whether it is worth opening."""
     inventory.sort(key=lambda r: (not r[3], r[0]))
     width = min(max((len(r[0]) for r in inventory), default=10), 68)
-    with open(os.path.join(outdir, "assets.txt"), "w") as fh:
+    with open(os.path.join(outdir, "assets.txt"), "w", **TEXT_OUT) as fh:
         fh.write(f"{len(inventory)} files in the Flutter asset bundle. "
                  f"`*` marks ones worth opening first:\n")
         fh.write("a certificate, a key, a database, a model, or a name suggesting "

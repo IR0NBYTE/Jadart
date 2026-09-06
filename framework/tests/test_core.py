@@ -1860,6 +1860,44 @@ def test_json_output_is_one_parseable_document():
     assert doc["ok"] is False and doc["exit"] == rc and doc["type"]
 
 
+def test_every_public_entry_point_raises_only_jadart_errors():
+    """The one promise the package docstring makes: `except jadart.JadartError` is enough.
+
+    It was not. A missing path raised FileNotFoundError from os.stat, a file that was not
+    a Flutter binary raised a bare ValueError or a KeyError from deep in the container
+    reader, and none of those are named by any documented except clause, so a batch scan
+    over a directory of APKs died on the first bad file however carefully it was written.
+    """
+    import tempfile
+    bad = []
+    with tempfile.NamedTemporaryFile(suffix=".so", delete=False) as f:
+        f.write(b"\x7fELF" + b"\x00" * 200)
+        elf_path = f.name
+    outdir = tempfile.mkdtemp()
+    cases = [
+        ("header", lambda p: jadart.header(p)),
+        ("program", lambda p: jadart.program(p)),
+        ("verify", lambda p: jadart.verify(p)),
+        ("strings", lambda p: jadart.strings(p)),
+        ("constants", lambda p: jadart.constants(p)),
+        ("decompile", lambda p: jadart.decompile(p, "Foo")),
+        ("export", lambda p: jadart.export(p, outdir)),
+    ]
+    try:
+        for label, fn in cases:
+            for what, path in (("missing path", "/nonexistent/nope.so"),
+                               ("not a Flutter binary", elf_path)):
+                try:
+                    fn(path)
+                except jadart.JadartError:
+                    pass
+                except Exception as exc:            # noqa: BLE001 - that IS the assertion
+                    bad.append(f"{label}({what}) raised {type(exc).__name__}")
+    finally:
+        os.unlink(elf_path)
+    assert not bad, "these escape `except jadart.JadartError`: " + "; ".join(bad)
+
+
 def test_the_version_is_declared_once_and_the_changelog_agrees():
     # One source of truth for the number, and a record of what it means. pyproject reads
     # __version__ dynamically so those two cannot drift; the CHANGELOG is hand-written and

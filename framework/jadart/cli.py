@@ -18,12 +18,14 @@ import shutil
 import sys
 
 from . import console
+from .errors import JadartError
 from .console import bold, comment, dim, error, heading
 from .snapshot import parse_libapp, walk_isolate
 
 EXIT_OK = 0
 EXIT_MISS = 1        # nothing recovered under that name, or a Tier-A gate failed
 EXIT_USAGE = 2       # argparse rejected the command line, or the snapshot won't parse
+EXIT_INTERNAL = 3    # a bug in jadart, not a problem with the input
 
 _COMMANDS = ("info", "libraries", "classes", "disasm", "lift", "decompile",
              "selectors", "strings", "constants", "verify", "export", "xrefs",
@@ -90,7 +92,7 @@ def cmd_info(args) -> int:
     """Header summary for both snapshots in the library."""
     try:
         snaps = parse_libapp(args.libapp, strict=not args.lenient)
-    except Exception as e:      # UnknownEpoch, truncated/malformed, or not-a-Dart-lib
+    except JadartError as e:    # UnknownEpoch, truncated/malformed, or not-a-Dart-lib
         return _fail(e)
 
     if getattr(args, "json", False):
@@ -135,7 +137,7 @@ def cmd_classes(args) -> int:
     from .program import recover_program, emit_tier0
     try:
         prog = recover_program(args.libapp)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
 
     if args.library:
@@ -180,7 +182,7 @@ def cmd_export(args) -> int:
                        label=getattr(args, "container", None) or args.libapp,
                        container=getattr(args, "container", None),
                        sigs=getattr(args, "sigs", None))
-    except Exception as e:
+    except JadartError as e:
         if not quiet:
             print()
         return _fail(e)
@@ -221,7 +223,7 @@ def cmd_libraries(args) -> int:
     from .program import recover_program
     try:
         prog = recover_program(args.libapp)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
     libs = prog.libraries()
     rows = sorted(libs.items(), key=lambda kv: (-len(kv[1]), kv[0]))
@@ -254,7 +256,7 @@ def cmd_lift(args) -> int:
     from .fields import recover_fields
     try:
         image, fr, hdr = load_instructions(args.libapp)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
     ranges = named_ranges(image, fr, args.symbol)
     if not ranges:
@@ -266,7 +268,7 @@ def cmd_lift(args) -> int:
         return EXIT_MISS
     try:
         pc_to_name, signote = names_with_signatures(image, fr, getattr(args, "sigs", None))
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
     if signote and not getattr(args, "json", False):
         print(comment(f"// {signote}"))
@@ -307,7 +309,7 @@ def cmd_disasm(args) -> int:
     from .signatures import names_with_signatures
     try:
         image, fr, _hdr = load_instructions(args.libapp)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
 
     as_json = getattr(args, "json", False)
@@ -320,7 +322,7 @@ def cmd_disasm(args) -> int:
         return EXIT_MISS
     try:
         pc_to_name, signote = names_with_signatures(image, fr, getattr(args, "sigs", None))
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
     if signote and not as_json:
         print(comment(f"// {signote}"))
@@ -359,7 +361,7 @@ def cmd_decompile(args) -> int:
         out = decompile_class(args.libapp, args.klass,
                               structured=args.tier >= 2, tier=args.tier,
                               sigs=getattr(args, "sigs", None))
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
 
     if getattr(args, "json", False):
@@ -385,7 +387,7 @@ def cmd_functions(args) -> int:
         image, fr, hdr = load_instructions(args.libapp)
         table, graph_error = function_table(image, fr, hdr,
                                             sigs=getattr(args, "sigs", None))
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
 
     rows = table
@@ -458,7 +460,7 @@ def cmd_signatures(args) -> int:
                         progress=None if quiet else
                         (lambda p: print(comment(f"// reading {p}"), file=sys.stderr)))
         sig.save(lib, args.out)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
 
     refs = [{"path": s, "dart": d, "named": n} for s, d, n in lib.sources]
@@ -482,7 +484,7 @@ def cmd_selectors(args) -> int:
     try:
         image, fr, hdr = load_instructions(args.libapp)
         sel = recover_selectors(image, fr, hdr)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
 
     if getattr(args, "json", False):
@@ -515,7 +517,7 @@ def cmd_constants(args) -> int:
     try:
         image, fr, _hdr = load_instructions(args.libapp)
         lists = const_lists(fr, getattr(image, "arch", None))
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
     if getattr(args, "json", False):
         return emit({"ok": True, "count": len(lists),
@@ -535,7 +537,7 @@ def cmd_strings(args) -> int:
     from .fill import printable
     try:
         r = walk_isolate(args.libapp, full=True)
-    except Exception as e:      # UnknownEpoch or AllocError
+    except JadartError as e:    # UnknownEpoch or AllocError
         return _fail(e)
 
     h, strings = r["header"], r["strings"]
@@ -691,7 +693,7 @@ def cmd_ffi(args) -> int:
     from .program import static_function_refs, receiver_for
     try:
         image, fr, hdr = load_instructions(args.libapp)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
     pool = build_pool_map(fr, getattr(image, "arch", None))
     rx = _soname_re()
@@ -778,7 +780,7 @@ def cmd_xrefs(args) -> int:
     from .disasm import load_instructions, build_pool_map, pool_xrefs
     try:
         image, fr, hdr = load_instructions(args.libapp)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
     pool = build_pool_map(fr, getattr(image, "arch", None))
     needle = args.pattern
@@ -824,7 +826,7 @@ def cmd_verify(args) -> int:
     from .verify import verify_file
     try:
         rep = verify_file(args.libapp)
-    except Exception as e:
+    except JadartError as e:
         return _fail(e)
 
     if getattr(args, "json", False):
@@ -1125,6 +1127,15 @@ def _translate_legacy(argv: list[str]) -> list[str]:
 # ----------------------------------------------------------------- entry point
 
 def main(argv=None) -> int:
+    # Recovered text is arbitrary bytes out of someone else's binary, and a console that
+    # cannot represent them is the user's environment, not an error in the file. Without
+    # this, `jadart strings` on a cp1252 console died with a UnicodeEncodeError traceback
+    # partway through the output.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass                      # not a real stream (a StringIO in the tests), fine
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
 
@@ -1180,16 +1191,36 @@ def main(argv=None) -> int:
         from .disasm import UnsupportedArch, MissingDisassembler
         if isinstance(e, MissingDisassembler):
             return _fail(e)
-        if not isinstance(e, UnsupportedArch):
-            raise
-        # The snapshot parsed; only the machine-code layer is out of reach. Say which
-        # commands still work rather than leaving the user to find out one at a time.
+        if isinstance(e, UnsupportedArch):
+            # The snapshot parsed; only the machine-code layer is out of reach. Say which
+            # commands still work rather than leaving the user to find out one at a time.
+            if _JSON[0]:
+                return _json_error(e, EXIT_MISS)
+            error(e)
+            print("  try: jadart classes / libraries / strings / info / verify",
+                  file=sys.stderr)
+            return EXIT_MISS
+        if isinstance(e, JadartError):
+            return _fail(e)
+        # Anything left is a bug in jadart, and it gets its own exit code and its own
+        # wording. Reporting it through _fail said "your file is bad" about a defect in
+        # this program: pointing any command at libflutter.so printed
+        # `jadart: '_kDartIsolateSnapshotData'` and exited 2, while the issue template
+        # asked the reporter for a traceback the tool had just swallowed.
         if _JSON[0]:
-            return _json_error(e, EXIT_MISS)
-        error(e)
-        print("  try: jadart classes / libraries / strings / info / verify",
-              file=sys.stderr)
-        return EXIT_MISS
+            import json
+            json.dump({"ok": False, "error": str(e), "type": type(e).__name__,
+                       "internal": True, "exit": EXIT_INTERNAL},
+                      sys.stdout, indent=2, default=str)
+            sys.stdout.write("\n")
+            return EXIT_INTERNAL
+        if os.environ.get("JADART_DEBUG"):
+            raise
+        error(f"internal error: {type(e).__name__}: {e}")
+        print("  This is a bug in jadart, not a problem with your file.\n"
+              "  Re-run with JADART_DEBUG=1 for the traceback, and please report it:\n"
+              "  https://github.com/IR0NBYTE/Jadart/issues", file=sys.stderr)
+        return EXIT_INTERNAL
     finally:
         if workdir:
             shutil.rmtree(workdir, ignore_errors=True)

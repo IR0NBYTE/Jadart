@@ -45,6 +45,14 @@ import re
 import shutil
 import zipfile
 
+#: Every text file jadart writes is UTF-8 with LF endings, on every platform.
+#: Without the explicit encoding Python uses the locale one, and a Windows console
+#: at cp1252 aborted an export partway through on the first recovered string it
+#: could not represent. Recovered text is arbitrary bytes out of someone else's
+#: binary, so it is escaped rather than allowed to fail, and the newline is pinned
+#: so the same input exports to the same bytes wherever it runs.
+TEXT_OUT = {"encoding": "utf-8", "errors": "backslashreplace", "newline": "\n"}
+
 
 # Preferred first: arm64 is what jadart lifts, and what nearly every shipped app carries.
 _ABI_ORDER = ("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
@@ -72,6 +80,11 @@ def resolve_cached(path: str) -> str:
     import zipfile
     if os.path.isfile(path) and not zipfile.is_zipfile(path):
         return path
+    if not os.path.exists(path):
+        # Before os.stat, which raised FileNotFoundError: the commonest failure of all
+        # (a typo in a path) escaped every `except jadart.JadartError` the package
+        # docstring tells callers to write.
+        raise InputError(f"{path}: no such file or directory")
     stat = os.stat(path)
     key = (os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
     if key not in _EXTRACTED:
@@ -181,8 +194,45 @@ def library_path(url: str) -> str:
         rel = re.sub(r"[^\w.\-]", "_", url) + ".dart"
     if not rel.endswith(".dart"):
         rel += ".dart"
-    # never let a crafted url escape the output directory
-    parts = [p for p in rel.split("/") if p not in ("", ".", "..")]
+    return _safe_relpath(rel)
+
+
+#: Windows treats these as devices whatever the extension, so a library called `con`
+#: would produce a file that cannot be created or opened.
+_WIN_RESERVED = frozenset(
+    ["con", "prn", "aux", "nul"] + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)])
+#: Illegal in a Windows filename; the control range is illegal everywhere worth caring.
+_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+#: A component longer than this is refused by most filesystems, and the library url is
+#: attacker-controlled text out of the snapshot.
+_MAX_COMPONENT = 120
+
+
+def _safe_relpath(rel: str) -> str:
+    """A library url turned into a relative path that cannot leave the output directory.
+
+    Splitting on "/" alone was POSIX-only thinking: on Windows a backslash is also a
+    separator, so `package:foo\\..\\..\\evil` kept its `..` as part of a single
+    component here and then escaped once the OS resolved it. Everything else below is the
+    same class of problem, a name coming out of an untrusted binary and being trusted as
+    a filename.
+    """
+    parts = []
+    for raw in re.split(r"[/\\]", rel):
+        if raw in ("", ".", ".."):
+            continue
+        p = _BAD_CHARS.sub("_", raw)
+        # a drive letter or a trailing dot/space, both of which Windows strips silently
+        p = p.rstrip(". ")
+        if not p or p in ("", ".", ".."):
+            continue
+        stem = p.split(".", 1)[0].lower()
+        if stem in _WIN_RESERVED:
+            p = "_" + p
+        if len(p) > _MAX_COMPONENT:
+            p = p[:_MAX_COMPONENT]
+        parts.append(p)
     return os.path.join(*parts) if parts else "unnamed.dart"
 
 
@@ -311,19 +361,19 @@ def export(path: str, outdir: str, tier: int = 3, app_only: bool = False,
                 stats["classes"] += 1
                 stats["methods"] += len(methods.get(k.ref, []))
             stats["libraries"] += 1
-        with open(dest, "w") as fh:
+        with open(dest, "w", **TEXT_OUT) as fh:
             fh.write("\n".join(body))
         stats["files"].append(rel)
         if progress:
             progress(i + 1, len(by_path), rel)
 
     from .fill import printable
-    with open(os.path.join(outdir, "strings.txt"), "w") as fh:
+    with open(os.path.join(outdir, "strings.txt"), "w", **TEXT_OUT) as fh:
         # Escaped, so one recovered string is one line. Literals contain newlines and NULs,
         # and writing them raw makes the dump binary as far as grep is concerned.
         for s in sorted(set(S.values())):
             fh.write(printable(s) + "\n")
-    with open(os.path.join(outdir, "pool.txt"), "w") as fh:
+    with open(os.path.join(outdir, "pool.txt"), "w", **TEXT_OUT) as fh:
         for off, entry in sorted(pool_map.items()):
             fh.write(f"0x{off:x}\t{entry}\n")
     # The elements behind every `const[N] @0xOFF{...}` label pool.txt and the lifted
@@ -334,13 +384,13 @@ def export(path: str, outdir: str, tier: int = 3, app_only: bool = False,
     from .disasm import const_lists
     consts = const_lists(fr, getattr(image, "arch", None))
     if consts:
-        with open(os.path.join(outdir, "constants.txt"), "w") as fh:
+        with open(os.path.join(outdir, "constants.txt"), "w", **TEXT_OUT) as fh:
             for off, vals in sorted(consts.items()):
                 body = ", ".join(printable(v) if isinstance(v, str) else hex(v)
                                  for v in vals)
                 fh.write(f"0x{off:x}\t[{len(vals)}]\t{body}\n")
     if selectors:
-        with open(os.path.join(outdir, "selectors.txt"), "w") as fh:
+        with open(os.path.join(outdir, "selectors.txt"), "w", **TEXT_OUT) as fh:
             for imm, name in sorted(selectors.items(), key=lambda kv: kv[1]):
                 fh.write(f"{name}\tselector_offset={imm + ORIGIN_ELEMENT_ARM64}\t"
                          f"call_site_imm={imm}\n")
@@ -358,7 +408,7 @@ def export(path: str, outdir: str, tier: int = 3, app_only: bool = False,
     c = unpack(container, outdir) if container else None
     stats["container"] = c if c and (c["assets"] or c["resources"] or c["native"]) else None
 
-    with open(os.path.join(outdir, "summary.txt"), "w") as fh:
+    with open(os.path.join(outdir, "summary.txt"), "w", **TEXT_OUT) as fh:
         fh.write(f"source      {label or path}\n")
         fh.write(f"epoch       {prog.epoch_name} (dart {prog.dart})\n")
         fh.write(f"target      {hdr.arch}\n")
