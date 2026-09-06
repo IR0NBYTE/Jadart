@@ -3599,10 +3599,27 @@ def test_the_skill_file_names_only_commands_that_exist():
     import re as _re
 
     root = os.path.join(os.path.dirname(__file__), "..", "..")
-    skill = os.path.join(root, "SKILL.md")
+    skill = os.path.join(root, "skills", "flutter-reverse-engineering", "SKILL.md")
     if not os.path.exists(skill):
         _skip("  SKIP test_the_skill_file_names_only_commands_that_exist (no SKILL.md)")
     text = open(skill).read()
+
+    # The frontmatter is what makes the file loadable at all: an agent runtime reads
+    # `name` and `description` to decide whether the skill applies, and the directory has
+    # to be named for the skill or it will not be found. A file with drifted frontmatter
+    # is not a skill, it is a markdown document nobody will ever see.
+    assert text.startswith("---\n"), "SKILL.md must open with YAML frontmatter"
+    fm = text.split("---", 2)[1]
+    name = _re.search(r"^name:\s*(\S+)\s*$", fm, _re.M)
+    desc = _re.search(r"^description:\s*(\S.*)$", fm, _re.M)
+    assert name, "frontmatter has no `name:`"
+    assert desc, "frontmatter has no `description:`"
+    assert name.group(1) == os.path.basename(os.path.dirname(skill)), (
+        f"skill is named {name.group(1)!r} but sits in "
+        f"{os.path.basename(os.path.dirname(skill))!r}; the two have to match")
+    assert len(desc.group(1)) > 60, (
+        "the description is what a runtime matches on; one line of detail is the "
+        "difference between the skill firing and never being offered")
 
     from jadart.cli import build_parser
     parser = build_parser()

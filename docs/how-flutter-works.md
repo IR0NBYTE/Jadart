@@ -266,7 +266,7 @@ flowchart LR
 - **Use the tool:** [../README.md](../README.md), then [usage.md](usage.md).
 - **The pipeline in detail:** [../HOW-IT-WORKS.md](../HOW-IT-WORKS.md).
 - **The format itself, cited to dart-lang/sdk:** [../DESIGN.md](../DESIGN.md).
-- **Working with a coding agent:** [../SKILL.md](../SKILL.md) is a portable Flutter RE skill
+- **Working with a coding agent:** [../skills/flutter-reverse-engineering/SKILL.md](../skills/flutter-reverse-engineering/SKILL.md) is a portable Flutter RE skill
   whose central rule is the one this page keeps circling: report the gaps, never fill them.
 
 A deeper companion covering the engine internals and the Android intersection, with a

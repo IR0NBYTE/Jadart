@@ -12,8 +12,12 @@ The instrument is `jadart`. Everything below is about how to *think* while using
 command reference lives in `jadart <command> --help` and does not need repeating.
 
 ```
-pip install 'jadart[disasm]'
+git clone https://github.com/IR0NBYTE/Jadart.git
+pip install './Jadart/framework[disasm]'
 ```
+
+If `jadart` is not on PATH, say so and stop rather than guessing at an install: a wrong
+package is worse than no tool.
 
 ---
 

@@ -302,6 +302,37 @@ whole annotate, strip, CFG, structure, lift pipeline runs with **zero exceptions
 code ranges** across the clean build, the obfuscated build, and a real third-party app.
 
 
+## Using it from a coding agent
+
+Jadart is a CLI that prints text, so any agent that can run a shell command can drive it.
+What an agent cannot do on its own is know when a gap in the output is deliberate, and
+that is the failure worth preventing: shown `x1.sel_0xb34(...)`, the natural move is to
+say what it "probably" does, which turns a careful analysis into a confident fabrication
+carrying the authority of a byte-exact tool.
+
+[`skills/flutter-reverse-engineering/`](skills/flutter-reverse-engineering/SKILL.md) is a
+skill that teaches exactly that. It routes each question to the command that answers it,
+and spends most of its length on how to read a gap.
+
+**Claude Code.** Copy the directory into your skills folder and it loads on the next run:
+
+```bash
+cp -r skills/flutter-reverse-engineering ~/.claude/skills/     # every project
+cp -r skills/flutter-reverse-engineering .claude/skills/       # just this one
+```
+
+Then ask for the work in your own words. "Audit this APK for hardcoded secrets" matches
+the skill's description and it applies itself; `/flutter-reverse-engineering` invokes it
+by name.
+
+**Anything else.** The file is plain Markdown with a YAML header, and nothing in the body
+is vendor-specific. Cursor, Copilot, Cline, OpenAI's Agents SDK and a hand-rolled tool loop
+all take the same content, as a system prompt, a rule file, or whatever that runtime calls
+its instructions. Point it at a binary and give the agent a shell.
+
+The one thing to keep, whatever you paste it into, is the rule at the top: never fill in a
+gap the tool deliberately left. Everything else is routing.
+
 ## Documentation
 
 | document | what is in it |
@@ -312,7 +343,7 @@ code ranges** across the clean build, the obfuscated build, and a real third-par
 | [docs/support.md](docs/support.md) | platform and version support in detail |
 | [DESIGN.md](DESIGN.md) | the annotated Dart AOT snapshot format, cited to dart-lang/sdk |
 | [EVAL.md](EVAL.md) | evaluation against existing tools, and the failure taxonomy |
-| [SKILL.md](SKILL.md) | a portable Flutter reverse-engineering skill for coding agents |
+| [skills/](skills/flutter-reverse-engineering/SKILL.md) | a portable Flutter reverse-engineering skill for coding agents |
 | [CHANGELOG.md](CHANGELOG.md) | what changed, and what the version number covers |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | how to add an epoch, a grammar or a gate |
 
