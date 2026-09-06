@@ -5,7 +5,7 @@
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
 [![tests: 193](https://img.shields.io/badge/tests-193-brightgreen.svg)](#tests)
 
-**jadx for Flutter.** Point it at an APK and get back a class tree, method bodies as
+**A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
 
 It is for reverse engineers, security reviewers, and anyone auditing a shipped Flutter app
