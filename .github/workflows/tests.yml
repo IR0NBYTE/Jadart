@@ -1,0 +1,102 @@
+name: tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the package claims; the newest is what most people will have.
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: install
+        run: python -m pip install --upgrade pip && pip install ./framework[disasm]
+
+      - name: the package works without being run from its own directory
+        working-directory: /tmp
+        run: jadart --version
+
+      # pytest, not `python tests/test_core.py`. The script's own runner collects
+      # `globals()` at the point it runs, so while that block sat mid-file CI executed 180
+      # of 188 tests and reported success, and the eight it silently dropped were the
+      # whole field-layout suite. The block is at EOF now and a test keeps it there, but
+      # the collector that cannot have the problem is the one to run in CI.
+      - name: tests
+        working-directory: framework
+        run: |
+          python -m pip install pytest
+          python -m pytest tests -q
+
+      # EVAL.md's numbers were hand-maintained and went stale, so they are generated now
+      # and checked here. On a checkout without the (gitignored, regenerable) corpus this
+      # verifies that everything present passes and says so, rather than failing over
+      # binaries it was never going to have.
+      - name: measured claims still hold
+        working-directory: framework
+        run: python tools/measure.py --check
+
+      # The point of this project is that a wrong grammar is caught rather than guessed at,
+      # so the gates run in CI on the two committed fixtures. They are byte-exact: if one
+      # fails, a parse changed, and no other check in here would notice.
+      - name: acceptance gates on the committed fixtures
+        run: |
+          for f in flubench/artifacts/clean/lib/arm64-v8a/libapp.so \
+                   flubench/artifacts/obf/lib/arm64-v8a/libapp.so; do
+            echo "== $f"
+            jadart verify "$f" | tail -3
+            jadart verify "$f" | grep -q "VERDICT: grammar consistent" || exit 1
+          done
+
+      # A rendered edge the CFG does not have is the worst defect this tool can ship: the
+      # output stays plausible and says control goes somewhere it cannot. Nothing was
+      # watching it between releases. 1.7s on the 8,194-function fixture.
+      - name: no function claims an edge its CFG does not have
+        working-directory: framework
+        run: |
+          for f in ../flubench/artifacts/clean/lib/arm64-v8a/libapp.so \
+                   ../flubench/artifacts/obf/lib/arm64-v8a/libapp.so; do
+            out=$(python tools/cfgcheck.py "$f")
+            echo "$out"
+            case "$out" in *"0 edge violations"*) ;; *) exit 1 ;; esac
+          done
+
+      # Python randomises string hashing per process, and a set of register names iterated
+      # in hash order has already shipped here once: two runs over the same binary named
+      # the same values differently, about one run in five. Repeating a run inside ONE
+      # process cannot see that, so this is two interpreters with different seeds.
+      - name: the same binary exports to the same bytes
+        working-directory: framework
+        run: |
+          for s in 1 424242; do
+            PYTHONHASHSEED=$s python -m jadart.cli export \
+              ../flubench/artifacts/clean/lib/arm64-v8a/libapp.so -o "/tmp/det$s" -q
+          done
+          diff -r /tmp/det1 /tmp/det424242
+
+  install-without-capstone:
+    # The snapshot layer is stdlib-only on purpose. Installing without the disasm extra has
+    # to still parse, still list classes, and still refuse loudly. Otherwise that claim is
+    # only true until someone tests it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ./framework
+      - name: parse and list classes with no capstone present
+        run: |
+          python -c "import capstone" 2>/dev/null && { echo "capstone should NOT be installed"; exit 1; }
+          jadart info flubench/artifacts/clean/lib/arm64-v8a/libapp.so | head -5
+          jadart classes flubench/artifacts/clean/lib/arm64-v8a/libapp.so -f BenchAccount

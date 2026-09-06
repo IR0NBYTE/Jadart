@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: "jadart: a decompiler for Flutter/Dart AOT snapshots"
+message: "If you use this software or its findings in academic work, please cite it."
+type: software
+authors:
+  - alias: ir0nbyte
+repository-code: "https://github.com/IR0NBYTE/jadart"
+version: 1.1.0
+date-released: "2026-09-06"
+abstract: >-
+  jadart recovers the class tree, method bodies as pseudo-Dart, the string pool,
+  embedded const data and virtual-call names from a stripped Flutter AOT snapshot
+  (libapp.so or an iOS App binary). It parses the Dart AOT clustered snapshot format
+  directly, keyed on the snapshot version hash, and refuses to parse a release whose
+  grammar is not registered rather than producing a plausible but fictional object graph.
+keywords:
+  - flutter
+  - dart
+  - reverse-engineering
+  - decompiler
+  - mobile-security
+  - aot
+license: MIT

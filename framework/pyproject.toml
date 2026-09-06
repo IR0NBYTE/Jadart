@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jadart"
+dynamic = ["version"]
+description = "A decompiler for Flutter/Dart AOT snapshots: class tree, pseudo-Dart bodies, and virtual-call names out of a stripped libapp.so"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "ir0nbyte" }]
+keywords = ["flutter", "dart", "aot", "snapshot", "decompiler", "reverse-engineering"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Disassemblers",
+]
+
+# The snapshot layer (header, cluster grammar, object graph, class tree, strings,
+# selectors, the acceptance gates) is stdlib only, on purpose: the part that has to be
+# correct should be the part with nothing under it. capstone is needed only to decode
+# instructions, so `pip install jadart` without it still parses and still refuses loudly.
+dependencies = []
+
+# Every key below this point belongs to a sub-table, so nothing that belongs to [project]
+# itself may follow: opening a sub-table above `dependencies` silently reparents it and the
+# build fails on a type error two levels away.
+
+[project.urls]
+Homepage = "https://github.com/IR0NBYTE/jadart"
+Repository = "https://github.com/IR0NBYTE/jadart"
+Issues = "https://github.com/IR0NBYTE/jadart/issues"
+Changelog = "https://github.com/IR0NBYTE/jadart/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+disasm = ["capstone>=5.0"]
+
+[project.scripts]
+jadart = "jadart.cli:main"
+
+[tool.setuptools]
+packages = ["jadart"]
+# 26 of 29 modules carry `from __future__ import annotations` and the public surface is
+# annotated, but without this marker PEP 561 says a consumer's type checker must ignore all
+# of it. Shipping the marker is what makes those annotations visible downstream.
+package-data = { jadart = ["py.typed"] }
+
+# One source of truth. A version in both places drifts, and the first person
+# to notice is whoever files a bug against the wrong release.
+[tool.setuptools.dynamic]
+version = { attr = "jadart.__version__" }

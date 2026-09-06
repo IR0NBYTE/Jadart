@@ -1,0 +1,19 @@
+{
+  "classes": [
+    "BenchAccount"
+  ],
+  "functions": [
+    "BenchAccount",
+    "benchCheckSecret",
+    "benchComputeChecksum",
+    "benchDecodeFlag",
+    "benchFetchToken",
+    "benchFirstOrDefault",
+    "benchMakeAdder",
+    "benchMakePair",
+    "benchWithdraw"
+  ],
+  "strings": [
+    "FLUBENCH{str_literal_compare}"
+  ]
+}

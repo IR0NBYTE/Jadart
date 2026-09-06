@@ -1,0 +1,4 @@
+# jadart runtime dependencies.
+# The snapshot core (parsing, object graph, Tier 0) is stdlib-only.
+# Disassembly (Tier 1/2, ObjectPool annotation) needs capstone.
+capstone>=5.0
