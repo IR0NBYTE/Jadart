@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from jadart.snapshot import parse_libapp, parse_blob, UnknownEpoch  # noqa: E402
 import struct  # noqa: E402
+import unittest  # noqa: E402
 import jadart  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
@@ -148,9 +149,8 @@ def test_elf_backfill_recovers_real_names_on_real_app():
     # at least one to a code range.
     lib = os.environ.get("JADART_REALAPP_LIB")
     if not lib or not os.path.exists(lib):
-        print("  SKIP test_elf_backfill_recovers_real_names_on_real_app "
+        _skip("  SKIP test_elf_backfill_recovers_real_names_on_real_app "
               "(set JADART_REALAPP_LIB to an unstripped dwarf-mode libapp.so)")
-        return
     from jadart.disasm import load_instructions, named_ranges
     image, fr, _ = load_instructions(lib)
     assert image.symbol_names, "no ELF symbols backfilled from a dwarf-mode build"
@@ -276,6 +276,18 @@ def test_fill_walk_completes_obf():
 
 # --- Tier 1: instructions image + annotated disassembly -----------------------
 
+
+def _skip(reason):
+    """Skip for real, instead of printing and returning.
+
+    Seventy tests used to `print("  SKIP ...")` and return, which pytest counts as a PASS
+    and whose print it captures, so the suite reported 192 passing while 131 had actually
+    run. If disasm.py had ever failed to import, about forty tests would have gone green
+    saying nothing. unittest.SkipTest is stdlib, pytest reports it as a skip, and the
+    runner at the bottom of this file counts it separately."""
+    raise unittest.SkipTest(reason)
+
+
 def _capstone_available():
     try:
         import capstone  # noqa: F401
@@ -286,8 +298,7 @@ def _capstone_available():
 
 def test_tier1_disassembles_benchwithdraw():
     if not _capstone_available():
-        print("  SKIP test_tier1_disassembles_benchwithdraw (no capstone)")
-        return
+        _skip("  SKIP test_tier1_disassembles_benchwithdraw (no capstone)")
     from jadart.disasm import load_instructions, disassemble_function
     image, fr, _ = load_instructions(CLEAN)
     refs = [ref for ref, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchWithdraw"]
@@ -302,8 +313,7 @@ def test_tier1_disassembles_benchwithdraw():
 
 def test_tier1_call_targets_resolve_to_recovered_names():
     if not _capstone_available():
-        print("  SKIP test_tier1_call_targets (no capstone)")
-        return
+        _skip("  SKIP test_tier1_call_targets (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate)
     image, fr, _ = load_instructions(CLEAN)
@@ -349,8 +359,7 @@ def test_tier1_objectpool_loads_resolve_to_strings():
     # pool offset is 0x10 + idx*8. This is the byte-exact regression guard for the
     # ObjectPool offset (element_offset = 0x10 + idx*8, PP untagged) + far-load handling.
     if not _capstone_available():
-        print("  SKIP test_tier1_objectpool_loads (no capstone)")
-        return
+        _skip("  SKIP test_tier1_objectpool_loads (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
     image, fr, _ = load_instructions(CLEAN)
@@ -369,8 +378,7 @@ def test_unified_decompile_view():
     # The end-to-end JADX-for-Flutter view: Tier 0 header + Tier 1 body with a
     # control-flow label.
     if not _capstone_available():
-        print("  SKIP test_unified_decompile_view (no capstone)")
-        return
+        _skip("  SKIP test_unified_decompile_view (no capstone)")
     from jadart.program import decompile_class
     out = decompile_class(CLEAN, "BenchAccount", structured=False)
     assert "class BenchAccount {" in out
@@ -383,8 +391,7 @@ def test_tier2_control_flow_reconstruction():
     # benchWithdraw: `if (amount > balance) return false; balance -= amount; return true;`
     # structures to a real if/else (condition x2 > x3, return in both arms).
     if not _capstone_available():
-        print("  SKIP test_tier2_control_flow_reconstruction (no capstone)")
-        return
+        _skip("  SKIP test_tier2_control_flow_reconstruction (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
     from jadart.cfg import build_cfg, structure, render
@@ -404,8 +411,7 @@ def test_tier1_tier2_no_crash_over_sample():
     # real function (e.g. a bare `[reg]` load with no displacement once broke the far-load
     # parser). Sweep a large sample and require zero exceptions.
     if not _capstone_available():
-        print("  SKIP test_tier1_tier2_no_crash_over_sample (no capstone)")
-        return
+        _skip("  SKIP test_tier1_tier2_no_crash_over_sample (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
     from jadart.cfg import build_cfg, structure, render
@@ -432,8 +438,7 @@ def test_tier2_loop_body_is_reconstructed():
     # while, with the length test as an exit `break`, not a bare `return` in while(true)
     # (the old naive succ[0] walk dropped the body and followed the exit edge).
     if not _capstone_available():
-        print("  SKIP test_tier2_loop_body_is_reconstructed (no capstone)")
-        return
+        _skip("  SKIP test_tier2_loop_body_is_reconstructed (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
     from jadart.cfg import build_cfg, structure, render
@@ -453,8 +458,7 @@ def test_tier2_loop_body_is_reconstructed():
 
 def test_tier2_decompile_view_is_structured():
     if not _capstone_available():
-        print("  SKIP test_tier2_decompile_view_is_structured (no capstone)")
-        return
+        _skip("  SKIP test_tier2_decompile_view_is_structured (no capstone)")
     from jadart.program import decompile_class
     out = decompile_class(CLEAN, "BenchAccount", tier=2)      # explicit Tier 2 view
     assert "if (x2 > x3) {" in out and "} else {" in out
@@ -481,8 +485,7 @@ def test_tier3_reconstructs_benchwithdraw_expressions():
     # Tier 3 must lift the whole body to expressions: the field compare, the two bool
     # returns, and the compound field store-back (recognised as `-=`).
     if not _capstone_available():
-        print("  SKIP test_tier3_reconstructs_benchwithdraw_expressions (no capstone)")
-        return
+        _skip("  SKIP test_tier3_reconstructs_benchwithdraw_expressions (no capstone)")
     body = _lift("benchWithdraw")
     assert "> x1.field_0x8" in body            # amount > balance (field load resolved)
     assert "return false;" in body            # NULL_REG+0x30 -> false
@@ -530,8 +533,7 @@ def test_tier3_reconstructs_loop_accumulator():
     # The loop-carried accumulate must become an assignment with `* 31` and an element
     # read, the length test an exit `break`, and the index a `+= 1` increment.
     if not _capstone_available():
-        print("  SKIP test_tier3_reconstructs_loop_accumulator (no capstone)")
-        return
+        _skip("  SKIP test_tier3_reconstructs_loop_accumulator (no capstone)")
     body = _lift("benchComputeChecksum")
     assert "while (true) {" in body
     loop = body.split("while (true) {", 1)[1]
@@ -552,8 +554,7 @@ def test_tier3_reconstructs_loop_accumulator():
 def test_tier3_decompile_view_reads_as_dart():
     # The default decompile view is Tier 3; class members get `this` as the receiver.
     if not _capstone_available():
-        print("  SKIP test_tier3_decompile_view_reads_as_dart (no capstone)")
-        return
+        _skip("  SKIP test_tier3_decompile_view_reads_as_dart (no capstone)")
     from jadart.program import decompile_class
     out = decompile_class(CLEAN, "BenchAccount")      # default tier=3
     assert "Tier 3 expressions" in out
@@ -569,8 +570,7 @@ def test_tier3_reconstructs_call_arguments():
     #   benchWithdraw(this, amount)=2, benchCheckSecret(input)=1, benchComputeChecksum(d)=1,
     #   benchFirstOrDefault(...)=stack (0 register args).
     if not _capstone_available():
-        print("  SKIP test_tier3_reconstructs_call_arguments (no capstone)")
-        return
+        _skip("  SKIP test_tier3_reconstructs_call_arguments (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver, entry_arity
@@ -628,8 +628,7 @@ def test_argument_reconstruction_does_not_depend_on_the_callee_having_a_name():
     # reason beyond the callee having no recovered name, which is the whole of an
     # --obfuscate build, exactly where the argument list is the only thing left to read.
     if not _capstone_available():
-        print("  SKIP test_argument_reconstruction_does_not_depend_on_the_callee_having_a_name")
-        return
+        _skip("  SKIP test_argument_reconstruction_does_not_depend_on_the_callee_having_a_name")
     import re
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc)
@@ -770,8 +769,7 @@ def test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology():
     # pre-call values both sides rendered as `this.field_0x10`, so the guard read as a
     # comparison that can never fail and the throw behind it as dead code.
     if not _capstone_available():
-        print("  SKIP test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology")
-        return
+        _skip("  SKIP test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology")
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc)
     from jadart.expr import lift_function, make_arity_resolver
@@ -805,8 +803,7 @@ def test_the_lifted_output_does_not_depend_on_the_hash_seed():
     # equivalence, could not tell a real change from a reshuffle. Two subprocesses, because
     # the seed is fixed for the life of one.
     if not _capstone_available():
-        print("  SKIP test_the_lifted_output_does_not_depend_on_the_hash_seed")
-        return
+        _skip("  SKIP test_the_lifted_output_does_not_depend_on_the_hash_seed")
     import subprocess
     prog = (
         "import hashlib,sys;"
@@ -846,8 +843,7 @@ def test_tier3_strips_smi_box_idiom():
     # not leak as a bogus self-comparison `if (x != x)`, and the Smi tag `sbfiz` must not
     # appear raw. benchRunAll boxes several int results and exercises this.
     if not _capstone_available():
-        print("  SKIP test_tier3_strips_smi_box_idiom (no capstone)")
-        return
+        _skip("  SKIP test_tier3_strips_smi_box_idiom (no capstone)")
     import re
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
@@ -868,9 +864,8 @@ def test_tier3_renders_runtime_stubs_semantically():
     # never as a raw `stub _iso_stub_...` call. Portable: set JADART_REALAPP_LIB.
     lib = os.environ.get("JADART_REALAPP_LIB")
     if not lib or not os.path.exists(lib) or not _capstone_available():
-        print("  SKIP test_tier3_renders_runtime_stubs_semantically "
+        _skip("  SKIP test_tier3_renders_runtime_stubs_semantically "
               "(set JADART_REALAPP_LIB to an unstripped dwarf-mode libapp.so)")
-        return
     from jadart.disasm import (load_instructions, disassemble_range,
                                function_name_by_pc, annotate, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
@@ -897,8 +892,7 @@ def test_tier3_attributes_virtual_dispatch():
     # X21 dispatch table. Tier 3.3 attributes the call to the receiver + a stable selector offset
     # (sel_0x<off>) instead of an opaque (dynamic call).
     if not _capstone_available():
-        print("  SKIP test_tier3_attributes_virtual_dispatch (no capstone)")
-        return
+        _skip("  SKIP test_tier3_attributes_virtual_dispatch (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
     from jadart.expr import lift_function, detect_dispatch, strip_boilerplate
@@ -960,8 +954,7 @@ def test_every_corpus_binary_passes_the_gates():
     # real binaries. This walks whatever the corpus builder has produced, so it tightens
     # automatically as more versions are collected.
     if not _capstone_available():
-        print("  SKIP test_every_corpus_binary_passes_the_gates (no capstone)")
-        return
+        _skip("  SKIP test_every_corpus_binary_passes_the_gates (no capstone)")
     from jadart.macho import open_container
     from jadart.verify import verify_file
     checked = 0
@@ -980,7 +973,7 @@ def test_every_corpus_binary_passes_the_gates():
         assert len(ran) >= 8, f"dart {dart}: only {len(ran)} gates ran"
         checked += 1
     if checked == 0:
-        print("  SKIP test_every_corpus_binary_passes_the_gates (no corpus built)")
+        _skip("  SKIP test_every_corpus_binary_passes_the_gates (no corpus built)")
     else:
         assert checked >= 2, "expected the corpus to cover more than one epoch"
 
@@ -1017,8 +1010,7 @@ def test_hashed_file_list_is_read_per_version():
     cache = os.path.join(os.path.dirname(__file__), "..", ".sdkcache")
     old = os.path.join(cache, "b04011c77cd93e6ab9144af37976733b558d716c")
     if not (os.path.isdir(old) or os.environ.get("JADART_SDK_FETCH")):
-        print("  SKIP test_hashed_file_list_is_read_per_version (no .sdkcache)")
-        return
+        _skip("  SKIP test_hashed_file_list_is_read_per_version (no .sdkcache)")
     files = snapshot_files("b04011c77cd93e6ab9144af37976733b558d716c")
     assert len(files) == 15
     assert sorted(files) == sorted(VM_SNAPSHOT_FILES), "same files, different order"
@@ -1056,12 +1048,11 @@ def test_snapshot_hash_is_md5_of_fifteen_vm_files():
     # suite stays offline-safe. Set JADART_SDK_FETCH=1 to allow a cold fetch.
     cache = os.path.join(os.path.dirname(__file__), "..", ".sdkcache", "3.12.2")
     if not (os.path.isdir(cache) or os.environ.get("JADART_SDK_FETCH")):
-        print("  SKIP snapshot-hash fetch half (no .sdkcache; set JADART_SDK_FETCH=1)")
-        return
+        _skip("  SKIP snapshot-hash fetch half (no .sdkcache; set JADART_SDK_FETCH=1)")
     try:
         assert snapshot_hash("3.12.2") == KNOWN_HASH, "3.12.2 source must reproduce the hash"
     except FetchError as e:
-        print(f"  SKIP snapshot-hash fetch half (network: {e})")
+        _skip(f"  SKIP snapshot-hash fetch half (network: {e})")
 
 
 # Optional fixtures that are not committed: JADART_EXTRA_BINARIES is a colon-separated list
@@ -1129,8 +1120,7 @@ def test_macho_container_reads_ios_snapshot():
     # so a production-identical artifact needs no Xcode. The blobs sit in __TEXT,__const and
     # __TEXT,__text under the same _kDart* names ELF uses.
     if not os.path.exists(IOS_DYLIB):
-        print(f"  SKIP test_macho_container_reads_ios_snapshot ({_IOS_HOWTO})")
-        return
+        _skip(f"  SKIP test_macho_container_reads_ios_snapshot ({_IOS_HOWTO})")
     import struct as _s
     from jadart.macho import open_container, MachO64
     from jadart.stream import ReadStream
@@ -1154,8 +1144,7 @@ def test_uncompressed_pointers_parse_end_to_end():
     # lives in the RO data image. Getting the object graph AND the identifier pool out of a
     # target with a different cluster routing is the whole point of the profile split.
     if not os.path.exists(IOS_DYLIB):
-        print(f"  SKIP test_uncompressed_pointers_parse_end_to_end ({_IOS_HOWTO})")
-        return
+        _skip(f"  SKIP test_uncompressed_pointers_parse_end_to_end ({_IOS_HOWTO})")
     from jadart.program import recover_program
     from jadart.clusters import RODATA
     prog = recover_program(IOS_DYLIB)
@@ -1175,11 +1164,9 @@ def test_uncompressed_grammar_passes_the_gates():
     # The gates are the objective test that a new target's grammar is right, rather than
     # merely not crashing, which the alloc self-check alone would have allowed.
     if not os.path.exists(IOS_DYLIB):
-        print("  SKIP test_uncompressed_grammar_passes_the_gates (no fixture)")
-        return
+        _skip("  SKIP test_uncompressed_grammar_passes_the_gates (no fixture)")
     if not _capstone_available():
-        print("  SKIP test_uncompressed_grammar_passes_the_gates (no capstone)")
-        return
+        _skip("  SKIP test_uncompressed_grammar_passes_the_gates (no capstone)")
     from jadart.verify import verify_file
     rep = verify_file(IOS_DYLIB)
     assert "uncompressed" in rep.arch
@@ -1248,8 +1235,7 @@ def test_library_url_maps_to_a_path_like_blutter():
 
 def test_export_writes_a_browsable_tree():
     if not _capstone_available():
-        print("  SKIP test_export_writes_a_browsable_tree (no capstone)")
-        return
+        _skip("  SKIP test_export_writes_a_browsable_tree (no capstone)")
     import tempfile
     from jadart.export import export
     with tempfile.TemporaryDirectory() as out:
@@ -1338,7 +1324,7 @@ def test_library_recovery_works_across_epochs_and_targets():
         assert any(u.startswith("package:") for u in libs), "iOS: no package: urls"
         checked.append("ios")
     if len(checked) < 2:
-        print("  SKIP test_library_recovery_works_across_epochs_and_targets (thin corpus)")
+        _skip("  SKIP test_library_recovery_works_across_epochs_and_targets (thin corpus)")
 
 
 def test_far_pool_loads_resolve_not_fake_field_reads():
@@ -1496,11 +1482,9 @@ def test_fmov_between_int_and_fp_is_not_a_move():
 
 def test_fp_function_bodies_read_as_source():
     if not os.path.exists(SHAPES):
-        print("  SKIP test_fp_function_bodies_read_as_source (no shapes_oop fixture)")
-        return
+        _skip("  SKIP test_fp_function_bodies_read_as_source (no shapes_oop fixture)")
     if not _capstone_available():
-        print("  SKIP test_fp_function_bodies_read_as_source (no capstone)")
-        return
+        _skip("  SKIP test_fp_function_bodies_read_as_source (no capstone)")
     from jadart.program import decompile_class
     out = decompile_class(SHAPES, "Triangle")
     # Newton's method: `g = (g + x / g) / 2`, 24 iterations. The guess is loop-carried, so
@@ -1533,8 +1517,7 @@ def _walk_for_gates(path):
 
 def test_acceptance_gates_pass_on_the_corpus():
     if not _capstone_available():
-        print("  SKIP test_acceptance_gates_pass_on_the_corpus (no capstone)")
-        return
+        _skip("  SKIP test_acceptance_gates_pass_on_the_corpus (no capstone)")
     from jadart.verify import verify_file
     for path, label in ((CLEAN, "clean"), (OBF, "obfuscated")):
         rep = verify_file(path)
@@ -1550,8 +1533,7 @@ def test_acceptance_gates_detect_a_wrong_grammar():
     # alloc-pass self-check already passes on a mismatched profile. Each perturbation below
     # is the shape of a real grammar error, and must be caught by its specific gate.
     if not _capstone_available():
-        print("  SKIP test_acceptance_gates_detect_a_wrong_grammar (no capstone)")
-        return
+        _skip("  SKIP test_acceptance_gates_detect_a_wrong_grammar (no capstone)")
     import copy
     from jadart.verify import run_gates
     clusters, fr, hdr, image = _walk_for_gates(CLEAN)
@@ -1806,6 +1788,8 @@ def test_stack_passed_arguments_are_recovered():
 
 
 def test_pool_xrefs_finds_both_addressing_forms():
+    if not _capstone_available():
+        _skip("test_pool_xrefs_finds_both_addressing_forms (no capstone)")
     # "what uses this string" is the first question anyone asks of a binary, and on an
     # obfuscated build it is often the only one still answerable, names are gone, but a
     # literal is a literal. Two forms reach the pool, and a scan that handles only the near
@@ -1992,15 +1976,13 @@ def test_ffi_reports_the_native_boundary_of_a_real_app():
     import contextlib
     import zipfile
     if not _capstone_available():
-        print("  SKIP test_ffi_reports_the_native_boundary_of_a_real_app (no capstone)")
-        return
+        _skip("  SKIP test_ffi_reports_the_native_boundary_of_a_real_app (no capstone)")
     cache = os.path.expanduser("~/.cache/jadart-ctfbench")
     apk = next((os.path.join(cache, n) for n in sorted(os.listdir(cache))
                 if "Brod_and_Co" in n and n.endswith(".apk")), None) \
         if os.path.isdir(cache) else None
     if not apk:
-        print("  SKIP test_ffi_reports_the_native_boundary_of_a_real_app (no cached APK)")
-        return
+        _skip("  SKIP test_ffi_reports_the_native_boundary_of_a_real_app (no cached APK)")
     import tempfile
     from jadart import cli
     with zipfile.ZipFile(apk) as z, tempfile.TemporaryDirectory() as td:
@@ -2076,12 +2058,10 @@ def test_arm32_target_table_is_right_where_it_is_checkable():
     3/9 to 5/9 against the app's own source where arm64 scores 9/9. See LIFTABLE_ARCHS.
     """
     if not _capstone_available():
-        print("  SKIP test_arm32_target_table_is_right_where_it_is_checkable")
-        return
+        _skip("  SKIP test_arm32_target_table_is_right_where_it_is_checkable")
     arm32 = os.path.join(ROOT, "flubench/corpus/arm32-3.3.4/libapp.so")
     if not os.path.exists(arm32):
-        print("  SKIP test_arm32_target_table_is_right_where_it_is_checkable (no arm32)")
-        return
+        _skip("  SKIP test_arm32_target_table_is_right_where_it_is_checkable (no arm32)")
     from jadart import expr as E
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc)
@@ -2143,8 +2123,7 @@ def test_snapshot_kind_matches_the_vm_enum():
 
     # And the binaries agree: a Flutter release AOT snapshot is kind 3, on every epoch.
     if not os.path.exists(CLEAN):
-        print("  SKIP kind-vs-binary half (no corpus)")
-        return
+        _skip("  SKIP kind-vs-binary half (no corpus)")
     from jadart.disasm import load_instructions
     _img, _fr, hdr = load_instructions(CLEAN)
     assert hdr.kind == 3 and hdr.kind_name == "kFullAOT", hdr.kind_name
@@ -2207,6 +2186,8 @@ def test_every_lift_call_site_passes_the_target():
 
 
 def test_each_tier_refuses_the_targets_it_cannot_model():
+    if not _capstone_available():
+        _skip("test_each_tier_refuses_the_targets_it_cannot_model (no capstone)")
     # Capstone decodes one instruction set as another without complaining and returns
     # confident nonsense, so every tier has to refuse what it does not model, but they
     # do not all model the same thing, and collapsing them into one gate costs a tier that
@@ -2437,8 +2418,7 @@ def test_tier34_names_virtual_calls_in_bodies():
     # End to end: a dispatch call whose offset is recovered renders with the source
     # selector name instead of sel_0x<off>.
     if not _capstone_available():
-        print("  SKIP test_tier34_names_virtual_calls_in_bodies (no capstone)")
-        return
+        _skip("  SKIP test_tier34_names_virtual_calls_in_bodies (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
@@ -2477,8 +2457,7 @@ def test_tier3_no_crash_over_sample():
     # The full annotate + strip + build_cfg + structure + lift pipeline must not raise on
     # any real function (register reuse, bare loads, indirect calls, irreducible regions).
     if not _capstone_available():
-        print("  SKIP test_tier3_no_crash_over_sample (no capstone)")
-        return
+        _skip("  SKIP test_tier3_no_crash_over_sample (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, annotate, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
@@ -2502,6 +2481,8 @@ def test_tier3_no_crash_over_sample():
 
 
 def test_bool_singletons_are_the_only_null_offsets_used():
+    if not _capstone_available():
+        _skip("test_bool_singletons_are_the_only_null_offsets_used (no capstone)")
     # Reading NULL+0x20 as `false` instead of `true` would invert a boolean in recovered
     # source, and nothing downstream would look wrong. The constants are not derivable from
     # the snapshot, so pin them: if a future epoch lays the VM heap out differently, some
@@ -2537,6 +2518,8 @@ def test_bool_singletons_are_the_only_null_offsets_used():
 
 
 def test_every_goto_has_a_label_and_no_block_is_dropped():
+    if not _capstone_available():
+        _skip("test_every_goto_has_a_label_and_no_block_is_dropped (no capstone)")
     # structure() used to turn a block it reached twice into a goto and then never emit it.
     # The goto named a label no tier defined, so the output gave no sign that a hundred
     # instructions had gone missing, which is exactly the failure mode this project
@@ -2861,8 +2844,7 @@ def test_the_memory_oracle_catches_a_stale_field_expression():
     store. Disabling `_pin_mem` restores exactly the state the fix left, and the harness
     has to fail."""
     if not _unicorn_available() or not _capstone_available():
-        print("  SKIP test_the_memory_oracle_catches_a_stale_field_expression")
-        return
+        _skip("  SKIP test_the_memory_oracle_catches_a_stale_field_expression")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     from jadart import expr
@@ -2906,8 +2888,7 @@ def test_the_control_flow_memory_oracle_catches_every_defect_it_found():
     loads those registers from memory first, which gives the chain a decidable start
     without changing what a bare register means, and the defect is caught again."""
     if not _unicorn_available() or not _capstone_available():
-        print("  SKIP test_the_control_flow_memory_oracle_catches_every_defect_it_found")
-        return
+        _skip("  SKIP test_the_control_flow_memory_oracle_catches_every_defect_it_found")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     from jadart import expr
@@ -2939,8 +2920,7 @@ def test_the_scalar_fp_oracle_catches_a_precedence_slip():
     A Python float is an IEEE-754 binary64 and `+ - * /` and sqrt are correctly rounded in
     both, so the comparison is bit-exact with no approximation anywhere in it."""
     if not _unicorn_available() or not _capstone_available():
-        print("  SKIP test_the_scalar_fp_oracle_catches_a_precedence_slip")
-        return
+        _skip("  SKIP test_the_scalar_fp_oracle_catches_a_precedence_slip")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     from jadart import expr
@@ -2969,8 +2949,7 @@ def test_irfuzz_memory_encodings_and_field_names_are_what_they_claim():
     different offset every trial would still run and compare against the wrong address,
     and the harness would report a clean pass."""
     if not _capstone_available():
-        print("  SKIP test_irfuzz_memory_encodings_and_field_names_are_what_they_claim")
-        return
+        _skip("  SKIP test_irfuzz_memory_encodings_and_field_names_are_what_they_claim")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     bad = irfuzz.verify_mem_encodings()
@@ -3152,8 +3131,7 @@ def test_no_printed_phi_assigns_a_machine_register_anywhere_in_the_corpus():
     the single place a join picks a name, so the check is that what it returns is never a
     register, read off the real rendering rather than off the method."""
     if not _capstone_available():
-        print("  SKIP test_no_printed_phi_assigns_a_machine_register_anywhere_in_the_corpus")
-        return
+        _skip("  SKIP test_no_printed_phi_assigns_a_machine_register_anywhere_in_the_corpus")
     from jadart.disasm import (load_instructions, disassemble_function, annotate,
                                function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function
@@ -3283,8 +3261,7 @@ def test_every_printed_write_to_a_machine_register_comes_from_a_pinned_bump():
     whole (over every function in the shipped build, all 858 register writes) rather
     than argued from the three call sites."""
     if not _capstone_available():
-        print("  SKIP test_every_printed_write_to_a_machine_register_comes_from_a_pinned_bump")
-        return
+        _skip("  SKIP test_every_printed_write_to_a_machine_register_comes_from_a_pinned_bump")
     from jadart import expr
     from jadart.disasm import (load_instructions, disassemble_function, annotate,
                                function_name_by_pc, build_pool_map)
@@ -3362,8 +3339,7 @@ def test_a_goto_join_gets_the_meet_for_the_heap_as_well_as_the_registers():
     `structure` cannot nest, which is not something to fake convincingly. The seeds are the
     ones where switching `_writes_heap` off puts the disagreement back."""
     if not _unicorn_available() or not _capstone_available():
-        print("  SKIP test_a_goto_join_gets_the_meet_for_the_heap_as_well_as_the_registers")
-        return
+        _skip("  SKIP test_a_goto_join_gets_the_meet_for_the_heap_as_well_as_the_registers")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     from jadart import expr
@@ -3410,8 +3386,7 @@ def test_the_three_late_identified_epochs_pass_the_gates_on_their_own_app():
     the network and a fresh clone has not run it."""
     import os
     if not _capstone_available():
-        print("  SKIP test_the_three_late_identified_epochs_pass_the_gates_on_their_own_app")
-        return
+        _skip("  SKIP test_the_three_late_identified_epochs_pass_the_gates_on_their_own_app")
     from jadart.verify import verify_file
     from jadart.snapshot import parse_libapp
 
@@ -3432,7 +3407,7 @@ def test_the_three_late_identified_epochs_pass_the_gates_on_their_own_app():
         assert rep.supported and not bad, f"{app} ({dart}): Tier A gates failed: {bad}"
         assert len(ran) >= 8, f"{app}: only {len(ran)} Tier A gates ran"
     if not ran_any:
-        print("  SKIP test_the_three_late_identified_epochs (no appsweep cache)")
+        _skip("  SKIP test_the_three_late_identified_epochs (no appsweep cache)")
 
 
 def test_an_epoch_switch_keys_on_the_family_not_the_release():
@@ -3471,8 +3446,7 @@ def test_a_const_list_in_the_pool_resolves_to_its_elements():
     Pinned on two lists the Dart SDK itself carries, so the expectation does not depend on
     anything we wrote."""
     if not _capstone_available():
-        print("  SKIP test_a_const_list_in_the_pool_resolves_to_its_elements")
-        return
+        _skip("  SKIP test_a_const_list_in_the_pool_resolves_to_its_elements")
     from jadart.disasm import load_instructions, const_lists
 
     image, fr, _hdr = load_instructions(CLEAN)
@@ -3627,8 +3601,7 @@ def test_the_skill_file_names_only_commands_that_exist():
     root = os.path.join(os.path.dirname(__file__), "..", "..")
     skill = os.path.join(root, "SKILL.md")
     if not os.path.exists(skill):
-        print("  SKIP test_the_skill_file_names_only_commands_that_exist (no SKILL.md)")
-        return
+        _skip("  SKIP test_the_skill_file_names_only_commands_that_exist (no SKILL.md)")
     text = open(skill).read()
 
     from jadart.cli import build_parser
@@ -3661,6 +3634,8 @@ def test_an_extending_addressing_operand_carries_its_shift():
 
 
 def test_structured_output_claims_exactly_the_edges_the_cfg_has():
+    if not _capstone_available():
+        _skip("test_structured_output_claims_exactly_the_edges_the_cfg_has (no capstone)")
     # "Every block is placed once and none is dropped" is necessary and nowhere near
     # sufficient. A structuring pass can place every block exactly once and still claim an
     # edge that does not exist, which is the failure mode that matters: an `if` whose arms
@@ -3930,8 +3905,7 @@ def test_the_oracle_actually_catches_a_wrong_lowering():
     zero-extended. That is the oracle being right and the perturbation being wrong.
     """
     if not _unicorn_available():
-        print("  SKIP test_the_oracle_actually_catches_a_wrong_lowering (no unicorn)")
-        return
+        _skip("  SKIP test_the_oracle_actually_catches_a_wrong_lowering (no unicorn)")
     from jadart.ir import Graph, evaluate
 
     rng = random.Random(11)
@@ -3972,8 +3946,7 @@ def test_lowering_matches_the_cpu_on_real_corpus_code():
     """Synthetic cases test the rules someone thought to write. This tests the ones the
     compiler actually emits, in the combinations it emits them."""
     if not _unicorn_available() or not _capstone_available():
-        print("  SKIP test_lowering_matches_the_cpu_on_real_corpus_code")
-        return
+        _skip("  SKIP test_lowering_matches_the_cpu_on_real_corpus_code")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     rc = irfuzz.run_corpus(CLEAN, want=60, trials=25, seed=3, verbose=False)
@@ -4063,8 +4036,7 @@ def test_irfuzz_encodings_decode_to_what_they_claim():
     fifteen were wrong when written, and this check is what caught them: without it the
     harness fuzzes a different instruction than the DAG models and reports a pass."""
     if not _capstone_available():
-        print("  SKIP test_irfuzz_encodings_decode_to_what_they_claim (no capstone)")
-        return
+        _skip("  SKIP test_irfuzz_encodings_decode_to_what_they_claim (no capstone)")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     bad = irfuzz.verify_encodings()
@@ -4090,8 +4062,7 @@ def test_entry_arity_refuses_when_the_args_descriptor_is_live():
     passes exactly when the signature has optional or named parameters and therefore does
     NOT pass in registers. Counting instead of refusing produced a fabricated argument."""
     if not _capstone_available():
-        print("  SKIP test_entry_arity_refuses_when_the_args_descriptor_is_live")
-        return
+        _skip("  SKIP test_entry_arity_refuses_when_the_args_descriptor_is_live")
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc)
     from jadart.expr import entry_arity, ARG_REGS
@@ -4236,8 +4207,7 @@ def test_signature_names_obfuscated_code_from_a_reference():
     """The point of the feature: the obfuscated build carries almost no names, and a
     reference build of the same source supplies them by shape."""
     if not _capstone_available():
-        print("  SKIP test_signature_names_obfuscated_code_from_a_reference (no capstone)")
-        return
+        _skip("  SKIP test_signature_names_obfuscated_code_from_a_reference (no capstone)")
     from jadart.disasm import load_instructions, function_name_by_pc
     from jadart import signatures as S
 
@@ -4262,8 +4232,7 @@ def test_signature_precision_on_a_binary_with_ground_truth():
     cross-application number lives in EVAL.md, where it can be stated with its method.
     """
     if not _capstone_available():
-        print("  SKIP test_signature_precision_on_a_binary_with_ground_truth (no capstone)")
-        return
+        _skip("  SKIP test_signature_precision_on_a_binary_with_ground_truth (no capstone)")
     from jadart.disasm import load_instructions, function_name_by_pc
     from jadart import signatures as S
 
@@ -4290,8 +4259,7 @@ def test_signature_native_thunks_are_never_signed():
     distinguishing operand is a pool slot the runtime patches to null. Signing those
     invents names; Ghidra calls the same mitigation Auto Fail."""
     if not _capstone_available():
-        print("  SKIP test_signature_native_thunks_are_never_signed (no capstone)")
-        return
+        _skip("  SKIP test_signature_native_thunks_are_never_signed (no capstone)")
     from jadart.signatures import normalise, _NATIVE_KINDS
     dis = [(0, "stp", "x29, x30, [x15, #-0x10]!"), (4, "mov", "x29, x15"),
            (8, "ldr", "x5, [x27, #0xf18]"), (12, "blr", "x30")]
@@ -4308,8 +4276,7 @@ def test_function_table_covers_every_code_range():
     """The list is the whole image, not the subset that kept a name. Ranges whose Code
     object --obfuscate discarded are still real code and still reachable."""
     if not _capstone_available():
-        print("  SKIP test_function_table_covers_every_code_range (no capstone)")
-        return
+        _skip("  SKIP test_function_table_covers_every_code_range (no capstone)")
     from jadart.disasm import load_instructions
     from jadart.callgraph import function_table, ORIGINS
     image, fr, hdr = load_instructions(CLEAN)
@@ -4335,15 +4302,13 @@ def test_call_graph_refuses_rather_than_returning_an_empty_one():
     the rows rather than raised.
     """
     if not _capstone_available():
-        print("  SKIP test_call_graph_refuses_rather_than_returning_an_empty_one")
-        return
+        _skip("  SKIP test_call_graph_refuses_rather_than_returning_an_empty_one")
     from jadart.disasm import UnsupportedArch, load_instructions
     from jadart.callgraph import build_index, function_table
 
     arm32 = os.path.join(ROOT, "flubench/corpus/arm32-3.3.4/libapp.so")
     if not os.path.exists(arm32):
-        print("  SKIP test_call_graph_refuses_rather_than_returning_an_empty_one (no arm32)")
-        return
+        _skip("  SKIP test_call_graph_refuses_rather_than_returning_an_empty_one (no arm32)")
     image, fr, hdr = load_instructions(arm32)
 
     # arm32 now DECODES (Tier 1), so the graph is real and the assertion that matters
@@ -4376,8 +4341,7 @@ def test_call_graph_edges_are_symmetric():
     """callers and callees are two views of one edge set; if they disagree the graph is
     lying to whichever command reads the other side."""
     if not _capstone_available():
-        print("  SKIP test_call_graph_edges_are_symmetric (no capstone)")
-        return
+        _skip("  SKIP test_call_graph_edges_are_symmetric (no capstone)")
     from jadart.disasm import load_instructions
     from jadart.callgraph import build_index
     image, fr, _ = load_instructions(CLEAN)
@@ -4394,8 +4358,7 @@ def test_call_graph_finds_a_known_caller():
     """benchRunAll calls benchWithdraw in the fixture's source, so the edge must be there
     and must be reported from the callee's side."""
     if not _capstone_available():
-        print("  SKIP test_call_graph_finds_a_known_caller (no capstone)")
-        return
+        _skip("  SKIP test_call_graph_finds_a_known_caller (no capstone)")
     from jadart.disasm import load_instructions, function_name_by_pc
     from jadart.callgraph import callers_of
     image, fr, _ = load_instructions(CLEAN)
@@ -4415,8 +4378,7 @@ def test_virtual_targets_are_filtered_by_the_defining_name():
     targets, which is nonsense for a method a few dozen classes override. Every real
     implementation carries the same method name, so the modal name is the selector."""
     if not _capstone_available():
-        print("  SKIP test_virtual_targets_are_filtered_by_the_defining_name (no capstone)")
-        return
+        _skip("  SKIP test_virtual_targets_are_filtered_by_the_defining_name (no capstone)")
     from jadart.disasm import load_instructions
     from jadart.callgraph import build_index
     image, fr, _ = load_instructions(CLEAN)
@@ -4436,8 +4398,7 @@ def test_virtual_edges_stay_separate_from_direct_ones():
     """A direct edge is a fact and a virtual edge is a maybe. Merging them would let one
     toString site add eighty-odd edges indistinguishable from real calls."""
     if not _capstone_available():
-        print("  SKIP test_virtual_edges_stay_separate_from_direct_ones (no capstone)")
-        return
+        _skip("  SKIP test_virtual_edges_stay_separate_from_direct_ones (no capstone)")
     from jadart.disasm import load_instructions
     from jadart.callgraph import build_index
     image, fr, _ = load_instructions(CLEAN)
@@ -4459,8 +4420,7 @@ def test_unresolved_call_targets_are_counted_not_dropped():
     Counting those keeps the edge totals honest; dropping them silently would make the
     graph look complete when it is not."""
     if not _capstone_available():
-        print("  SKIP test_unresolved_call_targets_are_counted_not_dropped (no capstone)")
-        return
+        _skip("  SKIP test_unresolved_call_targets_are_counted_not_dropped (no capstone)")
     from jadart.disasm import load_instructions
     from jadart.callgraph import build_index
     image, fr, _ = load_instructions(CLEAN)
@@ -4478,8 +4438,7 @@ def test_operand_memoisation_is_transparent():
     invisible in ordinary use and wrong everywhere, so the sweep is long enough to trip
     the ceiling many times over."""
     if not _capstone_available():
-        print("  SKIP test_operand_memoisation_is_transparent (no capstone)")
-        return
+        _skip("  SKIP test_operand_memoisation_is_transparent (no capstone)")
     from jadart.disasm import load_instructions, disassemble_range
     from jadart import expr
 
@@ -4607,8 +4566,7 @@ def test_implicit_getters_load_the_offset_their_field_records():
     # self-consistent: an ImplicitGetter's body is one load of the field its Function.data
     # points at, so the code generator and the serialiser encode the same number twice.
     if not _capstone_available():
-        print("  SKIP test_implicit_getters_load_the_offset_their_field_records")
-        return
+        _skip("  SKIP test_implicit_getters_load_the_offset_their_field_records")
     from jadart.verify import verify_file
     rep = verify_file(CLEAN)
     g = next(g for g in rep.gates if g.gate.startswith("G14"))
@@ -4688,8 +4646,7 @@ def test_the_recovered_layout_spaces_unboxed_slots_eight_bytes_apart():
     from jadart.fields import recover_fields
     image, fr, hdr = load_instructions(CLEAN)
     if hdr.arch.compressed_word_size == hdr.arch.word_size:
-        print("  SKIP: uncompressed target, every slot is one word")
-        return
+        _skip("  SKIP: uncompressed target, every slot is one word")
     layout = recover_fields(fr, hdr.arch)
     ref = next(r for r, n in layout.class_name.items() if n == "PointerEvent")
     own = sorted((off, fi) for off, fi in layout.by_class[ref].items() if not fi.inherited)
@@ -4741,13 +4698,20 @@ if __name__ == "__main__":
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
     # and reported success, and the eight it dropped were the whole field-layout suite.
     # test_the_runner_block_is_the_last_thing_in_this_file keeps it here.
-    passed = 0
+    passed = skipped = 0
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
-            fn()
+            try:
+                fn()
+            except unittest.SkipTest as exc:
+                # Counted apart from the passes, and named. A skip reported as a pass is
+                # how this suite came to claim 192 while running 131.
+                print(f"  SKIP {name}: {exc}")
+                skipped += 1
+                continue
             print(f"  PASS {name}")
             passed += 1
-    print(f"{passed} tests passed")
+    print(f"{passed} passed, {skipped} skipped")
 
 
 # ── field layout: the offset -> name map the snapshot still carries ───────────────

@@ -19,7 +19,7 @@ You need python3 and nothing else for the core. Disassembly needs capstone.
 ```bash
 cd jadart/framework
 pip install -e '.[disasm]' pytest
-python3 -m pytest tests -q      # 192 tests, all must pass
+python3 -m pytest tests -q      # 193 tests, all must pass
 ```
 
 Use pytest, not `python3 tests/test_core.py`. The file still carries a script runner for

@@ -32,11 +32,22 @@ jobs:
       # of 188 tests and reported success, and the eight it silently dropped were the
       # whole field-layout suite. The block is at EOF now and a test keeps it there, but
       # the collector that cannot have the problem is the one to run in CI.
+      # -rs prints why each test skipped. Seventy tests used to skip by printing and
+      # returning, which pytest counts as a PASS and whose print it captures, so the
+      # suite reported 192 green while 131 had run. They raise unittest.SkipTest now,
+      # and the count below fails the build if skipping ever spreads quietly.
       - name: tests
         working-directory: framework
         run: |
           python -m pip install pytest
-          python -m pytest tests -q
+          python -m pytest tests -q -rs | tee /tmp/pytest.out
+          skipped=$(sed -n 's/.*[^0-9]\([0-9]\+\) skipped.*/\1/p' /tmp/pytest.out | tail -1)
+          skipped=${skipped:-0}
+          echo "skipped: $skipped"
+          if [ "$skipped" -gt 25 ]; then
+            echo "::error::$skipped tests skipped; expected at most 25 on a CI checkout"
+            exit 1
+          fi
 
       # EVAL.md's numbers were hand-maintained and went stale, so they are generated now
       # and checked here. On a checkout without the (gitignored, regenerable) corpus this
@@ -100,3 +111,12 @@ jobs:
           python -c "import capstone" 2>/dev/null && { echo "capstone should NOT be installed"; exit 1; }
           jadart info flubench/artifacts/clean/lib/arm64-v8a/libapp.so | head -5
           jadart classes flubench/artifacts/clean/lib/arm64-v8a/libapp.so -f BenchAccount
+
+      # The suite itself, without the extra. This job used to run three commands and stop,
+      # so five tests that imported capstone unguarded were failing here for nobody to see.
+      # Every test that needs it must skip, not error.
+      - name: the suite skips rather than errors without capstone
+        working-directory: framework
+        run: |
+          python -m pip install pytest
+          python -m pytest tests -q -rs

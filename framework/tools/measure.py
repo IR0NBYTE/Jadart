@@ -121,6 +121,7 @@ def check_doc_test_counts() -> list:
     with open(tests) as f:
         actual = len(re.findall(r"^def (test_\w+)", f.read(), re.M))
     pats = (r"tests-(\d+)%20passing",
+            r"tests-(\d+)-brightgreen",
             r"test_core\.py\s*#\s*(\d+)\s+passing",
             r"test_core\.py\s+#\s+(\d+)\s+tests")
     bad = []
