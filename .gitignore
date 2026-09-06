@@ -8,7 +8,7 @@ flubench/artifacts/symbols/
 *.apk
 *.so
 !flubench/artifacts/*/lib/arm64-v8a/libapp.so
-!challenges/*/bin/libapp.so
+!challenges/*/*.apk
 *.unflutter/
 __pycache__/
 *.pyc

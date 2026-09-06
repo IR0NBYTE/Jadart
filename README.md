@@ -169,8 +169,9 @@ is wrong.
 Full walkthroughs: [docs/usage.md](docs/usage.md). Per-command help: `jadart <cmd> --help`.
 
 Want something to point it at? [challenges/xorgate](challenges/xorgate) is a small Flutter
-crackme built for exactly that: the licence key is compared in compiled code and the flag
-is a XOR table, so `strings` gives you neither. Six commands take it apart.
+crackme built for exactly that: an installable APK whose licence key is compared in
+compiled code and whose flag is a XOR table, so `strings` gives you neither. Six commands
+take it apart, straight from the APK.
 
 ## What it recovers, tier by tier
 
@@ -318,7 +319,7 @@ code ranges** across the clean build, the obfuscated build, and a real third-par
 | [SKILL.md](SKILL.md) | a portable Flutter reverse-engineering skill for coding agents |
 | [CHANGELOG.md](CHANGELOG.md) | what changed, and what the version number covers |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | how to add an epoch, a grammar or a gate |
-| [challenges/xorgate](challenges/xorgate) | a crackme to practise on, with the binary included |
+| [challenges/xorgate](challenges/xorgate) | a crackme to practise on, APK included |
 
 ## Repository layout
 
@@ -333,7 +334,7 @@ framework/            jadart itself, plus its test suite
   tools/              gen_cids, gen_epoch, sdk_source, build_corpus, measure,
                       cfgcheck, irfuzz, appsweep, ctfbench, bench, quality, semdiff
   tests/test_core.py  validation against the FluBench corpus
-challenges/           practice binaries, source included
+challenges/           practice APKs, source included
 flubench/             the controlled corpus: a labelled construct app and its harness
   app/                the Flutter app whose declared symbols are exact ground truth
   artifacts/          the arm64 fixtures, clean and --obfuscate
