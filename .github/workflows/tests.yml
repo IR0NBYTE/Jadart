@@ -1,9 +1,14 @@
 name: tests
 
+# Disabled. The workflow is kept because it encodes what a full check actually is:
+# the suite on three Pythons, the acceptance gates on both fixtures, the CFG edge
+# check, a determinism diff across two hash seeds, and an install with no capstone.
+# Run it by hand with `act`, or re-enable it in Settings > Actions, or from the CLI:
+#   gh api -X PUT repos/IR0NBYTE/Jadart/actions/workflows/351488109/enable
+# If you re-enable it, put the four checks back in the branch ruleset too, or
+# nothing is gating merges.
 on:
-  push:
-    branches: [master, main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   test:

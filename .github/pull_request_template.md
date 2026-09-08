@@ -7,7 +7,7 @@ Link the issue if there is one.
 ## Tests
 
 ```
-cd framework && python3 -m pytest tests -q
+./check.sh
 ```
 
 - [ ] The suite passes and the count didn't go down

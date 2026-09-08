@@ -23,7 +23,12 @@ python3 -m pytest tests -q      # 193 tests, all must pass
 ```
 
 Use pytest, not `python3 tests/test_core.py`. The file still carries a script runner for
-convenience, but pytest is what CI runs and the only collector that cannot miss a test.
+convenience, but pytest is the only collector that cannot miss a test.
+
+`./check.sh` from the repository root runs the suite, the acceptance gates on both
+fixtures, the measured claims and the no-capstone install. `./check.sh --full` adds the
+CFG edge check and the determinism diff. Run it before you open a pull request: there is
+no CI doing it for you.
 
 The suite runs against the committed FluBench fixtures, so a fresh clone works with no
 Flutter install. To also exercise the ELF symbol backfill, point it at any unstripped

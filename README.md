@@ -1,6 +1,5 @@
 # Jadart
 
-[![tests](https://github.com/IR0NBYTE/Jadart/actions/workflows/tests.yml/badge.svg)](https://github.com/IR0NBYTE/Jadart/actions/workflows/tests.yml)
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
 [![tests: 193](https://img.shields.io/badge/tests-193-brightgreen.svg)](#tests)
@@ -232,9 +231,10 @@ the clusters and checks each one ends exactly where the format says it must, cro
 recovered field offsets against the displacement the field's own implicit getter compiled
 to, and refuses rather than reports when a check cannot be understood.
 
-Those gates run in CI on committed fixtures, alongside a determinism diff across two
+The gates run on the committed fixtures, alongside a determinism diff across two
 `PYTHONHASHSEED` values and differential oracles that execute the printed pseudo-Dart
-against an emulated CPU and compare it to the real one.
+against an emulated CPU and compare it to the real one. `.github/workflows/tests.yml`
+lists the full set; it is disabled, so run them yourself before a release.
 
 The full evaluation, including the comparison against `unflutter`, Blutter, Ghidra and
 radare2, is in [EVAL.md](EVAL.md).
@@ -371,6 +371,8 @@ docs/                 usage, support, and the Flutter internals explainer
 
 ```bash
 cd framework && python3 -m pytest tests -q     # 193 tests
+./check.sh                                     # the suite, the gates, the measured claims
+./check.sh --full                              # adds the CFG edge check and determinism
 ```
 
 Some tests need something this repository does not ship: a multi-version corpus, an
