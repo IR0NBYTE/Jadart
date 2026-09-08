@@ -45,20 +45,15 @@ _CSL_NAMES = ("TypeArgumentsCid", "TypeCid", "FunctionTypeCid", "RecordTypeCid",
               "TypeParameterCid", "StringCid")
 
 
-# per-cid alloc pattern for the ReadCluster switch (compressed-pointers AOT target).
-# Built from the M2 grammar master table. Cids that never appear as concrete
-# serialized objects are absent; an unknown one fails loud.
-# This is the Dart 3.12.2 epoch profile. Two clusters differ from the SDK `main`
-# (c6d9d592) checkout the grammar was extracted from, confirmed against the binary
-# and cross-checked with unflutter's version-parameterized model:
-#   * Class alloc reads predefined_count + predefined x ReadCid(int32) + new_count
-#     (main refactored this to a plain fixed count).
-#   * Closure alloc is FIXED (main added a per-object `length` for inline context in
-#     3.13; it is absent in 3.12.2).
-# That drift per epoch is what the version-robust design is there to handle.
-# Full per-cluster alloc-kind profile for this epoch, keyed by cid enum name (from the
-# confirmed master grammar table). Type/FunctionType/RecordType/TypeParameter/String/
-# TypeArguments additionally carry a canonical-set tail (see _CSL_CIDS) applied on top.
+# Per-cid alloc pattern for the ReadCluster switch, compressed-pointers AOT target, keyed
+# by cid enum name. Cids that never appear as concrete serialized objects are absent and an
+# unknown one fails loud. Type/FunctionType/RecordType/TypeParameter/String/TypeArguments
+# additionally carry a canonical-set tail (_CSL_CIDS) applied on top.
+#
+# This is the 3.12.2 profile. Two clusters differ from SDK main: Class alloc reads
+# predefined_count + predefined x ReadCid(int32) + new_count, and Closure alloc is fixed
+# (main added a per-object length in 3.13). Drift like that is what the epoch table exists
+# to carry.
 _FIXED_NAMES = frozenset({
     "PatchClassCid", "TypeParametersCid", "FunctionCid", "ClosureDataCid",
     "FfiTrampolineDataCid", "FieldCid", "ScriptCid", "LibraryCid", "NamespaceCid",

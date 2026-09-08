@@ -257,27 +257,14 @@ _EPOCHS: dict[str, Epoch] = {
     ),
 }
 
-# The rest of the ObjectHeader era, one entry per distinct snapshot hash.
+# The rest of the ObjectHeader era, one entry per distinct snapshot hash. These share
+# 3.12.2's cluster grammar, established by diffing every ReadAlloc and ReadFill body in
+# app_snapshot.cc from 3.4.0 up with the preprocessor resolved for an AOT product build:
+# no cluster changes the bytes it reads. What does move is the class-id table in
+# class_id.h, which tools/gen_epoch.py derives per release.
 #
-# These share 3.12.2's cluster grammar. That is not an assumption: every ReadAlloc and
-# ReadFill body in app_snapshot.cc was extracted with the preprocessor resolved for the
-# configuration a Flutter release build actually runs (DART_PRECOMPILED_RUNTIME and PRODUCT
-# defined), then diffed pairwise from 3.4.0 up. Not one of the 51 clusters changes the
-# sequence of bytes it reads. The churn that a naive text diff reports, fifteen bodies
-# between 3.4 and 3.5 alone, all sits in JIT-only or non-PRODUCT arms that AOT never
-# compiles, plus two widened integer types (uint16 -> uint32) that were already the same
-# signed varint on the wire.
-#
-# What does move is the class-id table, which lives in class_id.h rather than the
-# serializer: 3.4 and 3.5 have 174 predefined cids with typed data at 111..167, and 3.6
-# onwards has 175 at 112..168. tools/gen_epoch.py derives those per release. The tag layout
-# moves too, but only in bits jadart records and never reads, the canonical and immutable
-# flags are carried on the Cluster for reporting, and nothing in the walk branches on them,
-# so only the cid field position has to be right.
-#
-# An identical grammar still has to be earned per epoch: the rule is that the Tier-A gates
-# pass on a real binary before a profile claims a target. See flubench/corpus/ and
-# framework/tools/build_corpus.py for the binaries these were validated against.
+# An identical grammar is still earned per epoch, not assumed: the Tier-A gates have to
+# pass on a real binary before a profile claims a target.
 _IDENTIFIED = {
     # hash: (name, dart, cid table, td_int8_cid, td_byte_data_view_cid, immutable bit)
     "41be3daaabd524b8aa7423bc24584957": ("objectheader-3.12", "3.12.0", ERA_3_9, 112, 168, 7),

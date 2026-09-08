@@ -24,6 +24,7 @@ and isolate snapshots. Anything less is a hypothesis.
 """
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -62,9 +63,27 @@ class VerifyReport:
         ran = [g for g in self.tier_a if not g.skipped]
         return bool(ran) and all(g.passed for g in ran)
 
-    def render(self) -> str:
-        out = [f"// jadart verify: {self.path} [{self.which}]",
-               f"//   epoch {self.epoch}   target {self.arch}", ""]
+    def render(self, verbose: bool = False) -> str:
+        """One line when everything passed, the whole table when it did not.
+
+        A gate that passed is not news. Printing twenty two lines to say so buries the
+        one line that matters and trains the reader to skip all of it, which is exactly
+        the habit this tool should not be building. Failures always print in full, and
+        `-v` prints the table on demand.
+        """
+        ran = [g for g in self.tier_a if not g.skipped]
+        bad = [g for g in ran if not g.passed]
+        head = f"{os.path.basename(self.path)}  {self.epoch}  {self.arch}"
+
+        if not verbose and not bad:
+            b_ran = [g for g in self.gates if g.tier == "B" and not g.skipped]
+            b_bad = [g for g in b_ran if not g.passed]
+            checks = sum(g.checks for g in ran)
+            return (f"{head}\n"
+                    f"Tier A {len(ran)}/{len(ran)}, Tier B {len(b_ran) - len(b_bad)}/"
+                    f"{len(b_ran)}, {checks} checks. Grammar consistent.")
+
+        out = [head, ""]
         for tier, label in (("A", "Tier A, byte-exact (a failure means the grammar is wrong)"),
                             ("B", "Tier B, plausibility (reported, never gating)")):
             rows = [g for g in self.gates if g.tier == tier]
@@ -75,14 +94,10 @@ class VerifyReport:
                 note = g.skipped or g.detail
                 out.append(f"  [{g.status}] {g.gate:<34} {g.checks:>7} checks  {note}")
             out.append("")
-        ran = [g for g in self.tier_a if not g.skipped]
-        bad = [g for g in ran if not g.passed]
         out.append(f"Tier A: {len(ran) - len(bad)}/{len(ran)} passed"
                    + (f"  FAILED: {', '.join(g.gate for g in bad)}" if bad else ""))
         out.append("VERDICT: " + ("grammar consistent with this snapshot"
                                   if self.supported else "GRAMMAR MISMATCH"))
-        out.append("  (one binary is not support; that needs >=3 binaries incl. an "
-                   "--obfuscate build, on both snapshots)")
         return "\n".join(out)
 
 
@@ -199,10 +214,8 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None) -> list:
     # The alloc pass reads each string's (length, is_two_byte); the fill pass reads the same
     # header again before the bytes. This pins the alloc->fill boundary to the byte: a
     # one-byte slip makes the very first string's length disagree.
-    # This compared nothing until it was measured: the pass condition was `total > 0`,
-    # where total counted only what ALLOC had recorded, so the gate reported thousands of
-    # checks it never made and FAIL was unreachable. The fill walk now keeps the pairs it
-    # read (fillwalk.FillResult.string_lengths) and they are compared elementwise here.
+    # Compared elementwise against what the fill walk read (FillResult.string_lengths).
+    # Counting only the alloc side would make FAIL unreachable.
     total, bad = 0, []
     for cl in by_name.get("StringCid", []):
         alloc = cl.lengths or []

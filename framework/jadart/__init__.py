@@ -74,11 +74,9 @@ from .fillwalk import FillError
 from .program import recover_program as _recover_program
 from .verify import verify_file as _verify_file
 from .export import export as _export_tree
-# Lives in export.py beside `resolve_input`, which it wraps. It used to be defined
-# here and reached by `from . import _resolve` in signatures.py, a leaf importing a
-# private out of the package root, which inverts the layering and drags APK
-# extraction, an atexit hook and a process-lifetime cache into the analysis layer
-# with nothing in that module saying so.
+# Lives in export.py beside `resolve_input`, which it wraps. Defining it here would
+# make leaves import a private out of the package root, dragging APK extraction, an
+# atexit hook and a process-lifetime cache into the analysis layer.
 from .export import resolve_cached as _resolve
 
 #: Covers the INTERFACE, the command set and their options, the exit codes, the shape of

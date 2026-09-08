@@ -46,50 +46,16 @@ from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, 
 _REG_RE = re.compile(r"\b([wx](?:3[01]|[12]\d|\d)|[ds](?:3[01]|[12]\d|\d))\b")
 _FREG_RE = re.compile(r"^[ds](?:3[01]|[12]\d|\d)$")
 
-# ── memoisation of the operand-text parsers ─────────────────────────────────
-#
-# The IR below the statement tree is TEXT: an instruction is (addr, mnemonic, op_str,
-# note), and every pass that wants to know something about an operand re-parses that
-# string. There are a lot of passes, strip_boilerplate, build_cfg, detect_dispatch,
-# liveness inside _live_in_header, entry_arity on every call target, then the lifter
-# itself, so the same handful of characters gets split, stripped and regex-scanned
-# over and over. Measured on the clean corpus binary: 457,622 instructions but only
-# 72,784 DISTINCT operand strings (6.3x reuse before a single pass repeats), and one
-# `export` run made 2.07M _split_ops calls, 3.67M canon calls and 798k _def_use calls.
-# That is ~28 calls per distinct string, all returning the same answer. (_split_ops is
-# down to 856k calls per export since strip_boilerplate and detect_dispatch learned to
-# skip instructions they cannot match; the reuse ratio is what motivates this, and it
-# did not move.)
-#
-# So they are memoised. This is safe for a structural reason rather than a hopeful one:
-# every function here is a pure function of its string argument, with no reference to the
-# image, the epoch or any lifter state, and each now returns an IMMUTABLE value (tuple /
-# frozenset), so a caller that tried to mutate a shared result would raise rather than
-# corrupt the next lookup. Nothing about what the tool prints changes; the same answer is
-# simply computed once.
-#
-# The key space of every cache here is the set of distinct operand strings in the images
-# this process opens, so it GROWS WITH THE INPUT: 73k strings and 10.1MB of Python heap
-# for a 3MB libapp.so, and a shipped app can be twenty times that. _SPLIT_CACHE is the
-# one big enough to care about, so it has a ceiling, and it is emptied rather than evicted
-# from. Discarding everything is what an O(1) policy buys, and the hot set comes straight
-# back because instructions arrive clustered by function and the common idioms recur in
-# every one of them: measured on a full export, the ceiling costs 0.5% of wall time and
-# returns 3.9MB. LRU bookkeeping on 856k lookups would cost more than that to save the
-# same memory.
-#
-# The VALUES are interned, and that is not tidiness. Memoising _def_use naively cost
-# 17.4MB on one export, because 46,884 distinct (mnemonic, operand) pairs produced 46,884
-# separate pairs of frozensets holding just 783 distinct values between them: a bare cache
-# buys speed with memory, and this project cares about both. Interning gives the space
-# back, and the split tokens likewise collapse from 91,656 string objects to the 48,418
-# distinct ones they spell.
+# The IR below the statement tree is text, so every pass re-parses the same operand
+# strings: about 6x reuse across an image. These parsers are therefore memoised.
+# Safe because each is a pure function of its string argument, touching no image,
+# epoch or lifter state, and each returns an immutable value. _SPLIT_CACHE is the
+# only one large enough to bound; it is cleared wholesale rather than evicted from,
+# and the values are interned so the cache does not buy speed with memory.
 _CANON_CACHE: dict = {}
 _SPLIT_CACHE: dict = {}
-#: Ceiling on _SPLIT_CACHE. 16,384 holds ~95% of the call volume on the corpus binary
-#: (measured: the 16,384 commonest of its 45,796 operand strings answer 95.3% of the
-#: 856,217 lookups a full export makes), and caps the cache at about 2MB whatever the
-#: input.
+#: Ceiling on _SPLIT_CACHE: the commonest 16k operand strings answer ~95% of lookups,
+#: which caps it near 2MB whatever the input.
 _SPLIT_CACHE_MAX = 16384
 _IMM_CACHE: dict = {}
 _MEM_CACHE: dict = {}
@@ -163,17 +129,12 @@ def _scalar_fp_ops(ops) -> bool:
 
 # machine registers with a fixed role; used both as leaf display names and to keep the
 # lifter from mistaking a role register for an object/argument.
-#: Architectures this lifter has a register-role model for. Tier 1 decodes more than this
-#: (disasm.py), and the difference is deliberate: annotated arm32 is honest without any of
-#: the tables below, while lifting arm32 through the arm64 roles is not merely incomplete,
-#: it is WRONG in the one direction that matters. `ldr r0, [sl, #0x3c]` reads a canonical
-#: object out of the thread, and with no role for r10 it renders as `sl.field_0x3d`, a
-#: field access, on an untagged pointer, with the tag bias added anyway. A reader cannot
-#: tell that from a real field read.
-#:
-#: The gate used to be incidental: `disassemble_range` refused arm32, so nothing here was
-#: ever reached with it. Tier 1 now decodes arm32, so the invariant has to be stated where
-#: it actually holds instead of relying on a refusal three modules away.
+#: Architectures this lifter has a register-role model for. Tier 1 (disasm.py) decodes
+#: more than this on purpose: annotated arm32 is honest without these tables, while lifting
+#: it through arm64's roles is wrong in the direction that matters. `ldr r0, [sl, #0x3c]`
+#: reads a canonical object out of the thread, and with no role for r10 it renders as
+#: `sl.field_0x3d`: a field access, on an untagged pointer, with the tag bias added anyway,
+#: which a reader cannot tell from a real field read.
 @dataclass(frozen=True)
 class Target:
     """The per-architecture facts the lifter reads a register file through.
@@ -1670,18 +1631,10 @@ class Lifter:
             exc = g(_T.ret_int)        # captured before the call clobbers it (throw)
             st.set(_T.ret_int, V(_T.ret_int, P_ATOM))
             self._args_desc = False
-            # Read the outgoing area BEFORE dropping it, which is the order `blr` below has
-            # always used. Doing it after meant `_call_args` was handed an area that had
-            # just been emptied, so a direct call could never fall back to its stack
-            # arguments: every declining site measured as "no contiguous run from SP+0"
-            # because there was nothing there at all.
-            #
-            # This is not a second guess at the same question. `entry_arity` declines for
-            # ONE reason (the callee reads its arguments off the stack) and that is a
-            # statement that the caller PUSHED them, so the values are sitting in the
-            # outgoing area. The register convention and the stack convention are two
-            # conventions, and the lifter knew how to read both; it just asked in an order
-            # that guaranteed the second answer was empty.
+            # Read the outgoing area BEFORE dropping it, the order `blr` uses. `entry_arity`
+            # declines for one reason, that the callee reads its arguments off the stack,
+            # which is itself a statement that the caller pushed them. So the values are in
+            # the outgoing area, and reading it after the drop always found it empty.
             pushed = self._stack_args(st, drop_receiver=False)
             # A direct call consumes the outgoing area exactly as an indirect one does.
             # Leaving it behind let a bl's arguments be read back as the arguments of the
@@ -2443,20 +2396,13 @@ class Lifter:
             va, vb = a.reg.get(r) or bare.setdefault(r, V(r, P_ATOM)), b.reg.get(r) or bare.setdefault(r, V(r, P_ATOM))
             if va == vb or not (live & _reg_mask((r,))):
                 continue
-            # Only where an arm COMPUTED something. A name or a field read that reaches
-            # the join is a value the reader can still see coming; an expression is not.
-            # Writing every disagreement out instead was measured: it turns 11,180
-            # register-to-register moves into statements for the 3,874 that carry
-            # arithmetic, and costs more lines than the arithmetic is worth.
+            # Only where an arm COMPUTED something: a name or a field read reaching the
+            # join is still visible to the reader, an expression is not. Writing out every
+            # disagreement costs more lines than the arithmetic is worth.
             #
-            # It rests on the bare register meaning "whatever the machine has there",
-            # and that stops being true once one of the two values is a name this lifter
-            # MINTED. A `t3` from an earlier join or a loop exists only in the printed
-            # body; declining the phi drops it to a bare `x3`, and the binding that said
-            # what x3 holds is then the one thing the reader cannot see. Measured on the
-            # clean build, that is 833 joins in 266 of 8,194 functions. Found by
-            # tools/irfuzz.py --cfgmem on `x3 = x14 * x10;` in one join followed by a
-            # `ldur x3, [x20, #0xf]` in an arm of the next.
+            # The exception is a name this lifter MINTED. A `t3` exists only in the printed
+            # body, so declining the phi drops it to a bare `x3` and the binding that said
+            # what x3 holds becomes the one thing the reader cannot see.
             if (va.prec >= P_POST and vb.prec >= P_POST
                     and not _MINTED_RE.fullmatch(va.text)
                     and not _MINTED_RE.fullmatch(vb.text)):
@@ -2686,20 +2632,14 @@ class Lifter:
             carried = (_live_in_header(self.blocks, nodes, header, self._preds)
                        & self._written(nodes)) - _SPECIAL
             self.carried[header] = carried
-        # A loop-carried register is the one place the old design gave up a value it still
-        # had. Forgetting it made the whole body print the machine register, and MEASURED on
-        # the 3.12.2 corpus that single decision is 95.7% of every bare register in the
-        # output, an order of magnitude more than merges and call clobbers combined.
+        # A loop-carried register is a phi, and a phi reaching exactly one join has a name
+        # in the source: bind it before the loop with the entry value, read that name in
+        # the body, assign back at the bottom. Nothing new is claimed; the tail update was
+        # already emitted, it just assigned to `x5` instead of to something followable.
+        # Left as a bare register this is 95.7% of every machine register in the output.
         #
-        # It is a phi, and a phi that reaches exactly one join has a name in the source: bind
-        # it before the loop with the value on entry, read that name in the body, and assign
-        # back to it at the bottom. Nothing here is newly claimed. The update at the tail was
-        # already emitted; it was assigning to `x5` instead of to something a reader can
-        # follow, and the entry value was being discarded rather than written down.
-        #
-        # sorted, not set order: the map's insertion order decides the order temporaries are
-        # minted in, and iterating a set of strings made that depend on Python's per-process
-        # hash seed, so two runs over the same binary numbered the same variables differently.
+        # sorted, not set order: insertion order decides how temporaries are numbered, and
+        # iterating a set made that depend on the per-process hash seed.
         init = {r: st.get(r) for r in sorted(carried)}
         names = {}
         for r in sorted(carried):

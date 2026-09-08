@@ -24,18 +24,9 @@ from .macho import open_container
 from .stream import ReadStream
 
 DART_MAGIC = 0xDCDCF5F5
-#: Snapshot::Kind, snapshot.h. kFullCore was missing from this table, so every value
-#: from 1 up was shifted by one and every Flutter release snapshot, which is kind 3,
-#: kFullAOT, was reported as "kModule". Wrong in `info`, in the export header, and in
-#: anything quoting them.
-#:
-#: It also misleads about the format: LibraryPrefix serialises `name` and `imports` under
-#: kFullAOT but is UNREACHABLE under kModule (raw_object.h:2891), so the mislabel makes
-#: the cluster grammar look impossible to derive.
-#:
-#: 0..3 are identical in every release jadart parses. Index 4 is not: kModule was inserted
-#: there in 3.12 and everything below it has kNone. Rather than pick one, anything past
-#: kFullAOT reports its number, which no release binary reaches.
+#: Snapshot::Kind, snapshot.h. 0..3 are identical in every release jadart parses. Index 4
+#: is not (kModule was inserted there in 3.12), so anything past kFullAOT reports its
+#: number rather than a name no release binary would reach anyway.
 KIND = {0: "kFull", 1: "kFullCore", 2: "kFullJIT", 3: "kFullAOT"}
 _MAX_KIND = max(KIND)
 

@@ -842,7 +842,7 @@ def cmd_verify(args) -> int:
                      "failed": [g.gate for g in rep.gates
                                 if not g.passed and not g.skipped]},
                     EXIT_OK if rep.supported else EXIT_MISS)
-    print(rep.render())
+    print(rep.render(verbose=getattr(args, "verbose", False)))
     return EXIT_OK if rep.supported else EXIT_MISS
 
 
@@ -1055,6 +1055,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_ffi)
 
     p = _add(sub, common, "verify", "byte-exact acceptance gates for the parse")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="print every gate, not just the verdict")
     p.set_defaults(func=cmd_verify)
     return ap
 
