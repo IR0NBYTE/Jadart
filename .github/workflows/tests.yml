@@ -65,8 +65,10 @@ jobs:
           for f in flubench/artifacts/clean/lib/arm64-v8a/libapp.so \
                    flubench/artifacts/obf/lib/arm64-v8a/libapp.so; do
             echo "== $f"
-            jadart verify "$f" | tail -3
-            jadart verify "$f" | grep -q "VERDICT: grammar consistent" || exit 1
+            # The exit code is the contract: 0 when every applicable Tier-A gate passed,
+            # 1 when one did not. Grepping the wording tied this step to the phrasing of
+            # a human-readable line, and it broke the day that line got shorter.
+            jadart verify "$f" || exit 1
           done
 
       # A rendered edge the CFG does not have is the worst defect this tool can ship: the
