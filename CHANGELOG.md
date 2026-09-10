@@ -37,6 +37,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   switch to arm32 still clears and restores, and `export` is byte-identical with and without
   the change. Uncached `canon()` calls over those 400 functions go from 7,771 to 1,187.
   Closes #4.
+- **`Function::Kind` is a named table with a measured provenance.** The constructor,
+  getter and setter labels, and the instance/static receiver witnesses, were three sets of
+  bare numbers commented "for this epoch" and applied to all eighteen. They are now derived
+  by name from `FOR_EACH_RAW_FUNCTION_KIND`, and that list was fetched from `raw_object.h`
+  for every registered release, 2.19.0 through 3.12.2: all eighteen declare the same
+  seventeen kinds in the same order, so the numbers are right everywhere the tool parses.
+  A test pins the derived values, and the comment carries the two-line check to repeat
+  when a newer release is registered. Closes #6.
 
 ## 1.1.0 - 2026-09-06
 
