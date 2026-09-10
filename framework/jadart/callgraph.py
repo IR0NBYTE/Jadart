@@ -33,6 +33,8 @@ genuinely unresolvable is a closure call through a captured context.
 """
 from dataclasses import dataclass, field
 
+from .errors import JadartError
+
 from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassemble_range,
                      build_pool_map, _mem_base_disp, _add_imm_from_pp)
 
@@ -62,6 +64,7 @@ class CallIndex:
     sel_targets: dict = field(default_factory=dict)        # sel off -> {target pc}
     virtual_sites: int = 0                         # blr sites attributed to a selector
     opaque_sites: int = 0                          # blr sites nothing could attribute
+    undecodable: list = field(default_factory=list)  # pcs of ranges that would not decode
 
 
 def selector_targets(image, fr, offsets, extra_names: dict = None) -> dict:
@@ -173,6 +176,11 @@ def build_index(image, fr=None, virtual: bool = True,
             # which reads as "nothing calls this" rather than "we cannot see calls here".
             raise
         except Exception:
+            # One range that will not decode must not take the graph down with it, but it
+            # must not vanish either: a function missing from the graph reads as "nothing
+            # calls this" when the truth is that nothing could look. Recorded by pc so the
+            # caller can say how many and which.
+            idx.undecodable.append(cr.pc_offset)
             continue
         src = cr.pc_offset
         if want_virtual:
@@ -266,7 +274,11 @@ ORIGINS = ("snapshot", "symtab", "signature", "anonymous")
 
 
 def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
-    """Every code range in the image as a Func. Returns (rows, graph_error).
+    """Every code range in the image as a Func. Returns (rows, graph_error, notes).
+
+    `notes` is a list of things the caller should print beside the table: ranges that
+    were dropped from the graph, or a library attribution that could not be made. They
+    are gaps in the output, and a gap that is not named reads as a fact.
 
     `graph_error` is None when the call graph was built, and the exception when it could
     not be: arm32 has no instruction decoder, and capstone is an optional extra. Both are
@@ -297,6 +309,7 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
 
     # function pc -> owning library, through the class that owns the function
     lib_by_pc = {}
+    notes = []
     if hdr is not None:
         try:
             from .program import build_program
@@ -306,8 +319,12 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
                 cr = image.code_ranges.get(ref)
                 if cr is not None and ow in lib_by_ref:
                     lib_by_pc[cr.pc_offset] = lib_by_ref[ow]
-        except Exception:
+        except JadartError as e:
+            # Every function then prints with no library, which is indistinguishable from
+            # a snapshot that records none. Say why instead. Anything that is not a
+            # JadartError is a defect in this program and propagates to the caller.
             lib_by_pc = {}
+            notes.append(f"library attribution unavailable: {e}")
 
     graph_error = None
     try:
@@ -315,6 +332,11 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
             pc: m.name for pc, m in matched.items()} if matched else None)
     except (MissingDisassembler, UnsupportedArch) as e:
         idx, graph_error = CallIndex(), e
+    if idx.undecodable:
+        shown = ", ".join(f"0x{pc:x}" for pc in idx.undecodable[:5])
+        more = f" and {len(idx.undecodable) - 5} more" if len(idx.undecodable) > 5 else ""
+        notes.append(f"{len(idx.undecodable)} code ranges would not decode and are absent "
+                     f"from the call graph: {shown}{more}")
     # How many implementations share a target's selector. 1 means a virtual site reaching
     # it has exactly one possible landing, which is as good as a direct edge.
     share = {}
@@ -342,7 +364,7 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
                         virtual_callers=len(idx.may_be_called_by.get(pc, ())),
                         overloads=share.get(pc, 0)))
     out.sort(key=lambda f: f.pc_offset)
-    return out, graph_error
+    return out, graph_error, notes
 
 
 def callers_of(image, fr, targets, extra_names: dict = None) -> dict:

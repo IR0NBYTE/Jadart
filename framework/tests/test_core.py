@@ -4297,7 +4297,7 @@ def test_function_table_covers_every_code_range():
     from jadart.disasm import load_instructions
     from jadart.callgraph import function_table, ORIGINS
     image, fr, hdr = load_instructions(CLEAN)
-    table, graph_error = function_table(image, fr, hdr)
+    table, graph_error, _notes = function_table(image, fr, hdr)
     assert graph_error is None, f"call graph failed on arm64: {graph_error}"
     assert len(table) == len(image.all_ranges)
     assert {f.origin for f in table} <= set(ORIGINS)
@@ -4332,7 +4332,7 @@ def test_call_graph_refuses_rather_than_returning_an_empty_one():
     # flipped: a table of all-zero call counts on this binary would once again be the
     # symptom this test exists for, except now it would mean the decoder silently stopped.
     build_index(image, fr)
-    rows, graph_error = function_table(image, fr, hdr)
+    rows, graph_error, _notes = function_table(image, fr, hdr)
     assert rows, "the function list should still work: it comes from the snapshot"
     assert graph_error is None, f"arm32 decodes now; got {graph_error!r}"
     assert any(f.callees for f in rows), "no call edges at all on a binary that decodes"
@@ -4346,7 +4346,7 @@ def test_call_graph_refuses_rather_than_returning_an_empty_one():
     saved = _DECODERS.pop("arm")
     try:
         image2, fr2, hdr2 = load_instructions(arm32)
-        rows2, err2 = function_table(image2, fr2, hdr2)
+        rows2, err2, _notes2 = function_table(image2, fr2, hdr2)
         assert rows2, "the function list comes from the snapshot and must survive"
         assert isinstance(err2, UnsupportedArch), f"got {err2!r}"
         assert all(f.callers == 0 and f.callees == 0 for f in rows2)
