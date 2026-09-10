@@ -70,22 +70,44 @@ class Program:
                 if (k.class_id & 0xFFFFFFFF) >= b and k.name and not k.name.startswith("<")]
 
 
-# Dart FunctionLayout::Kind (low bits of kind_tag) for this epoch. Only the values we
-# label are listed; anything else stays a plain method.
-_FN_KIND = {5: "ctor", 3: "getter", 4: "setter"}
+# FOR_EACH_RAW_FUNCTION_KIND, raw_object.h, in declaration order. Function.kind_tag
+# carries the index in its low five bits, so this is per-release data in principle:
+# inserting a kind renumbers everything after it, and the cid table proves the SDK does
+# that between releases. In practice it has not moved. raw_object.h was fetched for every
+# one of the 18 registered releases, 2.19.0-444.2.beta through 3.12.2, and all 18 declare
+# exactly this list. When a release newer than 3.12 is registered, repeat that check:
+#
+#   from tools.sdk_source import fetch
+#   re.findall(r"V\((\w+)\)", fetch(tag, "raw_object.h").decode())  # inside the macro
+#
+# and if the list differs, this table moves onto Epoch beside the cid table.
+_FUNCTION_KINDS = (
+    "RegularFunction", "ClosureFunction", "ImplicitClosureFunction", "GetterFunction",
+    "SetterFunction", "Constructor", "ImplicitGetter", "ImplicitSetter",
+    "ImplicitStaticGetter", "FieldInitializer", "MethodExtractor",
+    "NoSuchMethodDispatcher", "InvokeFieldDispatcher", "IrregexpFunction",
+    "DynamicInvocationForwarder", "FfiTrampoline", "RecordFieldGetter",
+)
+_KIND_INDEX = {name: i for i, name in enumerate(_FUNCTION_KINDS)}
+
+# Only the kinds that get a label; anything else prints as a plain method.
+_FN_KIND = {_KIND_INDEX["Constructor"]: "ctor",
+            _KIND_INDEX["GetterFunction"]: "getter",
+            _KIND_INDEX["SetterFunction"]: "setter"}
 
 
 def _decode_fn_kind(kind_tag: int) -> str:
     return _FN_KIND.get(kind_tag & 0x1F, "method")
 
 
-# Function::Kind indices, FOR_EACH_RAW_FUNCTION_KIND in raw_object.h. The SDK's own
-# comments state the staticness of these by definition, which is what makes them usable as
-# witnesses: ImplicitGetter/ImplicitSetter are "for instance fields", MethodExtractor
-# returns "a closure on the receiver", the dispatchers and the dynamic forwarder all act on
-# a receiver, and ImplicitStaticGetter is "for static fields".
-_KIND_INSTANCE = frozenset({6, 7, 10, 11, 12, 14, 16})
-_KIND_STATIC = frozenset({8})
+# Kinds whose staticness the SDK's own comments state by definition, which is what makes
+# them usable as witnesses: ImplicitGetter/ImplicitSetter are "for instance fields",
+# MethodExtractor returns "a closure on the receiver", the dispatchers and the dynamic
+# forwarder all act on a receiver, and ImplicitStaticGetter is "for static fields".
+_KIND_INSTANCE = frozenset(_KIND_INDEX[n] for n in (
+    "ImplicitGetter", "ImplicitSetter", "MethodExtractor", "NoSuchMethodDispatcher",
+    "InvokeFieldDispatcher", "DynamicInvocationForwarder", "RecordFieldGetter"))
+_KIND_STATIC = frozenset({_KIND_INDEX["ImplicitStaticGetter"]})
 
 
 def static_bit(fr) -> int | None:

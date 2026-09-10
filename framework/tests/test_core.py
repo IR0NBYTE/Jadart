@@ -1882,6 +1882,27 @@ def test_every_public_entry_point_raises_only_jadart_errors():
     assert not bad, "these escape `except jadart.JadartError`: " + "; ".join(bad)
 
 
+def test_function_kind_table_matches_the_sdk_enum():
+    """Function.kind_tag carries an index into FOR_EACH_RAW_FUNCTION_KIND, and the labels
+    and the receiver witnesses are derived from that list by name. The list was fetched
+    from raw_object.h for all 18 registered releases and is identical in every one, which
+    is what makes a module constant defensible here. This pins the derived numbers to the
+    values the lifter has always used, so a reordering of the list, or a release that
+    inserts a kind, shows up as a failure rather than as constructors printing as methods."""
+    from jadart.program import _FUNCTION_KINDS, _KIND_INDEX, _FN_KIND, _KIND_INSTANCE, _KIND_STATIC
+    assert len(_FUNCTION_KINDS) == 17
+    assert _FUNCTION_KINDS[0] == "RegularFunction"
+    assert _FUNCTION_KINDS[-1] == "RecordFieldGetter"
+    assert len(set(_FUNCTION_KINDS)) == 17, "a kind is listed twice"
+    # the numbers the rest of the module and the corpus tests have always relied on
+    assert _FN_KIND == {5: "ctor", 3: "getter", 4: "setter"}
+    assert _KIND_INSTANCE == frozenset({6, 7, 10, 11, 12, 14, 16})
+    assert _KIND_STATIC == frozenset({8})
+    # every witness set names a real kind, and the two sets do not overlap
+    assert not (_KIND_INSTANCE & _KIND_STATIC)
+    assert _KIND_INDEX["ImplicitStaticGetter"] in _KIND_STATIC
+
+
 def test_the_version_is_declared_once_and_the_changelog_agrees():
     # One source of truth for the number, and a record of what it means. pyproject reads
     # __version__ dynamically so those two cannot drift; the CHANGELOG is hand-written and
