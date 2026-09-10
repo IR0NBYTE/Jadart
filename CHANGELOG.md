@@ -21,6 +21,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   header misparse on either side is what would make it fail. A container with no vm
   snapshot, such as a stripped binary found by the magic scan, gets a skip that says so.
   Closes #3.
+- **The call graph says what it dropped.** A code range that failed to decode was skipped
+  with `except Exception: continue`, so the function was simply absent from the graph and
+  every count printed beside it looked complete. Those ranges are recorded by pc on
+  `CallIndex.undecodable` now, and `functions` prints how many and which. The library
+  attribution had the same shape: one failure blanked the library column for every
+  function, indistinguishable from a snapshot that records none. It now says why, and only
+  swallows a `JadartError`; a defect in this program propagates. `function_table` returns a
+  third value, `notes`, carrying both. Closes #5.
 
 ## 1.1.0 - 2026-09-06
 

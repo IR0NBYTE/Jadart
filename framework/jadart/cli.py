@@ -385,7 +385,7 @@ def cmd_functions(args) -> int:
     from .callgraph import function_table, ORIGINS
     try:
         image, fr, hdr = load_instructions(args.libapp)
-        table, graph_error = function_table(image, fr, hdr,
+        table, graph_error, notes = function_table(image, fr, hdr,
                                             sigs=getattr(args, "sigs", None))
     except JadartError as e:
         return _fail(e)
@@ -413,6 +413,7 @@ def cmd_functions(args) -> int:
         return emit({"ok": True, "total": len(table), "matched": len(rows),
                      "call_graph": None if graph_error else "built",
                      "call_graph_error": str(graph_error) if graph_error else None,
+                     "notes": notes,
                      "functions": [{"pc_offset": f.pc_offset, "size": f.size,
                                     "name": f.name, "label": f.label, "origin": f.origin,
                                     "library": f.library, "callers": f.callers,
@@ -432,6 +433,8 @@ def cmd_functions(args) -> int:
         # read as "nothing calls this" when the truth is that nothing could look.
         print(comment(f"// no call graph: {graph_error}"))
         print(comment("// the calls/in/vin columns are omitted rather than shown as 0"))
+    for note in notes:
+        print(comment(f"// {note}"))
     if graph_error:
         print(heading(f"{'address':<14} {'size':>7}  name"))
     else:
