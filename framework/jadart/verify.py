@@ -180,7 +180,7 @@ def getter_field_load(dis, recv0="x1", frame=("x15", "x29")):
     return None
 
 
-def run_gates(clusters, fr, hdr, image=None, dispatch=None) -> list:
+def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
     """Evaluate every gate we can from an already-completed walk."""
     import collections
     from . import cids as C
@@ -473,11 +473,20 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None) -> list:
                             else "no getter on a compressed target to read a width from"))
 
     # ---- Tier B ------------------------------------------------------------------------
-    # G13: the isolate snapshot's base objects are the vm snapshot's objects. The VM asserts
-    # this at load with a release FATAL, so it is a real format invariant. We can check it
-    # only when both snapshots were parsed.
-    gates.append(_g("G13 base objects vs vm snapshot", "B", True, 0,
-                    skipped="checked by --verify only when both snapshots are present"))
+    # G13: the isolate snapshot's base objects are the vm snapshot's objects. The two
+    # snapshots chain: the vm one is deserialised first, and the isolate one numbers its
+    # own objects from num_base_objects + 1 (clusters.py, next_ref). The VM asserts the
+    # equality at load with a release FATAL, so it is a format invariant, and the two
+    # numbers come out of two separately parsed headers, which is what makes it a check.
+    if vm is None:
+        gates.append(_g("G13 base objects vs vm snapshot", "B", False, 0,
+                        skipped="no vm snapshot in this container"))
+    else:
+        ok = (hdr.num_base_objects == vm.num_objects)
+        rel = "==" if ok else "!="
+        gates.append(_g("G13 base objects vs vm snapshot", "B", ok, 1,
+                        f"isolate base_objects {hdr.num_base_objects} {rel} "
+                        f"vm objects {vm.num_objects}"))
 
     # G2: no unknown bits set in cluster tags.
     stray = [cl.cid for cl in clusters if cl.cid < 0]
@@ -519,8 +528,14 @@ def verify_file(path: str) -> VerifyReport:
         pos, entries, end = found
         dispatch = (pos, entries, end, image.data_length)
 
+    # The vm snapshot is a second header in the same container. parse_libapp reads both;
+    # a stripped binary found by the magic scan may carry only the isolate one, and then
+    # G13 has nothing to compare against and says so.
+    from .snapshot import parse_libapp
+    vm = parse_libapp(path, strict=False).get("vm")
+
     rep = VerifyReport(path=path, which="isolate",
                        epoch=hdr.epoch.name if hdr.epoch else "?",
                        arch=str(hdr.arch) if hdr.arch else "?")
-    rep.gates = run_gates(clusters, fr, hdr, image=image, dispatch=dispatch)
+    rep.gates = run_gates(clusters, fr, hdr, image=image, dispatch=dispatch, vm=vm)
     return rep

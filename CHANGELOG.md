@@ -9,6 +9,19 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
+## Unreleased
+
+### Fixed
+
+- **G13 checks something now.** It sat in the Tier B table on every run, hardcoded to pass
+  with zero checks, waiting for a "both snapshots present" case that `verify_file` never
+  produced. It now parses the vm header alongside the isolate one and compares the vm
+  snapshot's object count against the isolate snapshot's base object count, which the VM
+  itself asserts at load. The two numbers come out of two separately parsed headers, so a
+  header misparse on either side is what would make it fail. A container with no vm
+  snapshot, such as a stripped binary found by the magic scan, gets a skip that says so.
+  Closes #3.
+
 ## 1.1.0 - 2026-09-06
 
 ### Added
