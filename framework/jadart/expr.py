@@ -3101,8 +3101,9 @@ def use_target(tgt: Target):
     add a second architecture without touching sixty call sites and hoping the first one
     still renders identically, and `export` on arm64 is byte-for-byte what it was.
 
-    The caches have to go with them: `sp` canonicalises to x15 on one target and r13 on
-    the other, so an entry made under one is wrong under the other. That is true of all
+    When the target actually changes, the caches have to go with it: `sp` canonicalises
+    to x15 on one target and r13 on the other, so an entry made under one is wrong under
+    the other. That is true of all
     three, not just `_CANON_CACHE`, `_MEM_CACHE` and `_DEFUSE_CACHE` store `canon()`
     results keyed on the operand STRING alone, so whichever target parsed a given string
     first would answer for both. Nothing catches it today because `LIFTABLE_ARCHS` admits
@@ -3110,6 +3111,15 @@ def use_target(tgt: Target):
     gate opens the wrong register file is a silently wrong body.
     """
     global _T, ROLE, _SPECIAL, _UNTAGGED, ARG_REGS, _CALL_CLOBBERS, _RET_USES
+    if tgt is _T:
+        # Already bound. The caches are keyed on operand text and every entry in them was
+        # made under this same target, so they are valid as they stand. Clearing them here
+        # anyway is what made every lift start cold: measured over 400 functions the cache
+        # was empty when the lifting was done, and the module had spent its memoisation
+        # paying an O(cache) snapshot and restore per function for nothing. Only a change
+        # of target invalidates anything, and that path is below.
+        yield
+        return
     prev = (_T, ROLE, _SPECIAL, _UNTAGGED, ARG_REGS, _CALL_CLOBBERS, _RET_USES,
             dict(_CANON_CACHE), dict(_MEM_CACHE), dict(_DEFUSE_CACHE))
     _T = tgt

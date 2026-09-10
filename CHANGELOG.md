@@ -29,6 +29,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   function, indistinguishable from a snapshot that records none. It now says why, and only
   swallows a `JadartError`; a defect in this program propagates. `function_table` returns a
   third value, `notes`, carrying both. Closes #5.
+- **The operand caches survive between lifts.** `use_target` snapshotted, cleared and
+  restored the three operand parser caches on every `lift_function` call, so every
+  function started cold and the memoisation the module spends paragraphs justifying never
+  paid: over 400 functions the cache was empty when lifting finished. It now returns early
+  when the target being bound is the one already bound, which is every arm64 lift. A real
+  switch to arm32 still clears and restores, and `export` is byte-identical with and without
+  the change. Uncached `canon()` calls over those 400 functions go from 7,771 to 1,187.
+  Closes #4.
 
 ## 1.1.0 - 2026-09-06
 
