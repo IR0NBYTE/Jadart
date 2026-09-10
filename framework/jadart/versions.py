@@ -316,14 +316,12 @@ _UNIDENTIFIED = {
     "853774151675607809640123f1ab2cab": "Dart 3.5.x-3.8.x dev, arm64 android (com.open_usos)",
 }
 
-# Identified, deliberately NOT claimed. 3.1 reads its whole alloc pass and most of its fill
-# correctly, then desyncs somewhere in the run of fixed clusters between the Class cluster
-# and WeakArray (Class, PatchClass, TypeParameters, ClosureData, FfiTrampolineData, Field,
-# Script, Library). Every one of those bodies is wire-identical to 3.2 in app_snapshot.cc,
-# every pointer range they use is identical in raw_object.h, and the same grammar passes all
-# ten gates on 3.2, so the difference is somewhere neither source file describes and has
-# not been found yet. Refusing is the correct answer until it is: the alloc pass would
-# otherwise "succeed" and hand back a plausible, wrong object graph.
+# Epoch families that are identified but deliberately not claimed. An entry here keeps its
+# hash in the registry so the failure names the release, and gets an empty grammar set so
+# nothing tries to parse it: the alloc pass would otherwise "succeed" on a wrong grammar and
+# hand back a plausible, fictional object graph. A family leaves this set only when the
+# Tier-A gates pass on a real binary. Empty at the moment; 3.1 sat here until its desync
+# was traced to PatchClass dropping origin_class, now carried in _FILL_OVERRIDES below.
 _UNVALIDATED = set()
 
 # Per-epoch fill deltas against the 3.2+ base table in fillwalk._REFS.
