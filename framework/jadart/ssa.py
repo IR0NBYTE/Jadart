@@ -19,8 +19,15 @@ The one subtlety is loops. A loop header's back edge comes from a block that has
 lowered yet, so its phi cannot be completed when the header is first visited. Braun handles
 this with SEALING: a block is sealed once all its predecessors are known, an unsealed block
 gets an incomplete phi as a promise, and sealing fills the operands in. Getting this wrong
-does not crash, it silently drops the loop-carried value, which is exactly the class of
-bug the emulator oracle exists to catch, and `tools/irfuzz.py --whole` does catch it.
+does not crash, it silently drops the loop-carried value.
+
+What covers that today is structural: test_ssa_handles_a_loop_back_edge builds a loop by
+hand and checks the phi has both operands after sealing. There is no CPU oracle for this
+path. tools/irfuzz.py fuzzes lower_block, one basic block at a time against unicorn, and
+never calls lower_function, so a wrong join or a wrong seal that still produces a
+well-formed graph is not something the emulator gets to disagree with. That is the gap to
+close if this module ever feeds user-facing output; at the moment it feeds irfuzz and the
+tests and nothing else.
 """
 from __future__ import annotations
 
