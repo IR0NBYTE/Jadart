@@ -4731,6 +4731,119 @@ def test_the_getter_reader_handles_a_register_offset_load():
     assert getter_field_load([(0, "ldr", "w0, [x1, x9]"), (4, "ret", "")]) is None
 
 
+def test_bench_compare_fails_only_past_the_tolerance_and_the_floor():
+    # ./check.sh --full guards the benchmark through this comparison, so the tolerances are
+    # pinned here rather than discovered by a flaky afternoon: a ratio inside the limit
+    # passes, a ratio past it with a tiny absolute delta passes (that is noise on a 40 ms
+    # workload), a real regression fails with a line naming workload, baseline and value.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import bench
+    base = {"workloads": {"xrefs": {"median_s": 0.800, "peak_rss_mb": 60.0},
+                          "info": {"median_s": 0.080, "peak_rss_mb": 29.0}}}
+    inside = {"xrefs": {"median_s": 1.100, "peak_rss_mb": 72.0},
+              "info": {"median_s": 0.110, "peak_rss_mb": 33.0}}
+    rows, failures = bench.compare(base, inside)
+    assert failures == [] and [t for _n, _b, _g, t in rows] == [["ok"], ["ok"]]
+
+    slower = {"xrefs": {"median_s": 1.400, "peak_rss_mb": 60.0},
+              "info": {"median_s": 0.080, "peak_rss_mb": 29.0}}
+    _rows, failures = bench.compare(base, slower)
+    assert len(failures) == 1 and "xrefs" in failures[0]
+    assert "1.400s" in failures[0] and "0.800s" in failures[0]
+
+    # 1.6x but only 18 ms more: under the floor, so not a regression
+    tiny = {"workloads": {"info": {"median_s": 0.030, "peak_rss_mb": 29.0}}}
+    assert bench.compare(tiny, {"info": {"median_s": 0.048, "peak_rss_mb": 29.0}})[1] == []
+
+    bigger = {"xrefs": {"median_s": 0.800, "peak_rss_mb": 80.0},
+              "info": {"median_s": 0.080, "peak_rss_mb": 29.0}}
+    _rows, failures = bench.compare(base, bigger)
+    assert len(failures) == 1 and "peak RSS" in failures[0] and "80.0MB" in failures[0]
+
+    # the cold start budget is absolute: a baseline that was itself slow does not excuse
+    # 250 ms, even though 1.39x of it is inside the ratio
+    slow_base = {"workloads": {"info": {"median_s": 0.180, "peak_rss_mb": 29.0}}}
+    _rows, failures = bench.compare(slow_base, {"info": {"median_s": 0.250, "peak_rss_mb": 29.0}})
+    assert len(failures) == 1 and "cold start" in failures[0]
+
+    # a workload this checkout could not run is reported as skipped, never as a failure
+    rows, failures = bench.compare(base, {"xrefs": inside["xrefs"]})
+    assert failures == [] and rows[1][3] == ["skip"]
+
+
+def test_bench_baseline_round_trip_and_the_check_cli():
+    # check.sh runs the gate as a subprocess, so the paths that decide its exit code are
+    # exercised the way the shell sees them: a fresh baseline passes, a baseline naming a
+    # workload this checkout does not have is refused with a sentence, so is a file that is
+    # not a baseline, and --baseline refuses a workload name so one habit cannot overwrite
+    # the committed file with a single row. `classes` is the workload because it has no
+    # absolute budget, so a slow machine cannot fail this on its own.
+    import json
+    import subprocess
+    import tempfile
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import bench
+    if not os.path.exists(bench.CLEAN):
+        raise unittest.SkipTest("no flubench fixture")
+    tool = os.path.join(os.path.dirname(__file__), "..", "tools", "bench.py")
+
+    def run(*args):
+        p = subprocess.run([sys.executable, tool, *args], capture_output=True, text=True)
+        return p.returncode, p.stdout + p.stderr
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "b.json")
+        measured = {"classes": {"median_s": 2.0, "best_s": 2.0, "peak_rss_mb": 200.0, "last": ""}}
+        bench.write_baseline(path, bench.workloads(d), measured, 1)
+        doc = bench.load_baseline(path)
+        assert doc["workloads"]["classes"]["median_s"] == 2.0 and doc["machine"]["cpu"]
+        assert set(doc["fixtures_mb"]) == {"clean", "obf"}
+
+        rc, out = run("--check", "--file", path, "-n", "1")
+        assert rc == 0 and "nothing slower" in out, out
+
+        doc["workloads"]["gone"] = doc["workloads"].pop("classes")
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        rc, out = run("--check", "--file", path, "-n", "1")
+        assert rc == 2 and "no such workload" in out, out
+
+        with open(path, "w") as f:
+            f.write('{"jadart": "1.1.0"}')
+        rc, out = run("--check", "--file", path)
+        assert rc == 2 and "missing" in out, out
+
+        rc, out = run("classes", "--baseline", "--file", path)
+        assert rc == 2 and "takes no names" in out, out
+
+
+def test_measure_readme_block_needs_the_markers_and_forgives_trailing_space():
+    # The README's How fast block is checked against the baseline by measure.py --check on
+    # the fast path of check.sh, so what counts as a disagreement is pinned: no markers is
+    # one, a changed row is one, a trailing space on a line is not.
+    import tempfile
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import bench
+    import measure
+    if not os.path.exists(bench.BASELINE):
+        raise unittest.SkipTest("no committed baseline")
+    block = measure.perf_block()
+    assert block.startswith("| workload |")
+    with tempfile.TemporaryDirectory() as d:
+        readme = os.path.join(d, "README.md")
+        with open(readme, "w") as f:
+            f.write("# x\n\nno block here\n")
+        assert "no <!-- bench:start -->" in measure.check_readme_perf_block(readme)[0]
+        with open(readme, "w") as f:
+            f.write("# x\n\n<!-- bench:start -->\n" + block.replace("\n", "  \n", 1)
+                    + "\n<!-- bench:end -->\n")
+        assert measure.check_readme_perf_block(readme) == []
+        with open(readme, "w") as f:
+            f.write("# x\n\n<!-- bench:start -->\n" + block + "\n| `fake` | x | 1.00 s | 1 MB |"
+                    + "\n<!-- bench:end -->\n")
+        assert "disagrees" in measure.check_readme_perf_block(readme)[0]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

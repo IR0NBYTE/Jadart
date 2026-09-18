@@ -25,6 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FRAMEWORK = os.path.dirname(HERE)
 ROOT = os.path.dirname(FRAMEWORK)
 sys.path.insert(0, FRAMEWORK)
+BASELINE = os.path.join(ROOT, "flubench", "bench", "baseline.json")
 
 
 def binaries():
@@ -104,6 +105,62 @@ def results():
     return rows, npass, len(rows)
 
 
+def perf_block(baseline_path: str = None) -> str:
+    """The README's "How fast" block, from the baseline that ./check.sh --full guards.
+
+    The two are one set of numbers on purpose: a table typed by hand is true the day it is
+    written, while this one cannot drift from the file that fails the build when it moves.
+    The prose lines are wrapped here at the README's width so the block pastes as is.
+    Empty when the checkout has no baseline, and then nothing holds the README to it. A
+    baseline that exists but does not load raises BaselineError."""
+    import textwrap
+    sys.path.insert(0, HERE)
+    from bench import load_baseline, TIME_TOLERANCE, RSS_TOLERANCE
+    path = baseline_path or BASELINE
+    if not os.path.exists(path):
+        return ""
+    b = load_baseline(path)
+    rows = ["| workload | what it does | median | peak RSS |",
+            "|---|---|---|---|"]
+    for name, w in b["workloads"].items():
+        rows.append(f"| `{name}` | {w['doc']} | {w['median_s']:.2f} s | {w['peak_rss_mb']:.0f} MB |")
+    m, fx = b["machine"], b["fixtures_mb"]
+    rows += ["", textwrap.fill(
+        f"Median of {b['repetitions']} fresh processes on the FluBench fixtures (clean "
+        f"{fx['clean']} MB, obf {fx['obf']} MB), {m['cpu']}, Python {b['python']}, jadart "
+        f"{b['jadart']}, taken {b['taken']} with `tools/bench.py --baseline`.", 92)]
+    rows += ["", textwrap.fill(
+        f"`./check.sh --full` reruns these against the same file and fails when a median "
+        f"grows past {TIME_TOLERANCE}x its baseline or peak RSS past {RSS_TOLERANCE}x, so "
+        f"the table cannot go stale quietly.", 92)]
+    return "\n".join(rows)
+
+
+def check_readme_perf_block(readme_path: str = None, baseline_path: str = None) -> list:
+    """The README's How fast block against the baseline it claims to come from. Lines are
+    compared after rstrip, so a trailing space is not a disagreement and a changed number
+    is."""
+    from bench import BaselineError
+    readme = readme_path or os.path.join(ROOT, "README.md")
+    try:
+        want = perf_block(baseline_path)
+    except BaselineError as exc:
+        return [str(exc)]
+    if not want or not os.path.exists(readme):
+        return []
+    with open(readme) as f:
+        text = f.read()
+    m = re.search(r"<!-- bench:start -->\n(.*?)\n<!-- bench:end -->", text, re.S)
+    name = os.path.basename(readme)
+    if not m:
+        return [f"{name}: no <!-- bench:start --> block to hold the How fast table"]
+    have = [ln.rstrip() for ln in m.group(1).strip().splitlines()]
+    if have != [ln.rstrip() for ln in want.strip().splitlines()]:
+        return [f"{name}: the How fast block disagrees with flubench/bench/baseline.json; "
+                f"run tools/measure.py and paste the block"]
+    return []
+
+
 def check_doc_test_counts() -> list:
     """Docs that state a test count, against the number of tests that exist.
 
@@ -157,7 +214,7 @@ def main(argv=None) -> int:
             return 1
 
         # Checkable on any checkout: it needs the test file, not the corpus.
-        stale = check_doc_test_counts()
+        stale = check_doc_test_counts() + check_readme_perf_block()
         if stale:
             for s in stale:
                 print(s)
@@ -192,6 +249,13 @@ def main(argv=None) -> int:
     print("\nG4 and G4b are a complementary pair: exactly one runs per target, because a")
     print("compressed build keeps its strings in the stream and an uncompressed one keeps")
     print("them in the RO data image. Whichever applies, the alloc->fill boundary is pinned.")
+    try:
+        block = perf_block()
+    except ValueError as exc:
+        block = str(exc)
+    if block:
+        print("\n## How fast (README.md, between the bench markers)\n")
+        print(block)
     print(f"\n## Results: {npass} of {ntotal} binaries pass every applicable Tier-A gate\n")
     print("| binary | result |")
     print("|--------|--------|")

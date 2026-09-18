@@ -19,7 +19,7 @@ You need python3 and nothing else for the core. Disassembly needs capstone.
 ```bash
 cd jadart/framework
 pip install -e '.[disasm]' pytest
-python3 -m pytest tests -q      # 194 tests, all must pass
+python3 -m pytest tests -q      # 197 tests, all must pass
 ```
 
 Use pytest, not `python3 tests/test_core.py`. The file still carries a script runner for
@@ -27,8 +27,23 @@ convenience, but pytest is the only collector that cannot miss a test.
 
 `./check.sh` from the repository root runs the suite, the acceptance gates on both
 fixtures, the measured claims and the no-capstone install. `./check.sh --full` adds the
-CFG edge check and the determinism diff. Run it before you open a pull request: there is
-no CI doing it for you.
+CFG edge check, the determinism diff and the benchmark against
+`flubench/bench/baseline.json`. Run it before you open a pull request: there is no CI
+doing it for you.
+
+A change that is meant to make something faster, or that has to make something slower,
+retakes the baseline with `python3 tools/bench.py --baseline` from `framework/` and says
+so in the pull request. The file records the machine it was taken on; the README's "How
+fast" table is generated from it by `tools/measure.py`, so paste that block too.
+
+The committed baseline was taken on one machine. If `--full` goes red only on the bench
+step on yours, that is the machine, not your change. Take a baseline on `main` first, then
+check the branch against it:
+
+```bash
+python3 tools/bench.py --baseline --file /tmp/main.json    # on main
+BENCH_BASELINE=/tmp/main.json ./check.sh --full            # on your branch
+```
 
 The suite runs against the committed FluBench fixtures, so a fresh clone works with no
 Flutter install. To also exercise the ELF symbol backfill, point it at any unstripped
