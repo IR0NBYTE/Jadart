@@ -783,47 +783,294 @@ def cmd_ffi(args) -> int:
 
 def cmd_xrefs(args) -> int:
     """Which functions load a given string or pool entry, or call a given function."""
-    from .disasm import load_instructions, build_pool_map, pool_xrefs
+    from .disasm import (
+        load_instructions,
+        build_pool_map,
+        pool_xrefs,
+    )
+
     try:
         image, fr, hdr = load_instructions(args.libapp)
     except JadartError as e:
         return _fail(e)
+
     pool = build_pool_map(fr, getattr(image, "arch", None))
-    needle = args.pattern
+
+    # New syntax:
+    #   xrefs LIBAPP string PATTERN
+    #   xrefs LIBAPP pool PATTERN
+    #   xrefs LIBAPP function PATTERN
+    #
+    # Legacy syntax:
+    #   xrefs LIBAPP PATTERN
+    if args.pattern is None:
+        kind = None
+        needle = args.kind_or_pattern
+    else:
+        kind = args.kind_or_pattern
+        needle = args.pattern
+
+    # Remember whether the user used the legacy/bare syntax.
+    legacy = kind is None
+
+    # addr is used for pool-offset detection in both legacy and
+    # JSON result handling.
     addr = None
-    try:
-        addr = int(needle, 0)
-    except ValueError:
-        pass
-    matches = {off: lab for off, lab in pool.items()
-               if (addr is not None and off == addr) or (addr is None and needle in lab)}
-    if not matches:
+
+    # Explicit function syntax
+    if kind == "function":
         rc = _xrefs_to_function(args, image, fr)
         if rc is not None:
             return rc
+
         if getattr(args, "json", False):
-            return emit({"ok": False, "pattern": needle, "count": 0, "entries": []},
-                        EXIT_MISS)
-        error(f"nothing matching {needle!r}: no ObjectPool entry holds it, and no "
-              f"function goes by that name or address")
+            return emit(
+                {
+                    "ok": False,
+                    "pattern": needle,
+                    "kind": "function",
+                    "count": 0,
+                    "entries": [],
+                },
+                EXIT_MISS,
+            )
+
+        error(
+            f"nothing matching {needle!r}: "
+            f"no function goes by that name or address"
+        )
         return EXIT_MISS
 
+    # Explicit pool syntax
+    if kind == "pool":
+        try:
+            addr = int(needle, 0)
+        except ValueError:
+            if getattr(args, "json", False):
+                return emit(
+                    {
+                        "ok": False,
+                        "pattern": needle,
+                        "kind": "pool",
+                        "count": 0,
+                        "entries": [],
+                    },
+                    EXIT_MISS,
+                )
+
+            error(f"invalid pool offset: {needle!r}")
+            return EXIT_MISS
+
+        matches = {
+            off: lab
+            for off, lab in pool.items()
+            if off == addr
+        }
+
+    # Explicit string syntax
+    elif kind == "string":
+        exact = getattr(args, "exact", False)
+
+        if exact:
+            matches = {
+                off: lab
+                for off, lab in pool.items()
+                if lab == needle or lab == f'"{needle}"'
+            }
+        else:
+            matches = {
+                off: lab
+                for off, lab in pool.items()
+                if needle in lab
+            }
+
+    # Legacy/bare syntax
+    else:
+        try:
+            addr = int(needle, 0)
+        except ValueError:
+            addr = None
+
+        matches = {
+            off: lab
+            for off, lab in pool.items()
+            if (
+                (addr is not None and off == addr)
+                or (addr is None and needle in lab)
+            )
+        }
+
+    # No pool/string matches
+    if not matches:
+        # Only legacy syntax should fall back to function lookup.
+        if legacy:
+            original_pattern = args.pattern
+            args.pattern = needle
+
+            try:
+                rc = _xrefs_to_function(args, image, fr)
+            finally:
+                args.pattern = original_pattern
+
+            if rc is not None:
+                error("// resolved as function")
+                return rc
+
+        if getattr(args, "json", False):
+            result = {
+                "ok": False,
+                "pattern": needle,
+                "count": 0,
+                "entries": [],
+            }
+
+            if kind is not None:
+                result["kind"] = kind
+
+                if kind == "string":
+                    result["exact"] = getattr(args, "exact", False)
+
+            return emit(result, EXIT_MISS)
+
+        error(
+            f"nothing matching {needle!r}: no ObjectPool entry holds it, "
+            f"and no function goes by that name or address"
+        )
+        return EXIT_MISS
+
+    # We found one or more pool entries.
     refs = pool_xrefs(image, matches)
-    entries = [{"pool_offset": off, "entry": matches[off],
-                "referenced_by": [{"pc_offset": c.pc_offset, "size": c.size}
-                                  for c in refs[off]]}
-               for off in sorted(matches)]
+
+    # Report how the legacy syntax was resolved.
+    if legacy:
+        if addr is not None:
+            error("// resolved as pool")
+        else:
+            error("// resolved as string")
+
+    # --class filtering
+    class_name = getattr(args, "class_name", None)
+
+    function_owners = {}
+    class_names = {}
+
+    if class_name:
+        # CodeRange.owner_ref points to a function.
+        # The function's owner_ref points to its class.
+        function_owners = {
+            ref: owner_ref
+            for ref, _name_ref, owner_ref, _kind_tag in fr.functions
+        }
+
+        # Map class reference -> class name.
+        class_names = {
+            ref: fr.strings.get(name_ref, "")
+            for ref, name_ref, _cid, _super_ref in fr.classes
+        }
+
+    entries = [
+        {
+            "pool_offset": off,
+            "entry": matches[off],
+            "referenced_by": [
+                {
+                    "pc_offset": c.pc_offset,
+                    "size": c.size,
+                }
+                for c in refs[off]
+                if (
+                    not class_name
+                    or class_names.get(
+                        function_owners.get(c.owner_ref)
+                    ) == class_name
+                )
+            ],
+        }
+        for off in sorted(matches)
+    ]
+
+    # When --class is supplied, remove entries that have
+    # no references belonging to that class.
+    if class_name:
+        entries = [
+            entry
+            for entry in entries
+            if entry["referenced_by"]
+        ]
+
+    # Class filtering resulted in no references.
+    if not entries:
+        if getattr(args, "json", False):
+            if kind is not None:
+                resolved_kind = kind
+            elif addr is not None:
+                resolved_kind = "pool"
+            else:
+                resolved_kind = "string"
+
+            result = {
+                "ok": False,
+                "pattern": needle,
+                "kind": resolved_kind,
+                "count": 0,
+                "entries": [],
+            }
+
+            if resolved_kind == "string":
+                result["exact"] = getattr(args, "exact", False)
+
+            return emit(result, EXIT_MISS)
+
+        error(
+            f"nothing matching {needle!r} is referenced by "
+            f"class {class_name!r}"
+        )
+        return EXIT_MISS
+
+    # JSON output
     if getattr(args, "json", False):
-        return emit({"ok": True, "pattern": needle, "count": len(entries),
-                     "entries": entries})
+        if kind is not None:
+            resolved_kind = kind
+        elif addr is not None:
+            resolved_kind = "pool"
+        else:
+            resolved_kind = "string"
+
+        result = {
+            "ok": True,
+            "pattern": needle,
+            "kind": resolved_kind,
+            "count": len(entries),
+            "entries": entries,
+        }
+
+        if resolved_kind == "string":
+            result["exact"] = getattr(args, "exact", False)
+
+        return emit(result)
+
+    # Human-readable output
     for e in entries:
-        print(comment(f"// pool_0x{e['pool_offset']:x}  {e['entry']}"))
+        print(
+            comment(
+                f"// pool_0x{e['pool_offset']:x}  {e['entry']}"
+            )
+        )
+
         if not e["referenced_by"]:
-            print(dim("    no direct loads found "
-                      "(reached through a closure or built at runtime)"))
+            print(
+                dim(
+                    "    no direct loads found "
+                    "(reached through a closure or built at runtime)"
+                )
+            )
+
         for r in e["referenced_by"]:
             size = dim(f"{r['size']} bytes")
-            print(f"    .text+0x{r['pc_offset']:<8x} {size}")
+            print(
+                f"    .text+0x{r['pc_offset']:<8x} {size}"
+            )
+
     return EXIT_OK
 
 
@@ -1044,9 +1291,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_strings)
 
     p = _add(sub, common, "xrefs", "what references a string, a pool entry or a function")
-    p.add_argument("pattern", metavar="STRING|0xOFFSET|FUNCTION",
-                   help="substring of a pool entry, a pool offset, or the name or "
-                        "address of a function whose call sites you want")
+    p.add_argument(
+        "kind_or_pattern",
+        metavar="KIND|PATTERN",
+        help="string, pool, or function; or a bare pattern for the legacy form",
+    )
+    p.add_argument(
+        "pattern",
+        nargs="?",
+        metavar="PATTERN",
+        help="string, pool offset, or function name/address",
+    )
+    p.add_argument(
+        "--exact",
+        action="store_true",
+        help="for string, match the pool entry exactly",
+    )
+    p.add_argument(
+        "--class",
+        dest="class_name",
+        metavar="NAME",
+        help="keep only references owned by this class",
+    )
     _add_sigs(p)
     p.set_defaults(func=cmd_xrefs)
 
