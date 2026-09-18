@@ -5,7 +5,8 @@
 # disabled, so these checks live here instead: same checks, run when you decide to.
 #
 #   ./check.sh            the fast set, about a minute
-#   ./check.sh --full     adds the CFG edge check and the determinism diff, a few minutes
+#   ./check.sh --full     adds the CFG edge check, the determinism diff and the benchmark
+#                         against its baseline, a few minutes
 set -uo pipefail
 cd "$(dirname "$0")"
 
@@ -67,6 +68,13 @@ if [ "$FULL" = 1 ]; then
       PYTHONHASHSEED=$s '"$JADART"' export '"$CLEAN"' -o "$t/$s" -q >/dev/null || exit 1
     done
     diff -r "$t/1" "$t/424242" >/dev/null && echo "   identical across two hash seeds"'
+
+  # The costs in README.md come from flubench/bench/baseline.json, and this is what stops
+  # a change from quietly making one workload slower. A change that is meant to move a
+  # number retakes the baseline with tools/bench.py --baseline and says so. On another
+  # machine, BENCH_BASELINE points this at one taken there, on main, before the change.
+  step "no workload got slower than the baseline" "$PY" framework/tools/bench.py --check \
+    --file "${BENCH_BASELINE:-flubench/bench/baseline.json}"
 fi
 
 echo
