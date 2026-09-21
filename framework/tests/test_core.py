@@ -14,12 +14,29 @@ from jadart.snapshot import parse_libapp, parse_blob, UnknownEpoch  # noqa: E402
 import struct  # noqa: E402
 import unittest  # noqa: E402
 import jadart  # noqa: E402
+import pytest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 CLEAN = os.path.join(ROOT, "flubench/artifacts/clean/lib/arm64-v8a/libapp.so")
 OBF = os.path.join(ROOT, "flubench/artifacts/obf/lib/arm64-v8a/libapp.so")
 KNOWN_HASH = "ace654289f5abc240509fc941453ebc5"
+@pytest.fixture(scope="module")
+def clean_loaded():
+    from jadart.disasm import load_instructions
+    return load_instructions(CLEAN)
 
+
+@pytest.fixture
+def xrefs_cli(monkeypatch, clean_loaded):
+    from jadart import cli
+    from jadart import disasm
+
+    monkeypatch.setattr(
+        disasm,
+        "load_instructions",
+        lambda _path: clean_loaded,
+    )
+    return cli
 
 def test_parses_both_snapshots():
     s = parse_libapp(CLEAN)
@@ -1811,11 +1828,11 @@ def test_pool_xrefs_finds_both_addressing_forms():
     assert want & {c.pc_offset for c in refs}, "xref should point at benchCheckSecret"
 
 
-def test_xrefs_explicit_string_kind():
+def test_xrefs_explicit_string_kind(xrefs_cli):
     import json
     import io
     import contextlib
-    from jadart import cli
+    cli = xrefs_cli
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -2015,6 +2032,101 @@ def test_xrefs_string_exact():
     assert doc["ok"] is False
     assert doc["kind"] == "string"
     assert doc["exact"] is True
+
+
+def test_xrefs_invalid_arguments_are_usage_errors():
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    cases = [
+        (
+            ["xrefs", CLEAN, "func", "foo", "-j"],
+            "invalid xrefs kind",
+        ),
+        (
+            ["xrefs", CLEAN, "string", "-j"],
+            "needs a PATTERN",
+        ),
+        (
+            [
+                "xrefs",
+                CLEAN,
+                "function",
+                "benchCheckSecret",
+                "--class",
+                "Licence",
+                "-j",
+            ],
+            "--class is not supported",
+        ),
+        (
+            ["xrefs", CLEAN, "foo", "--exact", "-j"],
+            "--exact requires an explicit string kind",
+        ),
+        (
+            ["xrefs", CLEAN, "pool", "not-an-offset", "-j"],
+            "invalid pool offset",
+        ),
+    ]
+
+    for argv, message in cases:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(argv)
+
+        doc = json.loads(buf.getvalue())
+
+        assert rc == 2
+        assert doc["ok"] is False
+        assert message in doc["error"]
+
+
+def test_xrefs_legacy_does_not_report_exact():
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "Future.",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "string"
+    assert "exact" not in doc
+
+
+def test_xrefs_legacy_exact_is_usage_error():
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "Future.",
+            "--exact",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 2
+    assert doc["ok"] is False
+    assert "error" in doc
 
 
 def test_xrefs_string_class_filter():
