@@ -1281,26 +1281,200 @@ def test_export_accepts_an_apk():
     # jadx and blutter both take the container. Making a user find lib/arm64-v8a/libapp.so
     # first is a poor greeting, and it is the step most likely to be got wrong.
     import tempfile, zipfile
-    from jadart.export import resolve_input, InputError
+    from jadart.source import open_source
+    from jadart.errors import InputError
     with tempfile.TemporaryDirectory() as tmp:
         apk = os.path.join(tmp, "fake.apk")
         with zipfile.ZipFile(apk, "w") as z:
             z.writestr("lib/x86_64/libapp.so", b"x86")
             z.writestr("lib/arm64-v8a/libapp.so", b"arm64")   # must win
             z.writestr("AndroidManifest.xml", b"")
-        got = resolve_input(apk, os.path.join(tmp, "work"))
-        assert open(got, "rb").read() == b"arm64", "arm64 should be preferred"
-        # a plain binary passes through untouched
-        assert resolve_input(CLEAN, os.path.join(tmp, "work2")) == CLEAN
+        got = open_source(apk)
+        assert got.data == b"arm64", "arm64 should be preferred"
+        # the label says the container AND the member, because on an apk neither one
+        # alone tells the reader which of four ABIs was read
+        assert got.member == "lib/arm64-v8a/libapp.so"
+        assert got.label == apk + "!lib/arm64-v8a/libapp.so"
+
+        # a plain binary is its own answer and carries no member
+        direct = open_source(CLEAN)
+        assert direct.member is None and direct.label == CLEAN
+        with open(CLEAN, "rb") as fh:
+            assert direct.data == fh.read()
+
         # a zip with no snapshot in it says so
         other = os.path.join(tmp, "other.zip")
         with zipfile.ZipFile(other, "w") as z:
             z.writestr("readme.txt", b"hi")
         try:
-            resolve_input(other, os.path.join(tmp, "work3"))
+            open_source(other)
             assert False, "should reject a zip with no snapshot"
         except InputError as e:
             assert "Flutter" in str(e)
+
+
+def test_a_container_asks_for_no_temp_file_and_answers_the_same_as_the_binary():
+    # The snapshot used to be copied out of the apk into a temp directory that an atexit
+    # hook removed, so a sandbox with no writable temp could not run the tool at all and
+    # every SIGKILL leaked a full copy of someone's app. Two ways of testing that do NOT
+    # work, both tried here first: counting leftover jadart-* directories passes on the old
+    # code because the hook does run on a clean exit, and pointing TMPDIR at an unwritable
+    # directory passes because tempfile quietly falls back to another one. What the claim
+    # actually is, is that no temp file is ever ASKED for, so the test takes the three
+    # functions that could ask and makes them raise. The old path dies on the first of
+    # them. Every command then has to answer exactly what it answers for the binary on its
+    # own, byte for byte. The member is STORED, which is how a real release apk carries a
+    # .so and the reason it can be read in place at all.
+    import subprocess
+    import tempfile
+    import zipfile
+    with open(CLEAN, "rb") as fh:
+        raw = fh.read()
+    with tempfile.TemporaryDirectory() as tmp:
+        apk = os.path.join(tmp, "app.apk")
+        with zipfile.ZipFile(apk, "w", compression=zipfile.ZIP_STORED) as z:
+            z.writestr("lib/arm64-v8a/libapp.so", raw)
+            z.writestr("AndroidManifest.xml", b"")
+        assert zipfile.ZipFile(apk).getinfo("lib/arm64-v8a/libapp.so").compress_type == 0
+
+        probe = ("import sys, tempfile\n"
+                 "def refuse(*a, **k):\n"
+                 "    raise AssertionError('jadart asked for a temp file')\n"
+                 "tempfile.mkdtemp = refuse\n"
+                 "tempfile.mkstemp = refuse\n"
+                 "tempfile.NamedTemporaryFile = refuse\n"
+                 "from jadart.cli import main\n"
+                 "sys.exit(main(sys.argv[1:]))\n")
+        env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(__file__)))
+        for argv in (["info"], ["classes"], ["strings"], ["verify"],
+                     ["decompile", "BenchAccount"], ["xrefs", "flutter"]):
+            base = [sys.executable, "-c", probe, argv[0]]
+            from_apk = subprocess.run(base + [apk] + argv[1:], capture_output=True, env=env)
+            assert from_apk.returncode == 0, (argv, from_apk.stderr[-600:])
+            direct = subprocess.run(base + [CLEAN] + argv[1:], capture_output=True, env=env)
+            assert from_apk.stdout == direct.stdout, f"{argv[0]} differs apk vs .so"
+
+
+def test_the_label_names_something_the_reader_can_open():
+    # Every message a command prints about its input, and the `file` field of --json, come
+    # from Source.label. It used to be the temp path the snapshot had been copied to, which
+    # named a directory that no longer existed by the time anyone read it. The rule now is
+    # that the label is a real path wherever a real file exists, and only says
+    # `container!member` when the bytes live nowhere else.
+    import json
+    import tempfile
+    import zipfile
+    from jadart.source import open_source
+    direct = open_source(CLEAN)
+    assert direct.label == CLEAN and direct.path == CLEAN and direct.member is None
+
+    from_dir = open_source(os.path.dirname(os.path.dirname(os.path.dirname(CLEAN))))
+    assert from_dir.label == CLEAN, "a directory resolves to the file it found"
+    assert from_dir.member == os.path.join("lib", "arm64-v8a", "libapp.so")
+
+    with open(CLEAN, "rb") as fh:
+        raw = fh.read()
+    with tempfile.TemporaryDirectory() as tmp:
+        apk = os.path.join(tmp, "app.apk")
+        with zipfile.ZipFile(apk, "w") as z:
+            z.writestr("lib/arm64-v8a/libapp.so", raw)
+        src = open_source(apk)
+        assert src.path is None, "a zip member has no file of its own"
+        assert src.label == f"{apk}!lib/arm64-v8a/libapp.so"
+
+        # an IPA keeps it somewhere else entirely, and that has to be found too
+        ipa = os.path.join(tmp, "app.ipa")
+        with zipfile.ZipFile(ipa, "w") as z:
+            z.writestr("Payload/App.app/Frameworks/App.framework/App", raw)
+        assert open_source(ipa).member.endswith("App.framework/App")
+
+        # and the label is what --json reports, so a caller gets the same string
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(__file__)))
+        out = subprocess.run([sys.executable, "-m", "jadart", "-j", "info", apk],
+                             capture_output=True, env=env)
+        assert json.loads(out.stdout)["file"] == src.label
+
+
+def test_a_member_is_inflated_under_a_bound_not_after_one():
+    # zipfile's read() with no argument asks zlib for up to a gigabyte before truncating to
+    # the size the container declared, so a member that declares four bytes and holds a
+    # 200 MB deflate stream spends the memory first and consults the declaration after. A
+    # 199 KB archive reached 422 MB of resident memory that way. The member is read in
+    # bounded pieces now, so the cost tracks what was declared rather than what was hidden.
+    import struct
+    import subprocess
+    import tempfile
+    import zlib
+    payload = b"\0" * (64 * 1024 * 1024)
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)
+    blob = co.compress(payload) + co.flush()
+    name = b"lib/arm64-v8a/libapp.so"
+    crc = zlib.crc32(b"AAAA") & 0xffffffff
+    lie = 4
+    lh = struct.pack("<IHHHHHIIIHH", 0x04034b50, 20, 0, 8, 0, 0,
+                     crc, len(blob), lie, len(name), 0) + name
+    body = lh + blob
+    cd = struct.pack("<IHHHHHHIIIHHHHHII", 0x02014b50, 20, 20, 0, 8, 0, 0,
+                     crc, len(blob), lie, len(name), 0, 0, 0, 0, 0, 0) + name
+    eocd = struct.pack("<IHHHHIIH", 0x06054b50, 0, 0, 1, 1, len(cd), len(body), 0)
+    import zipfile
+    with tempfile.TemporaryDirectory() as tmp:
+        bomb = os.path.join(tmp, "bomb.apk")
+        with open(bomb, "wb") as fh:
+            fh.write(body + cd + eocd)
+        assert os.path.getsize(bomb) < 200_000, "the archive itself has to stay small"
+        # An absolute ceiling would be a test of the interpreter's own footprint, which
+        # moves with the Python version. The control is a container of the same shape
+        # carrying nothing: whatever that costs, the bomb must cost about the same.
+        plain = os.path.join(tmp, "plain.apk")
+        with zipfile.ZipFile(plain, "w") as z:
+            z.writestr("lib/arm64-v8a/libapp.so", b"AAAA")
+        probe = ("import sys, resource, jadart\n"
+                 "try: jadart.header(sys.argv[1])\n"
+                 "except jadart.JadartError: pass\n"
+                 "print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)")
+        env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(__file__)))
+
+        def peak_mb(target):
+            out = subprocess.run([sys.executable, "-c", probe, target],
+                                 capture_output=True, env=env, text=True)
+            assert out.returncode == 0, out.stderr[-400:]
+            raw = int(out.stdout.split()[-1])
+            return raw / (1 << 20) if sys.platform == "darwin" else raw / 1024
+
+        control, bombed = peak_mb(plain), peak_mb(bomb)
+        assert bombed < control + len(payload) / 4e6, (
+            f"bomb peaked at {bombed:.0f} MB against {control:.0f} MB for the same archive "
+            f"holding nothing, so the {len(payload) / 1e6:.0f} MB payload was inflated")
+
+
+def test_a_deflated_member_and_an_oversized_one():
+    # Android has stored native libraries since AGP 3.6 so the loader can map them, and
+    # every apk in the corpus does. A container that deflates one anyway still has to
+    # work, and a container that claims a member far larger than any real snapshot has to
+    # be refused before the read rather than while this process grows.
+    import tempfile
+    import zipfile
+    from jadart import source
+    from jadart.errors import InputError
+    with tempfile.TemporaryDirectory() as tmp:
+        apk = os.path.join(tmp, "deflated.apk")
+        with zipfile.ZipFile(apk, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("lib/arm64-v8a/libapp.so", b"compress me" * 4096)
+        assert zipfile.ZipFile(apk).getinfo("lib/arm64-v8a/libapp.so").compress_type == 8
+        assert source.open_source(apk).data == b"compress me" * 4096
+
+        old = source.MAX_SNAPSHOT_BYTES
+        try:
+            source.MAX_SNAPSHOT_BYTES = 100
+            try:
+                source.open_source(apk)
+                assert False, "should refuse a member over the cap"
+            except InputError as e:
+                assert "limit for a snapshot" in str(e)
+        finally:
+            source.MAX_SNAPSHOT_BYTES = old
 
 
 def test_classes_carry_their_library():

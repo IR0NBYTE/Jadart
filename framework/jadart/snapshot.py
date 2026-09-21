@@ -134,7 +134,7 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
         first_cluster_cid=first_cid, epoch=epoch, arch=arch)
 
 
-def walk_isolate(path: str, *, full: bool = False) -> dict:
+def walk_isolate(path, *, full: bool = False) -> dict:
     """Full M2 pass on the isolate snapshot: parse header, walk the entire alloc
     pass (fail-loud on desync), then recover the canonical String cluster's text.
     Returns {header, clusters, cid_histogram, strings}. The `strings` are the
@@ -149,12 +149,13 @@ def walk_isolate(path: str, *, full: bool = False) -> dict:
     from .clusters import walk_alloc
     from .fill import recover_canonical_strings
 
-    data = open(path, "rb").read()
-    elf = open_container(data)
+    from .source import read_binary
+    src = read_binary(path)
+    elf = open_container(src.data)
     blob = elf.symbol_bytes("_kDartIsolateSnapshotData")
     hdr = parse_blob(blob, "isolate", strict=True)
     if hdr.epoch is None:
-        raise UnknownEpoch(f"unknown epoch for {path}")
+        raise UnknownEpoch(f"unknown epoch for {src.label}")
 
     st = ReadStream(blob, 52)
     st.read_cstring()
@@ -175,9 +176,14 @@ def walk_isolate(path: str, *, full: bool = False) -> dict:
             "cid_histogram": dict(hist.most_common())}
 
 
-def parse_libapp(path: str, *, strict: bool = True) -> dict[str, SnapshotHeader]:
-    """Parse both snapshots (vm + isolate) from a libapp.so."""
-    data = open(path, "rb").read()
+def parse_libapp(path, *, strict: bool = True) -> dict[str, SnapshotHeader]:
+    """Parse both snapshots (vm + isolate) from a libapp.so.
+
+    `path` is a libapp.so, a directory, an APK or IPA, or a Source already read out of
+    one. A container is read in place, never unpacked; see source.py."""
+    from .source import read_binary
+    src = read_binary(path)
+    data = src.data
     elf = open_container(data)
     out: dict[str, SnapshotHeader] = {}
     for which, sym in (("vm", "_kDartVmSnapshotData"),
@@ -196,6 +202,6 @@ def parse_libapp(path: str, *, strict: bool = True) -> dict[str, SnapshotHeader]
             out[f"blob{i}"] = parse_blob(data[off:], f"blob{i}", strict=strict)
     if not out:
         raise InputError(
-            f"{path}: no Dart snapshot found (missing _kDart*SnapshotData symbols and "
+            f"{src.label}: no Dart snapshot found (missing _kDart*SnapshotData symbols and "
             f"no snapshot magic). Not a Flutter/Dart AOT library?")
     return out

@@ -504,14 +504,19 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
     return gates
 
 
-def verify_file(path: str) -> VerifyReport:
-    """Full-pipeline verification of one .so."""
+def verify_file(path) -> VerifyReport:
+    """Full-pipeline verification of one .so, or of the container holding one.
+
+    The source is read once here and handed to both readers below. They each used to open
+    the file for themselves, which on an APK meant reading the same member twice."""
     from .disasm import load_instructions
     from .dispatch import find_dispatch_table
     from .clusters import walk_alloc
     from .stream import ReadStream
+    from .source import read_binary
 
-    image, fr, hdr = load_instructions(path)
+    src = read_binary(path)
+    image, fr, hdr = load_instructions(src)
     # re-walk the alloc pass to keep the Cluster objects (load_instructions discards them)
     data = image.data
     st = ReadStream(data, 52)
@@ -532,9 +537,9 @@ def verify_file(path: str) -> VerifyReport:
     # a stripped binary found by the magic scan may carry only the isolate one, and then
     # G13 has nothing to compare against and says so.
     from .snapshot import parse_libapp
-    vm = parse_libapp(path, strict=False).get("vm")
+    vm = parse_libapp(src, strict=False).get("vm")
 
-    rep = VerifyReport(path=path, which="isolate",
+    rep = VerifyReport(path=src.label, which="isolate",
                        epoch=hdr.epoch.name if hdr.epoch else "?",
                        arch=str(hdr.arch) if hdr.arch else "?")
     rep.gates = run_gates(clusters, fr, hdr, image=image, dispatch=dispatch, vm=vm)
