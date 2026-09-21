@@ -203,14 +203,15 @@ def build_program(fr, hdr) -> Program:
                    num_predefined_cids=hdr.epoch.num_predefined_cids)
 
 
-def recover_program(path: str) -> Program:
+def recover_program(path) -> Program:
     """Full pipeline on the isolate snapshot: header -> alloc walk -> fill walk ->
     resolve names/owners/fields/superclasses. Fail-loud on unknown epoch or desync."""
-    blob = open_container(open(path, "rb").read()).symbol_bytes(
-        "_kDartIsolateSnapshotData")
+    from .source import read_binary
+    src = read_binary(path)
+    blob = open_container(src.data).symbol_bytes("_kDartIsolateSnapshotData")
     hdr = parse_blob(blob, "isolate", strict=True)
     if hdr.epoch is None:
-        raise UnknownEpoch(f"unknown epoch for {path}")
+        raise UnknownEpoch(f"unknown epoch for {src.label}")
     st = ReadStream(blob, 52)
     st.read_cstring()
     for _ in range(5):
@@ -221,7 +222,7 @@ def recover_program(path: str) -> Program:
     return build_program(fr, hdr)
 
 
-def decompile_class(path: str, class_name: str, max_methods: int = 40,
+def decompile_class(path, class_name: str, max_methods: int = 40,
                     structured: bool = True, tier: int = 3,
                     sigs: str | None = None) -> str | None:
     """The unified JADX-for-Flutter view: the Tier 0 class header (extends + members)

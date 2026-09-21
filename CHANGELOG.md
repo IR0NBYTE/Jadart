@@ -46,6 +46,43 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   A test pins the derived values, and the comment carries the two-line check to repeat
   when a newer release is registered. Closes #6.
 
+### Changed
+
+- **A container is read in place, and nothing is written to disk.** Pointing any command
+  at an APK or IPA used to copy the snapshot member into a `jadart-` temp directory, read
+  the copy back, and remove the directory from an `atexit` hook. Since Android Gradle
+  Plugin 3.6 a release APK stores native libraries uncompressed so the loader can map them,
+  so `libapp.so` now comes straight out of the central directory: 1 ms for 4.2 MB, and a
+  container that does deflate its libraries still works because zipfile inflates into
+  memory just the same. Three things follow. A killed process leaves nothing behind, where
+  before every SIGKILL leaked a full copy of someone's app into the temp directory, because
+  `atexit` does not run; there was a fortnight old orphan in the temp directory here when
+  this was written. No command asks for a temp file at all now, so nothing depends on
+  finding a writable one. And `verify` reads the member once rather than twice, because the
+  bytes are read once and handed to both readers instead of each opening the file for
+  itself. The process wide cache that stopped one APK being unpacked three times is gone
+  with the unpacking: a second call re-reads the member for about a millisecond, against
+  the seventy the parse behind it takes, and holds no state between calls in exchange.
+  `jadart.source` holds the new reader; `export.resolve_input` and `export.resolve_cached`
+  are gone, both implementation under `jadart.*`. Closes #18.
+- **A container member is inflated under a bound, not after one.** The size a zip declares
+  for a member was checked before reading it, and then `ZipExtFile.read()` with no
+  argument asked zlib for up to a gigabyte before truncating the result to that declared
+  size, so the check was consulted only after the memory had been spent. A 199 KB archive
+  declaring a four byte member and holding a 200 MB deflate stream reached 422 MB of
+  resident memory. The member is now read a megabyte at a time and never past the size it
+  declared, so the same archive reaches 22 MB and fails on its own bad CRC, which is the
+  right answer for an archive that lies about a member. A test measures the peak against a
+  control container of the same shape holding nothing, and fails on the unbounded read.
+- **`--json` reports the file it actually read.** `jadart -j info app.apk` used to put the
+  temp path in `"file"`, which named a directory that no longer existed by the time the
+  caller read the document. It now names the container and the member it picked, as
+  `app.apk!lib/arm64-v8a/libapp.so`. A binary named directly, or found inside a directory
+  the user named, still reports its own path, so the field stays openable wherever a file
+  exists to open. A path that does not exist now says "no such file or directory" from
+  every entry point; the CLI and the library used to answer that with two different
+  sentences.
+
 ## 1.1.0 - 2026-09-06
 
 ### Added

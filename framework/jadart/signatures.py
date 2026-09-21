@@ -272,7 +272,7 @@ def build(paths, window: int = WINDOW, min_score: int = MIN_SCORE,
           progress=None) -> Library:
     """Build a signature library from reference binaries whose names survive."""
     from .disasm import load_instructions
-    from .export import resolve_cached as _resolve
+    from .source import open_source as _resolve
 
     ctx_p, pool_p, body_p, sources = [], [], [], []
     for path in paths:
