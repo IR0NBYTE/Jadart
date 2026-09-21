@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 197](https://img.shields.io/badge/tests-197-brightgreen.svg)](#tests)
+[![tests: 201](https://img.shields.io/badge/tests-201-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -394,7 +394,7 @@ docs/                 usage, support, and the Flutter internals explainer
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 197 tests
+cd framework && python3 -m pytest tests -q     # 201 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```

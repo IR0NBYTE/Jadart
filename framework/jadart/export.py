@@ -38,12 +38,10 @@ Matching it means output from the two tools can be diffed directly.
 """
 from __future__ import annotations
 
-from .errors import InputError, JadartError
+from .errors import JadartError
 
 import os
 import re
-import shutil
-import zipfile
 
 #: Every text file jadart writes is UTF-8 with LF endings, on every platform.
 #: Without the explicit encoding Python uses the locale one, and a Windows console
@@ -52,115 +50,6 @@ import zipfile
 #: binary, so it is escaped rather than allowed to fail, and the newline is pinned
 #: so the same input exports to the same bytes wherever it runs.
 TEXT_OUT = {"encoding": "utf-8", "errors": "backslashreplace", "newline": "\n"}
-
-
-# Preferred first: arm64 is what jadart lifts, and what nearly every shipped app carries.
-_ABI_ORDER = ("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
-
-# Ceiling on what will be unpacked out of an untrusted container (see resolve_input).
-_MAX_EXTRACT = 1_500_000_000
-
-
-_EXTRACTED: dict = {}
-
-
-def resolve_cached(path: str) -> str:
-    """An apk/ipa/directory becomes the snapshot inside it; a snapshot stays itself.
-
-    The extracted copy has to outlive this call, because the readers returned below keep
-    reading from it, so it lives as long as the process and is removed at exit rather than
-    left behind. It is also cached per source file: `header(apk)` then `program(apk)` then
-    `strings(apk)` used to mean three temp directories holding three copies of the same
-    libapp.so, which for a large app is most of a gigabyte to say three things about one
-    file."""
-    import atexit
-    import os
-    import shutil
-    import tempfile
-    import zipfile
-    if os.path.isfile(path) and not zipfile.is_zipfile(path):
-        return path
-    if not os.path.exists(path):
-        # Before os.stat, which raised FileNotFoundError: the commonest failure of all
-        # (a typo in a path) escaped every `except jadart.JadartError` the package
-        # docstring tells callers to write.
-        raise InputError(f"{path}: no such file or directory")
-    stat = os.stat(path)
-    key = (os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
-    if key not in _EXTRACTED:
-        workdir = tempfile.mkdtemp(prefix="jadart-")
-        atexit.register(shutil.rmtree, workdir, True)
-        _EXTRACTED[key] = resolve_input(path, workdir)
-    return _EXTRACTED[key]
-
-
-def resolve_input(path: str, workdir: str) -> str:
-    """Accept what a user actually has and return a snapshot binary path.
-
-    An APK or IPA is a zip, so the snapshot can be pulled straight out of it. jadx and
-    blutter both take the container rather than making you unzip first, and asking a user
-    to know that `lib/arm64-v8a/libapp.so` is the interesting member is a poor greeting."""
-    if os.path.isdir(path):                        # an extracted lib/ tree or .framework
-        for abi in _ABI_ORDER:
-            cand = os.path.join(path, "lib", abi, "libapp.so")
-            if os.path.exists(cand):
-                return cand
-        for name in ("libapp.so", "App"):
-            cand = os.path.join(path, name)
-            if os.path.exists(cand):
-                return cand
-        raise InputError(f"{path}: no libapp.so or App binary under this directory")
-
-    if not os.path.exists(path):
-        raise InputError(f"{path}: no such file")
-    if not zipfile.is_zipfile(path):
-        return path                                # a .so / .dylib / App binary
-
-    with zipfile.ZipFile(path) as z:
-        names = z.namelist()
-        cands = [n for n in names if n.endswith("libapp.so")]
-        cands.sort(key=lambda n: next((i for i, a in enumerate(_ABI_ORDER) if a in n), 99))
-        if not cands:
-            # an IPA keeps it in Payload/<App>.app/Frameworks/App.framework/App
-            cands = [n for n in names if n.endswith("App.framework/App")]
-        if not cands:
-            # A debug build has no AOT snapshot at all: the Dart code ships as kernel
-            # bytecode that the JIT loads at runtime. Saying so is worth a line, because
-            # "no snapshot found" otherwise reads as a jadart limitation rather than as a
-            # fact about the build, and the two need completely different tools.
-            if any(n.endswith("flutter_assets/kernel_blob.bin") for n in names):
-                raise InputError(
-                    f"{path}: a debug/JIT build. Its Dart code is kernel bytecode in "
-                    f"assets/flutter_assets/kernel_blob.bin, not an AOT snapshot, so there "
-                    f"is nothing here for jadart to parse.\n"
-                    f"  You are better off than with a release build, though: a debug "
-                    f"kernel embeds the ORIGINAL SOURCE for hot reload and stack traces, "
-                    f"so `strings` on that blob gives back the app's own .dart files "
-                    f"verbatim, names, comments and literals included.")
-            if any("libflutter.so" in n for n in names):
-                raise InputError(
-                    f"{path}: carries libflutter.so but no libapp.so. That is a Flutter "
-                    f"app whose Dart code is not AOT-compiled into the APK, a debug "
-                    f"build, or one that loads its code some other way.")
-            raise InputError(
-                f"{path}: a zip with no Flutter snapshot in it (looked for libapp.so and "
-                f"App.framework/App). Not a Flutter app?")
-        pick = cands[0]
-        # A member's declared size is free to read and a lie is cheap to tell, so check it
-        # before writing a gigabyte of someone else's zip to this machine's disk. The
-        # largest real libapp.so in the corpus is under 60 MB; the cap is generous enough
-        # not to argue with a genuinely huge app and small enough to be a cap.
-        declared = z.getinfo(pick).file_size
-        if declared > _MAX_EXTRACT:
-            raise InputError(
-                f"{path}: {pick} claims to be {declared / 1e6:.0f} MB, over the "
-                f"{_MAX_EXTRACT / 1e6:.0f} MB limit for an extracted snapshot. Unpack it "
-                f"yourself and point jadart at the file if that is genuinely its size.")
-        os.makedirs(workdir, exist_ok=True)
-        out = os.path.join(workdir, os.path.basename(pick))
-        with z.open(pick) as src, open(out, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        return out
 
 
 def is_framework(url: str) -> bool:
@@ -236,7 +125,7 @@ def _safe_relpath(rel: str) -> str:
     return os.path.join(*parts) if parts else "unnamed.dart"
 
 
-def export(path: str, outdir: str, tier: int = 3, app_only: bool = False,
+def export(path, outdir: str, tier: int = 3, app_only: bool = False,
            max_methods: int = 200, progress=None, label: str = None,
            container: str = None, sigs: str = None) -> dict:
     """Recover everything and write it to `outdir`. Returns a stats dict.

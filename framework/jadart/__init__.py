@@ -38,8 +38,9 @@ not walk, `UnsupportedArch` where a tier does not model the target, and
 A bug in this library is deliberately NOT a `JadartError`, so it keeps its own type instead
 of being swallowed by an `except` that meant to skip a bad file.
 
-THREAD SAFETY: none. The lifter binds its architecture tables as module state, capstone
-handles are shared, and the extraction cache is process-global. Use processes, not threads.
+THREAD SAFETY: none. The lifter binds its architecture tables as module state and
+capstone handles are shared. Use processes, not threads. Reading a container is the one
+part that is safe on its own: it holds no state between calls and writes nothing.
 
 Three entry points share a name with the submodule behind them: `program`, `verify` and
 `export`. The function wins, on purpose: `jadart.verify(path)` is the interface and the
@@ -57,7 +58,7 @@ has to be correct is the part with nothing underneath it.
 from .errors import JadartError
 from .snapshot import parse_libapp, parse_blob, SnapshotHeader, UnknownEpoch
 from .versions import UnsupportedTarget
-from .export import InputError
+from .errors import InputError
 # The rest of the taxonomy, reachable by name. Five of these used to exist only inside the
 # modules that raise them, so a caller following the docstring below could not name what it
 # was catching and fell back to matching on messages.
@@ -74,10 +75,10 @@ from .fillwalk import FillError
 from .program import recover_program as _recover_program
 from .verify import verify_file as _verify_file
 from .export import export as _export_tree
-# Lives in export.py beside `resolve_input`, which it wraps. Defining it here would
-# make leaves import a private out of the package root, dragging APK extraction, an
-# atexit hook and a process-lifetime cache into the analysis layer.
-from .export import resolve_cached as _resolve
+# A container is read in place, so this is one zip read and no temp file. It lives in
+# source.py because every reader needs it and none of them should have to know what an
+# APK is; see that module for why the copy it replaces was worth removing.
+from .source import open_source as _resolve
 
 #: Covers the INTERFACE, the command set and their options, the exit codes, the shape of
 #: `--json`, and the names in `__all__`. Everything under `jadart.*` is implementation.

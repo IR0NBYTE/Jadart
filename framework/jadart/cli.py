@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import sys
 
 from . import console
-from .errors import JadartError
+from .errors import InputError, JadartError
 from .console import bold, comment, dim, error, heading
 from .snapshot import parse_libapp, walk_isolate
 
@@ -96,7 +95,7 @@ def cmd_info(args) -> int:
         return _fail(e)
 
     if getattr(args, "json", False):
-        return emit({"ok": True, "file": args.libapp, "snapshots": {
+        return emit({"ok": True, "file": str(args.libapp), "snapshots": {
             which: {
                 "kind": h.kind_name,
                 "version_hash": h.version_hash,
@@ -179,7 +178,7 @@ def cmd_export(args) -> int:
     try:
         stats = export(args.libapp, args.out, tier=args.tier, app_only=args.app,
                        progress=None if quiet else progress,
-                       label=getattr(args, "container", None) or args.libapp,
+                       label=getattr(args, "container", None) or str(args.libapp),
                        container=getattr(args, "container", None),
                        sigs=getattr(args, "sigs", None))
     except JadartError as e:
@@ -1164,25 +1163,22 @@ def main(argv=None) -> int:
 
     # Accept a container for EVERY command, not just export. An APK or IPA is what a user
     # actually has, and making `info` reject one that `export` accepts is a papercut with
-    # no reason behind it, the extraction is the same three lines either way.
-    workdir = None
+    # no reason behind it. The container is read in place: nothing is written to disk, so
+    # there is no temp directory to remove and nothing is left behind if this process is
+    # killed rather than allowed to exit.
     if getattr(args, "libapp", None):
-        import tempfile
-        from .export import resolve_input, InputError
+        from .source import open_source
         try:
-            workdir = tempfile.mkdtemp(prefix="jadart-")
-            target = resolve_input(args.libapp, workdir)
+            src = open_source(args.libapp)
         except InputError as e:
-            shutil.rmtree(workdir, ignore_errors=True)
             return _fail(e)
-        if target != args.libapp:
-            print(comment(f"// {os.path.basename(target)} from "
-                          f"{os.path.basename(args.libapp)}"), file=sys.stderr)
+        if src.member:
+            print(comment(f"// {os.path.basename(src.member)} from "
+                          f"{os.path.basename(src.origin)}"), file=sys.stderr)
             # Keep the container itself. `export` unpacks the assets and the Android side
-            # out of it, and once libapp is rewritten to the extracted path there is no
-            # way back to the apk it came from.
-            args.container = args.libapp
-            args.libapp = target
+            # out of it, and the Source carries only the member it read.
+            args.container = src.origin
+        args.libapp = src
 
     try:
         return args.func(args)
@@ -1229,9 +1225,6 @@ def main(argv=None) -> int:
               "  Re-run with JADART_DEBUG=1 for the traceback, and please report it:\n"
               "  https://github.com/IR0NBYTE/Jadart/issues", file=sys.stderr)
         return EXIT_INTERNAL
-    finally:
-        if workdir:
-            shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
