@@ -1901,6 +1901,32 @@ def test_xrefs_explicit_function_kind():
     assert doc["pattern"] == "benchCheckSecret"
 
 
+def test_xrefs_legacy_function_kind(xrefs_cli, capsys):
+    import json
+    import io
+    import contextlib
+
+    cli = xrefs_cli
+    buf = io.StringIO()
+
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "benchCheckSecret",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "function"
+    assert doc["pattern"] == "benchCheckSecret"
+    assert "exact" not in doc
+    assert "resolved as function" in capsys.readouterr().err
+
+
 def test_xrefs_ambiguous_pattern_requires_explicit_kind():
     import json
     import io

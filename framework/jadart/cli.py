@@ -592,7 +592,7 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
     from .disasm import named_ranges
     from .callgraph import callers_of
     try:
-        ranges = named_ranges(image, fr, args.pattern)
+        ranges = named_ranges(image, fr, pattern)
     except JadartError:
         # The pattern names nothing this binary can offer. A bug in named_ranges is a
         # different thing and belongs in main's internal-error path, not silently in None.
