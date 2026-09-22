@@ -159,15 +159,20 @@ class InstrImage:
                                # has to know when it is not looking at arm64
 
 
-def load_instructions(path: str):
+def load_instructions(path):
     """Parse the isolate instructions image + table and build owner_ref -> CodeRange.
     Returns (image, fr, hdr): the InstrImage, the FillResult from walk_fill, and the
-    parsed snapshot header."""
+    parsed snapshot header.
+
+    `path` is anything source.open_source accepts: a binary, a directory, an APK or IPA,
+    or a Source already read out of one."""
     from .snapshot import parse_blob
     from .clusters import walk_alloc
     from .fillwalk import walk_fill
+    from .source import read_binary
 
-    raw = open(path, "rb").read()
+    src = read_binary(path)
+    raw = src.data
     elf = open_container(raw)
     data = elf.symbol_bytes("_kDartIsolateSnapshotData")
     text = elf.symbol_bytes("_kDartIsolateSnapshotInstructions")
