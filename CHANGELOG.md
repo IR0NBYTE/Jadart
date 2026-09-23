@@ -13,6 +13,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`export` works on every input the other commands take.** Pointing it at a directory
+  exited 3, the code that says the defect is in this program rather than in the file, with
+  `KeyError: 'resources'`. The summary decided whether to describe the container by reading
+  `c["assets"] or c["resources"] or c["native"]`, and no version of `unpack` has ever
+  returned the last two. A container with assets never noticed, because `or` stops at the
+  first truthy value; anything with none of them reached the second key and raised. That
+  is a directory, and also an APK carrying no `flutter_assets`, which the report did not
+  mention. A bare `.so` was never affected, because the CLI passes no container for one at
+  all, and the report was wrong to say so. The test is now `c["members"]`, which is the same one
+  `container.py` uses to decide whether to write `container.txt`, so the summary block and
+  the file it points the reader at agree rather than being gated on different things. Two
+  tests: one exports from all four inputs and checks that the block and the file appear
+  together or not at all, the other compares the keys the summary reads against the keys
+  the container walk writes, because `or` will hide the next wrong name exactly as it hid
+  this one. While fixing it: the summary named `assets/` on a container that carried none,
+  which is a path that is never created, and `jadart export` has always guarded the same
+  line on the terminal. It reads `1 member` rather than `1 members` now too, which only
+  became reachable once a single member container stopped crashing. Closes #25.
 - **G13 checks something now.** It sat in the Tier B table on every run, hardcoded to pass
   with zero checks, waiting for a "both snapshots present" case that `verify_file` never
   produced. It now parses the vm header alongside the isolate one and compares the vm
