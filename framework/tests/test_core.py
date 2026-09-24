@@ -5413,6 +5413,76 @@ def test_measure_readme_block_needs_the_markers_and_forgives_trailing_space():
         assert "disagrees" in measure.check_readme_perf_block(readme)[0]
 
 
+def test_export_takes_every_input_the_other_commands_take():
+    # `export` accepts whatever the rest of the CLI accepts, and on two of them it used to
+    # exit 3, the code that says the defect is in this program. A directory reaches
+    # `unpack`, which returns a container holding nothing, and the summary then read two
+    # keys of it that do not exist; an apk carrying no flutter_assets reached the same line
+    # for the same reason, because it is only reached when the asset count is zero. A bare
+    # .so was never affected, since the CLI passes no container for one at all, and it is
+    # here to keep it that way.
+    import subprocess
+    import tempfile
+    import zipfile
+    with open(CLEAN, "rb") as fh:
+        raw = fh.read()
+    root = os.path.dirname(os.path.dirname(os.path.dirname(CLEAN)))
+    with tempfile.TemporaryDirectory() as tmp:
+        bare = os.path.join(tmp, "bare.apk")
+        with zipfile.ZipFile(bare, "w") as z:
+            z.writestr("lib/arm64-v8a/libapp.so", raw)      # no flutter_assets at all
+            z.writestr("AndroidManifest.xml", b"")
+        full = os.path.join(tmp, "full.apk")
+        with zipfile.ZipFile(full, "w") as z:
+            z.writestr("lib/arm64-v8a/libapp.so", raw)
+            z.writestr("assets/flutter_assets/AssetManifest.json", b'{"a.png":["a.png"]}')
+            z.writestr("assets/flutter_assets/a.png", b"\x89PNG\r\n\x1a\n")
+
+        env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(__file__)))
+        for label, target in (("directory", root), ("bare .so", CLEAN),
+                              ("apk, no assets", bare), ("apk, with assets", full)):
+            # only a real container has members, and only members earn the block
+            expect_container = label.startswith("apk")
+            out = os.path.join(tmp, "out", label.replace(", ", "_").replace(" ", "_"))
+            p = subprocess.run([sys.executable, "-m", "jadart", "export", target, "-o", out, "-q"],
+                               capture_output=True, env=env)
+            assert p.returncode == 0, (label, p.stderr[-500:])
+            summary = open(os.path.join(out, "summary.txt")).read()
+            said = any(ln.startswith("Container:") for ln in summary.splitlines())
+            wrote = os.path.exists(os.path.join(out, "container.txt"))
+            # the summary block is what points the reader at container.txt, so the two
+            # have to agree: describing a file nobody wrote is the same defect backwards
+            assert said == wrote == expect_container, (label, said, wrote, expect_container)
+
+
+def test_export_reads_only_keys_the_container_walk_writes():
+    # The crash above was one key name, and nothing would have caught a second one: the
+    # summary reads the stats dict by hand, and `or` short-circuits past a bad name for as
+    # long as an earlier key happens to be truthy. So the two halves are compared directly.
+    # unpack returns ONE shape for every input, which is the property that makes this a
+    # fair comparison; the test states that first.
+    import re
+    import tempfile
+    import zipfile
+    from jadart.container import unpack
+    shapes = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        empty = os.path.join(tmp, "empty.zip")
+        zipfile.ZipFile(empty, "w").close()
+        for label, target in (("directory", os.path.dirname(os.path.dirname(os.path.dirname(CLEAN)))),
+                              ("bare .so", CLEAN), ("missing", os.path.join(tmp, "nope")),
+                              ("empty zip", empty)):
+            shapes[label] = tuple(sorted(unpack(target, os.path.join(tmp, "o", label))))
+        assert len(set(shapes.values())) == 1, f"unpack returns more than one shape: {shapes}"
+
+    written = set(next(iter(shapes.values())))
+    src = os.path.join(os.path.dirname(__file__), "..", "jadart", "export.py")
+    with open(src) as fh:
+        read = set(re.findall(r"""\bc\[['"]([a-z_]+)['"]\]""", fh.read()))
+    assert not (read - written), (
+        f"export.py reads container keys unpack never writes: {sorted(read - written)}")
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

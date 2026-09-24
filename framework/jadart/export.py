@@ -292,10 +292,19 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     stats["selectors"] = len(selectors or {})
 
     from .container import unpack
-    # A directory or a bare .so resolves to a "container" that holds nothing to unpack.
-    # Reporting `0 files` three times reads as a failure; having no container is not one.
+    # A directory resolves to a "container" that holds nothing to unpack. Reporting
+    # `0 files` three times reads as a failure; having no container is not one.
+    #
+    # `members` is the test because it is the same one container.py uses to decide whether
+    # to write container.txt, and the summary block below is what points the reader at
+    # that file. Gating the two on different things is how you get a summary that describes
+    # a file nobody wrote, or a file nothing mentions. The previous test read `resources`
+    # and `native`, which no version of unpack has ever returned. A container with assets
+    # never noticed, because `or` stops at the first truthy value; a directory, or an apk
+    # carrying no flutter_assets, reached the second name and exited 3, which claims a bug
+    # in jadart rather than naming the input.
     c = unpack(container, outdir) if container else None
-    stats["container"] = c if c and (c["assets"] or c["resources"] or c["native"]) else None
+    stats["container"] = c if c and c["members"] else None
 
     with open(os.path.join(outdir, "summary.txt"), "w", **TEXT_OUT) as fh:
         fh.write(f"source      {label or path}\n")
@@ -317,16 +326,22 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
 
         c = stats.get("container")
         if c:
-            fh.write(f"\nContainer:  {c['members']} members, "
+            fh.write(f"\nContainer:  {c['members']} "
+                     f"member{'' if c['members'] == 1 else 's'}, "
                      f"{c['bytes'] / 1e6:.1f} MB uncompressed\n")
-            fh.write(f"  assets      {c['assets']} files "
-                     f"({c['assets_bytes'] / 1e6:.1f} MB) -> assets/\n")
-            if c["declared_assets"]:
-                fh.write(f"              {c['declared_assets']} declared in "
-                         f"AssetManifest\n")
-            if c["packages"]:
-                fh.write(f"  packages    {c['packages']} third-party packages named in "
-                         f"NOTICES -> assets/dependencies.txt\n")
+            # assets/ is only created when something is written into it, so naming it
+            # here on a container that carried none sends the reader to a path that does
+            # not exist. `jadart export` prints the same summary to the terminal and has
+            # always guarded it this way; this is the file catching up.
+            if c["assets"]:
+                fh.write(f"  assets      {c['assets']} files "
+                         f"({c['assets_bytes'] / 1e6:.1f} MB) -> assets/\n")
+                if c["declared_assets"]:
+                    fh.write(f"              {c['declared_assets']} declared in "
+                             f"AssetManifest\n")
+                if c["packages"]:
+                    fh.write(f"  packages    {c['packages']} third-party packages named in "
+                             f"NOTICES -> assets/dependencies.txt\n")
             if c["notable"]:
                 fh.write(f"  worth a look: {', '.join(c['notable'][:6])}"
                          f"{' ...' if len(c['notable']) > 6 else ''}\n")

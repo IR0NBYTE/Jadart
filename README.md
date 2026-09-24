@@ -394,7 +394,7 @@ docs/                 usage, support, and the Flutter internals explainer
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 201 tests
+cd framework && python3 -m pytest tests -q     # 203 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
