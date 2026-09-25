@@ -852,40 +852,23 @@ def _xrefs_filter_class(fr, hdr, refs, class_name):
     if class_ref is None:
         return None, 0
 
+    owner_by_ref = {
+        ref: owner_ref
+        for ref, _name_ref, owner_ref, _kind_tag in fr.functions
+    }
+
     filtered = {}
     unattributed = 0
 
     for off, ranges in refs.items():
         keep = []
+
         for cr in ranges:
             if cr.owner_ref < 0:
                 unattributed += 1
                 continue
 
-            owner_by_ref = {
-                ref: owner_ref
-                for ref, _name_ref, owner_ref, _kind_tag in fr.functions
-            }
-
-            filtered = {}
-            unattributed = 0
-
-            for off, ranges in refs.items():
-                keep = []
-                for cr in ranges:
-                    if cr.owner_ref < 0:
-                        unattributed += 1
-                        continue
-
-                    owner = owner_by_ref.get(cr.owner_ref)
-                    if owner is None:
-                        unattributed += 1
-                    elif owner == class_ref:
-                         keep.append(cr)
-
-                if keep:
-                    filtered[off] = keep
-
+            owner = owner_by_ref.get(cr.owner_ref)
             if owner is None:
                 unattributed += 1
             elif owner == class_ref:

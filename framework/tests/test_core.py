@@ -2380,6 +2380,121 @@ def test_xrefs_string_class_filter():
     assert doc["entries"] == []
 
 
+def test_xrefs_class_filter_does_not_duplicate_last_matching_reference(monkeypatch):
+    from types import SimpleNamespace
+    from jadart import cli
+
+    class_ref = 100
+
+    import importlib
+
+    program_module = importlib.import_module("jadart.program")
+    monkeypatch.setattr(
+        program_module,
+        "build_program",
+        lambda _fr, _hdr: SimpleNamespace(
+            classes=[SimpleNamespace(ref=class_ref, name="ImageShader")]
+        ),
+    )
+
+    fr = SimpleNamespace(
+        functions=[
+            (1, 0, 200, 0),  # belongs to another class
+            (2, 0, class_ref, 0),  # matching ImageShader reference, deliberately last
+        ]
+    )
+    hdr = SimpleNamespace()
+
+    first = SimpleNamespace(pc_offset=1000, owner_ref=1)
+    matching = SimpleNamespace(pc_offset=2000, owner_ref=2)
+
+    refs = {0x1234: [first, matching]}
+
+    filtered, unattributed = cli._xrefs_filter_class(
+        fr, hdr, refs, "ImageShader"
+    )
+
+    assert unattributed == 0
+    assert list(filtered) == [0x1234]
+    assert filtered[0x1234] == [matching]
+    assert len(filtered[0x1234]) == 1
+
+
+def _pool_xrefs_by_disassembly(image, offsets):
+    from jadart.disasm import disassemble_range, _mem_base_disp, _add_imm_from_pp
+    want = set(offsets)
+    out = {off: [] for off in want}
+    for cr in image.all_ranges:
+        far_base, seen = {}, set()
+        for _addr, mn, op in disassemble_range(image, cr):
+            op = op or ""
+            if mn in ("ldr", "ldur"):
+                md = _mem_base_disp(op)
+                off = None
+                if md and md[0] == "x27":
+                    off = md[1]
+                elif md and md[0] in far_base:
+                    off = far_base[md[0]] + md[1]
+                if off is not None and off in want and off not in seen:
+                    seen.add(off)
+                    out[off].append(cr)
+            fb = _add_imm_from_pp(op) if mn == "add" else None
+            if fb is not None:
+                far_base[fb[0]] = fb[1]
+            elif far_base:
+                far_base.pop(op.split(",", 1)[0].strip(), None)
+    return out
+
+
+def test_pool_xrefs_word_scan_matches_the_disassembly():
+    if not _capstone_available():
+        _skip("test_pool_xrefs_word_scan_matches_the_disassembly (no capstone)")
+    from jadart.disasm import load_instructions, build_pool_map, pool_xrefs
+
+    for path in (CLEAN, OBF):
+        image, fr, _hdr = load_instructions(path)
+        pool = build_pool_map(fr, image.arch)
+        scan = pool_xrefs(image, pool)
+        ref = _pool_xrefs_by_disassembly(image, pool)
+        assert sum(len(v) for v in ref.values()) > 1000, "the fixtures load their pools"
+        for off in pool:
+            assert ([c.pc_offset for c in scan[off]]
+                    == [c.pc_offset for c in ref[off]]), (path, hex(off))
+
+
+def test_pool_xrefs_word_scan_drops_a_clobbered_base():
+    import struct
+    from jadart.disasm import InstrImage, CodeRange, pool_xrefs, UnsupportedArch
+    from jadart import versions
+
+    add_far = 0x91400770
+    ldr_far = 0xF9400600
+    ldr_near = 0xF9400B61
+
+    def refs(*words):
+        text = struct.pack(f"<{len(words)}I", *words)
+        whole = CodeRange(pc_offset=0, size=len(text), owner_ref=-1)
+        img = InstrImage(text=text, pcs=[0], first_code=0, code_ranges={},
+                         all_ranges=[whole], arch=versions.Arch("arm64", 8, True))
+        got = pool_xrefs(img, [0x10, 0x1008])
+        return {off for off, crs in got.items() if crs}
+
+    assert refs(add_far, ldr_far) == {0x1008}
+    assert refs(ldr_near) == {0x10}
+    assert refs(add_far, 0xAA0103F0, ldr_far) == set(), "mov x16, x1 drops the base"
+    assert refs(add_far, 0x2A0103F0, ldr_far) == set(), "mov w16, w1 drops it too"
+    assert refs(add_far, 0xD503201F, ldr_far) == {0x1008}, "a nop leaves it alone"
+
+    img = InstrImage(text=b"\x00" * 16, pcs=[0], first_code=0, code_ranges={},
+                     all_ranges=[CodeRange(pc_offset=0, size=16, owner_ref=-1)],
+                     arch=versions.Arch("arm", 4, False))
+    try:
+        pool_xrefs(img, [0x10])
+        assert False, "arm32 must be refused, not answered with nothing"
+    except UnsupportedArch as e:
+        assert "arm64" in str(e)
+
+
 def test_json_output_is_one_parseable_document():
     # `-j` is what makes this composable with everything else a reverse engineer already
     # runs. One object per invocation, never a stream, so a caller can json.load it whole.

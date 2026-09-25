@@ -658,6 +658,57 @@ def render_body(dis, pc_to_name: dict, pool_map: dict | None = None, indent: str
     return lines
 
 
+_PP = 27
+
+_PP_WORD = re.compile(
+    b"(?=[\x60-\x7f]["
+    + b"".join(re.escape(bytes([b])) for b in range(256) if b & 3 == 3)
+    + b"].["
+    + b"".join(re.escape(bytes([b])) for b in
+               (0x38, 0x39, 0x3c, 0x3d, 0x78, 0x79, 0x7c, 0x7d,
+                0xb8, 0xb9, 0xbc, 0xbd, 0xf8, 0xf9, 0xfc, 0xfd, 0x91))
+    + b"])", re.S)
+
+
+def _word_load(w: int):
+    size, v, opc = w >> 30, (w >> 26) & 1, (w >> 22) & 3
+    if not v:
+        if opc != 1 or size < 2:
+            return None
+        scale = size
+    elif opc == 1:
+        scale = size
+    elif opc == 3 and size == 0:
+        scale = 4
+    else:
+        return None
+    rn = (w >> 5) & 31
+    if (w & 0x3B000000) == 0x39000000:
+        return rn, ((w >> 10) & 0xFFF) << scale
+    if (w & 0x3B200000) == 0x38000000:
+        mode = (w >> 10) & 3
+        if mode == 2:
+            return None
+        if mode == 1:
+            return rn, 0
+        imm9 = (w >> 12) & 0x1FF
+        return rn, imm9 - 0x200 if imm9 & 0x100 else imm9
+    return None
+
+
+def _word_add_pp(w: int):
+    if (w & 0xFF8003E0) != 0x91000000 | _PP << 5:
+        return None
+    imm = (w >> 10) & 0xFFF
+    return w & 31, imm << 12 if w & (1 << 22) else imm
+
+
+def _word_dest(w: int):
+    if (w >> 25) & 7 in (4, 5) or (w >> 26) & 7 == 4:
+        return w & 31
+    return None
+
+
 def pool_xrefs(image: InstrImage, offsets) -> dict:
     """Which functions load these ObjectPool entries: `{pool offset: [CodeRange, ...]}`.
 
@@ -673,34 +724,57 @@ def pool_xrefs(image: InstrImage, offsets) -> dict:
     A far base is only a pool base until something overwrites that register. Tracking the
     `add` without tracking the clobber attributes the string to whatever function happens to
     reload that register later, a spill restore ~250 bytes on, and the answer to "what uses
-    this string" comes back three-quarters wrong. `annotate` already does this correctly, so
-    the two share `_add_imm_from_pp`/`_mem_base_disp` rather than keeping second copies that
-    can drift apart again.
+    this string" comes back three-quarters wrong.
     """
     want = set(offsets)
     out = {off: [] for off in want}
-    for cr in image.all_ranges:
-        dis = disassemble_range(image, cr)
-        if not dis:
+    arch = getattr(image, "arch", None)
+    arch_name = arch.name if arch is not None else "arm64"
+    if arch_name != "arm64":
+        raise UnsupportedArch(
+            f"finding pool loads is implemented for arm64, and this snapshot is "
+            f"{arch_name}. Its strings still read: `jadart strings` comes from the "
+            f"snapshot rather than from the code.")
+    ranges = image.all_ranges
+    if not want or not ranges:
+        return out
+    text = image.text
+    starts = [cr.pc_offset for cr in ranges]
+    word = struct.Struct("<I").unpack_from
+    hits = {}
+
+    for m in _PP_WORD.finditer(text):
+        pos = m.start()
+        if pos & 3:
             continue
-        far_base, seen = {}, set()
-        for _addr, mn, op in dis:
-            op = op or ""
-            if mn in ("ldr", "ldur"):
-                # Resolve off the memory operand, never off "is x27 anywhere in the text":
-                # that also matches `ldr x27, [x0, #8]`, where x27 is the destination.
-                md = _mem_base_disp(op)
-                off = None
-                if md and md[0] == "x27":
-                    off = md[1]
-                elif md and md[0] in far_base:
-                    off = far_base[md[0]] + md[1]
-                if off is not None and off in want and off not in seen:
-                    seen.add(off)
-                    out[off].append(cr)
-            fb = _add_imm_from_pp(op) if mn == "add" else None
+        i = bisect.bisect_right(starts, pos) - 1
+        if i < 0 or pos >= starts[i] + ranges[i].size:
+            continue
+        w = word(text, pos)[0]
+        ld = _word_load(w)
+        if ld is not None:
+            if ld[0] == _PP and ld[1] in want:
+                hits.setdefault(ld[1], set()).add(i)
+            continue
+        fb = _word_add_pp(w)
+        if fb is None or fb[0] == _PP:
+            continue
+        reg, hi = fb
+        end = min(starts[i] + ranges[i].size, len(text) - 3)
+        q = pos + 4
+        while q < end:
+            v = word(text, q)[0]
+            ld = _word_load(v)
+            if ld is not None and ld[0] == reg and hi + ld[1] in want:
+                hits.setdefault(hi + ld[1], set()).add(i)
+            fb = _word_add_pp(v)
             if fb is not None:
-                far_base[fb[0]] = fb[1]
-            elif far_base:
-                far_base.pop(op.split(",", 1)[0].strip(), None)
+                if fb[0] == reg:
+                    break
+            elif _word_dest(v) == reg:
+                break
+            q += 4
+
+    for off, idx in hits.items():
+        out[off] = [ranges[i] for i in sorted(idx)]
     return out
