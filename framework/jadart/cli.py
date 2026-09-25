@@ -577,7 +577,7 @@ def cmd_strings(args) -> int:
     return EXIT_OK
 
 
-def _xrefs_to_function(args, image, fr) -> int | None:
+def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
     """`xrefs` when the pattern names a function rather than a pool entry: report the
     call sites. Returns an exit code, or None if the pattern names no function.
 
@@ -586,10 +586,12 @@ def _xrefs_to_function(args, image, fr) -> int | None:
     tried first because a string is the more specific ask; a bare name that matches both
     reports both.
     """
+    pattern = args.pattern if pattern is None else pattern
+
     from .disasm import named_ranges
     from .callgraph import callers_of
     try:
-        ranges = named_ranges(image, fr, args.pattern)
+        ranges = named_ranges(image, fr, pattern)
     except JadartError:
         # The pattern names nothing this binary can offer. A bug in named_ranges is a
         # different thing and belongs in main's internal-error path, not silently in None.
@@ -618,7 +620,7 @@ def _xrefs_to_function(args, image, fr) -> int | None:
     total = sum(len(f["called_by"]) for f in fns)
     virt = sum(len(f["may_be_called_by"]) for f in fns)
     if getattr(args, "json", False):
-        return emit({"ok": True, "pattern": args.pattern, "kind": "function",
+        return emit({"ok": True, "pattern": pattern, "kind": "function",
                      "count": len(fns), "call_sites": total, "virtual_call_sites": virt,
                      "functions": fns})
     for f in fns:
@@ -780,49 +782,278 @@ def cmd_ffi(args) -> int:
     return EXIT_OK
 
 
+def _xrefs_usage(args, message):
+    if getattr(args, "json", False):
+        return emit({"ok": False, "error": message}, EXIT_USAGE)
+    error(message)
+    return EXIT_USAGE
+
+
+def _xrefs_miss(args, needle, kind, message, exact=None, unattributed=0):
+    if getattr(args, "json", False):
+        result = {
+            "ok": False,
+            "pattern": needle,
+            "kind": kind,
+            "count": 0,
+            "entries": [],
+        }
+        if kind == "string" and exact is not None:
+            result["exact"] = exact
+        if unattributed:
+            result["unattributed"] = unattributed
+        return emit(result, EXIT_MISS)
+    error(message)
+    return EXIT_MISS
+
+
+def _xrefs_exact(args, kind, legacy):
+    return getattr(args, "exact", False) if kind == "string" and not legacy else None
+
+
+def _xrefs_pool_matches(pool, kind, needle, exact=False):
+    if kind == "pool":
+        try:
+            addr = int(needle, 0)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid pool offset: {needle!r}")
+        return {off: lab for off, lab in pool.items() if off == addr}, addr
+
+    if kind == "string":
+        if exact:
+            return (
+                {
+                    off: lab for off, lab in pool.items()
+                    if lab == needle or lab == f'"{needle}"'
+                },
+                None,
+            )
+        return (
+            {off: lab for off, lab in pool.items() if needle in lab},
+            None,
+        )
+
+    try:
+        addr = int(needle, 0)
+    except (TypeError, ValueError):
+        addr = None
+
+    if addr is not None:
+        return {off: lab for off, lab in pool.items() if off == addr}, addr
+
+    return {off: lab for off, lab in pool.items() if needle in lab}, None
+
+
+def _xrefs_filter_class(fr, hdr, refs, class_name):
+    from .program import build_program
+
+    prog = build_program(fr, hdr)
+    class_ref = next((k.ref for k in prog.classes if k.name == class_name), None)
+    if class_ref is None:
+        return None, 0
+
+    owner_by_ref = {
+        ref: owner_ref
+        for ref, _name_ref, owner_ref, _kind_tag in fr.functions
+    }
+
+    filtered = {}
+    unattributed = 0
+
+    for off, ranges in refs.items():
+        keep = []
+
+        for cr in ranges:
+            if cr.owner_ref < 0:
+                unattributed += 1
+                continue
+
+            owner = owner_by_ref.get(cr.owner_ref)
+            if owner is None:
+                unattributed += 1
+            elif owner == class_ref:
+                keep.append(cr)
+
+        if keep:
+            filtered[off] = keep
+
+    return filtered, unattributed
+
+
+def _xrefs_entries(matches, refs):
+    return [
+        {
+            "pool_offset": off,
+            "entry": matches[off],
+            "referenced_by": [
+                {"pc_offset": cr.pc_offset, "size": cr.size}
+                for cr in refs.get(off, ())
+            ],
+        }
+        for off in sorted(matches)
+        if refs.get(off)
+    ]
+
+
 def cmd_xrefs(args) -> int:
-    """Which functions load a given string or pool entry, or call a given function."""
+    """Which functions load a string/pool entry, or call a function."""
     from .disasm import load_instructions, build_pool_map, pool_xrefs
+
+    kinds = ("string", "pool", "function")
+    exact = getattr(args, "exact", False)
+    class_name = getattr(args, "class_name", None)
+
+    if args.kind_or_pattern is None:
+        return _xrefs_usage(args, "xrefs needs a PATTERN or KIND PATTERN")
+
+    legacy = args.pattern is None
+    kind = None if legacy else args.kind_or_pattern
+    needle = args.kind_or_pattern if legacy else args.pattern
+
+    if legacy:
+        if needle in kinds:
+            return _xrefs_usage(
+                args, f"xrefs kind {needle!r} needs a PATTERN"
+            )
+        if exact:
+            return _xrefs_usage(
+                args, "--exact requires an explicit string kind"
+            )
+    else:
+        if kind not in kinds:
+            return _xrefs_usage(
+                args,
+                f"invalid xrefs kind {kind!r}; choose string, pool, or function",
+            )
+        if exact and kind != "string":
+            return _xrefs_usage(
+                args, "--exact is only valid with xrefs kind string"
+            )
+        if class_name and kind == "function":
+            return _xrefs_usage(
+                args, "--class is not supported for function xrefs"
+            )
+
     try:
         image, fr, hdr = load_instructions(args.libapp)
     except JadartError as e:
         return _fail(e)
+
+    if kind == "function":
+        rc = _xrefs_to_function(args, image, fr, needle)
+        return rc if rc is not None else _xrefs_miss(
+            args,
+            needle,
+            "function",
+            f"nothing matching {needle!r}: "
+            "no function goes by that name or address",
+        )
+
     pool = build_pool_map(fr, getattr(image, "arch", None))
-    needle = args.pattern
-    addr = None
+
     try:
-        addr = int(needle, 0)
-    except ValueError:
-        pass
-    matches = {off: lab for off, lab in pool.items()
-               if (addr is not None and off == addr) or (addr is None and needle in lab)}
-    if not matches:
-        rc = _xrefs_to_function(args, image, fr)
+        matches, addr = _xrefs_pool_matches(pool, kind, needle, exact)
+    except ValueError as e:
+        return _xrefs_usage(args, str(e))
+
+    if not matches and legacy:
+        rc = _xrefs_to_function(args, image, fr, needle)
         if rc is not None:
+            print(comment("// resolved as function"), file=sys.stderr)
             return rc
-        if getattr(args, "json", False):
-            return emit({"ok": False, "pattern": needle, "count": 0, "entries": []},
-                        EXIT_MISS)
-        error(f"nothing matching {needle!r}: no ObjectPool entry holds it, and no "
-              f"function goes by that name or address")
-        return EXIT_MISS
+
+    resolved_kind = (
+        kind if kind is not None else "pool" if addr is not None else "string"
+    )
+
+    if not matches:
+        return _xrefs_miss(
+            args,
+            needle,
+            resolved_kind,
+            f"nothing matching {needle!r}: no ObjectPool entry holds it, "
+            "and no function goes by that name or address",
+            exact=_xrefs_exact(args, resolved_kind, legacy),
+        )
 
     refs = pool_xrefs(image, matches)
-    entries = [{"pool_offset": off, "entry": matches[off],
-                "referenced_by": [{"pc_offset": c.pc_offset, "size": c.size}
-                                  for c in refs[off]]}
-               for off in sorted(matches)]
+
+    if legacy:
+        print(comment(f"// resolved as {resolved_kind}"), file=sys.stderr)
+
+    unattributed = 0
+    if class_name:
+        refs, unattributed = _xrefs_filter_class(
+            fr, hdr, refs, class_name
+        )
+        if refs is None:
+            return _xrefs_miss(
+                args,
+                needle,
+                resolved_kind,
+                f"class {class_name!r} was not found",
+                exact=_xrefs_exact(args, resolved_kind, legacy),
+            )
+
+    entries = _xrefs_entries(matches, refs)
+
+    if not entries:
+        if class_name and unattributed:
+            message = (
+                f"{unattributed} matching reference"
+                f"{'' if unattributed == 1 else 's'} could not be "
+                f"attributed to class {class_name!r}"
+            )
+        elif class_name:
+            message = (
+                f"nothing matching {needle!r} is referenced by "
+                f"class {class_name!r}"
+            )
+        else:
+            message = f"nothing matching {needle!r} was referenced"
+
+        return _xrefs_miss(
+            args,
+            needle,
+            resolved_kind,
+            message,
+            exact=_xrefs_exact(args, resolved_kind, legacy),
+            unattributed=unattributed if class_name else 0,
+        )
+
     if getattr(args, "json", False):
-        return emit({"ok": True, "pattern": needle, "count": len(entries),
-                     "entries": entries})
-    for e in entries:
-        print(comment(f"// pool_0x{e['pool_offset']:x}  {e['entry']}"))
-        if not e["referenced_by"]:
-            print(dim("    no direct loads found "
-                      "(reached through a closure or built at runtime)"))
-        for r in e["referenced_by"]:
-            size = dim(f"{r['size']} bytes")
-            print(f"    .text+0x{r['pc_offset']:<8x} {size}")
+        result = {
+            "ok": True,
+            "pattern": needle,
+            "kind": resolved_kind,
+            "count": len(entries),
+            "entries": entries,
+        }
+        if resolved_kind == "string" and not legacy:
+            result["exact"] = exact
+        if class_name:
+            result["unattributed"] = unattributed
+        return emit(result)
+
+    for entry in entries:
+        print(comment(
+            f"// pool_0x{entry['pool_offset']:x}  {entry['entry']}"
+        ))
+        for ref in entry["referenced_by"]:
+            print(
+                f"    .text+0x{ref['pc_offset']:<8x} "
+                f"{dim(str(ref['size']) + ' bytes')}"
+            )
+
+    if class_name and unattributed:
+        print(
+            dim(
+                f"    {unattributed} reference"
+                f"{'' if unattributed == 1 else 's'} could not be "
+                "attributed to a class"
+            )
+        )
+
     return EXIT_OK
 
 
@@ -844,6 +1075,7 @@ def cmd_verify(args) -> int:
                      "failed": [g.gate for g in rep.gates
                                 if not g.passed and not g.skipped]},
                     EXIT_OK if rep.supported else EXIT_MISS)
+
     print(rep.render(verbose=getattr(args, "verbose", False)))
     return EXIT_OK if rep.supported else EXIT_MISS
 
@@ -1043,23 +1275,52 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_strings)
 
     p = _add(sub, common, "xrefs", "what references a string, a pool entry or a function")
-    p.add_argument("pattern", metavar="STRING|0xOFFSET|FUNCTION",
-                   help="substring of a pool entry, a pool offset, or the name or "
-                        "address of a function whose call sites you want")
+    p.add_argument(
+        "kind_or_pattern",
+        metavar="KIND",
+        help="string, pool, or function",
+    )
+    p.add_argument(
+        "pattern",
+        nargs="?",
+        metavar="PATTERN",
+        help="string, pool offset, or function name/address",
+    )
+    p.add_argument(
+        "--exact",
+        action="store_true",
+        help="for string, match the pool entry exactly",
+    )
+    p.add_argument(
+        "--class",
+        dest="class_name",
+        metavar="NAME",
+        help="keep only references owned by this class",
+    )
     _add_sigs(p)
     p.set_defaults(func=cmd_xrefs)
 
-    p = _add(sub, common, "ffi", "the native boundary: shared objects and what is read out")
-    p.add_argument("--full", action="store_true",
-                   help="print the whole lifted body of each referencing function, not "
-                        "only the lines carrying a string literal")
+    p = _add(sub, common, "ffi",
+             "the native boundary: shared objects and what is read out")
+    p.add_argument(
+        "--full",
+        action="store_true",
+        help="print the whole lifted body of each referencing function, not "
+             "only the lines carrying a string literal",
+    )
     _add_sigs(p)
     p.set_defaults(func=cmd_ffi)
 
-    p = _add(sub, common, "verify", "byte-exact acceptance gates for the parse")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="print every gate, not just the verdict")
+    p = _add(sub, common, "verify",
+             "byte-exact acceptance gates for the parse")
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print every gate, not just the verdict",
+    )
     p.set_defaults(func=cmd_verify)
+
     return ap
 
 
@@ -1154,6 +1415,8 @@ def main(argv=None) -> int:
             parser.print_help()
             return EXIT_OK
         argv = _translate_legacy(argv)
+
+    args = parser.parse_args(argv)
 
     args = parser.parse_args(argv)
     console.configure(getattr(args, "color", "auto"))

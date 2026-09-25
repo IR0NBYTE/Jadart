@@ -137,6 +137,22 @@ is, by construction, the code somebody wrote for this app.
 
 ### xrefs now answers for functions too
 
+Explicit kinds are supported for strings, pool entries, and functions:
+
+```text
+jadart xrefs libapp.so string <pattern>
+jadart xrefs libapp.so string <pattern> --exact
+jadart xrefs libapp.so pool <offset>
+jadart xrefs libapp.so function <name-or-address>
+jadart xrefs libapp.so string <pattern> --class <Class>
+
+jadart xrefs libapp.so string sourdough
+jadart xrefs libapp.so string sourdough --exact
+jadart xrefs libapp.so pool 0xb618
+jadart xrefs libapp.so function Licence.check
+jadart xrefs libapp.so function 0x1a2b40
+jadart xrefs libapp.so string sourdough --class Licence
+
 `jadart xrefs` used to resolve ObjectPool entries only. On the corpus binary that is 349
 pool references against **34,979 direct calls**, so it answered about one call site in a
 hundred. It now also takes a function name or address and reports its call sites, the way
@@ -201,7 +217,7 @@ register, and the serialized dispatch table says which classes implement that se
 counted as opaque, which is what a closure call through a captured context genuinely is.
 
 ```
-$ jadart xrefs libapp.so createElement
+$ jadart xrefs libapp.so function createElement
 // createElement  .text+0xff398
   11 virtual call sites  (one of 18 implementations of this selector)
     .text+0x59fe4    636 bytes

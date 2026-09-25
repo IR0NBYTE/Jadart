@@ -14,12 +14,29 @@ from jadart.snapshot import parse_libapp, parse_blob, UnknownEpoch  # noqa: E402
 import struct  # noqa: E402
 import unittest  # noqa: E402
 import jadart  # noqa: E402
+import pytest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..", "..")
 CLEAN = os.path.join(ROOT, "flubench/artifacts/clean/lib/arm64-v8a/libapp.so")
 OBF = os.path.join(ROOT, "flubench/artifacts/obf/lib/arm64-v8a/libapp.so")
 KNOWN_HASH = "ace654289f5abc240509fc941453ebc5"
+@pytest.fixture(scope="module")
+def clean_loaded():
+    from jadart.disasm import load_instructions
+    return load_instructions(CLEAN)
 
+
+@pytest.fixture
+def xrefs_cli(monkeypatch, clean_loaded):
+    from jadart import cli
+    from jadart import disasm
+
+    monkeypatch.setattr(
+        disasm,
+        "load_instructions",
+        lambda _path: clean_loaded,
+    )
+    return cli
 
 def test_parses_both_snapshots():
     s = parse_libapp(CLEAN)
@@ -1983,6 +2000,424 @@ def test_pool_xrefs_finds_both_addressing_forms():
     from jadart.disasm import named_ranges
     want = {cr.pc_offset for _nm, cr in named_ranges(image, fr, "benchCheckSecret")}
     assert want & {c.pc_offset for c in refs}, "xref should point at benchCheckSecret"
+
+
+def test_xrefs_explicit_string_kind(xrefs_cli):
+    import json
+    import io
+    import contextlib
+    cli = xrefs_cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "string",
+            "FLUBENCH{str_literal_compare}",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "string"
+    assert doc["pattern"] == "FLUBENCH{str_literal_compare}"
+
+
+def test_xrefs_explicit_pool_kind():
+    import json
+    import io
+    import contextlib
+    from jadart import cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "pool",
+            "0x9760",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "pool"
+    assert doc["pattern"] == "0x9760"
+    assert doc["count"] == 1
+
+
+def test_xrefs_explicit_function_kind():
+    import json
+    import io
+    import contextlib
+    from jadart import cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "function",
+            "benchCheckSecret",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "function"
+    assert doc["pattern"] == "benchCheckSecret"
+
+
+def test_xrefs_legacy_function_kind(xrefs_cli, capsys):
+    import json
+    import io
+    import contextlib
+
+    cli = xrefs_cli
+    buf = io.StringIO()
+
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "benchCheckSecret",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "function"
+    assert doc["pattern"] == "benchCheckSecret"
+    assert "exact" not in doc
+    assert "resolved as function" in capsys.readouterr().err
+
+
+def test_xrefs_ambiguous_pattern_requires_explicit_kind():
+    import json
+    import io
+    import contextlib
+    from jadart import cli
+
+    # "Future." is both a pool-string substring and a function name.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "string",
+            "Future.",
+            "-j",
+        ])
+
+    string_doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert string_doc["ok"] is True
+    assert string_doc["kind"] == "string"
+    assert string_doc["count"] == 2
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "function",
+            "Future.",
+            "-j",
+        ])
+
+    function_doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert function_doc["ok"] is True
+    assert function_doc["kind"] == "function"
+    assert function_doc["count"] == 1
+    assert function_doc["functions"][0]["name"] == "Future."
+
+    # The legacy form remains supported and resolves this ambiguity
+    # using the existing legacy precedence.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()) as err:
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "Future.",
+            "-j",
+        ])
+
+    legacy_doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert legacy_doc["ok"] is True
+    assert legacy_doc["kind"] == "string"
+    assert legacy_doc["count"] == 2
+    assert "// resolved as string" in err.getvalue()
+
+
+def test_xrefs_explicit_function_no_match():
+    import json
+    import io
+    import contextlib
+    from jadart import cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "function",
+            "DefinitelyNotARealFunction",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc != 0
+    assert doc["ok"] is False
+    assert doc["kind"] == "function"
+    assert doc["pattern"] == "DefinitelyNotARealFunction"
+    assert doc["count"] == 0
+
+
+def test_xrefs_string_exact():
+    import json
+    import io
+    import contextlib
+    from jadart import cli
+
+    # Exact string should match.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "string",
+            "FLUBENCH{str_literal_compare}",
+            "--exact",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "string"
+    assert doc["exact"] is True
+    assert doc["count"] == 1
+
+    # A substring should NOT match with --exact.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "string",
+            "str_literal_compare",
+            "--exact",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc != 0
+    assert doc["ok"] is False
+    assert doc["kind"] == "string"
+    assert doc["exact"] is True
+
+
+def test_xrefs_invalid_arguments_are_usage_errors():
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    cases = [
+        (
+            ["xrefs", CLEAN, "func", "foo", "-j"],
+            "invalid xrefs kind",
+        ),
+        (
+            ["xrefs", CLEAN, "string", "-j"],
+            "needs a PATTERN",
+        ),
+        (
+            [
+                "xrefs",
+                CLEAN,
+                "function",
+                "benchCheckSecret",
+                "--class",
+                "Licence",
+                "-j",
+            ],
+            "--class is not supported",
+        ),
+        (
+            ["xrefs", CLEAN, "foo", "--exact", "-j"],
+            "--exact requires an explicit string kind",
+        ),
+        (
+            ["xrefs", CLEAN, "pool", "not-an-offset", "-j"],
+            "invalid pool offset",
+        ),
+    ]
+
+    for argv, message in cases:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(argv)
+
+        doc = json.loads(buf.getvalue())
+
+        assert rc == 2
+        assert doc["ok"] is False
+        assert message in doc["error"]
+
+
+def test_xrefs_legacy_does_not_report_exact():
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "Future.",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "string"
+    assert "exact" not in doc
+
+
+def test_xrefs_legacy_exact_is_usage_error():
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "Future.",
+            "--exact",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 2
+    assert doc["ok"] is False
+    assert "error" in doc
+
+
+def test_xrefs_string_class_filter():
+    import json
+    import io
+    import contextlib
+    from jadart import cli
+
+    # ImageShader owns a reference to this string.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "string",
+            "native peer has been collected",
+            "--class",
+            "ImageShader",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc == 0
+    assert doc["ok"] is True
+    assert doc["kind"] == "string"
+    assert doc["count"] == 1
+    assert len(doc["entries"]) == 1
+    assert len(doc["entries"][0]["referenced_by"]) == 1
+    assert doc["entries"][0]["referenced_by"][0]["pc_offset"] == 158500
+
+    # Matrix4 does not own a matching reference.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main([
+            "xrefs",
+            CLEAN,
+            "string",
+            "native peer has been collected",
+            "--class",
+            "Matrix4",
+            "-j",
+        ])
+
+    doc = json.loads(buf.getvalue())
+
+    assert rc != 0
+    assert doc["ok"] is False
+    assert doc["kind"] == "string"
+    assert doc["count"] == 0
+    assert doc["entries"] == []
+
+
+def test_xrefs_class_filter_does_not_duplicate_last_matching_reference(monkeypatch):
+    from types import SimpleNamespace
+    from jadart import cli
+
+    class_ref = 100
+
+    import importlib
+
+    program_module = importlib.import_module("jadart.program")
+    monkeypatch.setattr(
+        program_module,
+        "build_program",
+        lambda _fr, _hdr: SimpleNamespace(
+            classes=[SimpleNamespace(ref=class_ref, name="ImageShader")]
+        ),
+    )
+
+    fr = SimpleNamespace(
+        functions=[
+            (1, 0, 200, 0),  # belongs to another class
+            (2, 0, class_ref, 0),  # matching ImageShader reference, deliberately last
+        ]
+    )
+    hdr = SimpleNamespace()
+
+    first = SimpleNamespace(pc_offset=1000, owner_ref=1)
+    matching = SimpleNamespace(pc_offset=2000, owner_ref=2)
+
+    refs = {0x1234: [first, matching]}
+
+    filtered, unattributed = cli._xrefs_filter_class(
+        fr, hdr, refs, "ImageShader"
+    )
+
+    assert unattributed == 0
+    assert list(filtered) == [0x1234]
+    assert filtered[0x1234] == [matching]
+    assert len(filtered[0x1234]) == 1
 
 
 def _pool_xrefs_by_disassembly(image, offsets):

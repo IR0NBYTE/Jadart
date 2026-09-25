@@ -112,11 +112,20 @@ will bury the answer along with your context budget.
 | Show me the machine code | `jadart disasm <path> <symbol>` |
 | What text does it contain? | `jadart strings <path> -g <pattern>` |
 | What data tables are embedded? | `jadart constants <path>` |
-| Who touches this string or function? | `jadart xrefs <path> <what>` |
+| Who touches this string or function? | `jadart xrefs <path> <kind> <what>` |
 | What are the virtual calls really calling? | `jadart selectors <path>` |
 | What native code does it reach into? | `jadart ffi <path>` |
 | Did the parse actually work? | `jadart verify <path>` |
 | I want the whole tree on disk | `jadart export <path> <outdir>` |
+
+`xrefs` accepts an explicit kind:
+
+```text
+jadart xrefs <path> string <pattern>
+jadart xrefs <path> string <pattern> --exact
+jadart xrefs <path> pool <offset>
+jadart xrefs <path> function <name-or-address>
+jadart xrefs <path> string <pattern> --class <Class>
 
 `jadart` takes an APK, an IPA, a directory or a bare `libapp.so` / `App.framework/App`.
 You do not need to unzip anything first.
@@ -142,7 +151,7 @@ against the format, not guessed at. If it refuses, believe it.
 
 ```
 jadart strings app.apk -g "<label the user sees>"
-jadart xrefs app.apk "<that string>"        # who references it
+jadart xrefs app.apk string "<that string>"        # who references it
 jadart decompile app.apk <the class it named>
 ```
 
@@ -168,7 +177,7 @@ Read the table lengths. They are the tell:
 Then find the code that reads the interesting one and lift it:
 
 ```
-jadart xrefs app.apk 0x<pool offset from constants>
+jadart xrefs app.apk pool 0x<pool offset from constants>
 jadart lift app.apk <the function that came back>
 ```
 
