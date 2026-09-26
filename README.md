@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 217](https://img.shields.io/badge/tests-217-brightgreen.svg)](#tests)
+[![tests: 222](https://img.shields.io/badge/tests-222-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -231,17 +231,17 @@ prices a script or an agent pays per call, not warm numbers.
 <!-- bench:start -->
 | workload | what it does | median | peak RSS |
 |---|---|---|---|
-| `info` | header and epoch only | 0.05 s | 26 MB |
-| `classes` | Tier 0 skeleton (snapshot layer only) | 0.11 s | 42 MB |
-| `strings` | the identifier pool | 0.11 s | 39 MB |
-| `functions` | the call graph over the whole image | 0.91 s | 67 MB |
-| `xrefs` | who loads this string | 0.67 s | 53 MB |
-| `export` | Tier 3 source tree for the whole binary | 4.67 s | 74 MB |
-| `exportobf` | the same on an --obfuscate build | 0.20 s | 48 MB |
-| `lift` | Tier 3 for every code range, digest included | 5.85 s | 74 MB |
+| `info` | header and epoch only | 0.04 s | 26 MB |
+| `classes` | Tier 0 skeleton (snapshot layer only) | 0.10 s | 42 MB |
+| `strings` | the identifier pool | 0.10 s | 38 MB |
+| `functions` | the call graph over the whole image | 0.46 s | 66 MB |
+| `xrefs` | who loads this string | 0.16 s | 50 MB |
+| `export` | Tier 3 source tree for the whole binary | 4.55 s | 73 MB |
+| `exportobf` | the same on an --obfuscate build | 0.19 s | 48 MB |
+| `lift` | Tier 3 for every code range, digest included | 5.75 s | 74 MB |
 
-Median of 5 fresh processes on the FluBench fixtures (clean 3.1 MB, obf 2.6 MB), Apple M4
-Max, Python 3.14.7, jadart 1.1.0, taken 2026-09-18 with `tools/bench.py --baseline`.
+Median of 7 fresh processes on the FluBench fixtures (clean 3.1 MB, obf 2.6 MB), Apple M4
+Max, Python 3.14.7, jadart 1.1.0, taken 2026-09-26 with `tools/bench.py --baseline`.
 
 `./check.sh --full` reruns these against the same file and fails when a median grows past
 1.5x its baseline or peak RSS past 1.25x, so the table cannot go stale quietly.
@@ -394,7 +394,7 @@ docs/                 usage, support, and the Flutter internals explainer
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 205 tests
+cd framework && python3 -m pytest tests -q     # 222 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```

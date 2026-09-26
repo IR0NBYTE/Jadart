@@ -6,8 +6,8 @@
     "arch": "arm64",
     "system": "Darwin 25.6.0"
   },
-  "taken": "2026-09-18",
-  "repetitions": 5,
+  "taken": "2026-09-26",
+  "repetitions": 7,
   "fixtures_mb": {
     "clean": 3.1,
     "obf": 2.6
@@ -15,43 +15,43 @@
   "workloads": {
     "info": {
       "doc": "header and epoch only",
-      "median_s": 0.046,
-      "peak_rss_mb": 26.5
+      "median_s": 0.04,
+      "peak_rss_mb": 26.1
     },
     "classes": {
       "doc": "Tier 0 skeleton (snapshot layer only)",
-      "median_s": 0.113,
-      "peak_rss_mb": 41.9
+      "median_s": 0.105,
+      "peak_rss_mb": 41.5
     },
     "strings": {
       "doc": "the identifier pool",
-      "median_s": 0.106,
-      "peak_rss_mb": 38.7
+      "median_s": 0.1,
+      "peak_rss_mb": 37.9
     },
     "functions": {
       "doc": "the call graph over the whole image",
-      "median_s": 0.905,
-      "peak_rss_mb": 67.2
+      "median_s": 0.458,
+      "peak_rss_mb": 66.4
     },
     "xrefs": {
       "doc": "who loads this string",
-      "median_s": 0.666,
-      "peak_rss_mb": 53.0
+      "median_s": 0.158,
+      "peak_rss_mb": 50.2
     },
     "export": {
       "doc": "Tier 3 source tree for the whole binary",
-      "median_s": 4.668,
-      "peak_rss_mb": 73.6
+      "median_s": 4.547,
+      "peak_rss_mb": 73.1
     },
     "exportobf": {
       "doc": "the same on an --obfuscate build",
-      "median_s": 0.198,
-      "peak_rss_mb": 48.1
+      "median_s": 0.191,
+      "peak_rss_mb": 47.9
     },
     "lift": {
       "doc": "Tier 3 for every code range, digest included",
-      "median_s": 5.853,
-      "peak_rss_mb": 74.0
+      "median_s": 5.754,
+      "peak_rss_mb": 74.3
     }
   }
 }

@@ -20,6 +20,8 @@ from .errors import JadartError
 import bisect
 import re
 import struct
+import sys
+from array import array
 from dataclasses import dataclass
 
 try:
@@ -256,9 +258,12 @@ def truncated_by(cr: CodeRange, dis, max_insns: int = MAX_INSNS) -> int:
     return max(0, (cr.size or 0) // 4 - len(dis))
 
 
-def disassemble_range(image: InstrImage, cr: CodeRange, max_insns: int = MAX_INSNS):
-    """Disassemble one CodeRange (used for full-image coverage, incl. anonymous
-    obfuscation-discarded functions where owner_ref is -1)."""
+def require_decoder(image: InstrImage) -> str:
+    """The architecture name, or the error that says why this image cannot be decoded.
+
+    Split out of disassemble_range so a caller that decodes only some ranges still fails
+    the way it did when it decoded all of them: up front, with the same message, rather
+    than succeeding on an image where it happened not to need the decoder this time."""
     if not _HAVE_CAPSTONE:
         # The import error, when there was one. "install capstone" is the wrong advice for
         # a user who installed it and hit an ABI mismatch, and the exception already knew.
@@ -281,6 +286,13 @@ def disassemble_range(image: InstrImage, cr: CodeRange, max_insns: int = MAX_INS
             f"{' and '.join(sorted(_DECODERS))}, and this snapshot is "
             f"{arch_name}. Its structure still reads: classes, libraries, strings and "
             f"selectors come from the snapshot rather than from the code.")
+    return arch_name
+
+
+def disassemble_range(image: InstrImage, cr: CodeRange, max_insns: int = MAX_INSNS):
+    """Disassemble one CodeRange (used for full-image coverage, incl. anonymous
+    obfuscation-discarded functions where owner_ref is -1)."""
+    arch_name = require_decoder(image)
     size = cr.size or 512
     code = image.text[cr.pc_offset:cr.pc_offset + size]
     md = _decoder(arch_name)
@@ -707,6 +719,87 @@ def _word_dest(w: int):
     if (w >> 25) & 7 in (4, 5) or (w >> 26) & 7 == 4:
         return w & 31
     return None
+
+
+# ---------------------------------------------------------------------------
+# Reading arm64 without a decoder
+# ---------------------------------------------------------------------------
+
+#: Byte tables for the candidate filter in A64Words. An arm64 word is little endian, so its
+#: top byte (the opcode class) is every fourth byte from offset 3, and Rn (bits 5-9) is
+#: split across bytes 0 and 1: its low three bits are byte 0's top three, its high two are
+#: byte 1's bottom two.
+_TOP_CALL = bytes(1 if (0x94 <= b <= 0x97 or b == 0xD6) else 0 for b in range(256))
+
+
+def _rn_tables(reg: int):
+    lo, hi = (reg & 7) << 5, reg >> 3
+    return (bytes(1 if (b & 0xE0) == lo else 0 for b in range(256)),
+            bytes(1 if (b & 0x03) == hi else 0 for b in range(256)))
+
+
+A64_DISPATCH = 21                      # the dispatch table; the object pool is _PP
+_RN_TABLES = (_rn_tables(_PP), _rn_tables(A64_DISPATCH))
+
+A64_BL = 0x94000000            # bl #imm26                  (w & 0xFC000000)
+A64_BLR = 0xD63F0000           # blr xN                      (w & 0xFFFFFC1F)
+
+
+def _word_loadstore(w: int) -> bool:
+    """Whether `w` sits in the arm64 load/store encoding group (op0 = x1x0)."""
+    return (w & 0x0A000000) == 0x08000000
+
+
+def _word_loads_x(w: int) -> bool:
+    """Whether `w` is a load _word_load reads that writes a 64-bit general register, the
+    only kind whose first operand capstone spells `xN`."""
+    return _word_load(w) is not None and not (w >> 26) & 1 and w >> 30 == 3
+
+
+class A64Words:
+    """The instruction image as 32-bit words, with the few that name a call or the object
+    pool found without decoding any of them.
+
+    Capstone turns every word into text so that a caller can parse the text back into
+    numbers. For a question like "which `bl`s are in this range" that is the whole cost and
+    none of the value: a `bl` is one fixed opcode with its target in the low 26 bits. So
+    the candidates are found with byte slicing and a regex, which run in C, and only those
+    words are looked at in Python, about one word in six on a real image.
+
+    A candidate is a `bl`, a `blr`, or any word whose Rn field is x27, the object pool
+    register, or x21, the dispatch table. That is deliberately broad: it catches every
+    load and add off either, plus words where those five bits mean something else. Callers
+    classify pool words with _word_load and _word_add_pp, the decoders pool_xrefs uses.
+    Those two agree with capstone's own text, in both directions, on every one of the
+    7,755,621 instructions in the sixteen arm64 binaries of the corpus.
+    """
+
+    def __init__(self, text: bytes):
+        n = len(text) // 4
+        body = memoryview(text)[:n * 4]
+        if sys.byteorder == "little":
+            # A view, not a copy: the image is already in memory once.
+            self.words = body.cast("I")
+        else:
+            self.words = array("I", body.tobytes())
+            self.words.byteswap()
+        b0, b1 = bytes(body[0::4]), bytes(body[1::4])
+        marks = int.from_bytes(bytes(body[3::4]).translate(_TOP_CALL), "little")
+        for lo, hi in _RN_TABLES:
+            marks |= (int.from_bytes(b0.translate(lo), "little")
+                      & int.from_bytes(b1.translate(hi), "little"))
+        marks = marks.to_bytes(n, "little") if n else b""
+        # An array rather than a list: 70,000 indexes as Python ints are 2.5 MB of peak
+        # memory that `jadart functions` never used to pay; as 32-bit slots, 0.3 MB.
+        self.candidates = array("I", (m.start() for m in re.finditer(b"\x01", marks)))
+
+    def window(self, pc_offset: int, nwords: int):
+        """(word index, word) for every candidate in `nwords` words from `pc_offset`."""
+        first = pc_offset // 4
+        lo = bisect.bisect_left(self.candidates, first)
+        hi = bisect.bisect_left(self.candidates, first + nwords)
+        words = self.words
+        return [(i, words[i]) for i in self.candidates[lo:hi]]
 
 
 def pool_xrefs(image: InstrImage, offsets) -> dict:
