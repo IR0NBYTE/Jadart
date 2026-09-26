@@ -5598,6 +5598,144 @@ def test_export_reads_only_keys_the_container_walk_writes():
         f"export.py reads container keys unpack never writes: {sorted(read - written)}")
 
 
+def test_the_call_graph_read_off_words_is_the_one_the_full_decode_builds():
+    # build_index decodes only the ranges that need operand text and reads every other
+    # `bl` straight off the instruction words. That is only worth having if the graph is
+    # the same one, so every field of the index, in order, is compared against the full
+    # sweep it replaced, with and without virtual sites. Making A64Words return nothing
+    # is how the full sweep is asked for: it is the path any non-arm64 image takes.
+    from jadart import callgraph
+    from jadart.disasm import load_instructions
+    for path in (CLEAN, OBF):
+        if not os.path.exists(path):
+            raise unittest.SkipTest(f"no fixture at {path}")
+        image, fr, _hdr = load_instructions(path)
+        for virtual in (True, False):
+            fast = callgraph.build_index(image, fr, virtual=virtual)
+            real = callgraph.A64Words
+            callgraph.A64Words = lambda text: None
+            try:
+                full = callgraph.build_index(image, fr, virtual=virtual)
+            finally:
+                callgraph.A64Words = real
+            for name in vars(full):
+                a, b = getattr(fast, name), getattr(full, name)
+                if isinstance(a, dict):
+                    a, b = list(a.items()), list(b.items())
+                label = "obf" if path == OBF else "clean"
+                assert a == b, f"{label} virtual={virtual}: {name} differs"
+
+
+def test_capstone_decodes_every_word_the_word_reader_reads():
+    # The word reader is exact on two facts, both measured on sixteen arm64 binaries from
+    # Dart 2.19.6 to 3.12.2 and held here on the fixtures. Capstone decodes every word of
+    # every range: were it to stop early, a `bl` after that point would be in the words and
+    # missing from the old graph. And _word_load and _word_add_pp say exactly what the
+    # decoded path reads out of capstone's text, for every instruction, in both directions.
+    import struct
+    from jadart.disasm import (load_instructions, disassemble_range, MAX_INSNS, _word_load,
+                               _word_add_pp, _mem_base_disp, _add_imm_from_pp)
+    reg = {**{f"x{i}": i for i in range(31)}, "sp": 31}
+    for path in (CLEAN, OBF):
+        if not os.path.exists(path):
+            raise unittest.SkipTest(f"no fixture at {path}")
+        image, _fr, _hdr = load_instructions(path)
+        for cr in image.all_ranges:
+            span = len(image.text[cr.pc_offset:cr.pc_offset + (cr.size or 512)])
+            dis = disassemble_range(image, cr)
+            assert len(dis) == min(span // 4, MAX_INSNS), cr
+            for addr, mn, op in dis:
+                w = struct.unpack_from("<I", image.text, addr)[0]
+                md = _mem_base_disp(op or "") if mn in ("ldr", "ldur") else None
+                assert _word_load(w) == ((reg[md[0]], md[1]) if md else None), (hex(addr), op)
+                fa = _add_imm_from_pp(op or "") if mn == "add" else None
+                assert _word_add_pp(w) == ((reg[fa[0]], fa[1]) if fa else None), (hex(addr), op)
+
+
+def test_the_word_reader_finds_what_a_full_scan_finds():
+    # A64Words finds its candidates with byte slicing and a regex rather than a loop, which
+    # is the whole speed of it and also the easy place to be off by one byte. Checked
+    # against the obvious word by word scan, and the load offsets against hand encodings.
+    import struct
+    from jadart.disasm import load_instructions, A64Words, _word_loads_x
+    if not os.path.exists(CLEAN):
+        raise unittest.SkipTest("no fixture")
+    image, _fr, _hdr = load_instructions(CLEAN)
+    words = A64Words(image.text)
+    every = struct.unpack_from(f"<{len(image.text) // 4}I", image.text)
+    want = [i for i, w in enumerate(every)
+            if (w & 0xFC000000) == 0x94000000 or (w >> 24) == 0xD6
+            or ((w >> 5) & 31) in (21, 27)]
+    assert list(words.candidates) == want
+    assert list(words.words) == list(every)
+
+    # the far-base forget rule keys on the first operand capstone prints, `xN` or not
+    ldr_x = 0xF9400000 | (3 << 10) | (27 << 5) | 1          # ldr x1, [x27, #24]
+    ldur_x = 0xF8400000 | (0x1F8 << 12) | (16 << 5) | 2     # ldur x2, [x16, #-8]
+    ldr_d = 0xFD400000 | (2 << 10) | (16 << 5) | 0          # ldr d0, [x16, #16]
+    ldr_w = 0xB9400000 | (1 << 10) | (27 << 5) | 3          # ldr w3, [x27, #4]
+    str_x = 0xF9000000 | (3 << 10) | (27 << 5) | 1          # str x1, [x27, #24]
+    assert _word_loads_x(ldr_x) and _word_loads_x(ldur_x)
+    assert not (_word_loads_x(ldr_d) or _word_loads_x(ldr_w) or _word_loads_x(str_x))
+
+
+def test_every_pool_load_width_is_read_off_the_word_and_a_store_is_not():
+    # The decoded path resolves any `ldr` or `ldur` off x27, whatever it loads into, and
+    # ignores a store. Dart reads the pool with a 64-bit ldr, so no fixture has the other
+    # widths, and a word reader that only knew that one shape would quietly skip a w or q
+    # load of a function entry. Pinned by hand instead.
+    import struct
+    from types import SimpleNamespace
+    from jadart.callgraph import _read_words
+    from jadart.disasm import A64Words, CodeRange
+    ldr_w = 0xB9400000 | (4 << 10) | (27 << 5) | 3          # ldr w3, [x27, #16]
+    ldr_q = 0x3DC00000 | (1 << 10) | (27 << 5) | 3          # ldr q3, [x27, #16]
+    ldr_x_hit = 0xF9400000 | (2 << 10) | (27 << 5) | 3      # ldr x3, [x27, #16]
+    ldr_x_miss = 0xF9400000 | (3 << 10) | (27 << 5) | 3     # ldr x3, [x27, #24]
+    str_x = 0xF9000000 | (2 << 10) | (27 << 5) | 3          # str x3, [x27, #16]
+
+    def need_pool(w):
+        text = struct.pack("<I", w)
+        cr = CodeRange(pc_offset=0, size=4, owner_ref=-1)
+        return _read_words(A64Words(text), SimpleNamespace(text=text), cr, {16}, False).need_pool
+
+    assert need_pool(ldr_x_hit), "a function entry goes to capstone"
+    assert need_pool(ldr_w) and need_pool(ldr_q), "so does one read at any width"
+    assert not need_pool(ldr_x_miss), "an offset that names nothing stays on the words"
+    assert not need_pool(str_x), "a store is not a reference, decoded or not"
+
+
+def test_the_far_pool_walk_forgets_only_what_the_decoded_walk_forgets():
+    # A far pool load is `add xD, x27, #hi` and later `ldr xT, [xD, #lo]`. The word walk
+    # may forget a base only where the decoded walk also would, or it misses a load the
+    # decoded walk resolves and the edge is lost. The decoded walk forgets xD when an
+    # instruction's first operand is spelled `xD`, so `ldr x16, ...` forgets x16 and
+    # `ldr w16, ...` does not. Neither fixture happens to contain the second shape, which is
+    # why this is built by hand rather than left to the equivalence test.
+    import struct
+    from jadart.callgraph import _far_pool_hit
+    from jadart.disasm import A64Words
+    add_x16 = 0x91000000 | (1 << 22) | (8 << 10) | (27 << 5) | 16    # add x16, x27, #0x8000
+    ldr_w16 = 0xB9400000 | (0 << 5) | 16                             # ldr w16, [x0]
+    ldr_x16 = 0xF9400000 | (16 << 5) | 16                            # ldr x16, [x16]
+    use = 0xF9400000 | (1 << 10) | (16 << 5) | 1                     # ldr x1, [x16, #8]
+    fn = {0x8008}
+
+    def hit(*ws):
+        return _far_pool_hit(A64Words(struct.pack(f"<{len(ws)}I", *ws)), 0, len(ws), fn)
+
+    assert hit(add_x16, use), "the plain far load"
+    assert hit(add_x16, ldr_w16, use), "a w write is spelled w16, so x16 is still the base"
+    assert not hit(add_x16, ldr_x16, use), "an x write is spelled x16, and the base is gone"
+    assert not hit(add_x16, use & ~(1 << 10)), "0x8000 names no function"
+
+    # register 31 is `sp` as a base and `xzr` as a destination, two different names
+    add_sp = 0x91000000 | (1 << 22) | (8 << 10) | (27 << 5) | 31     # add sp, x27, #0x8000
+    ldr_xzr = 0xF9400000 | (0 << 5) | 31                             # ldr xzr, [x0]
+    use_sp = 0xF9400000 | (1 << 10) | (31 << 5) | 1                  # ldr x1, [sp, #8]
+    assert hit(add_sp, ldr_xzr, use_sp), "writing xzr leaves the sp base alone"
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

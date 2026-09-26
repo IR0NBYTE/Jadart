@@ -32,11 +32,14 @@ it, so those sites are attributed by selector rather than left as "indirect". Wh
 genuinely unresolvable is a closure call through a captured context.
 """
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from .errors import JadartError
 
 from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassemble_range,
-                     build_pool_map, _mem_base_disp, _add_imm_from_pp)
+                     build_pool_map, _mem_base_disp, _add_imm_from_pp, require_decoder,
+                     MAX_INSNS, A64Words, A64_BL, A64_BLR, A64_DISPATCH, _PP, _word_load,
+                     _word_add_pp, _word_loadstore, _word_loads_x)
 
 
 @dataclass
@@ -150,9 +153,23 @@ def build_index(image, fr=None, virtual: bool = True,
 
     Virtual sites need the dispatch table, which is decoded after the sweep so that only
     the selector offsets actually used get resolved.
+
+    Only the ranges that need operands are decoded. A `bl` is one fixed opcode, so direct
+    edges come straight off the raw words (A64Words). The other two kinds need text: a
+    virtual site is read by detect_dispatch off decoded instructions, and a pool-mediated
+    call needs its load resolved. So a range goes through capstone only when it holds a
+    `blr` beside a load from the dispatch table, or a pool access that could name a
+    function, which is about a fifth of the ranges in a real image.
+    Everything else is answered from the words, and the answer is the same one: capstone
+    decodes every word of every range on all sixteen arm64 binaries in the corpus, so the
+    words it would have printed a `bl` for are exactly the words read here.
     """
     idx = CallIndex()
-    starts = {cr.pc_offset for cr in image.all_ranges}
+    ranges = image.all_ranges
+    # Fail the way the full decode did, and before any work: an image that could not be
+    # decoded must not come back as a graph of only its direct calls.
+    arch_name = require_decoder(image) if ranges else None
+    starts = {cr.pc_offset for cr in ranges}
     pool = build_pool_map(fr, getattr(image, "arch", None)) if fr is not None else {}
     # A pool entry that names a function: `&name` is build_pool_map's spelling.
     fn_by_pool = {off: lbl[1:] for off, lbl in pool.items() if lbl.startswith("&")}
@@ -166,9 +183,25 @@ def build_index(image, fr=None, virtual: bool = True,
     if want_virtual:
         from .expr import detect_dispatch
 
-    for cr in image.all_ranges:
+    # The raw word reading is arm64 only; any other decoder keeps the full sweep.
+    words = A64Words(image.text) if arch_name == "arm64" else None
+    fn_offsets = set(fn_by_pool)
+
+    for cr in ranges:
+        src = cr.pc_offset
+        if words is not None and src % 4 == 0:
+            rw = _read_words(words, image, cr, fn_offsets, want_virtual)
+        else:
+            rw = _RangeWords(None, 0, want_virtual, True, None)
+        if not (rw.need_virtual or rw.need_pool):
+            _words_edges(idx, src, rw.targets, rw.nblr, starts)
+            continue
+        # detect_dispatch answers each `blr` from the instructions before it, so a range
+        # decoded only for dispatch can stop at its last `blr`. Nothing past that point
+        # could change a site, and it is a little under a third of what they hold.
+        limit = MAX_INSNS if rw.need_pool else rw.last_blr
         try:
-            dis = disassemble_range(image, cr)
+            dis = disassemble_range(image, cr, limit)
         except (MissingDisassembler, UnsupportedArch):
             # Not per-range noise: capstone is absent, or this is arm32 and there is no
             # decoder for it. Swallowing it once per range built an EMPTY call graph and
@@ -182,14 +215,20 @@ def build_index(image, fr=None, virtual: bool = True,
             # caller can say how many and which.
             idx.undecodable.append(cr.pc_offset)
             continue
-        src = cr.pc_offset
-        if want_virtual:
+        if rw.need_virtual:
             disp = detect_dispatch(dis)
             for blr_addr, (_recv, off) in disp.items():
                 if off is None:
                     continue
                 idx.sites.setdefault(src, []).append((blr_addr, off))
                 idx.virtual_sites += 1
+        if not rw.need_pool:
+            # Decoded for detect_dispatch alone. The words already hold every `bl` and
+            # `blr` in order, so re-reading them from text would only cost the time.
+            _words_edges(idx, src, rw.targets, rw.nblr, starts)
+            continue
+        # A pool-mediated edge interleaves with the direct ones in instruction order and
+        # shares their dedupe, so a range that may have one keeps the whole decoded walk.
         far, seen = {}, set()
         for _addr, mn, op in dis:
             op = op or ""
@@ -198,13 +237,7 @@ def build_index(image, fr=None, virtual: bool = True,
                     t = int(op[1:], 16)
                 except ValueError:
                     continue
-                if t in starts:
-                    if t not in seen:
-                        seen.add(t)
-                        idx.callees.setdefault(src, []).append(t)
-                        idx.callers.setdefault(t, []).append(src)
-                else:
-                    idx.unresolved += 1
+                _direct_edge(idx, src, t, starts, seen)
             elif mn == "blr":
                 idx.indirect[src] = idx.indirect.get(src, 0) + 1
             elif mn in ("ldr", "ldur") and fn_by_pool:
@@ -242,6 +275,139 @@ def build_index(image, fr=None, virtual: bool = True,
                     idx.may_call.setdefault(caller, set()).add(t)
                     idx.may_be_called_by.setdefault(t, set()).add(caller)
     return idx
+
+
+def _words_edges(idx: CallIndex, src: int, targets: list, nblr: int, starts: set) -> None:
+    """The direct edges and the `blr` count of one range, as read off its words."""
+    seen = set()
+    for t in targets:
+        _direct_edge(idx, src, t, starts, seen)
+    if nblr:
+        idx.indirect[src] = idx.indirect.get(src, 0) + nblr
+
+
+def _direct_edge(idx: CallIndex, src: int, t: int, starts: set, seen: set) -> None:
+    """Record `src` calling `t`, once per pair, or count it when `t` is not a range."""
+    if t in starts:
+        if t not in seen:
+            seen.add(t)
+            idx.callees.setdefault(src, []).append(t)
+            idx.callers.setdefault(t, []).append(src)
+    else:
+        idx.unresolved += 1
+
+
+def _far_pool_hit(words: A64Words, first: int, nwords: int, fn_set: set) -> bool:
+    """Whether any load off a far pool base in this window could name a function.
+
+    A far load is two instructions, `add xD, x27, #hi` then `ldr xT, [xD, #lo]`, and the
+    second one does not mention x27, so it is not a candidate and the whole window is
+    walked instead.
+
+    What this may forget has to be a subset of what the decoded path forgets, or it would
+    miss a load the decoded path resolves and lose an edge. The decoded path drops a base
+    whenever an instruction's first operand spells that register, which includes a store
+    or a compare that only reads it. This drops a base only when a 64-bit load writes it,
+    which is one of those cases. Dart builds a far load as `add x16, x27, #hi` then
+    `ldr x16, [x16, #lo]`, reusing x16 at once, and dropping the base there keeps a later
+    unrelated load off x16 from reading as a pool entry. With _word_load reading every
+    load exactly that saves little, one range in 8,194 on the clean fixture, but it is the
+    same rule the decoded path applies, so the two agree on which bases are live.
+
+    Register 31 is never dropped. As a load destination it is spelled `xzr` and as a base
+    `sp`: `add sp, x27, #hi; ldr xzr, [x0]; ldr x1, [sp, #8]` still reads through sp in
+    the decoded path, and dropping it here would lose that edge. An SVE load off a far
+    base goes unread for the reason _read_words gives.
+    """
+    far = {}
+    data = words.words
+    for i in range(first, first + nwords):
+        w = data[i]
+        base = _word_add_pp(w)
+        if base is not None:
+            if base[0] != _PP:                # x27 itself is read directly, never as a base
+                far[base[0]] = base[1]
+            continue
+        if not far:
+            continue
+        ld = _word_load(w)
+        if ld is None:
+            continue                          # not an ldr or ldur the decoded path resolves
+        if ld[0] in far and far[ld[0]] + ld[1] in fn_set:
+            return True
+        rt = w & 31
+        if rt != 31 and rt in far and _word_loads_x(w):
+            del far[rt]                       # read first, then overwritten, as decoded
+    return False
+
+
+class _RangeWords(NamedTuple):
+    """One range as read off its raw words, and what still needs a decode."""
+    targets: list          # bl targets in instruction order; None when not read
+    nblr: int              # blr sites
+    need_virtual: bool     # detect_dispatch has something to find here
+    need_pool: bool        # a pool load may name a function
+    last_blr: int          # instructions up to and including the last blr
+
+
+def _read_words(words: A64Words, image, cr, fn_offsets: set, want_virtual: bool):
+    """Read one range off its raw words into a _RangeWords. The two flags say what, if
+    anything, still needs the range decoded.
+
+    The window is the one disassemble_range reads, `size or 512` bytes capped at
+    MAX_INSNS instructions, so a range is scanned over exactly the words capstone would
+    have been handed.
+
+    need_virtual is a `blr` in a range that also loads from the dispatch table, when
+    virtual sites are wanted, because only detect_dispatch can say which selector it
+    calls. need_pool is a pool load, direct or far, whose offset is an entry that names a
+    function. A missed one would read as "nothing calls this", which is the one answer
+    the graph must not give by accident, so pool loads are read with _word_load and
+    _word_add_pp, which say exactly what the decoded path reads out of capstone's text for
+    every scalar and floating point `ldr`, `ldur` and `add` from x27.
+
+    The shapes they do not read are the scalable ones: SVE `ldr z0, [x27]` and
+    `ldr p0, [x27]`, and SME `ldr za[w12, 0], [x27]`. They sit outside that encoding
+    group, and at displacement zero the decoded path would resolve them. Dart AOT emits
+    none of them, and a vector, predicate or matrix loaded out of the object pool would
+    not be a function reference if it did, so the edge that would be missed is one that
+    should never have been drawn.
+
+    A `blr` with no dispatch load anywhere in its range is answered here. detect_dispatch
+    attributes a `blr` only when its register came out of an indexed load off x21, so
+    such a range gives it nothing to find: every one of its calls is a closure call, and
+    the count of them is all the graph keeps.
+    """
+    end = min(len(image.text), cr.pc_offset + (cr.size or 512))
+    nwords = min(max(0, end - cr.pc_offset) // 4, MAX_INSNS)
+    targets, nblr, far, dispatch, need_pool, last_blr = [], 0, False, False, False, 0
+    first = cr.pc_offset // 4
+    for i, w in words.window(cr.pc_offset, nwords):
+        if (w & 0xFC000000) == A64_BL:
+            imm = w & 0x03FFFFFF
+            if imm & 0x02000000:
+                imm -= 0x04000000
+            targets.append(i * 4 + imm * 4)
+        elif (w & 0xFFFFFC1F) == A64_BLR:
+            nblr += 1
+            last_blr = i - first + 1
+        elif ((w >> 5) & 31) == A64_DISPATCH:
+            dispatch = dispatch or _word_loadstore(w)
+        elif ((w >> 5) & 31) == _PP and fn_offsets and not need_pool:
+            ld = _word_load(w)
+            if ld is not None:
+                need_pool = ld[1] in fn_offsets
+            elif _word_add_pp(w) is not None:
+                far = True                   # the load that uses it is not a candidate
+            # anything else with 27 in bits 5-9 is not an ldr, ldur or add from the pool,
+            # which are the only three the decoded path resolves
+        # Whatever is left is a pool word nothing asked about (no function entries, or
+        # the range already needs a decode) or a 0xD6 word that is not a plain blr: ret,
+        # br, or blraaz and its kin, which the decoded path does not count either.
+    if far and not need_pool:
+        need_pool = _far_pool_hit(words, first, nwords, fn_offsets)
+    return _RangeWords(targets, nblr, bool(want_virtual and nblr and dispatch), need_pool,
+                       last_blr)
 
 
 # ---------------------------------------------------------------------------

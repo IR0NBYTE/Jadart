@@ -66,6 +66,35 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **`jadart functions` is twice as fast, and draws the same graph.** Building the call
+  graph ran every code range through capstone and parsed the operand text back into
+  numbers, about 0.73 s of the 0.89 s the command took on the clean fixture. A `bl` is
+  one fixed opcode with its target in the low 26 bits, so direct edges now come off the
+  raw instruction words, found with byte slicing and a regex in about 10 ms for the whole
+  image. Capstone still reads the ranges that need operand text, and only those: a `blr`
+  in a range that also loads from the dispatch table, since that is the only kind of
+  `blr` the dispatch detector can name, and a pool load that could name a function,
+  including the two instruction far form. A range decoded for dispatch alone stops at its
+  last `blr`. That leaves 17 to 20% of the ranges and 28 to 34% of the instructions for
+  capstone across the corpus, and the median `functions` run goes from 0.905 s to 0.458 s
+  with peak memory unchanged; `xrefs` on a function name takes the same path. Pool loads
+  are read with `_word_load` and `_word_add_pp`, the decoders `xrefs` gained in #27, so
+  there is one reading of a pool access rather than two; both agree with capstone's own
+  text on every one of the 7,755,621 instructions in the corpus, and a test holds that
+  on the fixtures. The graph was compared field by field, list order included, against
+  the full decode on sixteen arm64 binaries from Dart 2.19.6 to 3.12.2, with virtual
+  sites on and off and with no snapshot names, and every one matches. It is exact because
+  capstone decodes every word of every range on all of them, so the words read here are
+  the words it would have printed. That premise is about real code. On crafted input it
+  can fail: capstone stops at the first word it cannot decode and drops everything after
+  it without saying so, while the word reader carries on, so a `bl` placed after a junk
+  word now appears in the graph where it used to vanish. A range that still goes to
+  capstone keeps the old stopping point. The silent stop itself predates this and is
+  filed as #29. An arm32 image keeps the full sweep; the report said
+  arm32 raises instead, but capstone's arm backend decodes it, and its graph is unchanged.
+  The benchmark baseline was retaken with this, and it is also the first to record #27:
+  `xrefs` on a string went from 0.666 s to 0.158 s there. Closes #17.
+
 - **A container is read in place, and nothing is written to disk.** Pointing any command
   at an APK or IPA used to copy the snapshot member into a `jadart-` temp directory, read
   the copy back, and remove the directory from an `atexit` hook. Since Android Gradle
