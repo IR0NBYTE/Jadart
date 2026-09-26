@@ -1,4 +1,4 @@
-# Jadart
+<h1 align="center"><img src="docs/logo/jadart-logo.png" alt="Jadart" width="600"></h1>
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
@@ -388,7 +388,7 @@ flubench/             the controlled corpus: a labelled construct app and its ha
   app/                the Flutter app whose declared symbols are exact ground truth
   artifacts/          the arm64 fixtures, clean and --obfuscate
   corpus/             one build per distinct snapshot hash (regenerate, not committed)
-docs/                 usage, support, and the Flutter internals explainer
+docs/                 usage, support, the Flutter internals explainer, and the logo
 ```
 
 ## Tests
