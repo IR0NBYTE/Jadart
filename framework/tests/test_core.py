@@ -5914,6 +5914,445 @@ def test_json_carries_va_beside_every_pc_offset():
             assert node["va"] == image.anchor_va + node["pc_offset"], argv
 
 
+# ── tool exports (interop) and Frida hooks ────────────────────────────────────────
+
+def test_interop_addresses_follow_the_anchor():
+    """va and file_offset are the anchor plus the pc_offset, for every range."""
+    from jadart.disasm import load_instructions, ISOLATE_INSTRUCTIONS
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    assert len(syms) == len(image.all_ranges)
+    a_va, a_off = image.anchor_va, image.anchor_file_offset
+    for s in syms:
+        assert s.va == a_va + s.pc_offset
+        assert s.file_offset == a_off + s.pc_offset
+    # benchWithdraw sits where r2 and Ghidra put it, and its bytes are the real prologue.
+    bw = next(s for s in syms if s.name == "benchWithdraw")
+    assert bw.va == 0x1eebac
+    assert image.text[bw.pc_offset:bw.pc_offset + 4] == bytes.fromhex("237040f8")  # ldur x3,[x1,7]
+
+
+def test_interop_entry_offset_only_on_monomorphic_ranges():
+    """A monomorphic-entry Code enters AOT_ENTRY_OFFSET in; every such range on the clean
+    fixture has `br x16` at +4, the switchable-call miss handler, and no other range does."""
+    import struct as _struct
+    from jadart.disasm import load_instructions, AOT_ENTRY_OFFSET
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    mono = [s for s in syms if s.entry_offset]
+    assert mono, "the fixture has monomorphic-entry functions"
+    for s in mono:
+        assert s.entry_offset == AOT_ENTRY_OFFSET["arm64"] == 24
+        assert s.entry_va == s.va + 24
+        word = _struct.unpack_from("<I", image.text, s.pc_offset + 4)[0]
+        assert word == 0xd61f0200, f"br x16 expected at {s.qualified}+4"
+    br = {s.pc_offset for s in syms
+          if len(image.text) >= s.pc_offset + 8
+          and _struct.unpack_from("<I", image.text, s.pc_offset + 4)[0] == 0xd61f0200}
+    # Every range whose +4 is `br x16` is one we marked, bar the two known plain stubs.
+    assert len(br - {s.pc_offset for s in mono}) == 2
+
+
+def test_interop_names_are_reduced_and_unique():
+    """A tool name is [A-Za-z0-9_] plus the address; two ranges never collide."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    names = [interop.safe_name(s, "dart_") for s in syms if s.name]
+    assert len(names) == len(set(names)), "names collide"
+    assert all(re.fullmatch(r"dart_[A-Za-z0-9_]+_[0-9a-f]+", n) for n in names)
+
+
+def test_interop_visible_escapes_unsafe_characters():
+    """A newline, a bidi override or a backslash in a name is escaped, so it cannot end a
+    comment line, reverse a name in a disassembler, or break a JSON string."""
+    from jadart import interop
+    assert interop.visible("plain.name") == "plain.name"
+    assert interop.visible("a‮b") == "a\\u202eb"      # right-to-left override
+    assert interop.visible("x\ny") == "x\\u000ay"
+    assert interop.visible("a\\b") == "a\\\\b"
+    assert " " not in interop.visible("a b")     # line separator
+
+
+def test_interop_blob_is_pure_ascii_base64():
+    """Embedded data is base64 of ASCII JSON: a hostile name cannot carry a quote,
+    backslash or newline into the script's string literal."""
+    import base64 as _b64
+    import json as _json
+    from jadart import interop
+    blob = interop._blob({"name": "a\"b\\c\nd", "x": 1})
+    raw = _b64.b64decode(blob)
+    assert raw.isascii()
+    assert _json.loads(raw)["name"] == "a\"b\\c\nd"
+
+
+def test_r2_script_guards_and_escaping():
+    """The r2 script checks the anchor, its size and known bytes before it applies
+    anything, and never puts a raw Dart name on a command line."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    script = interop.render_r2(image, hdr, syms, CLEAN, "test")
+    assert "obj._kDartIsolateSnapshotInstructions" in script
+    assert "q!!" in script                      # a guard stops the script
+    assert "wrong binary, nothing applied" in script
+    # comments carry the name as base64, so `CCu` lines never hold the raw name
+    assert "CCu base64:" in script
+    assert "e anal.limits=true" in script       # each range analysed in its own bounds
+
+
+def test_scripts_refuse_a_hostile_name_on_the_command_line():
+    """A name with r2 metacharacters (| > `) reaches no command line raw: it is reduced
+    for the flag/function name and base64-encoded for the comment."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    hostile = next(s for s in syms if s.name)
+    object.__setattr__(hostile, "name", "pwn|`touch x`>/tmp/y")
+    object.__setattr__(hostile, "owner", "")
+    script = interop.render_r2(image, hdr, [hostile], CLEAN, "test")
+    for line in script.splitlines():
+        if line.startswith("#") or line.startswith("CCu "):
+            continue
+        assert "|" not in line and "`touch" not in line and ">/tmp" not in line, line
+
+
+def test_ghidra_and_ida_scripts_embed_data_not_code():
+    """The Ghidra and IDA scripts carry their data as one base64 blob, so a name from the
+    binary is never interpolated into the script text."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    import base64 as _b64
+    import json as _json
+    for render in (interop.render_ghidra, interop.render_ida):
+        script = render(image, hdr, syms, CLEAN, "test")
+        assert 'base64.b64decode("' in script
+        assert "wrong binary" in script
+        # the guard has to carry real bytes, not just the words: an empty checks list
+        # would leave the script applying its names to any binary at all
+        blob = re.search(r'b64decode\("([A-Za-z0-9+/=]*)"\)', script).group(1)
+        data = _json.loads(_b64.b64decode(blob))
+        assert data["anchor"] == "_kDartIsolateSnapshotInstructions"
+        assert len(data["checks"]) >= 1
+        for c in data["checks"]:
+            assert len(c["hex"]) == 16, "8 bytes per check"
+            at = c["off"]
+            assert image.text[at:at + 8].hex() == c["hex"], "the check must match the image"
+
+
+def test_symbols_document_is_versioned_and_self_describing():
+    """The JSON says how to compute addresses and carries a format version."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    doc = interop.symbols_document(image, hdr, syms[:5], CLEAN, "test")
+    assert doc["ok"] and doc["format"] == "jadart-symbols"
+    assert doc["format_version"] == interop.FORMAT_VERSION
+    assert doc["binary"]["anchor"]["symbol"] == "_kDartIsolateSnapshotInstructions"
+    assert "anchor.va + pc_offset" in doc["address_rule"]
+
+
+def test_interop_refuses_binary_without_anchor():
+    """No anchor symbol means no address to give, and that is refused, not guessed."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    from jadart.errors import InputError
+    image, fr, hdr = load_instructions(CLEAN)
+    object.__setattr__(image, "anchor_va", None)
+    with pytest.raises(InputError):
+        interop.code_symbols(image, fr, hdr)
+
+
+def test_symbols_json_mode_is_always_one_json_document():
+    """`-j` means the whole of stdout parses as JSON, on every path.
+
+    `--format r2 -j` used to print the raw script while the same command's error path
+    printed JSON, so a caller that always passes `-j` got JSON only when the command
+    failed. The script now travels inside the document, as `hook -j` already carried its
+    own."""
+    import json as _json
+    import subprocess
+    for extra in (["-n", "1"], ["--format", "json", "-n", "1"], ["--format", "r2"],
+                  ["--format", "ghidra"], ["--format", "ida"]):
+        r = subprocess.run([sys.executable, "-m", "jadart", "symbols", CLEAN, "-j"] + extra,
+                           capture_output=True, cwd=os.path.join(ROOT, "framework"))
+        assert r.returncode == 0, extra
+        doc = _json.loads(r.stdout)           # raises if stdout is not one document
+        assert doc["ok"] is True
+        if extra[:1] == ["--format"] and extra[1] != "json":
+            assert doc["format"] == f"jadart-script-{extra[1]}"
+            assert doc["script"].startswith("#") or doc["script"].startswith("'use strict'")
+
+
+def test_hook_convention_from_kind_and_version():
+    """Register convention only from Dart 3.4, and never for the kinds the VM always
+    calls through the stack."""
+    from jadart import hooks
+
+    class S:
+        def __init__(self, kind):
+            self.kind = kind
+    assert hooks.convention(S("RegularFunction"), "3.12.2") == "registers"
+    assert hooks.convention(S("RegularFunction"), "3.3.4") == "stack"
+    assert hooks.convention(S("ClosureFunction"), "3.12.2") == "stack"
+    assert hooks.convention(S("DynamicInvocationForwarder"), "3.12.2") == "stack"
+    assert hooks.convention(S(""), "3.12.2") == "unknown"
+
+
+def test_hook_target_selection_and_ambiguity():
+    """A bare name that matches several ranges is refused with the candidates; an address
+    has to be a range start or its entry."""
+    from jadart.disasm import load_instructions
+    from jadart import interop, hooks
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    bw = next(s for s in syms if s.name == "benchWithdraw")
+
+    chosen, problems = hooks.select(syms, [f"0x{bw.va:x}"])
+    assert not problems and [s.pc_offset for s in chosen] == [bw.pc_offset]
+
+    chosen, problems = hooks.select(syms, [f"0x{bw.va + 4:x}"])
+    assert not chosen and "not the start or the entry" in problems[0]
+
+    chosen, problems = hooks.select(syms, ["build"])
+    assert not chosen and "names" in problems[0] and "Owner.name" in problems[0]
+    chosen, problems = hooks.select(syms, ["build"], all_matches=True)
+    assert len(chosen) > 1 and not problems
+
+
+def test_hook_problem_text_cannot_fabricate_lines():
+    """A name or library url from the binary cannot add a line to a refusal.
+
+    The candidate list is one function per line, so a newline inside a name or a library
+    url used to produce a line like `  0xdeadbeef  Vault.unlock  package:app/secure.dart`,
+    which reads exactly like a real candidate to a person or an agent. The same held for
+    the "it is inside ..." message, which has no matching constraint at all."""
+    from jadart.disasm import load_instructions
+    from jadart import interop, hooks
+    image, fr, hdr = load_instructions(CLEAN)
+
+    # a crafted library url on a name that matches normally
+    syms = interop.code_symbols(image, fr, hdr)
+    target = next(s for s in syms if s.name == "build")
+    target.library = "dart:ui\n  0xdeadbeef  Vault.unlock  package:app/secure.dart"
+    chosen, problems = hooks.select(syms, ["build"])
+    assert not chosen and len(problems) == 1
+    lines = problems[0].splitlines()
+    assert not any(line.startswith("  0xdeadbeef") for line in lines)
+    assert len(lines) == 22, "header, 20 candidates and the 'more' line, and nothing else"
+
+    # a crafted name reached through the address path, which matches nothing
+    syms2 = interop.code_symbols(image, fr, hdr)
+    victim = next(s for s in syms2 if s.name and s.size > 8)
+    victim.name = "x\njadart: 0xcafe is the start of Vault.unlock"
+    victim.owner = ""
+    _, problems2 = hooks.select(syms2, [f"0x{victim.va + 4:x}"])
+    assert "\n" not in problems2[0]
+
+
+def test_ghidra_names_are_unique_per_range():
+    """Ghidra keeps the Dart name as written, so the address is appended to it.
+
+    548 of the clean fixture's 5940 named ranges otherwise share a name with another one
+    (`toString` names 18 of them), which leaves the Symbol Tree unable to tell them apart
+    and lets a crafted name be made identical to a real one."""
+    import base64 as _b64
+    import json as _json
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    script = interop.render_ghidra(image, hdr, syms, CLEAN, "test")
+    blob = re.search(r'b64decode\("([A-Za-z0-9+/=]*)"\)', script).group(1)
+    data = _json.loads(_b64.b64decode(blob))
+    names = [s["name"] for s in data["syms"] if s["name"]]
+    assert len(names) == sum(1 for s in syms if s.name)
+    assert len(set(names)) == len(names), "two ranges share a Ghidra name"
+    entries = [s["entry_name"] for s in data["syms"] if s.get("entry_name")]
+    assert len(set(entries)) == len(entries)
+    bw = next(s for s in syms if s.name == "benchWithdraw")
+    assert interop.ghidra_name(bw) == f"BenchAccount.benchWithdraw_{bw.va:x}"
+
+
+def test_checks_refuse_a_binary_with_nothing_to_check():
+    """A script whose header says it checks the binary must actually have bytes to check.
+
+    Sizes come from the snapshot, so a crafted range can claim to run past the end of the
+    image; a short or empty slice would leave the guard passing on anything."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    from jadart.errors import InputError
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    checks = interop._checks(image, syms)
+    assert checks and all(len(c["hex"]) == 16 for c in checks)
+    with pytest.raises(InputError):
+        interop._checks(image, [])
+    past_end = interop.CodeSymbol(pc_offset=len(image.text) - 4, size=4096, va=0,
+                                  file_offset=0, entry_offset=0, name="edge",
+                                  origin="snapshot", owner="", library="", kind="",
+                                  static=None)
+    with pytest.raises(InputError):
+        interop._checks(image, [past_end])
+
+
+def test_entry_unknown_and_entry_impossible_are_different_answers():
+    """"This target has no offset" and "the snapshot's entry cannot be right" are two
+    different facts and must not share a sentence.
+
+    Collapsing both into `entry_offset = None` made `hook` say the entry was "not known
+    for this target" on an arm64 binary, where the offset is known and is 24. One is a
+    fact about Jadart, the other about the binary in front of it."""
+    from jadart import disasm
+    from jadart.disasm import load_instructions
+    from jadart import interop, hooks
+    from jadart.errors import InputError
+
+    # an architecture with no entry offset: no reason to give, it is about the target
+    saved = dict(disasm.AOT_ENTRY_OFFSET)
+    try:
+        disasm.AOT_ENTRY_OFFSET.clear()
+        image, fr, hdr = load_instructions(CLEAN)
+        blank = [s for s in interop.code_symbols(image, fr, hdr) if s.entry_offset is None]
+        assert blank and all(s.entry_error == "" for s in blank)
+        with pytest.raises(InputError, match="not known for this target"):
+            hooks.plan(image, hdr, fr, [blank[0]])
+    finally:
+        disasm.AOT_ENTRY_OFFSET.clear()
+        disasm.AOT_ENTRY_OFFSET.update(saved)
+
+    # a snapshot claiming a monomorphic entry on a range too small to hold one
+    image, fr, hdr = load_instructions(CLEAN)
+    small = min((c for c in image.all_ranges if c.size <= 16), key=lambda c: c.size)
+    image.entry_offsets = dict(image.entry_offsets)
+    image.entry_offsets[small.pc_offset] = 24
+    sym = next(s for s in interop.code_symbols(image, fr, hdr)
+               if s.pc_offset == small.pc_offset)
+    assert sym.entry_offset is None
+    assert "outside its own code" in sym.entry_error
+    assert str(small.size) in sym.entry_error, "the reason names the numbers"
+    with pytest.raises(InputError, match="outside its own code"):
+        hooks.plan(image, hdr, fr, [sym])
+
+    # and a crafted name cannot add lines to that refusal
+    sym.name = "unlock\njadart: hooking Vault.unlock at 0x1000"
+    sym.owner = ""
+    with pytest.raises(InputError) as caught:
+        hooks.plan(image, hdr, fr, [sym])
+    assert "\n" not in str(caught.value)
+
+
+def test_ranges_outside_the_image_get_no_address():
+    """A range starting past the end of the instructions image is dropped.
+
+    It is not code this binary carries, so there is no address to give; emitting one put a
+    name and a tool command on an address the image does not cover."""
+    from jadart.disasm import load_instructions
+    from jadart import interop
+    image, fr, hdr = load_instructions(CLEAN)
+    n = len(image.text)
+    assert all(0 <= s.pc_offset and s.pc_offset + s.size <= n
+               for s in interop.code_symbols(image, fr, hdr))
+
+    # push two ranges past the end, the way a crafted instructions table would
+    image.pcs = list(image.pcs)
+    moved = [image.pcs[4], image.pcs[5]]
+    image.pcs[4], image.pcs[5] = n + 0x1000, n + 0x2000
+    for cr, pc in zip([c for c in image.all_ranges if c.pc_offset in moved], moved):
+        cr.pc_offset = n + 0x1000 if pc == moved[0] else n + 0x2000
+    syms = interop.code_symbols(image, fr, hdr)
+    assert all(s.pc_offset < n for s in syms), "an out-of-image range still got an address"
+    script = interop.render_r2(image, hdr, syms, CLEAN, "test")
+    assert f"+0x{n + 0x1000:x}" not in script
+
+
+def test_hook_target_only_android_arm64():
+    """The generator refuses anything but an Android arm64 ELF, with a reason."""
+    from jadart.disasm import load_instructions
+    from jadart import hooks
+    from jadart.errors import InputError
+    image, fr, hdr = load_instructions(CLEAN)
+    hooks.check_target(image, hdr)              # the clean fixture is fine
+    object.__setattr__(image, "container", "macho")
+    with pytest.raises(InputError):
+        hooks.check_target(image, hdr)
+
+
+def test_hook_refuses_an_entry_outside_the_image():
+    """A crafted snapshot must not produce a hook at an address nothing checked.
+
+    The entry offset comes from the snapshot's own payload_info, so a Code flagged as
+    having a monomorphic entry but only 8 bytes long puts the entry past the end of the
+    instructions image. The byte slice there is empty, and in the generated script
+    comparing no bytes against no bytes passes, so it would attach to a live process at an
+    unverified address. Both bounds are checked: the entry inside its own range, and the
+    guard window inside the image."""
+    from jadart.disasm import load_instructions
+    from jadart import interop, hooks
+    from jadart.errors import InputError
+    image, fr, hdr = load_instructions(CLEAN)
+    n = len(image.text)
+
+    def sym(pc, size, entry):
+        return interop.CodeSymbol(pc_offset=pc, size=size, va=image.anchor_va + pc,
+                                  file_offset=image.anchor_file_offset + pc,
+                                  entry_offset=entry, name="crafted", origin="snapshot",
+                                  owner="", library="", kind="RegularFunction",
+                                  static=False)
+
+    # an 8-byte Code at the end of the image claiming a 24-byte monomorphic entry
+    with pytest.raises(InputError):
+        hooks.plan(image, hdr, fr, [sym(n - 8, 8, 24)])
+    # the entry inside its declared range, but the range runs past the image
+    with pytest.raises(InputError):
+        hooks.plan(image, hdr, fr, [sym(n - 16, 4096, 24)])
+    # exactly the guard window left is still fine, and every real range plans
+    assert hooks.plan(image, hdr, fr, [sym(n - 40, 4096, 32)])[0]["bytes"]
+    real = interop.code_symbols(image, fr, hdr)
+    planned = hooks.plan(image, hdr, fr, real)
+    assert len(planned) == len(real)
+    assert {len(h["bytes"]) // 2 for h in planned} == {hooks.GUARD_BYTES}
+
+
+def test_hook_script_reads_registers_and_is_observation_only():
+    """The Frida script hooks at the entry, reads the argument registers, decodes a cid,
+    and never writes to the process."""
+    from jadart.disasm import load_instructions
+    from jadart import interop, hooks
+    image, fr, hdr = load_instructions(CLEAN)
+    syms = interop.code_symbols(image, fr, hdr)
+    chosen, problems = hooks.select(syms, ["benchWithdraw"])
+    assert not problems
+    planned = hooks.plan(image, hdr, fr, chosen)
+    script = hooks.render_frida(image, hdr, fr, syms, planned, CLEAN, "test")
+    assert "Interceptor.attach" in script
+    assert '"x1"' in script and '"x7"' in script          # the argument registers
+    assert "readU32" in script                             # the class-id read
+    # only onEnter/onLeave logging: no writes to registers or memory
+    assert "writePointer" not in script and "writeU" not in script
+    assert ".replace(" not in script and "Interceptor.replace" not in script
+    bw = next(s for s in syms if s.name == "benchWithdraw")
+    assert planned[0]["off"] == bw.pc_offset + (bw.entry_offset or 0)
+
+    # benchWithdraw has no monomorphic entry, so the assertion above holds at +0 whatever
+    # the code does with entry offsets. Plan one that does have one, where the range start
+    # and the address to hook are different addresses.
+    mono = next(s for s in syms if s.entry_offset)
+    assert mono.entry_offset > 0
+    p = hooks.plan(image, hdr, fr, [mono])[0]
+    assert p["off"] == mono.pc_offset + mono.entry_offset
+    assert p["off"] != mono.pc_offset, "the hook must not sit on the miss handler"
+    assert p["bytes"] == image.text[p["off"]:p["off"] + hooks.GUARD_BYTES].hex()
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

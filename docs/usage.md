@@ -283,6 +283,106 @@ Which means the pass needs names, so on an `--obfuscate` build it collapses on i
 Feeding it `--sigs` composes the two features: on the 24hCTF binary, functions reachable
 through a resolved virtual call go from **19 to 729**.
 
+## Taking the names into IDA, Ghidra, radare2 and Frida
+
+`jadart symbols` gives every code range the addresses another tool needs, and writes a
+script that applies the names inside it.
+
+```bash
+jadart symbols app.apk                       # a table: va, file offset, size, entry, name
+jadart symbols app.apk --format r2 > a.r2    # radare2 script
+jadart symbols app.apk --format ghidra > a.py
+jadart symbols app.apk --format ida > a.py
+jadart symbols app.apk -j                    # the same as JSON, for your own tooling
+```
+
+```
+r2 -i a.r2 libapp.so                                 # radare2
+pyghidraRun -H proj p -import libapp.so -postScript a.py   # Ghidra 12 (11 and older: analyzeHeadless)
+idat -A -S"a.py --exit" libapp.so                    # IDA, or File > Script file
+```
+
+**Addresses come from the export, not from `.text`.** Every offset in a script is relative
+to `_kDartIsolateSnapshotInstructions`, so a rebased load lines up on its own: an ELF
+loaded at its own base, the same file at `-B 0x7000000000`, and a Ghidra import with
+`-loader-imagebase` all land on the same instruction. `.text` would not, because it also
+holds the VM instructions image in front of the isolate one; on the clean fixture that is
+0x16a80 bytes, so a `.text`-relative address is inside a different function. The `va` and
+`file_offset` columns are absolute, and the rule is printed above the table.
+
+**A script refuses a binary it was not made for.** Each one resolves the anchor, checks its
+size and then the bytes of three known functions, and applies nothing at all on a mismatch.
+Running the clean fixture's script against the obfuscated build stops with
+`is not 1833776 bytes, wrong binary, nothing applied`; flipping a single byte inside a
+checked function stops it too.
+
+**Ranges are bounded, not guessed.** The snapshot knows where every function starts and
+ends, which an analyser does not: a Dart range often ends in a call to a stub that never
+returns, so analysis runs on into the next function. On the clean fixture's 8194 ranges:
+
+| radare2 on the clean fixture | starts found | runs past its range | body shorter | never found |
+|---|---|---|---|---|
+| `aaa` alone | 6707 | 652 | 40 | 1487 |
+| this script | 8194 | 0 | 65 | 0 |
+
+Every range is found and none runs past its end. The 65 shorter bodies are ones radare2
+ends at a return it can see; the range is still flagged from its start, and the code in
+between is not attributed to the wrong function. That holds on a fresh session, after a
+full `aaa`, and when the script is applied twice. Ghidra and IDA are bounded the same way:
+Ghidra gives 8194 functions with the exact recorded body.
+
+**Where calls actually enter.** A Code object with a monomorphic entry does not start where
+its range starts: the range opens on the switchable-call miss handler, and calls land 24
+bytes in on arm64. Those 78 ranges (clean fixture; 83 on iOS) get a second label at the
+real entry, and the plate comment says so. Every one of them has the miss handler's
+`br x16` at +4, which is what makes it checkable rather than assumed.
+
+Names are reduced to `[A-Za-z0-9_]` plus the address, so they are unique and cannot be
+read as anything else by a tool that takes a name on a command line. The Dart name as
+written travels as a base64 comment, and anything invisible in it (a bidi override, a zero
+width character, a newline) is escaped to `\uXXXX` rather than rendered.
+
+### hook: a Frida script on the right address, reading the right registers
+
+```bash
+jadart hook app.apk Vault.unlock > hook.js
+frida -U -p $(pidof com.example.app) -l hook.js
+```
+
+The script waits for `libapp.so` with `Process.attachModuleObserver`, resolves the anchor
+as an export, checks the bytes, and attaches at the entry calls actually land on. It only
+logs: `onEnter` and `onLeave` print, and nothing is written to the process.
+
+**It reads arguments where this Dart release puts them.** From Dart 3.4 the fixed
+parameters of most functions arrive in `x1, x2, x3, x5, x6, x7`, with the receiver first;
+before 3.4, and for closures, tear-offs, `dyn:` forwarders, dispatchers, method extractors,
+FFI trampolines, field initializers and irregexp functions in every release, they are on
+the Dart stack at `x15`, **last argument first**. The snapshot pins the release and the
+function kind, so the script picks the source rather than guessing, and prints the stack
+slots either way because whether the global type flow analysis kept a particular function
+on the stack is not recorded in the snapshot.
+
+blutter's Frida template gets both halves wrong, which is what this exists for: its
+`getArg(ctx, i)` reads `x15 + 8*i`, so on Dart 3 it reads nothing for register-passed
+arguments, and index 0 is the last stack argument rather than the first. Its hook address
+is also a `0xdeadbeef` placeholder and its first line throws until edited by hand.
+
+Values print raw, with both readings where the snapshot cannot settle it: an even word is
+a Smi or an unboxed int and is shown as both, `x22` is named as null, and an odd word is
+named as an object only when it lies in the compressed heap (its upper half matches `x28`)
+and its header's class id is one the snapshot has a class for.
+
+On a live app, hooking `FlagGate.open` in a small CTF build logs the receiver in `x1` and
+the submitted string in `x2` as `_OneByteString`, and `FlagGate.accepts` returning a `Bool`.
+
+Android arm64 only, and it says so rather than emitting a script for a target whose
+convention it has not established.
+
+**What was run against the real tool.** The radare2 script was applied in radare2 6.0.9 and
+the Ghidra script imported and run headless under Ghidra 12.1.4. IDA was not available
+here, so its script was checked against a model of the IDA API over the real file bytes,
+and its header says so.
+
 ## Naming library code that was obfuscated away
 
 On an ordinary build Jadart reads **72.5%** of function names straight out of the snapshot

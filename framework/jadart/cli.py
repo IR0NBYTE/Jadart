@@ -29,7 +29,7 @@ EXIT_INTERNAL = 3    # a bug in jadart, not a problem with the input
 _COMMANDS = ("info", "libraries", "classes", "disasm", "lift", "decompile",
              "selectors", "strings", "constants", "verify", "export", "xrefs",
              "signatures",
-             "functions", "ffi")
+             "functions", "ffi", "symbols", "hook")
 
 _EXAMPLES = """\
 examples:
@@ -42,6 +42,8 @@ examples:
   jadart ffi libapp.so                     native libraries and the symbols read out
   jadart strings libapp.so -g flutter      the identifier and string pool
   jadart verify libapp.so                  byte-exact acceptance gates
+  jadart symbols libapp.so --format r2     radare2 script naming every function (also ida, ghidra)
+  jadart hook app.apk Foo.bar > hook.js    Frida script logging one function's calls
 
 `jadart <command> --help` documents one command.
 `python3 -m jadart` and `python3 -m jadart.cli` are the same entry point.
@@ -484,6 +486,107 @@ def cmd_functions(args) -> int:
               f"{f.callers:>5} {vin:>5}  {f.label}{lib}")
     if args.limit > 0 and len(rows) > args.limit:
         print(dim(f"... {len(rows) - args.limit} more (raise with -n, or -n 0 for all)"))
+    return EXIT_OK
+
+
+def cmd_symbols(args) -> int:
+    """Every code range with the addresses other tools use, or a script that applies them."""
+    from . import __version__, interop
+    from .disasm import load_instructions
+    label = getattr(args, "container", None) or str(args.libapp)
+    fmt = args.format or ("json" if getattr(args, "json", False) else None)
+    # `--format json` asks for JSON on stdout as much as `-j` does, so a failure has to be
+    # a document too. Without this the command exited 2 with nothing at all on stdout.
+    if fmt == "json":
+        _JSON[0] = True
+    try:
+        image, fr, hdr = load_instructions(args.libapp)
+        notes: list = []
+        syms = interop.code_symbols(image, fr, hdr, sigs=getattr(args, "sigs", None),
+                                    notes=notes)
+    except JadartError as e:
+        return _fail(e)
+    if fmt in interop.RENDERERS:
+        # A script names every range, whatever the filters say: it also sets each range's
+        # bounds, and a range left out would be analysed into its neighbour.
+        script = interop.RENDERERS[fmt](image, hdr, syms, label, __version__)
+        if getattr(args, "json", False):
+            # -j means the whole of stdout is one JSON document, on success as well as on
+            # failure. The script travels inside it rather than replacing it, the way
+            # `hook -j` carries its own.
+            # A script always covers every range, so there is no filtered page here and
+            # no `count`. `total` and `named` are both over the whole binary, which is
+            # what they mean in the symbols document too.
+            return emit({"ok": True, "format": f"jadart-script-{fmt}",
+                         "format_version": interop.FORMAT_VERSION,
+                         "binary": interop.binary_info(image, hdr, label),
+                         "total": len(syms), "named": sum(1 for s in syms if s.name),
+                         "script": script})
+        sys.stdout.write(script)
+        return EXIT_OK
+
+    rows = syms
+    if args.filter:
+        rows = [s for s in rows if args.filter.lower() in s.qualified.lower()]
+    if args.named:
+        rows = [s for s in rows if s.name]
+    shown = rows if args.limit <= 0 else rows[:args.limit]
+    if fmt == "json":
+        doc = interop.symbols_document(image, hdr, shown, label, __version__)
+        doc.update({"total": len(syms), "matched": len(rows), "notes": notes})
+        return emit(doc)
+
+    info = interop.binary_info(image, hdr, label)
+    a = info["anchor"]
+    print(comment(f"// {len(syms)} code ranges, {sum(1 for s in syms if s.name)} named"))
+    print(comment(f"// va = 0x{a['va']:x} ({a['symbol']}) + pc_offset; "
+                  f"file offset = 0x{a['file_offset']:x} + pc_offset"))
+    if len(rows) != len(syms):
+        print(comment(f"// {len(rows)} match the filter"))
+    for note in notes:
+        print(comment(f"// {note}"))
+    print(heading(f"{'va':<12} {'file_off':<10} {'size':>7} {'entry':>6}  name"))
+    for s in shown:
+        entry = ("?" if s.entry_offset is None else
+                 f"+0x{s.entry_offset:x}" if s.entry_offset else "")
+        name = interop.visible(interop._capped(s.qualified)) if s.name else dim("(anonymous)")
+        print(f"0x{s.va:<10x} 0x{s.file_offset:<8x} {s.size:>7} {entry:>6}  {name}")
+    if args.limit > 0 and len(rows) > args.limit:
+        print(dim(f"... {len(rows) - args.limit} more (raise with -n, or -n 0 for all)"))
+    return EXIT_OK
+
+
+def cmd_hook(args) -> int:
+    """A Frida script that logs calls to the named functions, placed at their real entry."""
+    from . import __version__, hooks, interop
+    from .disasm import load_instructions
+    label = getattr(args, "container", None) or str(args.libapp)
+    try:
+        image, fr, hdr = load_instructions(args.libapp)
+        hooks.check_target(image, hdr)
+        syms = interop.code_symbols(image, fr, hdr, sigs=getattr(args, "sigs", None))
+        chosen, problems = hooks.select(syms, args.targets, args.all)
+        if problems:
+            if getattr(args, "json", False):
+                return emit({"ok": False, "error": "\n".join(problems),
+                             "type": "NotFound", "exit": EXIT_MISS}, EXIT_MISS)
+            for p in problems:
+                # hooks.select escaped everything that came out of the binary, so the only
+                # newlines left are the ones it put in to separate candidates. Escaping
+                # again here would double every backslash.
+                error(p)
+            return EXIT_MISS
+        planned = hooks.plan(image, hdr, fr, chosen)
+        script = hooks.render_frida(image, hdr, fr, syms, planned, label, __version__)
+    except JadartError as e:
+        return _fail(e)
+    if getattr(args, "json", False):
+        return emit({"ok": True, "binary": interop.binary_info(image, hdr, label),
+                     "hooks": [{k: h[k] for k in ("name", "va", "entry_va", "size", "kind",
+                                                  "convention", "static", "library")}
+                               for h in planned],
+                     "script": script})
+    sys.stdout.write(script)
     return EXIT_OK
 
 
@@ -1269,6 +1372,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true", help="show the owning library")
     _add_sigs(p)
     p.set_defaults(func=cmd_functions)
+
+    p = _add(sub, common, "symbols",
+             "every function with the addresses IDA, Ghidra, radare2 and Frida use")
+    p.add_argument("--format", choices=("json", "ida", "ghidra", "r2"),
+                   help="print a script that names every function in that tool (ida, "
+                        "ghidra, r2) or the JSON document. A script covers every range "
+                        "and ignores -f, --named and -n")
+    p.add_argument("-f", "--filter", metavar="STR", help="keep only matching names")
+    p.add_argument("--named", action="store_true", help="only ranges with a name")
+    p.add_argument("-n", "--limit", type=int, default=200, metavar="N",
+                   help="show at most N (default 200; 0 for all)")
+    _add_sigs(p)
+    p.set_defaults(func=cmd_symbols)
+
+    p = _add(sub, common, "hook",
+             "a Frida script that logs calls to functions, on Android arm64")
+    p.add_argument("targets", nargs="+", metavar="FUNCTION",
+                   help="a function name, Owner.name, or the 0x address `symbols` "
+                        "prints for it")
+    p.add_argument("--all", action="store_true",
+                   help="hook every function a name matches instead of refusing")
+    _add_sigs(p)
+    p.set_defaults(func=cmd_hook)
 
     p = _add(sub, common, "lift", "Tier 3 pseudo-Dart for one function")
     p.add_argument("symbol", help="function name, including top-level functions")

@@ -148,6 +148,21 @@ class UnsupportedArch(JadartError):
 #: in snapshot.py because `info` reads it and must not import capstone to do so.
 from .snapshot import ISOLATE_INSTRUCTIONS  # noqa: E402,F401
 
+#: Instructions::kPolymorphicEntryOffsetAOT (object.h), identical in 2.19.6 and 3.12.2: how
+#: far into the payload a Code object with a monomorphic entry has its normal entry point.
+#: Such a payload opens on the switchable-call miss handler, then the monomorphic entry,
+#: then the entry every static and dispatch-table call targets. ia32 has none in AOT, and
+#: is absent here, so a lookup on it returns None and the entry reads as unknown.
+#:
+#: arm64 and arm are measured: every range the snapshot flags carries the miss handler's
+#: `ldr x16, [x26, #off]; br x16` at +0 on arm64 across 2.19.6, 3.0.6, 3.2.6 and 3.12.2,
+#: and the prologue sits at +0x10 on arm32-3.4.4. x64 and riscv are read from the SDK and
+#: not measured: no corpus binary targets them, so `entry_va` on those is the SDK's number
+#: rather than something this code has seen.
+AOT_ENTRY_OFFSET = {"arm64": 24, "arm": 16, "x64": 22, "riscv32": 18, "riscv64": 18}
+
+
+
 @dataclass
 class InstrImage:
     text: bytes             # the instructions image bytes
@@ -172,6 +187,9 @@ class InstrImage:
     anchor_va: int = None
     anchor_file_offset: int = None
     container: str = ""        # "elf" or "macho"
+    # pc_offset -> bytes from the range start to the entry calls actually land on, for the
+    # Code objects with a monomorphic entry only. See AOT_ENTRY_OFFSET.
+    entry_offsets: dict = None
 
 
 def load_instructions(path):
@@ -252,11 +270,27 @@ def load_instructions(path):
     anchor_va = anchor.value if anchor is not None else None
     anchor_off = elf.va_to_offset(anchor_va) if anchor_va is not None else None
 
+    # A Code object's payload_info says whether it has a monomorphic entry; if so, calls
+    # land AOT_ENTRY_OFFSET bytes in. An arch missing from the table records None, which
+    # the consumers must treat as "entry unknown" rather than as the range start.
+    # A range with no Code object (discarded under --dwarf-stack-traces, before
+    # first_entry_with_code) has no payload_info, and its entry is the range start: every
+    # function that needs a monomorphic entry is put in functions_called_dynamically_,
+    # whose Code DiscardCodeObjects keeps (precompiler.cc, 2.19.6 and 3.12.2). The obf
+    # fixture agrees: none of its 6421 such ranges has the miss handler's br x16 at +4.
+    entry_offsets = {}
+    step = AOT_ENTRY_OFFSET.get(hdr.arch.name) if hdr.arch is not None else None
+    for ci, info in fr.code_payload_info.items():
+        slot = first_code + ci
+        if info & 1 and 0 <= slot < len(pcs):
+            entry_offsets[pcs[slot]] = step
+
     return InstrImage(text=text, pcs=pcs, first_code=first_code, code_ranges=ranges,
                       all_ranges=all_ranges, symbol_names=symbol_names,
                       data=data, data_length=header_length, arch=hdr.arch,
                       anchor_va=anchor_va, anchor_file_offset=anchor_off,
-                      container="macho" if type(elf).__name__ == "MachO64" else "elf"), fr, hdr
+                      container="macho" if type(elf).__name__ == "MachO64" else "elf",
+                      entry_offsets=entry_offsets), fr, hdr
 
 
 # One cap for every path into the disassembler. `decompile` and `export` used to pass a

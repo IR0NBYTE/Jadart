@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 228](https://img.shields.io/badge/tests-228-brightgreen.svg)](#tests)
+[![tests: 249](https://img.shields.io/badge/tests-249-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -156,6 +156,8 @@ jadart strings app.apk -g password         # the identifier and literal pool
 jadart constants app.apk                   # embedded data tables, elements and all
 jadart xrefs app.apk "some literal"        # who references it
 jadart export app.apk out/                 # the whole browsable tree on disk
+jadart symbols app.apk --format r2         # name every function in radare2 (also ida, ghidra)
+jadart hook app.apk Vault.unlock           # a Frida script that logs that function's calls
 ```
 
 It takes an APK, a directory or a bare `libapp.so`. You do not unzip anything first, and
@@ -394,7 +396,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 228 tests
+cd framework && python3 -m pytest tests -q     # 249 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
