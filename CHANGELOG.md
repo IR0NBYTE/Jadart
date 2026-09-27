@@ -11,6 +11,42 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Changed
+
+- **Addresses are virtual addresses, not `.text+0x..`.** Every address Jadart printed was
+  an offset into the isolate instructions image, labelled as though it were an offset into
+  `.text`. The two start at different places, because `.text` also holds the VM
+  instructions image in front of the isolate one, so the label named code somewhere else
+  entirely: 0x16a80 out on the clean fixture, and a different amount per build (0x5980 on
+  2.19.6, 0x6dc0 on arm32-3.11.5, 0x15f80 on x86_64, 0xc000 on iOS). Anyone pasting one
+  into IDA, Ghidra, radare2 or Frida landed inside a different function, and nothing in the
+  output offered an address that did work.
+  - `functions`, `disasm`, `lift`, `decompile`, `xrefs`, `ffi` and `export` now print the
+    virtual address, which is the value of `_kDartIsolateSnapshotInstructions` plus the
+    pc_offset. Verified on 58 ELF builds and an iOS dylib against the container's own
+    section headers, and against radare2 and Ghidra on the fixtures.
+  - `disasm` also rebases the addresses inside a listing and the target of a branch or an
+    `adr`, which capstone renders as a pc_offset (80 `adr` on the clean fixture). Every
+    address inside the pipeline stays a pc_offset, which is what the object pool, the call
+    graph and the lifter are keyed on. In `-j` the `operands` string is left exactly as
+    capstone rendered it, so a consumer that parsed it before reads the same thing, and the
+    rebased address is a new `target_va` beside it.
+  - `functions` prints the rule above the table, and `info` gained an `[addresses]` block
+    with the anchor symbol, its address and its file offset. `info -j` carries the same as
+    an `anchor` object plus `address_rule`, so a caller holding a pc_offset can do the
+    arithmetic without knowing where to look.
+  - Every `-j` record that has a `pc_offset` now has the `va` for it as well.
+  - A number typed as an address is read as a virtual address when it lands inside the
+    image, which is the form now printed, so anything jadart prints can be pasted back and
+    reach what it named. `disasm` prints `0x13ef44` inside `FormatException.`, and the
+    pc_offset reading returned `sub_0x13ee74` for it; 2506 of the clean fixture's addresses
+    sit in the window where the two readings overlap. `.text+`, `isolate+` and `+` still
+    mean the pc_offset, for anything written against the older output, and `va+` forces the
+    address reading.
+  - A range with no name still prints as `sub_0x<pc_offset>`. That is a synthetic name
+    rather than an address, and it is spelled the same way everywhere, so it is left alone
+    here rather than made to disagree between the function table and a lifted body.
+
 ### Fixed
 
 - **`export` works on every input the other commands take.** Pointing it at a directory

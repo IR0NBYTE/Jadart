@@ -135,7 +135,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     certificates, backend config, bundled models, are usually the next thing anyone
     wants, so they are unpacked too. See container.py for the layout."""
     from .disasm import (load_instructions, disassemble_function, build_pool_map,
-                         render_body, annotate, truncated_by)
+                         render_body, annotate, truncated_by, addr_label)
     from .signatures import names_with_signatures
     from .cfg import build_cfg, structure, render as render_cfg
     from .expr import lift_function, make_arity_resolver
@@ -191,7 +191,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
             cr = image.code_ranges[ref]
             cut = truncated_by(cr, dis)
             note = f", TRUNCATED: {len(dis)} of {len(dis) + cut} instructions" if cut else ""
-            out.append(f"  {disp}() {{  // .text+0x{cr.pc_offset:x}, {cr.size} bytes{note}")
+            out.append(f"  {disp}() {{  // {addr_label(image, cr.pc_offset)}, "
+                       f"{cr.size} bytes{note}")
             if tier >= 3:
                 ann = annotate(dis, pc_to_name, pool_map)
                 out.extend(lift_function(ann, pool_map,

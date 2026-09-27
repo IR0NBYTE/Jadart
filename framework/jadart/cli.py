@@ -89,13 +89,23 @@ def _fail(exc) -> int:
 
 def cmd_info(args) -> int:
     """Header summary for both snapshots in the library."""
+    # One read of the container gives both the headers and where the isolate instructions
+    # image sits, so a caller can turn any pc_offset jadart prints into an address itself.
+    # Reading it separately would hold the file twice, which `info` cannot afford: being
+    # fast and small is the whole point of this command.
+    from .snapshot import parse_libapp_with_anchor
     try:
-        snaps = parse_libapp(args.libapp, strict=not args.lenient)
+        snaps, anchor = parse_libapp_with_anchor(args.libapp, strict=not args.lenient)
     except JadartError as e:    # UnknownEpoch, truncated/malformed, or not-a-Dart-lib
         return _fail(e)
 
     if getattr(args, "json", False):
-        return emit({"ok": True, "file": str(args.libapp), "snapshots": {
+        return emit({"ok": True, "file": str(args.libapp),
+                     "anchor": anchor,
+                     "address_rule": ("va = anchor.va + pc_offset; file_offset = "
+                                      "anchor.file_offset + pc_offset")
+                                     if anchor else None,
+                     "snapshots": {
             which: {
                 "kind": h.kind_name,
                 "version_hash": h.version_hash,
@@ -128,6 +138,12 @@ def cmd_info(args) -> int:
         print(f"  clusters        {h.num_clusters}")
         print(f"  instr_table_len {h.instr_table_len}")
         print(f"  first_cid       {h.first_cluster_cid}")
+    if anchor:
+        print(heading("[addresses]"))
+        print(f"  anchor          {anchor['symbol']}")
+        print(f"  anchor va       0x{anchor['va']:x}  "
+              f"(file offset 0x{anchor['file_offset']:x}, {anchor['size']} bytes)")
+        print(f"  rule            the address jadart prints is this plus the pc_offset")
     return EXIT_OK
 
 
@@ -248,7 +264,7 @@ def cmd_libraries(args) -> int:
 def cmd_lift(args) -> int:
     """Tier 3 for a single function, including top-level ones that belong to no class."""
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
-                         build_pool_map)
+                         build_pool_map, addr_label, va_of)
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
@@ -288,10 +304,11 @@ def cmd_lift(args) -> int:
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref))
         if getattr(args, "json", False):
-            out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
+            out.append({"name": nm, "pc_offset": cr.pc_offset,
+                        "va": va_of(image, cr.pc_offset), "size": cr.size,
                         "instructions": len(dis), "body": [ln.strip() for ln in body]})
             continue
-        print(comment(f"// {nm}  .text+0x{cr.pc_offset:x}  ({cr.size} bytes)"))
+        print(comment(f"// {nm}  {addr_label(image, cr.pc_offset)}  ({cr.size} bytes)"))
         for ln in body:
             print(ln)
         print()
@@ -304,7 +321,8 @@ def cmd_lift(args) -> int:
 def cmd_disasm(args) -> int:
     """Tier 1: annotated arm64 for every code range under one name."""
     from .disasm import (load_instructions, disassemble_range, named_ranges,
-                         annotate, build_pool_map)
+                         annotate, build_pool_map, addr_label, rebase_operand, va_of,
+                         target_va)
     from .signatures import names_with_signatures
     try:
         image, fr, _hdr = load_instructions(args.libapp)
@@ -334,15 +352,25 @@ def cmd_disasm(args) -> int:
         ann = annotate(dis, pc_to_name, pool_map)
         printed += 1
         if as_json:
-            out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
-                        "instructions": [{"addr": a, "mnemonic": mn, "operands": op,
+            out.append({"name": nm, "pc_offset": cr.pc_offset,
+                        "va": va_of(image, cr.pc_offset), "size": cr.size,
+                        # `addr` stays the pc_offset every other field is keyed on and
+                        # `va` is the same instruction's virtual address. `operands` is
+                        # what capstone rendered, unchanged, so a consumer that parsed it
+                        # before still reads the same string; where that operand is a code
+                        # address `target_va` carries it as a virtual address, which is
+                        # what the text listing shows.
+                        "instructions": [{"addr": a, "va": va_of(image, a), "mnemonic": mn,
+                                          "operands": op,
+                                          "target_va": target_va(image, mn, op),
                                           "note": note.strip().lstrip("; ").strip()}
                                          for a, mn, op, note in ann]})
             continue
         print(dim("// ") + bold(nm)
-              + dim(f"  @ .text+0x{cr.pc_offset:x}  ({cr.size} bytes)"))
+              + dim(f"  @ {addr_label(image, cr.pc_offset)}  ({cr.size} bytes)"))
         for addr, mn, op, note in ann:
-            print("  " + dim(f"0x{addr:06x}") + f"  {mn:<7} {op}" + dim(note))
+            print("  " + dim(addr_label(image, addr))
+                  + f"  {mn:<7} {rebase_operand(image, mn, op)}" + dim(note))
         print()
     if as_json:
         return emit({"ok": bool(out), "symbol": args.symbol, "count": len(out),
@@ -380,7 +408,7 @@ def cmd_decompile(args) -> int:
 
 def cmd_functions(args) -> int:
     """Every code range in the image, the way `afl` and IDA's Functions window list them."""
-    from .disasm import load_instructions
+    from .disasm import load_instructions, addr_label, va_of
     from .callgraph import function_table, ORIGINS
     try:
         image, fr, hdr = load_instructions(args.libapp)
@@ -413,7 +441,8 @@ def cmd_functions(args) -> int:
                      "call_graph": None if graph_error else "built",
                      "call_graph_error": str(graph_error) if graph_error else None,
                      "notes": notes,
-                     "functions": [{"pc_offset": f.pc_offset, "size": f.size,
+                     "functions": [{"pc_offset": f.pc_offset,
+                                    "va": va_of(image, f.pc_offset), "size": f.size,
                                     "name": f.name, "label": f.label, "origin": f.origin,
                                     "library": f.library, "callers": f.callers,
                                     "callees": f.callees, "indirect": f.indirect,
@@ -425,6 +454,11 @@ def cmd_functions(args) -> int:
     by_origin = Counter(f.origin for f in table)
     print(comment(f"// {len(table)} code ranges  "
                   + "  ".join(f"{k} {by_origin[k]}" for k in ORIGINS if by_origin[k])))
+    # Say what the address column is. It used to read `.text+0x..`, which was wrong: the
+    # number is an offset into the isolate instructions image, and `.text` starts before it.
+    if image.anchor_va is not None:
+        print(comment(f"// address = 0x{image.anchor_va:x} "
+                      f"({image.anchor_symbol}) + pc_offset"))
     if len(rows) != len(table):
         print(comment(f"// {len(rows)} match the filter"))
     if graph_error:
@@ -441,13 +475,13 @@ def cmd_functions(args) -> int:
     for f in shown:
         lib = dim(f"   {f.library}") if f.library and args.verbose else ""
         if graph_error:
-            print(f".text+0x{f.pc_offset:<7x} {f.size:>7}  {f.label}{lib}")
+            print(f"{addr_label(image, f.pc_offset):<14} {f.size:>7}  {f.label}{lib}")
             continue
         # `vin` counts sites that could reach this through the dispatch table. It is a
         # maybe, not a fact, which is why it never merges into the direct `in` column.
         vin = str(f.virtual_callers) if f.virtual_callers else dim("-")
-        print(f".text+0x{f.pc_offset:<7x} {f.size:>7} {f.callees:>6} {f.callers:>5} "
-              f"{vin:>5}  {f.label}{lib}")
+        print(f"{addr_label(image, f.pc_offset):<14} {f.size:>7} {f.callees:>6} "
+              f"{f.callers:>5} {vin:>5}  {f.label}{lib}")
     if args.limit > 0 and len(rows) > args.limit:
         print(dim(f"... {len(rows) - args.limit} more (raise with -n, or -n 0 for all)"))
     return EXIT_OK
@@ -586,6 +620,7 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
     tried first because a string is the more specific ask; a bare name that matches both
     reports both.
     """
+    from .disasm import addr_label, va_of
     pattern = args.pattern if pattern is None else pattern
 
     from .disasm import named_ranges
@@ -612,9 +647,12 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
     for pc in sorted(targets):
         r = found[pc]
         fns.append({
-            "name": targets[pc], "pc_offset": pc, "overloads": r["overloads"],
-            "called_by": [{"pc_offset": c.pc_offset, "size": c.size} for c in r["direct"]],
-            "may_be_called_by": [{"pc_offset": c.pc_offset, "size": c.size}
+            "name": targets[pc], "pc_offset": pc, "va": va_of(image, pc),
+            "overloads": r["overloads"],
+            "called_by": [{"pc_offset": c.pc_offset, "va": va_of(image, c.pc_offset),
+                           "size": c.size} for c in r["direct"]],
+            "may_be_called_by": [{"pc_offset": c.pc_offset, "va": va_of(image, c.pc_offset),
+                                  "size": c.size}
                                  for c in r["virtual"]],
         })
     total = sum(len(f["called_by"]) for f in fns)
@@ -624,12 +662,13 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
                      "count": len(fns), "call_sites": total, "virtual_call_sites": virt,
                      "functions": fns})
     for f in fns:
-        print(comment(f"// {f['name']}  .text+0x{f['pc_offset']:x}"))
+        print(comment(f"// {f['name']}  {addr_label(image, f['pc_offset'])}"))
         if f["called_by"]:
             n = len(f["called_by"])
             print(heading(f"  {n} direct call site{'' if n == 1 else 's'}"))
             for c in f["called_by"]:
-                print(f"    .text+0x{c['pc_offset']:<8x} {dim(str(c['size']) + ' bytes')}")
+                print(f"    {addr_label(image, c['pc_offset']):<14} "
+                      f"{dim(str(c['size']) + ' bytes')}")
         if f["may_be_called_by"]:
             n, m = f["overloads"], len(f["may_be_called_by"])
             # An honest header. One implementation means the site can only land here; many
@@ -640,7 +679,8 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
             print(heading(f"  {m} virtual call site{'' if m == 1 else 's'}")
                   + dim(f"  ({certainty})"))
             for c in f["may_be_called_by"]:
-                print(f"    .text+0x{c['pc_offset']:<8x} {dim(str(c['size']) + ' bytes')}")
+                print(f"    {addr_label(image, c['pc_offset']):<14} "
+                      f"{dim(str(c['size']) + ' bytes')}")
         if not f["called_by"] and not f["may_be_called_by"]:
             # Still not the same as "unused": a closure is reached through a captured
             # context and leaves no edge any static pass can see.
@@ -690,6 +730,7 @@ def cmd_ffi(args) -> int:
     looking, and jadart already recovers all three, scattered across `strings`, `xrefs`
     and `lift`. This puts them on one page.
     """
+    from .disasm import addr_label, va_of
     from .disasm import (load_instructions, build_pool_map, pool_xrefs, disassemble_range,
                          annotate)
     from .signatures import names_with_signatures
@@ -747,7 +788,8 @@ def cmd_ffi(args) -> int:
             "pool_offset": off,
             "library": libs[off].strip('"'),
             "referenced_by": [
-                {"pc_offset": cr.pc_offset, "name": bodies.get(cr.pc_offset, {}).get("name"),
+                {"pc_offset": cr.pc_offset, "va": va_of(image, cr.pc_offset),
+                 "name": bodies.get(cr.pc_offset, {}).get("name"),
                  "size": cr.size, "lines": bodies.get(cr.pc_offset, {}).get("lines", [])}
                 for cr in sorted(refs.get(off, ()), key=lambda c: c.pc_offset)],
         })
@@ -771,7 +813,8 @@ def cmd_ffi(args) -> int:
                       "(reached through a closure, or built at runtime)"))
         for r in e["referenced_by"]:
             nm = r["name"] or f"sub_0x{r['pc_offset']:x}"
-            print(f"  {heading(nm)}  .text+0x{r['pc_offset']:x}  {dim(str(r['size']) + ' bytes')}")
+            print(f"  {heading(nm)}  {addr_label(image, r['pc_offset'])}  "
+                  f"{dim(str(r['size']) + ' bytes')}")
             for ln in r["lines"]:
                 print(f"      {ln}")
             if not r["lines"]:
@@ -880,13 +923,15 @@ def _xrefs_filter_class(fr, hdr, refs, class_name):
     return filtered, unattributed
 
 
-def _xrefs_entries(matches, refs):
+def _xrefs_entries(matches, refs, image):
+    from .disasm import va_of
     return [
         {
             "pool_offset": off,
             "entry": matches[off],
             "referenced_by": [
-                {"pc_offset": cr.pc_offset, "size": cr.size}
+                {"pc_offset": cr.pc_offset, "va": va_of(image, cr.pc_offset),
+                 "size": cr.size}
                 for cr in refs.get(off, ())
             ],
         }
@@ -897,7 +942,8 @@ def _xrefs_entries(matches, refs):
 
 def cmd_xrefs(args) -> int:
     """Which functions load a string/pool entry, or call a function."""
-    from .disasm import load_instructions, build_pool_map, pool_xrefs
+    from .disasm import (load_instructions, build_pool_map, pool_xrefs, addr_label,
+                         va_of)
 
     kinds = ("string", "pool", "function")
     exact = getattr(args, "exact", False)
@@ -995,7 +1041,7 @@ def cmd_xrefs(args) -> int:
                 exact=_xrefs_exact(args, resolved_kind, legacy),
             )
 
-    entries = _xrefs_entries(matches, refs)
+    entries = _xrefs_entries(matches, refs, image)
 
     if not entries:
         if class_name and unattributed:
@@ -1041,7 +1087,7 @@ def cmd_xrefs(args) -> int:
         ))
         for ref in entry["referenced_by"]:
             print(
-                f"    .text+0x{ref['pc_offset']:<8x} "
+                f"    {addr_label(image, ref['pc_offset']):<14} "
                 f"{dim(str(ref['size']) + ' bytes')}"
             )
 

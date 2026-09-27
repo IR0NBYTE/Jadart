@@ -2704,7 +2704,11 @@ def test_ffi_reports_the_native_boundary_of_a_real_app():
     # `process_data_complete` is the one the challenge turns on.
     assert "process_data_complete" in out, out
     assert "get_client_version" in out, out
-    assert ".text+0x166370" in out, out
+    # The address is the virtual one, not the old `.text+0x166370`. That label was an
+    # offset into the isolate instructions image, and this binary's image starts at
+    # 0x1b6880, so `.text+0x166370` named an address 0x1b6880 short of the real function.
+    assert "0x31cbf0" in out, out
+    assert ".text+" not in out, out
 
 
 def test_library_api_is_usable_without_the_cli():
@@ -5734,6 +5738,180 @@ def test_the_far_pool_walk_forgets_only_what_the_decoded_walk_forgets():
     ldr_xzr = 0xF9400000 | (0 << 5) | 31                             # ldr xzr, [x0]
     use_sp = 0xF9400000 | (1 << 10) | (31 << 5) | 1                  # ldr x1, [sp, #8]
     assert hit(add_sp, ldr_xzr, use_sp), "writing xzr leaves the sp base alone"
+
+
+# ── addresses: what gets printed, and what is accepted back ──────────────────────
+
+def test_printed_address_is_the_virtual_address_not_a_text_offset():
+    """The address every command prints is `anchor + pc_offset`.
+
+    It used to print `.text+<pc_offset>`, and the number was never an offset into `.text`:
+    that section also holds the VM instructions image in front of the isolate one, so the
+    label named code 0x16a80 earlier on the clean fixture, inside a different function.
+    Pasting it into IDA, Ghidra, radare2 or Frida landed in the wrong place."""
+    import io
+    import contextlib
+    from jadart import cli
+    from jadart.disasm import load_instructions
+    image, _fr, _hdr = load_instructions(CLEAN)
+    assert image.anchor_va == 0x136A80
+
+    for argv in (["functions", CLEAN, "-n", "5"],
+                 ["disasm", CLEAN, "benchWithdraw"],
+                 ["lift", CLEAN, "benchWithdraw"],
+                 ["decompile", CLEAN, "BenchAccount"]):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(argv)
+        out = buf.getvalue()
+        assert rc == cli.EXIT_OK, out
+        assert ".text+" not in out, f"{argv[0]} still prints a .text+ label:\n{out[:400]}"
+    # benchWithdraw's real address, and the bytes there are its prologue
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.main(["disasm", CLEAN, "benchWithdraw"])
+    out = buf.getvalue()
+    assert "0x1eebac" in out, out
+    assert "ldur" in out and "x3, [x1, #7]" in out.replace("  ", " "), out
+
+
+def test_branch_targets_inside_disasm_are_addresses_too():
+    """A branch target in the listing is an address someone reads off and uses, so it is
+    the virtual address. capstone renders it as a pc_offset, which next to virtual
+    addresses would read as one."""
+    from jadart.disasm import load_instructions, rebase_operand
+    image, _fr, _hdr = load_instructions(CLEAN)
+    base = image.anchor_va
+    assert rebase_operand(image, "b.le", "#0xb8140") == f"0x{base + 0xB8140:x}"
+    assert rebase_operand(image, "bl", "#0x10dd4") == f"0x{base + 0x10DD4:x}"
+    # a register branch, an immediate that is not a code offset, and a non-branch are left
+    assert rebase_operand(image, "br", "x16") == "x16"
+    assert rebase_operand(image, "b", f"#0x{len(image.text) + 8:x}") \
+        == f"#0x{len(image.text) + 8:x}"
+    assert rebase_operand(image, "add", "x0, x22, #0x30") == "x0, x22, #0x30"
+
+
+def test_a_printed_address_reads_back_as_the_thing_it_named():
+    """Anything jadart prints can be pasted back and reaches what it named.
+
+    The pc_offset and virtual-address readings of a bare number overlap, because the image
+    is longer than the address it starts at: 2506 of the clean fixture's addresses sit in
+    that window. Preferring the pc_offset there meant `disasm` printed `0x13ef44` inside
+    `FormatException.` and pasting it back returned `sub_0x13ee74`, a different function,
+    with nothing saying so. That is the defect this whole change exists to remove, so the
+    address reading wins inside the image and the prefixes keep meaning the pc_offset."""
+    import io
+    import contextlib
+    import re as _re
+    from jadart import cli
+    from jadart.disasm import load_instructions, _parse_addr, named_ranges
+    from jadart.errors import InputError
+    image, fr, _hdr = load_instructions(CLEAN)
+
+    # the exact case the reviewer found: an instruction address in the middle of a range
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.main(["disasm", CLEAN, "FormatException."])
+    out = buf.getvalue()
+    printed = [int(m, 16) for m in _re.findall(r"^  0x([0-9a-f]+)", out, _re.M)]
+    assert len(printed) > 2
+    head = named_ranges(image, fr, "FormatException.")[0][1]
+    for addr in printed[:5]:
+        got = named_ranges(image, fr, f"0x{addr:x}")
+        assert got and got[0][1].pc_offset == head.pc_offset, (
+            f"0x{addr:x} was printed inside FormatException. but reads back as "
+            f"pc_offset 0x{got[0][1].pc_offset:x}")
+
+    # and every range start round-trips through the address it is printed as
+    for cr in list(image.all_ranges)[:400]:
+        assert _parse_addr(f"0x{image.anchor_va + cr.pc_offset:x}", image) == cr.pc_offset
+
+    # the older spellings still mean a pc_offset, so anything written against them works
+    want = 0xB812C
+    for spelling in (f".text+0x{want:x}", f"isolate+0x{want:x}", f"+0x{want:x}"):
+        assert _parse_addr(spelling, image) == want, spelling
+    # `va+` forces the address reading, and refuses a number outside the image
+    assert _parse_addr(f"va+0x{image.anchor_va + want:x}", image) == want
+    with pytest.raises(InputError):
+        _parse_addr("va+0x10", image)
+    # a number below the image is only ever a pc_offset
+    assert _parse_addr("0x2414", image) == 0x2414
+
+
+def test_info_exposes_the_anchor_so_a_caller_can_do_the_arithmetic():
+    """`info -j` carries the anchor symbol, its address and the rule, so a consumer that
+    only has a pc_offset can work out the address itself."""
+    import io
+    import json as _json
+    import contextlib
+    from jadart import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["info", CLEAN, "-j"])
+    assert rc == cli.EXIT_OK
+    doc = _json.loads(buf.getvalue())
+    a = doc["anchor"]
+    assert a["symbol"] == "_kDartIsolateSnapshotInstructions"
+    assert a["va"] == 0x136A80 and a["file_offset"] == 0x136A80
+    assert a["container"] == "elf"
+    assert "anchor.va + pc_offset" in doc["address_rule"]
+
+
+def test_info_does_not_import_the_disassembler():
+    """`info` reports the anchor without importing capstone.
+
+    Reading the anchor through disasm.py pulled capstone in, which costs about 8 MB of RSS
+    and took `info` from 26 MB to 34 MB and 0.04s to 0.06s, over the benchmark's limits.
+    The command exists to be fast and small, and it does not disassemble anything."""
+    import subprocess
+    code = (
+        "import sys, resource; sys.path.insert(0, 'framework');\n"
+        "from jadart import cli;\n"
+        "rc = cli.main(['info', %r]);\n"
+        "print('capstone' in sys.modules, 'jadart.disasm' in sys.modules)" % CLEAN
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       cwd=os.path.join(ROOT))
+    assert r.returncode == 0, r.stderr
+    last = r.stdout.strip().splitlines()[-1]
+    assert last == "False False", f"info imported the disassembler: {last}\n{r.stdout}"
+    assert "_kDartIsolateSnapshotInstructions" in r.stdout
+
+
+def test_json_carries_va_beside_every_pc_offset():
+    """Anything with a `pc_offset` also has the `va` for it, so a caller never has to know
+    about the anchor to get an address."""
+    import io
+    import json as _json
+    import contextlib
+    from jadart import cli
+    from jadart.disasm import load_instructions
+    image, _fr, _hdr = load_instructions(CLEAN)
+
+    def walk(node, out):
+        if isinstance(node, dict):
+            if "pc_offset" in node:
+                out.append(node)
+            for v in node.values():
+                walk(v, out)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, out)
+
+    for argv in (["functions", CLEAN, "-n", "5", "-j"],
+                 ["disasm", CLEAN, "benchWithdraw", "-j"],
+                 ["lift", CLEAN, "benchWithdraw", "-j"],
+                 ["xrefs", CLEAN, "function", "benchWithdraw", "-j"],
+                 ["xrefs", CLEAN, "string", "flag", "-j"]):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(argv)
+        found = []
+        walk(_json.loads(buf.getvalue()), found)
+        assert found, argv
+        for node in found:
+            assert "va" in node, f"{argv[0]}: a pc_offset with no va: {node}"
+            assert node["va"] == image.anchor_va + node["pc_offset"], argv
 
 
 if __name__ == "__main__":

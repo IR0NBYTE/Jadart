@@ -232,7 +232,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
       tier 1:           block-labelled annotated arm64 (structured=False)
     structured=False forces tier 1."""
     from .disasm import (load_instructions, disassemble_function, build_pool_map,
-                         render_body, annotate, truncated_by)
+                         render_body, annotate, truncated_by, addr_label)
     from .signatures import names_with_signatures
     from .cfg import build_cfg, structure, render as render_cfg
     from .expr import lift_function, make_arity_resolver
@@ -281,7 +281,8 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
         cr = image.code_ranges[ref]
         cut = truncated_by(cr, dis)
         note = f", TRUNCATED: {len(dis)} of {len(dis) + cut} instructions" if cut else ""
-        lines.append(f"  {disp}() {{  // .text+0x{cr.pc_offset:x}, {cr.size} bytes{note}")
+        lines.append(f"  {disp}() {{  // {addr_label(image, cr.pc_offset)}, "
+                     f"{cr.size} bytes{note}")
         if lvl >= 3:
             ann = annotate(dis, pc_to_name, pool_map)
             lines.extend(lift_function(ann, pool_map,
