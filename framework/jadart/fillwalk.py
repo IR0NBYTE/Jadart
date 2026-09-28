@@ -125,6 +125,12 @@ class FillResult:
     # offset a lifted `field_0x8` is spelled with. See fields.py for the join.
     field_meta: dict = field(default_factory=dict)        # Field ref -> (kind_bits, value ref)
     patch_class: dict = field(default_factory=dict)       # PatchClass ref -> wrapped Class ref
+    #: Code instructions-table index -> payload_info, which the serializer writes as
+    #: `unchecked_offset << 1 | has_monomorphic_entry` (app_snapshot.cc WriteInstructions,
+    #: the same in 2.19.6 and 3.12.2). A function with a monomorphic entry does not start
+    #: where its range starts: the range opens on the miss handler, and a hook or a
+    #: disassembler label placed there is on code normal calls never execute.
+    code_payload_info: dict = field(default_factory=dict)
     func_data: dict = field(default_factory=dict)         # Function ref -> its `data` ref
     smi_values: dict = field(default_factory=dict)        # Mint/Smi ref -> the int it holds
     # A const list's ELEMENTS, which the fill pass was already reading and throwing away.
@@ -162,6 +168,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     classes: list = []
     types: dict = {}
     codes: list = []
+    code_payload_info: dict = {}
     pool: list = []
     func_code_index: dict = {}
     class_sizes: dict = {}
@@ -201,7 +208,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
             for _ in range(n):
                 st.read_int()          # Read<double> = Read64 varint
         elif name == "CodeCid":
-            _fill_code(st, cl, codes, instr_index)
+            _fill_code(st, cl, codes, instr_index, code_payload_info)
         elif name == "ObjectPoolCid":
             _fill_object_pool(st, cl, pool, epoch.objpool_has_behavior,
                               epoch.objpool_tagged_first)
@@ -289,6 +296,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       library_urls={r: (strings.get(u) or strings.get(n) or '')
                                    for r, n, u in libraries},
                       field_meta=meta["field"], patch_class=meta["patch"],
+                      code_payload_info=code_payload_info,
                       func_data=meta["fdata"],
                       arrays=arrays,
                       smi_values={cl.start_ref + i: v
@@ -472,12 +480,14 @@ def _fill_instance(st, cl, arch=None):
                 st.read_ref_id()
 
 
-def _fill_code(st, cl, codes, instr_index):
+def _fill_code(st, cl, codes, instr_index, payload_info=None):
     disc = cl.discarded or [False] * cl.count
     for i in range(cl.count):
         cluster_index = -1
         if i < cl.main_count:
-            st.read_unsigned()          # payload_info
+            info = st.read_unsigned()   # payload_info
+            if payload_info is not None:
+                payload_info[instr_index[0]] = info
             cluster_index = instr_index[0]
             instr_index[0] += 1
             if disc[i]:

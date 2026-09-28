@@ -117,6 +117,21 @@ will bury the answer along with your context budget.
 | What native code does it reach into? | `jadart ffi <path>` |
 | Did the parse actually work? | `jadart verify <path>` |
 | I want the whole tree on disk | `jadart export <path> <outdir>` |
+| Where is this function in IDA, Ghidra or radare2? | `jadart symbols <path> -f <name>` |
+| Name every function inside one of those | `jadart symbols <path> --format r2\|ghidra\|ida` |
+| Watch a function at run time | `jadart hook <path> <Class.method>` |
+
+`symbols` gives the real virtual address, file offset and size of every code range, and
+`--format` writes a script that names them inside the tool. Addresses are relative to
+`_kDartIsolateSnapshotInstructions`, so a rebased load still lines up, and a script refuses
+a binary whose bytes do not match rather than applying the wrong names. Any address jadart
+prints can go straight into another tool: `functions`, `disasm`, `lift`, `decompile` and
+`xrefs` all print the virtual address. (Older releases printed `.text+0x..`, which was
+relative to the VM instructions image and landed inside a different function.)
+
+`hook` writes a Frida script (Android arm64) that attaches where calls actually enter and
+logs arguments from the registers or the Dart stack, whichever this Dart release and
+function kind use. It only logs; it changes nothing in the process.
 
 `xrefs` accepts an explicit kind:
 

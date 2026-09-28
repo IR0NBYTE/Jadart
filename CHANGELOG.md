@@ -11,6 +11,91 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Added
+
+- **`jadart symbols`: the names, at addresses other tools can use.** Every code range with
+  its virtual address, file offset, size and the address calls actually enter at, as a
+  table, as JSON, or as a script for radare2, Ghidra or IDA that names all of them inside
+  the tool. It shares the address model the rest of the release moved to: every address is
+  `_kDartIsolateSnapshotInstructions` plus the pc_offset, so a rebased load lines up on its
+  own. Verified against the same binary loaded normally, at
+  `-B 0x7000000000` in radare2, and imported into Ghidra with `-loader-imagebase`.
+  - A script applies nothing to the wrong binary. It resolves the anchor, checks its size
+    and then the first bytes of three known functions, and stops on any mismatch: the
+    clean fixture's script against the obfuscated build stops at the size, and against a
+    copy with one byte flipped inside a checked function it stops at the bytes.
+  - Ranges get the bounds the snapshot records, which an analyser cannot work out, because
+    a Dart range often ends in a call to a stub that does not return and analysis carries
+    on into the next function. On the clean fixture's 8194 ranges, radare2 6.0.9 left to
+    itself (`aaa`) finds 6707 of the starts, runs 652 functions past their end and never
+    finds 1487; with the script it finds all 8194 and runs none past its end. 65 bodies
+    come back shorter than the range, where radare2 ends at a return it can see: the range
+    is still flagged from its start, so no code is attributed to the wrong function. That
+    holds on a fresh session, after a full `aaa`, and when the script is applied twice.
+    Ghidra gives 8194 of 8194 with the exact recorded body, with and without auto analysis,
+    and 11051 of 11051 on an iOS dylib; IDA the same against a model of its API.
+  - Functions whose Code has a monomorphic entry get a second label where calls land. Such
+    a range opens on the switchable-call miss handler, so a label at the range start is on
+    code normal calls never execute; the entry is `kPolymorphicEntryOffsetAOT` bytes in (24
+    on arm64). 78 ranges on the clean fixture, 83 on iOS, and every one of them carries the
+    miss handler's `br x16` at +4, which is what makes the claim checkable.
+  - Names on a command line are reduced to `[A-Za-z0-9_]` plus the address, so they are
+    unique and cannot be read as a pipe, a redirect or a backtick by the tool consuming
+    them. The Dart name as written travels as base64, and invisible characters (bidi
+    overrides, zero width, newlines) are escaped to `\uXXXX`.
+- **`jadart hook`: a Frida script on the right address, reading the right registers.**
+  Android arm64, observation only: `onEnter` and `onLeave` log and nothing is written to
+  the process. It waits for `libapp.so` through `Process.attachModuleObserver`, resolves
+  the anchor as an export, checks the bytes, and attaches at the entry calls enter at.
+  - It reads arguments where the release and the function kind actually put them. From
+    Dart 3.4 the fixed parameters of most functions arrive in `x1, x2, x3, x5, x6, x7`;
+    before 3.4, and for closures, tear-offs, `dyn:` forwarders, dispatchers, method
+    extractors, FFI trampolines, field initializers and irregexp functions in every
+    release, they are on the Dart stack with the **last** argument at `[x15+0]`. The
+    snapshot hash pins one Dart minor and the Function kind is in the snapshot, so the
+    script picks the source rather than guessing, and prints the stack slots either way,
+    because whether the global type flow analysis kept one function on the stack is not
+    recorded in the snapshot.
+  - Values print raw with both readings where the snapshot cannot settle it: an even word
+    is shown as a Smi and as an unboxed int, `x22` is named as null, and an odd word is
+    named as an object only when it lies in the compressed heap (upper half matching `x28`)
+    and its header's class id is one the snapshot has a class for. Class ids come from the
+    snapshot's own Class objects plus the epoch's table for the VM's predefined ones.
+  - The entry and the bytes it checks have to lie inside the instructions image, and the
+    entry inside its own range. Those offsets come from the snapshot, so a crafted one can
+    put them anywhere: a Code flagged as having a monomorphic entry but only 8 bytes long
+    sends the entry past the end of the image, where the byte slice is empty and the
+    script's comparison of no bytes against no bytes passes, which would attach to a live
+    process at an address nothing verified. Both bounds are refused with the reason.
+  - A code range that starts outside the instructions image gets no address, and how many
+    were dropped is said rather than left to read as a binary with fewer functions. When
+    every range is outside, that is refused instead of reported as an empty answer.
+  - Ambiguity is refused, not guessed: a bare name matching several ranges lists the
+    candidates with their addresses and libraries (59% of named ranges share a name), and
+    an address has to be a range start or its entry. Anything but Android arm64 is refused
+    with the reason.
+  - Tested against a running app: hooking a small CTF build on an emulator logged the
+    receiver in `x1`, the submitted string in `x2` as `_OneByteString`, and the verdict
+    function returning a `Bool`. For comparison, blutter's template reads every argument
+    from `x15 + 8*i`, which on Dart 3 holds none of the register-passed ones and whose
+    index 0 is the last stack argument rather than the first; its hook address is a
+    `0xdeadbeef` placeholder and its first line throws until hand-edited.
+- What was run against the real tool, and what was not. The radare2 script was applied in
+  radare2 6.0.9 and the Ghidra script imported and run headless under Ghidra 12.1.4
+  (PyGhidra). IDA was not available, so its script was checked against a model of
+  `ida_funcs`/`ida_name`/`ida_bytes` that enforces IDA's own rules (no overlapping
+  functions, `get_func` containment, `get_next_func` ordering) over the real file bytes.
+  The script itself says so in its header. That verifies the logic, not IDA's behaviour.
+- What is measured here and what is not. The address model is checked on 58 ELF builds and
+  an iOS dylib, 546,037 ranges, with no disagreement. The monomorphic entry offset is
+  measured on arm64 (2.19.6, 3.0.6, 3.2.6, 3.12.2) and arm32 (3.4.4); the x64 and riscv
+  entries in `AOT_ENTRY_OFFSET` are read from the SDK and not measured, because no corpus
+  binary targets them, so `entry_va` on those targets is the SDK's number rather than one
+  this code has seen. That a range with no Code object has no monomorphic entry rests on
+  the obfuscated arm64 fixture, the only obfuscated build here. The register convention
+  was confirmed by a def-use scan over every range of 3.3.4, 3.4.4 and 3.12.2, and the
+  class-id shift and width by disassembling the real prologues.
+
 ### Changed
 
 - **Addresses are virtual addresses, not `.text+0x..`.** Every address Jadart printed was
