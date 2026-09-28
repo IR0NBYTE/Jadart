@@ -21,6 +21,11 @@ from dataclasses import dataclass
 
 from . import versions
 from .macho import open_container
+
+#: The exported symbol the isolate instructions image starts at. Every address jadart
+#: prints is this plus a pc_offset. Dart 3.13 renames it (_kDartSnapshotText); no
+#: registered epoch is that new yet.
+ISOLATE_INSTRUCTIONS = "_kDartIsolateSnapshotInstructions"
 from .stream import ReadStream
 
 DART_MAGIC = 0xDCDCF5F5
@@ -181,10 +186,21 @@ def parse_libapp(path, *, strict: bool = True) -> dict[str, SnapshotHeader]:
 
     `path` is a libapp.so, a directory, an APK or IPA, or a Source already read out of
     one. A container is read in place, never unpacked; see source.py."""
+    return parse_libapp_with_anchor(path, strict=strict)[0]
+
+
+def parse_libapp_with_anchor(path, *, strict: bool = True):
+    """`(headers, anchor)` from a single read of the container.
+
+    `anchor` describes where the isolate instructions image sits, or is None when the
+    binary has no such export. It comes from here rather than from a second open because
+    holding the file twice cost `jadart info` a third of its memory, and reporting the
+    anchor is the whole reason it needs the container at all."""
     from .source import read_binary
     src = read_binary(path)
     data = src.data
     elf = open_container(data)
+    anchor = _anchor_from(elf)
     out: dict[str, SnapshotHeader] = {}
     for which, sym in (("vm", "_kDartVmSnapshotData"),
                        ("isolate", "_kDartIsolateSnapshotData")):
@@ -204,4 +220,24 @@ def parse_libapp(path, *, strict: bool = True) -> dict[str, SnapshotHeader]:
         raise InputError(
             f"{src.label}: no Dart snapshot found (missing _kDart*SnapshotData symbols and "
             f"no snapshot magic). Not a Flutter/Dart AOT library?")
-    return out
+    return out, anchor
+
+
+def _anchor_from(elf):
+    """Where the isolate instructions image sits, read off the container it came from.
+
+    The symbol name lives here rather than being imported from disasm.py: that module
+    imports capstone, which costs 8 MB of RSS, and `info` does not disassemble anything.
+    disasm.py re-exports this name so there is still one definition of it."""
+    sym = elf.symbols.get(ISOLATE_INSTRUCTIONS)
+    if sym is None:
+        return None
+    try:
+        # ELF records the size; Mach-O leaves it 0 and derives it by copying the image, so
+        # only pay that where there is no recorded size.
+        size = sym.size or len(elf.symbol_bytes(ISOLATE_INSTRUCTIONS))
+        return {"symbol": ISOLATE_INSTRUCTIONS, "va": sym.value,
+                "file_offset": elf.va_to_offset(sym.value), "size": size,
+                "container": "macho" if type(elf).__name__ == "MachO64" else "elf"}
+    except JadartError:
+        return None

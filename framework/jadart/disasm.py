@@ -15,7 +15,7 @@ first_entry_with_code + i; pc_offset is the byte offset into the instructions im
 """
 from __future__ import annotations
 
-from .errors import JadartError
+from .errors import InputError, JadartError
 
 import bisect
 import re
@@ -144,6 +144,10 @@ class UnsupportedArch(JadartError):
     code is still available."""
 
 
+#: Re-exported so `from .disasm import ISOLATE_INSTRUCTIONS` keeps working. It is defined
+#: in snapshot.py because `info` reads it and must not import capstone to do so.
+from .snapshot import ISOLATE_INSTRUCTIONS  # noqa: E402,F401
+
 @dataclass
 class InstrImage:
     text: bytes             # the instructions image bytes
@@ -159,6 +163,15 @@ class InstrImage:
     data_length: int = 0       # header.length: where the serialized stream ends
     arch: object = None        # the resolved target; the decoder below is arm64-only and
                                # has to know when it is not looking at arm64
+    # Where the image sits in the binary. pc_offset is relative to the exported symbol
+    # below, not to .text: .text also holds the VM instructions image in front of it, so a
+    # `.text+pc_offset` label names code that far into the WRONG image. `anchor_va +
+    # pc_offset` is the virtual address a disassembler shows. Checked on 58 ELF builds and
+    # an iOS dylib, 546,037 ranges, against the container's own section headers.
+    anchor_symbol: str = ISOLATE_INSTRUCTIONS
+    anchor_va: int = None
+    anchor_file_offset: int = None
+    container: str = ""        # "elf" or "macho"
 
 
 def load_instructions(path):
@@ -177,7 +190,7 @@ def load_instructions(path):
     raw = src.data
     elf = open_container(raw)
     data = elf.symbol_bytes("_kDartIsolateSnapshotData")
-    text = elf.symbol_bytes("_kDartIsolateSnapshotInstructions")
+    text = elf.symbol_bytes(ISOLATE_INSTRUCTIONS)
     hdr = parse_blob(data, "isolate", strict=True)
     # Snapshot::length() is the STORED int64 plus kMagicSize: the magic is excluded from the
     # written size (snapshot.h "Excluding the magic value from the size written in the buffer").
@@ -235,9 +248,15 @@ def load_instructions(path):
     from .symbols import pc_name_map
     symbol_names = pc_name_map(elf, len(text))
 
+    anchor = elf.symbols.get(ISOLATE_INSTRUCTIONS)
+    anchor_va = anchor.value if anchor is not None else None
+    anchor_off = elf.va_to_offset(anchor_va) if anchor_va is not None else None
+
     return InstrImage(text=text, pcs=pcs, first_code=first_code, code_ranges=ranges,
                       all_ranges=all_ranges, symbol_names=symbol_names,
-                      data=data, data_length=header_length, arch=hdr.arch), fr, hdr
+                      data=data, data_length=header_length, arch=hdr.arch,
+                      anchor_va=anchor_va, anchor_file_offset=anchor_off,
+                      container="macho" if type(elf).__name__ == "MachO64" else "elf"), fr, hdr
 
 
 # One cap for every path into the disassembler. `decompile` and `export` used to pass a
@@ -331,7 +350,8 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
 
     Three things a user actually types, in order of how exactly they mean it:
 
-    An address (`0xe0428` or `.text+0xe0428`) names a range that has no symbol at all.
+    An address (`0x1eebac`, the virtual address Jadart prints, or the older
+    `.text+0xb812c` spelling) names a range that has no symbol at all.
     AOT emits closures anonymously, so the lambda passed to `map` cannot be reached by name
     from anywhere, and it is regularly the function that holds the answer.
 
@@ -347,7 +367,7 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
     seen_pc = set()
     by_pc = {cr.pc_offset: cr for cr in image.all_ranges}
 
-    addr = _parse_addr(name)
+    addr = _parse_addr(name, image)
     if addr is not None:
         cr = by_pc.get(addr)
         if cr is None:                     # inside a range rather than at its start
@@ -377,19 +397,128 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
     return out
 
 
-def _parse_addr(text: str):
-    """`0x1234`, `.text+0x1234` or a bare hex/decimal offset -> int, else None."""
+def va_of(image: InstrImage, pc_offset: int):
+    """The virtual address of a pc_offset, or None when the anchor symbol is absent."""
+    return None if image.anchor_va is None else image.anchor_va + pc_offset
+
+
+def addr_label(image: InstrImage, pc_offset: int) -> str:
+    """The address to print for a code range.
+
+    The virtual address, which is what every other tool shows and what can be pasted into
+    one. Jadart used to print `.text+<pc_offset>`, but the number was never an offset into
+    `.text`: that section also holds the VM instructions image in front of the isolate one,
+    so the label named code that far into the wrong image, out by 0x16a80 on the clean
+    fixture and by a different amount per build. Without the anchor symbol there is no
+    virtual address to give, and the offset is named for what it actually is."""
+    va = va_of(image, pc_offset)
+    return f"0x{va:x}" if va is not None else f"isolate+0x{pc_offset:x}"
+
+
+#: Mnemonics whose last operand is a code address in this image, which capstone renders as
+#: a pc_offset: the branches, the compare-and-branch family, and `adr`, which computes one
+#: into a register (80 of them on the clean fixture). `br`/`blr` take a register, and
+#: `adrp` a page that is not an address in this image, so neither is here.
+_BRANCH_MNEMONICS = ("b", "bl", "cbz", "cbnz", "tbz", "tbnz", "adr")
+
+
+def target_va(image: InstrImage, mnemonic: str, op: str):
+    """The virtual address a branch or `adr` operand points at, or None when it is not one.
+
+    The text listing shows this in place of the operand; `-j` keeps `operands` exactly as
+    capstone rendered it and carries this beside it, so a consumer that already parsed that
+    string is not silently handed a different one."""
+    if image.anchor_va is None or "#0x" not in op:
+        return None
+    if mnemonic.split(".", 1)[0] not in _BRANCH_MNEMONICS:
+        return None
+    try:
+        target = int(op.rpartition("#0x")[2], 16)
+    except ValueError:
+        return None
+    return image.anchor_va + target if 0 <= target < len(image.text) else None
+
+
+def rebase_operand(image: InstrImage, mnemonic: str, op: str) -> str:
+    """A branch operand with its target written as a virtual address.
+
+    capstone is handed the range at its pc_offset, so it renders `bl #0xb8334`, a number
+    that is an offset into the instructions image. Printed next to virtual addresses that
+    would read as one, and pasting it into another tool lands in the wrong place. Only the
+    print layer rewrites it: every address inside the pipeline stays a pc_offset, which is
+    what the pool, the call graph and the lifter are keyed on."""
+    if image.anchor_va is None or "#0x" not in op:
+        return op
+    base = mnemonic.split(".", 1)[0]
+    if base not in _BRANCH_MNEMONICS:
+        return op
+    head, _, tail = op.rpartition("#0x")
+    try:
+        target = int(tail, 16)
+    except ValueError:
+        return op
+    if not 0 <= target < len(image.text):
+        return op
+    return f"{head}0x{image.anchor_va + target:x}"
+
+
+def _parse_addr(text: str, image: "InstrImage | None" = None):
+    """An address a person typed -> a pc_offset into the instructions image, else None.
+
+    Accepted forms, and why:
+    - `.text+0x1234`, the label Jadart used to print. It was never a `.text` offset; the
+      number after it is a pc_offset, so it is still read as one and old scripts keep
+      working.
+    - `isolate+0x1234`, the same number said correctly, and `va+0x1234` for the other
+      reading, so both are always expressible.
+    - `0x1234` or `1234`. Read as a virtual address when it lands inside the image, which
+      is the form every command prints now, so anything Jadart printed can be pasted back
+      and reach what it named. Outside that window it can only be a pc_offset, and is read
+      as one.
+
+    The two readings overlap, because the image is longer than the address it starts at.
+    Preferring the pc_offset there meant an address Jadart had just printed came back as a
+    different function: `disasm` prints `0x13ef44` inside `FormatException.`, and pasting
+    it returned `sub_0x13ee74`. 2506 of the clean fixture's addresses sit in that window.
+    Refusing them was not an option either, since they are the output's own spelling. So
+    the address reading wins, and `isolate+`/`.text+`/`+` keep meaning the pc_offset for
+    anything written against the older output.
+    """
     t = text.strip()
-    if t.startswith(".text+"):
-        t = t[len(".text+"):]
+    forced_va = False
+    for prefix in ("va+", "va:"):
+        if t.startswith(prefix):
+            t, forced_va = t[len(prefix):], True
+            break
+    else:
+        for prefix in (".text+", "isolate+", "+"):
+            if t.startswith(prefix):
+                t = t[len(prefix):]
+                image = None      # an explicit prefix means a pc_offset, not an address
+                break
     try:
         if t.lower().startswith("0x"):
-            return int(t, 16)
-        if t.isdigit():
-            return int(t)
+            n = int(t, 16)
+        elif t.isdigit():
+            n = int(t)
+        else:
+            return None
     except ValueError:
-        pass
-    return None
+        return None
+    if image is None or image.anchor_va is None:
+        if forced_va:
+            raise InputError(
+                "this binary has no anchor symbol, so there is no virtual address to "
+                "resolve `va+` against; give the pc_offset instead")
+        return n
+    as_va = n - image.anchor_va
+    if 0 <= as_va < len(image.text):
+        return as_va
+    if forced_va:
+        raise InputError(
+            f"0x{n:x} is not inside the instructions image, which runs from "
+            f"0x{image.anchor_va:x} to 0x{image.anchor_va + len(image.text):x}")
+    return n
 
 
 def function_name_by_pc(image: InstrImage, fr) -> dict:

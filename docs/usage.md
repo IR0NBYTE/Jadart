@@ -104,6 +104,45 @@ corroborated by 127 distinct defining classes, `toString` by 67, `build` by 48,
 Flutter widget lifecycle, each at its own offset. A name needs at least two agreeing
 classes, and an offset claimed by two different names is dropped.
 
+## Addresses
+
+Every address Jadart prints is a virtual address: the value of the exported symbol
+`_kDartIsolateSnapshotInstructions` plus the offset of the code inside the isolate
+instructions image. That is the address IDA, Ghidra, radare2 and a debugger all show, so it
+can be pasted straight into one. `jadart info` prints the anchor, and `info -j` carries it
+with the rule, so a caller holding only a `pc_offset` can do the arithmetic itself.
+
+```
+$ jadart info libapp.so | tail -4
+[addresses]
+  anchor          _kDartIsolateSnapshotInstructions
+  anchor va       0x136a80  (file offset 0x136a80, 1833776 bytes)
+  rule            the address jadart prints is this plus the pc_offset
+```
+
+Older versions printed `.text+0x..`. That label was wrong: the number is an offset into the
+isolate instructions image, and `.text` starts earlier because it also holds the VM
+instructions image. On the clean fixture the gap is 0x16a80, and it differs per build, so
+the label named an address inside a different function. Both spellings are still accepted as
+input, along with a bare offset, so anything written against the old output keeps working:
+
+```
+jadart disasm libapp.so 0x1eebac          # the virtual address, as printed
+jadart disasm libapp.so .text+0xb812c     # the old label
+jadart disasm libapp.so isolate+0xb812c   # the same number, said correctly
+jadart disasm libapp.so va+0x1393dc       # force the address reading
+```
+
+A bare number is read as a virtual address when it lands inside the image, which is the form
+every command prints, so anything jadart printed can be pasted back and reach what it named.
+The prefixes mean the pc_offset, for anything written against the older output.
+
+In `-j`, every record that has a `pc_offset` also has the `va` for it.
+
+One thing still carries the offset: a range with no name prints as `sub_0x<pc_offset>`,
+which is a synthetic name rather than an address, and it is spelled the same way in the
+function table and in lifted bodies.
+
 ## The function table, and what calls what
 
 `jadart functions` is the listing every disassembler opens on: radare2's `afl`, IDA's
@@ -114,11 +153,12 @@ its instructions in place, and those ranges are real and reachable.
 ```
 $ jadart functions TheTimer.apk --sigs dart33.sig -s callers
 // 9213 code ranges  snapshot 203  signature 4334  anonymous 4676
+// address = 0xc6580 (_kDartIsolateSnapshotInstructions) + pc_offset
 address           size  calls    in  name
-.text+0x2112e0     128      0  6095  stub _iso_stub_StackOverflowSharedWithoutFPURegsStub~
-.text+0x211460     180      0   810  stub _iso_stub_AllocateMintSharedWithoutFPURegsStub~
-.text+0x2111e4     252      0   645  stub _iso_stub_AllocateArrayStub~
-.text+0x2810       584      4   452  _interpolate~
+0x2d7860           128      0  6095  stub _iso_stub_StackOverflowSharedWithoutFPURegsStub~
+0x2d79e0           180      0   810  stub _iso_stub_AllocateMintSharedWithoutFPURegsStub~
+0x2d7764           252      0   645  stub _iso_stub_AllocateArrayStub~
+0xc8d90            584      4   452  _interpolate~
 ```
 
 Two columns exist here that a native disassembler has no way to fill:
@@ -160,8 +200,10 @@ r2 spells `axt`:
 
 ```
 $ jadart xrefs libapp.so benchWithdraw
-// benchWithdraw  .text+0xb812c  1 call sites
-    .text+0xb7db0    428 bytes
+// resolved as function
+// benchWithdraw  0x1eebac
+  1 direct call site
+    0x1ee830       428 bytes
 ```
 
 ### ffi: where the Dart stops being the answer
@@ -179,13 +221,13 @@ $ jadart ffi libapp.so
 // shared-object names in the ObjectPool, and the code that reads them
 
 libnative.so   pool_0xd650
-  initialize  .text+0x166370  476 bytes
+  initialize  0x31cbf0  476 bytes
       var t2 = lookup(pool_0xd658, t0, "process_data_complete");
       var t5 = lookup(pool_0xd670, THR.field_0x68.field_0x13b9, "get_client_version");
       printToConsole("Native library loaded successfully");
       printToConsole("Main function: process_data_complete");
       printToConsole("VULNERABILITIES ACTIVE: Buffer overflow, weak crypto, format string");
-  _open@9050071  .text+0x1666d0  136 bytes
+  _open@9050071  0x31cf50  136 bytes
       pool_0xd6d8.field_0x7("libnative.so", NULL);
 ```
 
@@ -218,9 +260,9 @@ counted as opaque, which is what a closure call through a captured context genui
 
 ```
 $ jadart xrefs libapp.so function createElement
-// createElement  .text+0xff398
+// createElement  0x235e18
   11 virtual call sites  (one of 18 implementations of this selector)
-    .text+0x59fe4    636 bytes
+    0x190a64       636 bytes
     ...
 ```
 
