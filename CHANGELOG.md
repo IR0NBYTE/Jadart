@@ -134,6 +134,26 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A word capstone cannot decode no longer hides the rest of a function.** capstone stops
+  at such a word, and `disassemble_range` returned what it had decoded up to there, so
+  everything after it was gone from `disasm`, `lift`, `decompile`, `export` and the call
+  graph with nothing marking the cut. A range whose second word was junk read as a
+  complete one-instruction function, which is the one kind of wrong answer this tool is
+  built not to give. The word is now emitted as `.word 0x...` and decoding continues after
+  it, which is what objdump does and what the lifter already did with an instruction it
+  could not model. Both instruction sets here are fixed width, so stepping to the next
+  word is exact rather than a resynchronisation guess.
+  - This changes real output, on arm32. The issue expected no corpus binary to contain
+    such a word, which holds for the arm64 fixtures: their output is byte-identical. It is
+    not true of arm32. `0xe7100c13` appears once each in the 2.19.6, 3.0.6 and 3.1.5
+    builds, in the middle of real code, and each was cutting its function short: 178
+    instructions per binary come back, and the call graph finds the calls among them, so
+    `_IntegerImplementation.~/` on arm32-2.19.6 gains a callee and a caller it always had.
+    The other 24 corpus binaries are unchanged.
+  - The cap every other path obeys still bounds the output, so a range of nothing but bad
+    words cannot make the loop emit more rows than `MAX_INSNS`, and a tail shorter than one
+    word is not reported as an instruction.
+
 - **`export` works on every input the other commands take.** Pointing it at a directory
   exited 3, the code that says the defect is in this program rather than in the file, with
   `KeyError: 'resources'`. The summary decided whether to describe the container by reading
