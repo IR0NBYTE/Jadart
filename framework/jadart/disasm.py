@@ -342,26 +342,59 @@ def require_decoder(image: InstrImage) -> str:
     return arch_name
 
 
+#: Both instruction sets here are fixed width, so a word capstone rejects can be stepped
+#: over and decoding picked up at the next one. Anything variable width would need a real
+#: resynchronisation strategy instead, and would have to be added to `_DECODERS` first.
+_WORD = 4
+
+#: What an undecodable word is rendered as, the spelling objdump uses. It is a mnemonic no
+#: instruction set has, so nothing downstream mistakes it for one it should model.
+UNDECODABLE = ".word"
+
+
 def disassemble_range(image: InstrImage, cr: CodeRange, max_insns: int = MAX_INSNS):
     """Disassemble one CodeRange (used for full-image coverage, incl. anonymous
-    obfuscation-discarded functions where owner_ref is -1)."""
+    obfuscation-discarded functions where owner_ref is -1).
+
+    A word capstone cannot decode is emitted as `.word 0x...` and decoding continues after
+    it. capstone stops at such a word, so this used to return the instructions before it
+    and nothing else: every command dropped the rest of the function silently, and a range
+    whose second word was junk read as a complete one-instruction function. No compiler
+    output does that (capstone decodes every word of every range on all sixteen arm64
+    corpus binaries), which is exactly why a crafted one must not be able to hide code
+    behind it."""
     arch_name = require_decoder(image)
     size = cr.size or 512
     code = image.text[cr.pc_offset:cr.pc_offset + size]
     md = _decoder(arch_name)
-    if _HAVE_LITE:
-        # disasm_lite yields (address, size, mnemonic, op_str) straight out of the C
-        # array. `disasm` builds a full CsInsn per instruction instead, and this walks
-        # the whole image: 457,622 instructions on the clean corpus binary, of which the
-        # lifter reads exactly the three fields below and never the operand detail. Same
-        # tuples, measured identical over all 457,622; 1.93x faster to produce them.
-        return [(a, mn, op)
-                for (a, _sz, mn, op) in md.disasm_lite(code, cr.pc_offset, max_insns)]
-    out = []
-    for insn in md.disasm(code, cr.pc_offset):
-        out.append((insn.address, insn.mnemonic, insn.op_str))
+
+    def decode(buf, addr, limit):
+        """(instructions, bytes consumed) from one capstone pass."""
+        if _HAVE_LITE:
+            # disasm_lite yields (address, size, mnemonic, op_str) straight out of the C
+            # array. `disasm` builds a full CsInsn per instruction instead, and this walks
+            # the whole image: 457,622 instructions on the clean corpus binary, of which
+            # the lifter reads exactly the three fields below and never the operand
+            # detail. Same tuples, measured identical over all 457,622; 1.93x faster.
+            got = [(a, mn, op) for (a, _sz, mn, op) in md.disasm_lite(buf, addr, limit)]
+        else:
+            got = [(i.address, i.mnemonic, i.op_str) for i in md.disasm(buf, addr)][:limit]
+        return got, len(got) * _WORD
+
+    out, used = decode(code, cr.pc_offset, max_insns)
+    # The common case decodes the whole range in that one pass and never enters the loop.
+    while used < len(code) and len(out) < max_insns:
+        left = len(code) - used
+        if left < _WORD:
+            break                      # a tail shorter than one word is not an instruction
+        word = int.from_bytes(code[used:used + _WORD], "little")
+        out.append((cr.pc_offset + used, UNDECODABLE, f"0x{word:08x}"))
+        used += _WORD
         if len(out) >= max_insns:
             break
+        more, consumed = decode(code[used:], cr.pc_offset + used, max_insns - len(out))
+        out.extend(more)
+        used += consumed
     return out
 
 

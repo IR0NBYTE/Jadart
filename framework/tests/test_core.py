@@ -6353,6 +6353,111 @@ def test_hook_script_reads_registers_and_is_observation_only():
     assert p["bytes"] == image.text[p["off"]:p["off"] + hooks.GUARD_BYTES].hex()
 
 
+# ── undecodable words: a bad word must not hide the rest of a function ────────
+
+def _image_of(words, arch="arm64"):
+    """A one-range InstrImage over the given 32-bit words, for decoder tests."""
+    import struct as _struct
+    from jadart.disasm import InstrImage, CodeRange
+    code = b"".join(_struct.pack("<I", w) for w in words)
+    image = InstrImage(text=code, pcs=[0], first_code=0, code_ranges={},
+                       all_ranges=[CodeRange(pc_offset=0, size=len(code), owner_ref=-1)],
+                       symbol_names={})
+    image.arch = type("Arch", (), {"name": arch, "compressed": True, "word_size": 8})()
+    return image, image.all_ranges[0]
+
+
+def test_an_undecodable_word_does_not_hide_the_rest_of_a_range():
+    """capstone stops at a word it cannot decode; the range must not stop with it.
+
+    Everything after such a word used to be gone from `disasm`, `lift`, `decompile`,
+    `export` and the call graph, with nothing marking the cut, so a range whose second
+    word was junk read as a complete one-instruction function. The word is emitted as
+    `.word 0x...` and decoding continues after it, which is what objdump does and what the
+    lifter already does with an instruction it cannot model."""
+    if not _capstone_available():
+        _skip("  SKIP test_an_undecodable_word_does_not_hide_the_rest_of_a_range (no capstone)")
+    from jadart.disasm import disassemble_range, UNDECODABLE
+    # the issue's reproduction: bl, a word capstone rejects, bl, ret
+    image, cr = _image_of([0x94000004, 0xFFFFFFFF, 0x94000005, 0xD65F03C0])
+    out = disassemble_range(image, cr)
+    assert len(out) == 4, out
+    assert [mn for _a, mn, _o in out] == ["bl", UNDECODABLE, "bl", "ret"], out
+    assert out[1] == (4, UNDECODABLE, "0xffffffff"), out[1]
+    # both calls are present, which is the whole point: the second one used to vanish
+    assert sum(1 for _a, mn, _o in out if mn == "bl") == 2
+
+    # several bad words, including one at the very start and two in a row
+    image, cr = _image_of([0xFFFFFFFF, 0xFFFFFFFF, 0xD65F03C0])
+    out = disassemble_range(image, cr)
+    assert [mn for _a, mn, _o in out] == [UNDECODABLE, UNDECODABLE, "ret"], out
+
+    # a range that is entirely undecodable comes back as words, not as nothing
+    image, cr = _image_of([0xFFFFFFFF] * 3)
+    out = disassemble_range(image, cr)
+    assert len(out) == 3 and all(mn == UNDECODABLE for _a, mn, _o in out), out
+
+    # the addresses stay the range's own pc_offsets, one word apart
+    assert [a for a, _m, _o in out] == [0, 4, 8]
+
+
+def test_the_cap_still_applies_across_undecodable_words():
+    """MAX_INSNS bounds the output however many bad words the range holds.
+
+    The resynchronisation loop is driven by a count out of the snapshot, so a crafted
+    range of nothing but bad words must not be able to make it emit more rows than the cap
+    every other path obeys."""
+    if not _capstone_available():
+        _skip("  SKIP test_the_cap_still_applies_across_undecodable_words (no capstone)")
+    from jadart.disasm import disassemble_range
+    image, cr = _image_of([0xFFFFFFFF] * 50)
+    assert len(disassemble_range(image, cr, max_insns=10)) == 10
+    # and a mixture, so the cap is reached from inside the loop rather than the first pass
+    image, cr = _image_of([0xD503201F, 0xFFFFFFFF] * 25)      # nop, bad, nop, bad, ...
+    assert len(disassemble_range(image, cr, max_insns=7)) == 7
+
+
+def test_a_tail_shorter_than_one_word_is_not_an_instruction():
+    """A range whose size is not a whole number of words stops at the last whole one."""
+    if not _capstone_available():
+        _skip("  SKIP test_a_tail_shorter_than_one_word_is_not_an_instruction (no capstone)")
+    from jadart.disasm import disassemble_range, InstrImage, CodeRange, UNDECODABLE
+    image, _cr = _image_of([0xFFFFFFFF, 0xD65F03C0])
+    short = CodeRange(pc_offset=0, size=6, owner_ref=-1)       # one word and a half
+    out = disassemble_range(image, short)
+    assert out == [(0, UNDECODABLE, "0xffffffff")], out
+
+
+def test_real_binaries_that_carry_an_undecodable_word():
+    """Three arm32 corpus builds hold one such word each, in the middle of real code.
+
+    The issue expected none of the corpus to contain one, which holds for the arm64
+    fixtures this repo ships. It is not true of arm32: `0xe7100c13` appears in
+    2.19.6, 3.0.6 and 3.1.5, and everything after it in those functions was being
+    dropped. Skips when the corpus is not checked out."""
+    if not _capstone_available():
+        _skip("  SKIP test_real_binaries_that_carry_an_undecodable_word (no capstone)")
+    import glob
+    from jadart.disasm import load_instructions, disassemble_range, UNDECODABLE
+    found = sorted(glob.glob(os.path.expanduser(
+        "~/My_MVPs/flutter_re_research/flubench/corpus/arm32-2.19.6/libapp.so")))
+    if not found:
+        _skip("  SKIP test_real_binaries_that_carry_an_undecodable_word (no corpus)")
+    image, _fr, _hdr = load_instructions(found[0])
+    hits = []
+    for cr in image.all_ranges:
+        rows = disassemble_range(image, cr)
+        bad = [i for i, (_a, mn, _o) in enumerate(rows) if mn == UNDECODABLE]
+        if bad:
+            hits.append((cr, rows, bad))
+    assert hits, "arm32-2.19.6 carries undecodable words"
+    for cr, rows, bad in hits:
+        # the range decodes to exactly its own length, not to the first bad word
+        assert len(rows) == cr.size // 4, (hex(cr.pc_offset), len(rows), cr.size // 4)
+        # and there is real code after the bad word, which is what used to be lost
+        assert bad[0] < len(rows) - 1
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
