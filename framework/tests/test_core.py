@@ -5355,15 +5355,178 @@ def test_signature_library_round_trips():
 
 def test_signature_library_rejects_a_foreign_file():
     import tempfile
+    from jadart.errors import InputError
     from jadart.signatures import load
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "x.sig")
         open(p, "w").write("not a signature file\n")
         try:
             load(p)
-        except ValueError:
+        except InputError as e:
+            assert "not a jadart signature file" in str(e) and p in str(e)
             return
         assert False, "loaded a file that is not a signature library"
+
+
+def test_signature_load_names_the_path_and_line_of_a_bad_file(tmp_path):
+    """A `--sigs` path is user input. A missing, unreadable or malformed file once
+    escaped load() as a builtin such as FileNotFoundError, IsADirectoryError,
+    PermissionError, ValueError, KeyError or UnicodeDecodeError, which the CLI reports as
+    a bug in jadart (#38). Each is an InputError now, naming the path and, for a bad line,
+    its number."""
+    from jadart.errors import InputError
+    from jadart.signatures import load
+    head = "# jadart-signatures-1\n"
+    good = "c\t0000000000000001\ta\n"
+    late = (head + good * 400).encode() + b"b\t0000000000000002\t\xff\n"  # past 8 KB
+    cases = {
+        "missing": (None, "no such file or directory"),
+        "folder": ("dir", "is a directory"),
+        "hosts.txt": ("127.0.0.1 localhost\n", "not a jadart signature file"),
+        "empty.sig": ("", "not a jadart signature file"),
+        "spaced.sig": ("# jadart-signatures-1 \n" + good, "not a jadart signature file"),
+        "tag.sig": (head + good + "x\t0000000000000002\tb\n", ":3: not a signature line"),
+        "hex.sig": (head + "b\tzz00000000000002\tb\n", ":2: not a signature line"),
+        "plus.sig": (head + "b\t+000000000000002\tb\n", ":2: not a signature line"),
+        "hex15.sig": (head + "b\t000000000000002\tb\n", ":2: not a signature line"),
+        "short.sig": (head + "b\t0000000000000002\n", ":2: not a signature line"),
+        "from.sig": (head + "# from\t3.12.2\tseven\tref.so\n", ":2: a '# from' line"),
+        "bigfrom.sig": (head + "# from\t3.12.2\t" + "9" * 5000 + "\tref.so\n",
+                        ":2: a '# from' line"),   # int() refuses more than 4300 digits
+        "nocount.sig": (head + "# from\t3.12.2\t\tref.so\n", ":2: a '# from' line"),
+        "crlf.sig": ((head + good + "x\t0000000000000002\tb\n").replace("\n", "\r\n"),
+                     ":3: not a signature line"),
+        "binary.sig": (head.encode() + b"b\t0000000000000002\t\xff\xfe\n",
+                       ":2: not UTF-8 text"),
+        "late.sig": (late, ":402: not UTF-8 text"),
+    }
+    for name, (body, why) in cases.items():
+        p = tmp_path / name
+        if body == "dir":
+            p.mkdir()
+        elif isinstance(body, bytes):
+            p.write_bytes(body)
+        elif body is not None:
+            p.write_text(body)
+        try:
+            load(str(p))
+        except InputError as e:
+            assert str(p) in str(e) and why in str(e), (name, str(e))
+        else:
+            assert False, f"{name}: loaded"
+    if hasattr(os, "symlink"):                 # errors other than a missing file
+        loop = tmp_path / "loop.sig"
+        os.symlink(loop, loop)
+        (tmp_path / "file").write_text("x")
+        for bad in (loop, tmp_path / "file" / "x.sig"):
+            try:
+                load(str(bad))
+            except InputError as e:
+                assert str(bad) in str(e) and "cannot read this file" in str(e), str(e)
+            else:
+                assert False, f"{bad}: loaded"
+    locked = tmp_path / "locked.sig"
+    locked.write_text(head + good)
+    os.chmod(locked, 0)
+    try:
+        if not os.access(locked, os.R_OK):     # root reads it anyway
+            try:
+                load(str(locked))
+            except InputError as e:
+                assert str(locked) in str(e) and "cannot read this file" in str(e), str(e)
+            else:
+                assert False, "read a file with no read permission"
+    finally:
+        os.chmod(locked, 0o600)
+
+    ok = tmp_path / "ok.sig"                   # comments, blank lines, CRLF, odd names
+    ok.write_bytes((head + "# a comment\n\n" + good + "p\t00000000000000ff\tb c\td\n"
+                    + "b\t0000000000000003\t\n").replace("\n", "\r\n").encode())
+    lib = load(str(ok))
+    assert lib.by_ctx == {1: "a"} and lib.by_pooled == {0xff: "b c\td"}
+    assert lib.by_body == {3: ""}      # save() writes base_name('@1'), which is empty
+
+
+def test_signature_load_reads_a_pipe_and_refuses_an_endless_file(tmp_path):
+    """A library read through a pipe (`--sigs <(zcat lib.sig.gz)`) loads as it did. A
+    file that is not a library is refused from its first line, so /dev/zero, which has
+    no line end, no longer keeps load() reading. Both run so that a regression fails
+    rather than hangs: the pipe has a writer, and /dev/zero runs under a timeout."""
+    import subprocess
+    import threading
+    from jadart.signatures import load
+    if not hasattr(os, "mkfifo") or not os.path.exists("/dev/zero"):
+        _skip("  SKIP test_signature_load_reads_a_pipe_and_refuses_an_endless_file "
+              "(no FIFOs or /dev/zero here)")
+    fifo = tmp_path / "pipe.sig"
+    os.mkfifo(fifo)
+
+    def write():
+        with open(fifo, "w") as w:
+            w.write("# jadart-signatures-1\nb\t0000000000000007\tfrom_a_pipe\n")
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    assert load(str(fifo)).by_body == {7: "from_a_pipe"}
+    writer.join(5)
+    framework = os.path.join(os.path.dirname(__file__), "..")
+    # the child's memory is capped where the platform enforces it, so a regression that
+    # reads /dev/zero whole fails on the cap or the timeout rather than filling the host
+    r = subprocess.run([sys.executable, "-c", "try:\n    import resource\n"
+                        "    resource.setrlimit(resource.RLIMIT_AS, (1 << 31, 1 << 31))\n"
+                        "except (ImportError, ValueError, OSError):\n    pass\n"
+                        "from jadart.signatures import load\n"
+                        "try:\n    load('/dev/zero')\nexcept Exception as e:\n"
+                        "    print(type(e).__name__, e)"],
+                       cwd=framework, capture_output=True, text=True, timeout=10)
+    assert r.stdout.startswith("InputError /dev/zero: not a jadart signature file"), r
+
+
+def test_signature_library_is_utf8_whatever_the_locale(tmp_path):
+    """save() and load() used the locale's encoding. Under a Latin-1 locale a name with
+    a character Latin-1 lacks could not be saved, and a library written under another
+    locale read back wrong. Both are UTF-8 now."""
+    import subprocess
+    code = ("import locale, sys\n"
+            "from jadart.signatures import Library, save, load\n"
+            "if '8859' not in locale.getpreferredencoding(False):\n"
+            "    print('no latin-1 locale'); sys.exit()\n"
+            "p = sys.argv[1]\n"
+            "save(Library(by_body={5: 'name_\\u540d'}), p)\n"
+            "assert load(p).by_body == {5: 'name_\\u540d'}\n"
+            "assert open(p, 'rb').read().endswith('\\u540d\\n'.encode('utf-8'))\n"
+            "print('ok')\n")
+    env = dict(os.environ, LC_ALL="en_US.ISO8859-1", PYTHONUTF8="0")
+    env.pop("PYTHONIOENCODING", None)
+    framework = os.path.join(os.path.dirname(__file__), "..")
+    r = subprocess.run([sys.executable, "-c", code, str(tmp_path / "x.sig")],
+                       cwd=framework, env=env, capture_output=True, text=True, timeout=60)
+    if r.stdout.strip() == "no latin-1 locale":
+        _skip("  SKIP test_signature_library_is_utf8_whatever_the_locale "
+              "(no latin-1 locale)")
+    assert r.stdout.strip() == "ok", r
+
+
+def test_a_bad_sigs_file_is_a_typed_input_error_on_the_cli(tmp_path, capsys):
+    """functions and symbols with a bad --sigs exit 2 with the path in the message, and
+    -j prints a typed document, not the internal-error one that asks for a bug report."""
+    import json
+    from jadart import cli
+    if not os.path.exists(CLEAN):
+        _skip("  SKIP test_a_bad_sigs_file_is_a_typed_input_error_on_the_cli "
+              "(no clean fixture)")
+    hosts = tmp_path / "hosts"
+    hosts.write_text("127.0.0.1 localhost\n")
+    bad = tmp_path / "bad.sig"
+    bad.write_text("# jadart-signatures-1\nb\tnothex\tx\n")
+    for sigs in (str(tmp_path / "missing.sig"), str(tmp_path), str(hosts), str(bad)):
+        for command in ("functions", "symbols"):
+            assert cli.main([command, CLEAN, "--sigs", sigs]) == 2, (command, sigs)
+            err = capsys.readouterr().err
+            assert sigs in err and "internal error" not in err, err
+            assert cli.main([command, CLEAN, "-j", "--sigs", sigs]) == 2
+            doc = json.loads(capsys.readouterr().out)
+            assert doc["ok"] is False and "internal" not in doc, doc
+            assert sigs in doc["error"], doc
 
 
 def test_signature_ambiguous_shapes_are_dropped():

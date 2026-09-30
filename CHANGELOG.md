@@ -134,6 +134,26 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A bad `--sigs` file is a typed input error, exit 2.** A missing path, a directory, a
+  file that is not a signature library, one that cannot be read, and a malformed line in
+  one each escaped `signatures.load()` as a builtin exception (such as
+  `FileNotFoundError`, `IsADirectoryError`, `PermissionError`, `ValueError`, `KeyError` or
+  `UnicodeDecodeError`), which all nine commands that take `--sigs` reported as a bug in
+  jadart: exit 3, a request to file an issue, and `"internal": true` under `-j`. Each is
+  now an `InputError` naming the path, and for a bad line its number and what the line
+  needs, so a script can tell a bad argument from a crash, as it already could for the
+  binary next to it. The first line is read only as far as the header needs, so a file
+  that does not start with it is refused at once: `--sigs /dev/zero` read without end
+  before, and a large file with no newline was read whole. A library read through a pipe,
+  from a process substitution or `/dev/stdin`, still loads. The file is read and written
+  as UTF-8 rather than in the locale's encoding. Every line has to be what `jadart
+  signatures` writes: the header exactly, a body line as a tag, 16 lowercase hex digits
+  and a name, a count of at most 18 digits, and `\n` or `\r\n` line ends. Before, a header
+  with spaces around it, `\r` line ends, uppercase or 17-digit hex, and a signed or padded
+  count also loaded, and `int(h, 16)` took `+1` or `1_0`. A library `jadart signatures`
+  wrote as UTF-8 loads to the same tables as before and saves back to the same bytes; one
+  an earlier version wrote under another locale, such as the Windows default, with a
+  non-ASCII character in it is refused as not UTF-8 and has to be rebuilt. Closes #38.
 - **The skill file and the usage guide render as written again.** The `xrefs` examples
   that #22 added to `SKILL.md` and `docs/usage.md` opened a code block and never closed
   it. Under CommonMark the next fence closed it instead, and the fences after it were
