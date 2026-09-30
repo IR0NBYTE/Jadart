@@ -34,6 +34,7 @@ genuinely unresolvable is a closure call through a captured context.
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
+from .branches import row_kinds
 from .errors import JadartError
 
 from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassemble_range,
@@ -58,7 +59,7 @@ class CallIndex:
     callers: dict = field(default_factory=dict)    # target pc -> [caller pc, ...]
     callees: dict = field(default_factory=dict)    # caller pc -> [target pc, ...]
     indirect: dict = field(default_factory=dict)   # caller pc -> count of blr sites
-    unresolved: int = 0                            # bl to something that is not a range
+    unresolved: int = 0                            # a call to no range start
 
     # virtual dispatch, resolved through the serialized dispatch table
     sites: dict = field(default_factory=dict)      # caller pc -> [(blr addr, sel off)]
@@ -147,9 +148,10 @@ def build_index(image, fr=None, virtual: bool = True,
                 extra_names: dict = None) -> CallIndex:
     """One pass over every code range, collecting direct, pool-mediated and virtual edges.
 
-    A `bl` whose target is not the start of a known range is counted rather than recorded:
-    those are branches into a runtime stub that lives outside the instructions table, and
-    silently dropping them would make the edge counts look complete when they are not.
+    A direct call whose target is not the start of a known range, or one the instruction
+    word and capstone do not confirm, is counted rather than recorded: mostly calls into
+    a stub's inner entries (arm32's write-barrier wrappers), and silently dropping them
+    would make the edge counts look complete when they are not.
 
     Virtual sites need the dispatch table, which is decoded after the sweep so that only
     the selector offsets actually used get resolved.
@@ -229,15 +231,18 @@ def build_index(image, fr=None, virtual: bool = True,
             continue
         # A pool-mediated edge interleaves with the direct ones in instruction order and
         # shares their dedupe, so a range that may have one keeps the whole decoded walk.
+        # A call is what the instruction word says it is, as in disasm: the mnemonic
+        # test this replaced (`bl` only) dropped arm32's `blls`, `bleq` and `blne`, a
+        # quarter of its direct edges (#44). One whose target the word and capstone do
+        # not confirm is counted like one to anything that is not a range.
         far, seen = {}, set()
-        for _addr, mn, op in dis:
+        for (_addr, mn, op), (kind, t) in zip(dis, row_kinds(image, dis)):
             op = op or ""
-            if mn == "bl" and op.startswith("#"):
-                try:
-                    t = int(op[1:], 16)
-                except ValueError:
-                    continue
-                _direct_edge(idx, src, t, starts, seen)
+            if kind in ("call", "ccall"):
+                if t is None:
+                    idx.unresolved += 1
+                else:
+                    _direct_edge(idx, src, t, starts, seen)
             elif mn == "blr":
                 idx.indirect[src] = idx.indirect.get(src, 0) + 1
             elif mn in ("ldr", "ldur") and fn_by_pool:
