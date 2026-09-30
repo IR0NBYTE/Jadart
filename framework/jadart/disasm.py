@@ -37,6 +37,7 @@ except Exception as exc:                       # noqa: BLE001 - reported, not sw
     _CAPSTONE_IMPORT_ERROR = exc
 
 from .macho import open_container
+from .branches import code_target
 from .fill import printable
 from .stream import ReadStream
 from . import versions
@@ -482,51 +483,34 @@ def addr_label(image: InstrImage, pc_offset: int) -> str:
     return f"0x{va:x}" if va is not None else f"isolate+0x{pc_offset:x}"
 
 
-#: Mnemonics whose last operand is a code address in this image, which capstone renders as
-#: a pc_offset: the branches, the compare-and-branch family, and `adr`, which computes one
-#: into a register (80 of them on the clean fixture). `br`/`blr` take a register, and
-#: `adrp` a page that is not an address in this image, so neither is here.
-_BRANCH_MNEMONICS = ("b", "bl", "cbz", "cbnz", "tbz", "tbnz", "adr")
+def target_va(image: InstrImage, pc_offset: int, op: str):
+    """The virtual address the operand of the instruction at `pc_offset` names as code, or
+    None when it names none.
 
-
-def target_va(image: InstrImage, mnemonic: str, op: str):
-    """The virtual address a branch or `adr` operand points at, or None when it is not one.
-
-    The text listing shows this in place of the operand; `-j` keeps `operands` exactly as
-    capstone rendered it and carries this beside it, so a consumer that already parsed that
-    string is not silently handed a different one."""
-    if image.anchor_va is None or "#0x" not in op:
+    Decided from the instruction word, not the mnemonic (see branches.py): a text rule
+    named arm64's `b.eq` and missed arm32's `beq` and `blls`. The text listing shows this
+    in place of the operand; `-j` keeps `operands` exactly as capstone rendered it and
+    carries this beside it, so a consumer that already parsed that string is not silently
+    handed a different one."""
+    if image.anchor_va is None:
         return None
-    if mnemonic.split(".", 1)[0] not in _BRANCH_MNEMONICS:
-        return None
-    try:
-        target = int(op.rpartition("#0x")[2], 16)
-    except ValueError:
-        return None
-    return image.anchor_va + target if 0 <= target < len(image.text) else None
+    t = code_target(image, pc_offset, op)
+    return None if t is None else image.anchor_va + t
 
 
-def rebase_operand(image: InstrImage, mnemonic: str, op: str) -> str:
-    """A branch operand with its target written as a virtual address.
+def rebase_operand(image: InstrImage, pc_offset: int, op: str) -> str:
+    """The operand of the instruction at `pc_offset`, with a code address it names written
+    as a virtual address.
 
     capstone is handed the range at its pc_offset, so it renders `bl #0xb8334`, a number
     that is an offset into the instructions image. Printed next to virtual addresses that
     would read as one, and pasting it into another tool lands in the wrong place. Only the
     print layer rewrites it: every address inside the pipeline stays a pc_offset, which is
     what the pool, the call graph and the lifter are keyed on."""
-    if image.anchor_va is None or "#0x" not in op:
+    if image.anchor_va is None:
         return op
-    base = mnemonic.split(".", 1)[0]
-    if base not in _BRANCH_MNEMONICS:
-        return op
-    head, _, tail = op.rpartition("#0x")
-    try:
-        target = int(tail, 16)
-    except ValueError:
-        return op
-    if not 0 <= target < len(image.text):
-        return op
-    return f"{head}0x{image.anchor_va + target:x}"
+    t = code_target(image, pc_offset, op)
+    return op if t is None else f"{op.rpartition('#0x')[0]}0x{image.anchor_va + t:x}"
 
 
 def _parse_addr(text: str, image: "InstrImage | None" = None):
@@ -741,33 +725,34 @@ def _const_list(fr, ref: int, off: int):
 
 
 
-_BRANCH = ("b", "cbz", "cbnz", "tbz", "tbnz")
+#: Branch kinds whose target is a place in the same function, so it gets a block label.
+_LABELLED = ("jump", "cjump")
+
+#: Branch kinds whose target is named after the function it lands on. A conditional jump
+#: is left out: it stays inside its function, where it gets a block label instead.
+_NAMED = ("jump", "call", "ccall")
 
 
-def _branch_target(mn: str, op: str, lo: int, hi: int):
-    """Return the intra-function target address of a conditional/uncond branch, or None.
-    Excludes calls (bl) and out-of-range targets."""
-    if not (mn == "b" or mn.startswith("b.") or mn in ("cbz", "cbnz", "tbz", "tbnz")):
-        return None
-    if "#" not in op:
-        return None
-    t = op.rsplit("#", 1)[1].strip().rstrip("]!")
-    try:
-        target = int(t, 16) if t.startswith("0x") else int(t)
-    except ValueError:
-        return None
-    return target if lo <= target < hi else None
+def _block_target(kind_row, lo: int, hi: int):
+    """A (kind, target) row's target when it is a branch into [lo, hi), else None."""
+    kind, t = kind_row
+    return t if kind in _LABELLED and t is not None and lo <= t < hi else None
 
 
-def label_blocks(dis) -> dict:
-    """Assign L0, L1, ... labels to intra-function branch targets, in address order."""
+def label_blocks(dis, kinds) -> dict:
+    """Assign L0, L1, ... labels to intra-function branch targets, in address order.
+
+    `kinds` is branches.row_kinds for the same rows, which reads each branch off its word.
+    It is required: the mnemonic test it replaces knew arm64's `b.eq` but not arm32's
+    `beq`, and over every range of arm32-2.19.6 labelled 7,583 targets where the word
+    gives 35,458."""
     if not dis:
         return {}
     lo = dis[0][0]
     hi = dis[-1][0] + 4
     targets = set()
-    for addr, mn, op in dis:
-        t = _branch_target(mn, op, lo, hi)
+    for row in kinds:
+        t = _block_target(row, lo, hi)
         if t is not None:
             targets.add(t)
     return {addr: f"L{i}" for i, addr in enumerate(sorted(targets))}
@@ -808,23 +793,36 @@ def _mem_base_disp(op: str):
     return m.group(1), (_parse_imm(m.group(2)) or 0)
 
 
-def annotate(dis, pc_to_name: dict, pool_map: dict | None = None) -> list:
+def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, kinds=None) -> list:
     """Annotate direct BL/B call targets with the callee name, and PP-relative pool
     loads with the referenced string/function. Handles both direct loads
     (`ldr xN, [x27, #off]`) and far loads (`add xD, x27, #hi; ldr xN, [xD, #lo]`,
-    used when the pool offset exceeds the 12-bit scaled ldr range ~0x7ff8)."""
+    used when the pool offset exceeds the 12-bit scaled ldr range ~0x7ff8).
+
+    `kinds` is branches.row_kinds for the same rows. With it a callee is found from the
+    word, so arm32's conditional calls are named too: `blls` to the stack-overflow stub
+    and `bleq` to the null-error stubs, 9,554 of them over every range of arm32-2.19.6
+    that the mnemonic test (`bl` and `b` only) passed over. Without it the mnemonic test
+    is kept."""
     ann = []
     far_base = {}   # reg -> pp-relative byte offset established by `add reg, x27, #hi`
-    for addr, mn, op in dis:
+    for i, (addr, mn, op) in enumerate(dis):
         note = ""
-        if mn in ("bl", "b") and op.startswith("#"):
+        if kinds is not None:
+            kind, target = kinds[i]
+            if kind in _NAMED and target is not None:
+                nm = pc_to_name.get(target)
+                if nm:
+                    note = f"  ; -> {nm}"
+        elif mn in ("bl", "b") and op.startswith("#"):
             try:
                 nm = pc_to_name.get(int(op[1:], 16))
                 if nm:
                     note = f"  ; -> {nm}"
             except ValueError:
                 pass
-        elif pool_map and mn in ("ldr", "ldur"):
+        # A branch is never a load, so this and the callee name above cannot both apply.
+        if pool_map and mn in ("ldr", "ldur"):
             off = None
             if "x27" in op:                          # direct PP load
                 off = _imm_from(op, "x27")
@@ -849,16 +847,22 @@ def annotate(dis, pc_to_name: dict, pool_map: dict | None = None) -> list:
     return ann
 
 
-def render_body(dis, pc_to_name: dict, pool_map: dict | None = None, indent: str = "    ") -> list:
-    """Render a function body as annotated, block-labelled arm64 lines. Branch operands to
-    intra-function targets are rewritten to the block label; calls and pool loads are named."""
-    labels = label_blocks(dis)
+def render_body(dis, pc_to_name: dict, pool_map: dict | None = None, indent: str = "    ",
+                *, kinds) -> list:
+    """Render a function body as annotated, block-labelled lines. Branch operands to
+    intra-function targets are rewritten to the block label; calls and pool loads are
+    named. `kinds` is branches.row_kinds for the same rows, and is required; see
+    label_blocks."""
+    if not dis:
+        return []
+    labels = label_blocks(dis, kinds)
+    lo, hi = dis[0][0], dis[-1][0] + 4
     lines = []
-    for addr, mn, op, note in annotate(dis, pc_to_name, pool_map):
+    for i, (addr, mn, op, note) in enumerate(annotate(dis, pc_to_name, pool_map, kinds)):
         if addr in labels:
             lines.append(f"  {labels[addr]}:")
         # rewrite an intra-function branch operand to its label
-        t = _branch_target(mn, op, dis[0][0], dis[-1][0] + 4)
+        t = _block_target(kinds[i], lo, hi)
         shown = op
         if t is not None and t in labels:
             shown = op.rsplit("#", 1)[0] + labels[t]

@@ -5782,13 +5782,14 @@ def test_branch_targets_inside_disasm_are_addresses_too():
     from jadart.disasm import load_instructions, rebase_operand
     image, _fr, _hdr = load_instructions(CLEAN)
     base = image.anchor_va
-    assert rebase_operand(image, "b.le", "#0xb8140") == f"0x{base + 0xB8140:x}"
-    assert rebase_operand(image, "bl", "#0x10dd4") == f"0x{base + 0x10DD4:x}"
-    # a register branch, an immediate that is not a code offset, and a non-branch are left
-    assert rebase_operand(image, "br", "x16") == "x16"
-    assert rebase_operand(image, "b", f"#0x{len(image.text) + 8:x}") \
-        == f"#0x{len(image.text) + 8:x}"
-    assert rebase_operand(image, "add", "x0, x22, #0x30") == "x0, x22, #0x30"
+    # real rows of the clean fixture: benchWithdraw's b.le, benchRunAll's bl
+    assert rebase_operand(image, 0xB8134, "#0xb8140") == f"0x{base + 0xB8140:x}"
+    assert rebase_operand(image, 0xB7DCC, "#0x10dd4") == f"0x{base + 0x10DD4:x}"
+    # a register branch and a non-branch are left as capstone printed them
+    assert rebase_operand(image, 0xB7E5C, "x2") == "x2"
+    assert rebase_operand(image, 0xB8138, "x0, x22, #0x30") == "x0, x22, #0x30"
+    # the word at 0xb8134 names 0xb8140; a printed number that disagrees is not trusted
+    assert rebase_operand(image, 0xB8134, "#0xb8144") == "#0xb8144"
 
 
 def test_a_printed_address_reads_back_as_the_thing_it_named():
@@ -6456,6 +6457,347 @@ def test_real_binaries_that_carry_an_undecodable_word():
         assert len(rows) == cr.size // 4, (hex(cr.pc_offset), len(rows), cr.size // 4)
         # and there is real code after the bad word, which is what used to be lost
         assert bad[0] < len(rows) - 1
+
+
+# ── branch operands decided by the instruction word, not the mnemonic (#37) ─
+
+#: nop x4 so every target is >= 0x10 and printed in hex, then the forms under test.
+_A32_WORDS = [0xE320F000] * 4 + [
+    0x0A000002,   # 0x10 beq   0x20
+    0x9B000003,   # 0x14 blls  0x28
+    0xEA000000,   # 0x18 b     0x20
+    0xEB000000,   # 0x1c bl    0x24
+    0xE59F0008,   # 0x20 ldr r0, [pc, #8]   (reads PC, but no code address)
+    0xE12FFF1E,   # 0x24 bx lr
+    0xE8BD8010,   # 0x28 pop {r4, pc}
+    0xE1A0900F,   # 0x2c mov sb, pc
+    0x1AFFFFF6,   # 0x30 bne   0x10   (backward: the immediate is negative)
+    0x9BFFFFF5,   # 0x34 blls  0x10
+]
+_A32_ANCHOR = 0x154E00
+
+
+def _word_image(words, arch, anchor):
+    """A one-range InstrImage over 32-bit words, anchored so addresses are virtual."""
+    import struct as _struct
+    from jadart.disasm import InstrImage, CodeRange
+    code = b"".join(_struct.pack("<I", w) for w in words)
+    image = InstrImage(text=code, pcs=[0], first_code=0, code_ranges={},
+                       all_ranges=[CodeRange(pc_offset=0, size=len(code), owner_ref=-1)],
+                       symbol_names={})
+    image.arch = type("Arch", (), {"name": arch, "compressed": arch == "arm64",
+                                   "word_size": 8 if arch == "arm64" else 4})()
+    image.anchor_va = anchor
+    return image
+
+
+def _disasm_cli(monkeypatch, image, *extra):
+    """Run the real `disasm` command over a synthetic image."""
+    import io
+    import types
+    import contextlib
+    from jadart import cli, disasm
+    fr = types.SimpleNamespace(functions=[], strings={}, pool=[], arrays={},
+                               smi_values={}, codes=[])
+    monkeypatch.setattr(disasm, "load_instructions", lambda p: (image, fr, None))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["disasm", CLEAN, f"0x{image.anchor_va:x}", *extra])
+    return rc, buf.getvalue()
+
+
+def test_arm32_conditional_branches_print_as_addresses_in_disasm(monkeypatch):
+    """arm32's conditional branches print their target as a virtual address.
+
+    The print layer decided which operands were code addresses from the mnemonic, a list
+    that knew arm64's `b.eq` and not arm32's `beq` or `blls`, so over every range of
+    arm32-2.19.6 48,839 of 85,944 targets stayed pc_offsets beside virtual addresses. The
+    word decides it now."""
+    if not _capstone_available():
+        _skip("  SKIP test_arm32_conditional_branches_print_as_addresses_in_disasm"
+              " (no capstone)")
+    rc, out = _disasm_cli(monkeypatch, _word_image(_A32_WORDS, "arm", _A32_ANCHOR))
+    assert rc == 0, out
+    lines = {" ".join(line.split()) for line in out.splitlines()}
+    want = {"0x154e10 beq 0x154e20", "0x154e14 blls 0x154e28",
+            "0x154e18 b 0x154e20", "0x154e1c bl 0x154e24",
+            "0x154e30 bne 0x154e10", "0x154e34 blls 0x154e10",
+            # PC is read or written, but no code address is named: left as printed
+            "0x154e20 ldr r0, [pc, #8]", "0x154e24 bx lr", "0x154e28 pop {r4, pc}",
+            "0x154e2c mov sb, pc"}
+    missing = want - lines
+    assert not missing, f"missing {sorted(missing)} in:\n{out}"
+
+
+def test_arm32_conditional_branches_json_target_va(monkeypatch):
+    """`-j` carries target_va for arm32 conditional branches; `operands` stays as is."""
+    import json as _json
+    if not _capstone_available():
+        _skip("  SKIP test_arm32_conditional_branches_json_target_va (no capstone)")
+    rc, out = _disasm_cli(monkeypatch, _word_image(_A32_WORDS, "arm", _A32_ANCHOR), "-j")
+    assert rc == 0, out
+    rows = {i["addr"]: i for i in _json.loads(out)["functions"][0]["instructions"]}
+    assert rows[0x10]["operands"] == "#0x20"            # capstone's text is kept as is
+    assert rows[0x10]["target_va"] == 0x154E20          # beq
+    assert rows[0x14]["target_va"] == 0x154E28          # blls
+    assert rows[0x18]["target_va"] == 0x154E20          # b
+    assert rows[0x1C]["target_va"] == 0x154E24          # bl
+    assert rows[0x30]["target_va"] == 0x154E10          # bne, backward
+    assert rows[0x34]["target_va"] == 0x154E10          # blls, backward
+    for a in (0x20, 0x24, 0x28, 0x2C):
+        assert rows[a]["target_va"] is None, rows[a]
+
+
+def test_arm32_conditional_calls_are_named(monkeypatch):
+    """A conditional call names its callee, the way an unconditional one always did.
+
+    The name was looked up only for `bl` and `b`, so `blls` to the stack-overflow stub and
+    `bleq` to the null-error stubs went unnamed: 9,554 calls on arm32-2.19.6."""
+    if not _capstone_available():
+        _skip("  SKIP test_arm32_conditional_calls_are_named (no capstone)")
+    image = _word_image(_A32_WORDS, "arm", _A32_ANCHOR)
+    image.symbol_names = {0x28: "callee"}
+    rc, out = _disasm_cli(monkeypatch, image)
+    assert rc == 0, out
+    lines = {" ".join(line.split()) for line in out.splitlines()}
+    assert "0x154e14 blls 0x154e28 ; -> callee" in lines, out
+
+
+def test_tier1_labels_arm32_conditional_branches():
+    """Tier 1 gives an arm32 conditional branch a block label, as it does arm64's.
+
+    `decompile -t 1` printed `blt #0x3e984` under a virtual-address header, unlabelled,
+    while the `b` beside it got `L1`: over every range of arm32-2.19.6, 7,583 targets
+    were labelled where the word gives 35,458."""
+    if not _capstone_available():
+        _skip("  SKIP test_tier1_labels_arm32_conditional_branches (no capstone)")
+    from jadart.branches import row_kinds
+    from jadart.disasm import disassemble_range, render_body
+    image = _word_image(_A32_WORDS, "arm", _A32_ANCHOR)
+    dis = disassemble_range(image, image.all_ranges[0])
+    body = [" ".join(line.split()) for line in
+            render_body(dis, {}, None, kinds=row_kinds(image, dis))]
+    # beq and b both land on 0x20, the backward bne on 0x10; blls is a call, no label
+    assert "beq L1" in body and "b L1" in body and "bne L0" in body, body
+    assert "L0:" in body and "L1:" in body, body
+    assert not any(line.startswith("blls L") for line in body), body
+
+
+def test_code_target_refuses_when_capstone_token_disagrees():
+    """A printed target that the word does not give is left exactly as printed."""
+    from jadart.disasm import rebase_operand, target_va
+    image = _word_image(_A32_WORDS, "arm", _A32_ANCHOR)
+    assert rebase_operand(image, 0x10, "#0x20") == "0x154e20"
+    assert target_va(image, 0x10, "#0x20") == 0x154E20
+    # the word at 0x10 says 0x20; a printed 0x24 is a disagreement, so neither is trusted
+    assert rebase_operand(image, 0x10, "#0x24") == "#0x24"
+    assert target_va(image, 0x10, "#0x24") is None
+    # a word that is not a branch keeps its operand even when the operand looks like one
+    assert rebase_operand(image, 0x20, "#0x20") == "#0x20"
+
+
+def test_code_target_arm64_forms():
+    """Every arm64 PC-relative code form is rebased; pages, literals and anything outside
+    the image are left as capstone printed them."""
+    from jadart.disasm import rebase_operand, target_va
+    words = [0xD503201F] * 4 + [
+        0x54000040,   # 0x10 b.eq  #0x18
+        0x14000002,   # 0x14 b     #0x1c
+        0x94000001,   # 0x18 bl    #0x1c
+        0xB4000040,   # 0x1c cbz   x0, #0x24
+        0x37000040,   # 0x20 tbnz  w0, #0, #0x28
+        0x10000040,   # 0x24 adr   x0, #0x2c
+        0x90000000,   # 0x28 adrp  x0, #0         (a page: left as printed)
+        0x58000040,   # 0x2c ldr   x0, #0x34      (a literal, data: left as printed)
+        0x17FFFFFC,   # 0x30 b     #0x20          (backward, in image)
+        0x14000100,   # 0x34 b     past the image end: left as printed
+        0x3607FF40,   # 0x38 tbz   w0, #0, #0x20  (backward)
+        0x30FFFFC0,   # 0x3c adr   x0, #0x35      (backward, and immlo is not 0)
+        0x30000001,   # 0x40 adr   x1, #0x41      (immlo is not 0)
+    ]
+    image = _word_image(words, "arm64", 0x136A80)
+    assert rebase_operand(image, 0x10, "#0x18") == "0x136a98"
+    assert rebase_operand(image, 0x14, "#0x1c") == "0x136a9c"
+    assert rebase_operand(image, 0x18, "#0x1c") == "0x136a9c"
+    assert rebase_operand(image, 0x1C, "x0, #0x24") == "x0, 0x136aa4"
+    assert rebase_operand(image, 0x20, "w0, #0, #0x28") == "w0, #0, 0x136aa8"
+    assert rebase_operand(image, 0x24, "x0, #0x2c") == "x0, 0x136aac"
+    assert rebase_operand(image, 0x28, "x0, #0") == "x0, #0"
+    assert rebase_operand(image, 0x2C, "x0, #0x34") == "x0, #0x34"
+    assert target_va(image, 0x2C, "x0, #0x34") is None
+    assert rebase_operand(image, 0x30, "#0x20") == "0x136aa0"
+    assert rebase_operand(image, 0x34, "#0x434") == "#0x434"
+    assert rebase_operand(image, 0x38, "w0, #0, #0x20") == "w0, #0, 0x136aa0"
+    assert rebase_operand(image, 0x3C, "x0, #0x35") == "x0, 0x136ab5"
+    assert rebase_operand(image, 0x40, "x1, #0x41") == "x1, 0x136ac1"
+
+
+def test_row_kinds_reads_b_al_as_a_jump_with_its_b_cond_target():
+    """`b.al` and `b.nv` always branch, so they are jumps, but their word is B.cond's.
+
+    The kind was decided first and the target then read as if the word were a `b`, whose
+    immediate is 26 bits where B.cond's is 19: the target came out wrong, the check
+    against capstone's number refused it, and the branch lost its target silently.
+    `bc.eq` (FEAT_HBC) is read like `b.eq`."""
+    from jadart.branches import row_kinds
+    words = [0xD503201F] * 4 + [0x54000040, 0x5400004E, 0x5400004F, 0x54000050] \
+        + [0xD503201F] * 4
+    image = _word_image(words, "arm64", 0x136A80)
+    rows = [(0x10, "b.eq", "#0x18"), (0x14, "b.al", "#0x1c"),
+            (0x18, "b.nv", "#0x20"), (0x1C, "bc.eq", "#0x24")]
+    assert row_kinds(image, rows) == [("cjump", 0x18), ("jump", 0x1C),
+                                      ("jump", 0x20), ("cjump", 0x24)]
+
+
+def test_branch_class_tables_follow_the_field_layout():
+    """Every top byte's class is what the architecture's field layout says it is.
+
+    The tables replace a list of mnemonic spellings, so their soundness is the fix. They
+    were checked against capstone over all 2^32 words of each instruction set when
+    written; this pins the layout, and with capstone installed it also samples each byte
+    through the decoder at two bases: the operand moves if and only if the table names a
+    PC-relative code or data class."""
+    import random
+    import struct as _struct
+    from jadart import branches as B
+    a32, a64 = B.CLASS["arm"], B.CLASS["arm64"]
+    for tb in range(256):
+        cond, op = tb >> 4, tb & 0xF
+        if op == 0xA:
+            want = B.JUMP if cond == 0xE else B.CALL if cond == 0xF else B.CJUMP
+        elif op == 0xB:
+            want = B.CALL if cond >= 0xE else B.CCALL
+        else:
+            want = B.NONE
+        assert a32[tb] == want, hex(tb)
+    assert {tb for tb in range(256) if a64[tb] in (B.JUMP, B.CALL)} == \
+        {0x14, 0x15, 0x16, 0x17, 0x94, 0x95, 0x96, 0x97}
+    assert [tb for tb in range(256) if a64[tb] == B.B54] == [0x54]
+    assert {tb for tb in range(256) if a64[tb] == B.CJUMP} == \
+        {0x34, 0x35, 0x36, 0x37, 0xB4, 0xB5, 0xB6, 0xB7}
+    if not _capstone_available():
+        return
+    import capstone
+    pcrel = {"arm": {B.JUMP, B.CJUMP, B.CALL, B.CCALL},
+             "arm64": {B.JUMP, B.CJUMP, B.CALL, B.B54, B.ADR, B.ADRP, B.LIT}}
+    cs = {"arm": capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM),
+          "arm64": capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_LITTLE_ENDIAN)}
+    rng = random.Random(37)
+    for arch, md in cs.items():
+        for tb in range(256):
+            for _ in range(8):
+                w = (tb << 24) | rng.getrandbits(24)
+                raw = _struct.pack("<I", w)
+                d0 = list(md.disasm_lite(raw, 0))
+                d1 = list(md.disasm_lite(raw, 0x10000))
+                if not d0 or not d1:
+                    continue
+                moved = d0[0][3] != d1[0][3]
+                named = B.CLASS[arch][tb] in pcrel[arch]
+                assert moved == named, (arch, hex(w), d0[0][2], d0[0][3], d1[0][3])
+
+
+def test_arm32_corpus_disasm_conditional_branch_and_call():
+    """The same on a real arm32 build, when the research corpus is checked out."""
+    import io
+    import contextlib
+    if not _capstone_available():
+        _skip("  SKIP test_arm32_corpus_disasm_conditional_branch_and_call (no capstone)")
+    lib = os.path.expanduser(
+        "~/My_MVPs/flutter_re_research/flubench/corpus/arm32-2.19.6/libapp.so")
+    if not os.path.exists(lib):
+        _skip("  SKIP test_arm32_corpus_disasm_conditional_branch_and_call (no corpus)")
+    from jadart import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.main(["disasm", lib, "isolate+0x972c"])
+    out = " ".join(buf.getvalue().split())
+    # anchor 0x154e00; radare2 and LLVM objdump both give these targets
+    assert "bne 0x15e568" in out, out
+    assert "blls 0x356c04" in out, out
+    assert "#0x9768" not in out and "#0x201e04" not in out, out
+
+
+def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
+    """`decompile -t 1` labels both `blt` in `CertificateException`, the issue's example.
+
+    render_body is tested on its own above; this goes through decompile_class, so a tier-1
+    caller that stops passing the word-decided kinds fails here."""
+    if not _capstone_available():
+        _skip("  SKIP test_arm32_corpus_decompile_tier1_labels_conditional_branches"
+              " (no capstone)")
+    lib = os.path.expanduser(
+        "~/My_MVPs/flutter_re_research/flubench/corpus/arm32-2.19.6/libapp.so")
+    if not os.path.exists(lib):
+        _skip("  SKIP test_arm32_corpus_decompile_tier1_labels_conditional_branches"
+              " (no corpus)")
+    from jadart.program import decompile_class
+    out = decompile_class(lib, "CertificateException", structured=False)
+    body = [" ".join(line.split()) for line in out.splitlines()]
+    blt = [line for line in body if line.startswith("blt ")]
+    assert len(blt) == 2 and all(line.split()[1].startswith("L") for line in blt), blt
+    for line in blt:
+        assert line.split()[1] + ":" in body, (line, out)
+
+
+#: The listing of every 32nd range of each arm64 fixture, text then `-j`, hashed. Recorded
+#: on main before #37 and unchanged by it: the fix may change arm32 output only. When a
+#: change is meant to alter arm64 disasm output, regenerate these and say so in the
+#: CHANGELOG, which is the rule these exist to enforce. Recorded with the capstone 5.0.9
+#: wheel, whose `capstone.__version__` reads 5.0.7; another build may print differently.
+_ARM64_DISASM_SAMPLE_SHA = {
+    "clean": "fc26a0bdb32c0e33f34858d7dccfa8b726c943785af412bd236962ce83749ea8",
+    "obf": "2f79c6b0392f44fcc98a731d5ee053cbe7a9e4fc93e65e9cd32242e8a08dabb4",
+}
+
+
+def _arm64_disasm_sample_sha(key):
+    import io
+    import hashlib
+    import contextlib
+    from jadart import cli, disasm, signatures
+    lib = os.path.join(ROOT, f"flubench/artifacts/{key}/lib/arm64-v8a/libapp.so")
+    loaded = disasm.load_instructions(lib)
+    image = loaded[0]
+    real_load = disasm.load_instructions
+    real_nws, real_pool = signatures.names_with_signatures, disasm.build_pool_map
+    memo = {}
+
+    def once(key, make):
+        if key not in memo:
+            memo[key] = make()
+        return memo[key]
+    disasm.load_instructions = lambda p: loaded
+    signatures.names_with_signatures = \
+        lambda im, f, s: once("nws", lambda: real_nws(im, f, s))
+    disasm.build_pool_map = lambda f, arch=None: once("pool", lambda: real_pool(f, arch))
+    try:
+        h = hashlib.sha256()
+        for cr in image.all_ranges[::32]:
+            for extra in ((), ("-j",)):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    va = f"0x{image.anchor_va + cr.pc_offset:x}"
+                    cli.main(["disasm", lib, va, *extra])
+                h.update(buf.getvalue().encode())
+        return h.hexdigest()
+    finally:
+        disasm.load_instructions = real_load
+        signatures.names_with_signatures, disasm.build_pool_map = real_nws, real_pool
+
+
+def test_arm64_disasm_listing_unchanged_clean():
+    """#37 changes what arm32 prints; the arm64 listing must not move by a byte."""
+    if not _capstone_available():
+        _skip("  SKIP test_arm64_disasm_listing_unchanged_clean (no capstone)")
+    assert _arm64_disasm_sample_sha("clean") == _ARM64_DISASM_SAMPLE_SHA["clean"]
+
+
+def test_arm64_disasm_listing_unchanged_obf():
+    """The same on the --obfuscate build."""
+    if not _capstone_available():
+        _skip("  SKIP test_arm64_disasm_listing_unchanged_obf (no capstone)")
+    assert _arm64_disasm_sample_sha("obf") == _ARM64_DISASM_SAMPLE_SHA["obf"]
 
 
 if __name__ == "__main__":

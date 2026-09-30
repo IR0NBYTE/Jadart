@@ -45,7 +45,9 @@ Issues = "https://github.com/IR0NBYTE/Jadart/issues"
 Changelog = "https://github.com/IR0NBYTE/Jadart/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-disasm = ["capstone>=5.0"]
+# The tests pin byte-exact listings recorded with capstone 5.0.9, and a major release may
+# print differently, so moving to one is a deliberate change rather than an upgrade.
+disasm = ["capstone>=5.0,<6"]
 
 [project.scripts]
 jadart = "jadart.cli:main"

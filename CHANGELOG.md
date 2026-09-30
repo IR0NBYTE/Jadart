@@ -134,6 +134,43 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **arm32 conditional branches print their target as an address.** Since addresses became
+  virtual addresses, a branch target is rebased to match the column beside it, but which
+  operands were branch targets was decided from the mnemonic: a list that knew arm64's
+  `b.eq` and not arm32's `beq` or `blls`. On arm32 every conditional branch and every
+  conditional call kept its pc_offset among virtual addresses with nothing marking it, and
+  a pc_offset such as `#0x201e04` falls inside the image's address window, so pasting it
+  back answered with the wrong function and exit 0. The print layer now reads the
+  instruction word instead (`branches.py`, stdlib only): on both instruction sets the top
+  byte fixes whether a word is a PC-relative branch or `adr`, and the immediate field gives
+  its target. An operand is printed as an address only when that target is the number
+  capstone printed and lies inside the image; otherwise it is left exactly as printed.
+  Closes #37.
+  - Relative branches left as pc_offsets, counted the way the issue counted them, with
+    capstone's detail mode over every word of the image and `blr` excluded by operand kind:
+    arm32-2.19.6 48,941 of 86,109 before and 0 after, arm32-3.11.5 45,461 of 84,351 before
+    and 0 after, and 0 on both arm64 fixtures before and after.
+  - The other two readers that decided from the mnemonic now read the word too, and the
+    mnemonic path for block labels is gone rather than kept as a fallback. A conditional
+    call names its callee, as `bl` always did: 9,554 more named calls over every range of
+    arm32-2.19.6, such as `blls` to the stack-overflow stub. And tier 1 labels a
+    conditional branch's target: over every range of arm32-2.19.6, 35,458 labels where
+    there were 7,583, including both `blt` in `CertificateException`.
+  - This changes arm32 output only. The text listing prints the address in place of the
+    pc_offset, and tier 1 numbers its labels in address order, so a function that gains a
+    label renumbers the ones after it: `CertificateException` prints `b L3` where it
+    printed `b L1`. `disasm -j` only gains: over every range of arm32-2.19.6, 48,839 rows
+    gain a `target_va` and 9,554 of those a callee note, and no other field of any row
+    moves. On the arm64 fixtures `disasm` text and `-j` over every range, and all three
+    `export` tiers, are byte-identical. Two new tests pin a hash of the `disasm` text and
+    `-j` of every 32nd range of each fixture.
+  - The top-byte tables were checked against capstone over all 2^32 words of each
+    instruction set, each decoded at the bases 0x100000 and 0xa3c4000: every
+    decodable word of a byte the tables name printed an address that moved with the base,
+    and no word of any other byte did, 536,870,912 words on each set with no exception.
+  - capstone is pinned below 6 in the `disasm` extra and in `requirements.txt`, because
+    the tests pin listings recorded with the 5.0.9 wheel (whose `capstone.__version__`
+    reads 5.0.7).
 - **A word capstone cannot decode no longer hides the rest of a function.** capstone stops
   at such a word, and `disassemble_range` returned what it had decoded up to there, so
   everything after it was gone from `disasm`, `lift`, `decompile`, `export` and the call
