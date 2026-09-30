@@ -322,6 +322,7 @@ def cmd_lift(args) -> int:
 
 def cmd_disasm(args) -> int:
     """Tier 1: annotated arm64 for every code range under one name."""
+    from .branches import row_kinds
     from .disasm import (load_instructions, disassemble_range, named_ranges,
                          annotate, build_pool_map, addr_label, rebase_operand, va_of,
                          target_va)
@@ -351,7 +352,7 @@ def cmd_disasm(args) -> int:
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        ann = annotate(dis, pc_to_name, pool_map)
+        ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
         printed += 1
         if as_json:
             out.append({"name": nm, "pc_offset": cr.pc_offset,
@@ -364,7 +365,7 @@ def cmd_disasm(args) -> int:
                         # what the text listing shows.
                         "instructions": [{"addr": a, "va": va_of(image, a), "mnemonic": mn,
                                           "operands": op,
-                                          "target_va": target_va(image, mn, op),
+                                          "target_va": target_va(image, a, op),
                                           "note": note.strip().lstrip("; ").strip()}
                                          for a, mn, op, note in ann]})
             continue
@@ -372,7 +373,7 @@ def cmd_disasm(args) -> int:
               + dim(f"  @ {addr_label(image, cr.pc_offset)}  ({cr.size} bytes)"))
         for addr, mn, op, note in ann:
             print("  " + dim(addr_label(image, addr))
-                  + f"  {mn:<7} {rebase_operand(image, mn, op)}" + dim(note))
+                  + f"  {mn:<7} {rebase_operand(image, addr, op)}" + dim(note))
         print()
     if as_json:
         return emit({"ok": bool(out), "symbol": args.symbol, "count": len(out),

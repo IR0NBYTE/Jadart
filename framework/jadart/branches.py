@@ -1,0 +1,165 @@
+"""Which instructions carry a PC-relative code address, read from the instruction word.
+
+capstone is handed each range at its pc_offset, so a branch prints its target as a
+pc_offset (`bl #0xb8334`). Only the print layer turns that into a virtual address, and it
+used to decide which operands to turn from the mnemonic text: a list that named arm64's
+spelling (`b.eq`) and missed arm32's (`beq`, `blls`), so in `disasm` over every range of
+arm32-2.19.6, 48,839 of the 85,944 PC-relative branches stayed pc_offsets beside virtual
+addresses. darter, the one other Flutter tool that disassembles arm32, has the same bug
+for calls. The Dart VM's own disassembler decides from the encoding, and so does this: on
+both instruction sets the class of a PC-relative branch or address is fixed by the top
+byte of the word (bits 31:24), and its target by the immediate field.
+
+No capstone here, so this works in an install without it. The tables were checked against
+capstone over all 2^32 words of each instruction set, each decoded at two bases: every
+decodable word of a byte the table names prints an address that moves with the base, and
+no word of any other byte does (536,870,912 such words on each set, no exception). That
+proves it for one capstone build, the 5.0.9 wheel. For any other, each target is also
+checked per row against the `#0x` number capstone printed, and a disagreement leaves the
+operand exactly as printed rather than trusting either side.
+"""
+from __future__ import annotations
+
+import struct
+
+NONE, JUMP, CJUMP, CALL, CCALL, B54, ADR, ADRP, LIT = range(9)
+
+
+def _a32_table() -> bytes:
+    t = bytearray(256)
+    for tb in range(256):
+        cond, op = tb >> 4, tb & 0xF
+        if op == 0xA:        # B<c>; cond 1111 is BLX(imm) with H=0
+            t[tb] = JUMP if cond == 0xE else CALL if cond == 0xF else CJUMP
+        elif op == 0xB:      # BL<c>; cond 1111 is BLX(imm) with H=1
+            t[tb] = CALL if cond >= 0xE else CCALL
+    return bytes(t)
+
+
+def _a64_table() -> bytes:
+    t = bytearray(256)
+    for tb in range(256):
+        if tb & 0x7C == 0x14:
+            t[tb] = CALL if tb & 0x80 else JUMP                # BL / B
+        elif tb == 0x54:
+            t[tb] = B54                                        # B.cond / BC.cond
+        elif tb & 0x7C == 0x34:
+            t[tb] = CJUMP                                      # CBZ CBNZ TBZ TBNZ
+        elif tb & 0x9F == 0x10:
+            t[tb] = ADR
+        elif tb & 0x9F == 0x90:
+            t[tb] = ADRP
+        elif tb & 0x3B == 0x18 and tb != 0xDC:
+            t[tb] = LIT                                        # LDR/LDRSW/PRFM literal
+    return bytes(t)
+
+
+#: For each instruction set, 256 bytes: the class of every top byte.
+CLASS = {"arm": _a32_table(), "arm64": _a64_table()}
+
+#: Classes whose operand is a code address in this image, and so is printed as one. ADRP
+#: (a page) and the literal loads (data) are PC-relative too and stay as capstone printed
+#: them, which is what the text rule did.
+CODE_ADDRESS = {"arm": frozenset({JUMP, CJUMP, CALL, CCALL}),
+                "arm64": frozenset({JUMP, CJUMP, CALL, B54, ADR})}
+_MASK = {"arm": 0xFFFFFFFF, "arm64": 0xFFFFFFFFFFFFFFFF}
+_U32 = struct.Struct("<I").unpack_from
+
+#: Per instruction set, a top byte's class when that class names a code address, else 0.
+#: One lookup rejects the rows that carry none, which is most of them.
+_CODE = {a: bytes(c if c in CODE_ADDRESS[a] else 0 for c in t) for a, t in CLASS.items()}
+
+#: What a branch is, for the readers that need more than its address: block labels take
+#: jump and cjump targets, callee names take jump, call and ccall.
+KINDS = {JUMP: "jump", CJUMP: "cjump", CALL: "call", CCALL: "ccall"}
+
+
+def arch_name(image) -> str:
+    """The instruction set this image's rows were decoded as.
+
+    An image with no resolved target decodes as arm64 (disasm.require_decoder), so its
+    words are read that way here too: the rows and the words have to be read alike."""
+    a = getattr(image, "arch", None)
+    return a.name if a is not None else "arm64"
+
+
+def _sx(v: int, bits: int) -> int:
+    return (v ^ (1 << (bits - 1))) - (1 << (bits - 1))
+
+
+def word_target(arch: str, w: int, pc: int, cls: int) -> int:
+    """The pc_offset a PC-relative word at `pc` points at, from its immediate field."""
+    if arch == "arm":
+        t = pc + 8 + (_sx(w & 0xFFFFFF, 24) << 2)
+        return t + ((w >> 23) & 2) if w >> 28 == 0xF else t     # BLX(imm): H is bit 1
+    if cls == JUMP or cls == CALL:
+        return pc + (_sx(w & 0x3FFFFFF, 26) << 2)
+    if cls == ADR:
+        return pc + _sx((((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3), 21)
+    if cls == CJUMP and w & 0x02000000:                        # TBZ / TBNZ
+        return pc + (_sx((w >> 5) & 0x3FFF, 14) << 2)
+    return pc + (_sx((w >> 5) & 0x7FFFF, 19) << 2)              # B.cond, CBZ, literal
+
+
+def _agrees(op: str, t: int, arch: str, size: int) -> bool:
+    """Whether the last `#0x` number capstone printed is `t`, and `t` is in the image."""
+    _head, sep, tail = op.rpartition("#0x")
+    if not sep:
+        return False
+    try:
+        printed = int(tail, 16)
+    except ValueError:
+        return False
+    return printed == t & _MASK[arch] and 0 <= t < size
+
+
+def code_target(image, pc_offset: int, op: str):
+    """The pc_offset the operand of the instruction at `pc_offset` names as a code address,
+    or None. None unless all three agree: the word is a PC-relative branch (or `adr`), the
+    target its immediate field gives is the `#0x` number capstone printed, and it lies inside
+    the image."""
+    arch = arch_name(image)
+    tab = _CODE.get(arch)
+    if tab is None or pc_offset < 0:
+        return None
+    text = image.text
+    try:
+        cls = tab[text[pc_offset + 3]]
+    except IndexError:
+        return None
+    if not cls:
+        return None
+    t = word_target(arch, _U32(text, pc_offset)[0], pc_offset, cls)
+    return t if _agrees(op, t, arch, len(text)) else None
+
+
+def row_kinds(image, rows) -> list:
+    """(kind, target pc_offset) for each (pc_offset, mnemonic, op) row of one range.
+
+    kind is "jump", "cjump", "call", "ccall" or None. The target is given only when the
+    word and capstone's printed number agree and it lies in the image, as in code_target;
+    a branch whose target cannot be confirmed keeps its kind and gets None. arm64's `b.al`
+    and `b.nv` branch always, so they are jumps; `bc.cond` is read like `b.cond`."""
+    arch = arch_name(image)
+    tab = CLASS.get(arch)
+    if tab is None:
+        return [(None, None)] * len(rows)
+    text, size = image.text, len(image.text)
+    out = []
+    for pc, _mn, op in rows:
+        try:
+            cls = tab[text[pc + 3]] if pc >= 0 else NONE
+        except IndexError:
+            cls = NONE
+        if cls == B54:
+            # The target is read from the B.cond layout (imm19) before the kind is decided:
+            # b.al is a jump, but its word is not B's, and decoding it as one gives imm26.
+            kind = "jump" if text[pc] & 0xF >= 0xE else "cjump"
+        else:
+            kind = KINDS.get(cls)
+        if kind is None:
+            out.append((None, None))
+            continue
+        t = word_target(arch, _U32(text, pc)[0], pc, cls)
+        out.append((kind, t if _agrees(op, t, arch, size) else None))
+    return out

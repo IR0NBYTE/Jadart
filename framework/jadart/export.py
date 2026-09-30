@@ -134,6 +134,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     one file out of a hundred in a shipped app, and the assets beside it, pinned
     certificates, backend config, bundled models, are usually the next thing anyone
     wants, so they are unpacked too. See container.py for the layout."""
+    from .branches import row_kinds
     from .disasm import (load_instructions, disassemble_function, build_pool_map,
                          render_body, annotate, truncated_by, addr_label)
     from .signatures import names_with_signatures
@@ -206,7 +207,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
                 blocks, entry = build_cfg(ann)
                 out.extend(render_cfg(blocks, structure(blocks, entry), indent="  ", depth=2))
             else:
-                out.extend(render_body(dis, pc_to_name, pool_map, indent="      "))
+                out.extend(render_body(dis, pc_to_name, pool_map, indent="      ",
+                                       kinds=row_kinds(image, dis)))
             out.append("  }")
         out.append("}")
         return out
