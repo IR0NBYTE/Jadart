@@ -4347,6 +4347,465 @@ def test_the_skill_file_names_only_commands_that_exist():
         f"SKILL.md sends an agent to commands that do not exist: {unknown}. "
         f"Known commands: {sorted(known)}")
 
+
+def test_fencecheck_reports_fences_that_do_not_pair_up(tmp_path, capsys):
+    """tools/fencecheck.py, which check.sh runs over the Markdown files (#39).
+
+    A missing closing fence inverts the fences after it, and the file still reads right in
+    an editor, so the check has to find both shapes that do it: a block left open to the
+    end of the file (SKILL.md from #22), and a fence with an info string standing where a
+    closing fence was needed, which cannot close anything and, when the total stays even,
+    passes a count. Outside a small dialect it refuses rather than guesses: fences other
+    than three backticks, fences in lists or quotes, fences in HTML, and HTML beyond a
+    few plain tags or holding Markdown syntax, where renderers disagree. Lines end only
+    where CommonMark ends them and only spaces and tabs are trimmed, so an invisible
+    character cannot make content look like a closing fence."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from fencecheck import (_ALLOWED, _ALLOWED_ATTRS, _CLOSE_ON_LINE, _INLINE,
+                            _STAYS_OPEN, check, main)
+
+    def kinds(text):
+        return [k for _n, k, _m in check(text)]
+
+    swallowed = ("```text\njadart xrefs a\n\nprose\n\n## Workflows\n\n"
+                 "```\njadart info\n```\n")
+    assert [(n, k) for n, k, _m in check(swallowed)] == [(10, "unclosed")]
+    assert check(swallowed)[0][2].endswith("(earlier blocks opened at lines 1)")
+    assert check(swallowed.replace("xrefs a\n", "xrefs a\n```\n")) == []
+
+    run_on = "```\none\n```bash\ntwo\n```python\nthree\n```\n"     # 4 fences, even
+    assert [(n, k) for n, k, _m in check(run_on)] == [(3, "opener"), (5, "opener")]
+    assert "inside the block opened at line 1," in check(run_on)[0][2]
+    after = check("```\na\n```\n\n```\nb\n```bash\nc\n```\n")
+    assert [(n, k) for n, k, _m in after] == [(7, "opener")]
+    assert "opened at line 5," in after[0][2]
+    assert after[0][2].endswith("(earlier blocks opened at lines 1)")
+
+    def closed(n):
+        return "".join("```\nx\n```\n" for _ in range(n)) + "```\n"
+    assert check(closed(10))[0][2].endswith(
+        "(the last 8 of 10 earlier blocks opened at lines 7, 10, 13, 16, 19, 22, 25, 28)")
+    assert check(closed(9))[0][2].endswith(
+        "(the last 8 of 9 earlier blocks opened at lines 4, 7, 10, 13, 16, 19, 22, 25)")
+    assert check(closed(8))[0][2].endswith(
+        "(earlier blocks opened at lines 1, 4, 7, 10, 13, 16, 19, 22)")
+
+    assert check("```\nx\n   ```\n") == []           # a closing fence may be indented
+    assert kinds("```\nx\n    ```\n") == ["unclosed"]  # four spaces is content
+    assert kinds("```\nx\n\t```\n") == ["unclosed"]    # and so is a tab
+    assert check("```\nx\n```\t\n") == []             # and followed by a tab
+    assert kinds("``\n\n```\nx\n") == ["unclosed"]     # two backticks are not a fence
+    assert check("```x``` inline\n- a list item that wraps onto\n"
+                 "  ```x``` inline\n") == []
+
+    # a longer or a tilde fence could close a block a missing fence left open, so the
+    # dialect has none: without that rule the last one reads as a clean file
+    for other in ("````\nx\n````\n", "~~~\nx\n~~~\n", "```\nx\n````\n", "```\n~~~\n```\n",
+                  "~~~ `x`\ntext\n",                  # a tilde info string may hold `
+                  "```\njadart info\n\n## Next\n\n````\n```\n````\n"):
+        assert "unsupported" in kinds(other), other
+
+    for container in ("- step\n\n   ```bash\n   x\n   ```\n", "> ```\n> x\n> ```\n",
+                      "- ```bash\n  x\n", "1. ```bash\n   x\n", "- - ```\nx\n",
+                      "1. - ```bash\nx\n", "> - ```\nx\n", ">\t```bash\nx\n",
+                      "* ```bash\nx\n", "+ ```\nx\n", "1) ```bash\nx\n",
+                      "10. ```bash\nx\n", "- ~~~\nx\n", "<div>\n- ```\nx\n",
+                      "-\t```bash\nx\n", "1.\t```bash\nx\n",
+                      "Run it.[^1]\n\n[^1]: ```bash\n    x\n\n    More.\n\nNext.\n",
+                      "[^flags]:```bash\nx\n"):
+        assert set(kinds(container)) == {"nested"}, container
+
+    # any line opening with `<` starts HTML that runs to the next blank line, and a fence
+    # in it is refused. GitHub's renderer or markdown-it hides the first fence under each
+    # of these starts except the ones in a list, a quote or a footnote, which the walk
+    # refuses without telling them apart: there HTML ends with the container
+    for start in ("<div>text", "<div/> x", "</div> x", "<div\falign=x>",
+                  '<p align="center"><img src="a.png">', "<table>", "<tr><td>",
+                  "<P ALIGN=center>", "</table>", "<h1>Jadart</h1>", "   <hr> x",
+                  "- <br>", "1. <br>", ">\t<br>", "> <hr>", "+ <br>",
+                  "-\t<br>", "1) <br>", "1.\t<br>", "10. <br>", "- - <br>",
+                  "1. - <br>", "> - <br>"):
+        doc = f"{start}\n```\n\n```\nleft open\n"
+        assert kinds(doc) == ["nested", "unclosed"], doc
+    # and refused as well: Markdown syntax, or a block left open in a container
+    for start in ("* <div>", "[^1]: <div>", "[^note]:<div>", "   <DIV> x", "- <div>",
+                  "> <p>", "1. - <div>"):
+        doc = f"{start}\n```\n\n```\nleft open\n"
+        assert kinds(doc) == ["unsupported", "nested", "unclosed"], doc
+    assert set(kinds("<div>\n\u00a0\n```\nx\n```\n")) == {"nested"}   # not a blank line
+    assert set(kinds("<div>\n>\n```\nx\n```\n")) == {"nested"}        # nor is a lone >
+    assert set(kinds("<div>\n\v\n```\nx\n```\n")) == {"nested"}       # nor \v
+    assert set(kinds("<div>\n\f\n```\nx\n```\n")) == {"nested"}       # nor \f
+    assert check('<p align="center"><img src="a.png" width="160"></p>\n\n'
+                 "```\nx\n```\n") == []
+    assert check("<table><tr><th>a</th><td><code>b</code></td></tr></table>\n") == []
+    # only the table structure, div and p may stay open past their line: an inline or
+    # heading element left open can wrap the rest, and GitHub shrinks each level it nests
+    assert check("<table>\n<tr><td>\n\ntext\n\n</td></tr></table>\n") == []
+    assert check('<div>\n\n<p align="center">\n') == []
+    for left_open in ("Intro.\n\n" + "<code>\n" * 12 + "\n## Install\n", "<h6><b>\n",
+                      "<a href=u>link\n", "<sub>x\n", "<b>x</b><i>\n", "<b><i>x</i>\n",
+                      "<SUB>x\n", "<div><sub>x</b>\n", "<sub><sub>x</sub>\n"):
+        assert "unsupported" in kinds(left_open), left_open
+    closes_on_line = "a b code em h1 h2 h3 h4 h5 h6 i kbd span strong sub sup".split()
+    assert _CLOSE_ON_LINE == set(closes_on_line)
+    left_open = "element left open at the end of its line"   # the 'open' message only
+    for tag in closes_on_line:
+        assert left_open in check(f"<{tag}>x\n")[0][2], tag
+    assert check("<b>x<i>y</b></i>\n") == []
+    # a block tag inside an open inline element can make a browser or GitHub ignore or
+    # undo the element's closer, and a closer holding more than its name can be text to
+    # CommonMark: either way the element can stay open over the rest of the page
+    inline = "a b br code em i img kbd span strong sub sup".split()
+    assert _INLINE == set(inline)
+    assert _ALLOWED == set("a b br code div em h1 h2 h3 h4 h5 h6 hr i img kbd p span "
+                           "strong sub sup table tbody td th thead tr".split())
+    assert _ALLOWED_ATTRS == set("align alt height href src title width".split())
+    for tag in sorted(_ALLOWED - _INLINE):
+        assert "unsupported" in kinds(f"<div><code><{tag}></code></div>\n"), tag
+    for kept_open in ("<div><code><div></code></div>\n",
+                      "<code><table><tr><td></code></td></tr></table>\n",
+                      "<h1><table><tr><td></h1></td></tr></table>\n",
+                      "<div><code><b>x</b><div></code></div>\n",
+                      "<div><code><tr></code></div>\n", "<a href=u>x</a title=y>\n",
+                      "<code>x</code/>\n", '<b>x</b title="y">\n', "<b>x</b\f>\n"):
+        assert "unsupported" in kinds(kept_open), kept_open
+    assert "unsupported" in kinds("<b><p>x</p></b>\n")   # even where it would not leak
+    assert check("<code>x <b>y</b> <img src=a.png> <br></code> z\n") == []
+    assert check("<b>x</b >\n<i>y</i\t>\n") == []   # spaces may end a closer
+    # Markdown's inline syntax can open emphasis, a link or a code span around a block
+    # tag or a closer, from this line or another of its paragraph, or from inside a tag
+    # CommonMark reads as text, so HTML holds none of it outside a comment block
+    for syntax in ("<br> <hr>~~<div>~~\n", '<img src="a.png"> <hr>*see <table>*\n',
+                   "<br> _<div>_\n", "<br> [<div>](u)\n", "- <br> *<br>*\n",
+                   "<br> *<br><div>*\n", "<br> *<!-- c --><div>*\n",
+                   "<code>x \\</code>\n", "<b>x `</b>`\n", "<code>[a](</code>)\n",
+                   "<b>x [y][</b>]\n", "<b>x ![a</b>](a.png)\n", "<br> `z` <b>x</b>\n",
+                   '<img src="a.png" / alt="*"> <table><tr><td>x*</td></tr></table>\n',
+                   "<br> <!-- *x ---> <table><tr><td>y*</td></tr></table>\n",
+                   "<br> *a\n<br> <table><tr><td>b*</td></tr></table>\n",
+                   "<br> <table><tr><td>x\ny*</td></tr></table>\n",
+                   "<br> <table><tr><td>b\n](u)</td></tr></table>\n",
+                   "<br> <table><tr><td>x\n    >* y</td></tr></table>\n",
+                   "<b>Note</b> read this\n[^<b>`]: x </b> y\n",
+                   '<img alt="a_b">\n', "<br><b>*x*</b>\n", "<br> [x\n", "<br> ~x\n",
+                   "  <!-- a list item's, perhaps --> *x*\n"):
+        assert "Markdown syntax" in check(syntax)[0][2], syntax
+    # HTML goes on from no line of Markdown, whose emphasis, link, title or reference
+    # definition could reach into it; a comment block may, since it ends the paragraph
+    for joined in ("Some *text\n<br> <table><tr><td>x</td></tr></table>\n",
+                   "[a\n<br> <table><tr><td>b</td></tr></table>\n",
+                   "> quote *a\n> <br> <table><tr><td>b</td></tr></table>\n",
+                   'See [the logo](a.png "\n<img src=logo.png alt=Jadart>\n") here\n',
+                   '[x]: /u "\n<img src=logo.png>\n"\n', "# Title\n<div>\n",
+                   "- item\n  <b>x</b>\n", "```\nx\n```\n<div>\n"):
+        assert "blank line" in check(joined)[0][2], joined
+    for ws in ("\f", "\v", "\u00a0", "    >"):             # none of which is blank
+        joined = f'See [the logo](a.png "\n{ws}\n<img src=logo.png>\n") here\n'
+        assert "blank line" in check(joined)[0][2], ascii(ws)
+    assert check("Text.\n<!-- note -->\n<div>\n\n<!-- a -->\n<br>\n") == []
+    # an ATX line is a heading of what it holds, and a setext underline makes the HTML
+    # above it one; either holds any block that HTML left open and, its closer lost
+    # there, can wrap everything after it
+    for heading in ("<br> <div>\n===\n", "<b>x</b> y\n## <div>\n", "<br> <div>\n=\n",
+                    "<br> <table><tr><td>\n===\n", "<br> <table><tr><td>\n==\n",
+                    "<br> <table><tr><td>\n-\n", "<br> <table><tr><td>\n- \n",
+                    "<br> x\n#\n", "<br> x\n  --- \n", "- <br> x\n  ===\n",
+                    "> <br> x\n> ---\n", "<br> x\n- # <div>\n",
+                    "<br> <table><tr><td>\n=== \n", "<br> <table><tr><td>\n=\t\n",
+                    "<br> <table><tr><td>\n---\t\n"):
+        assert "heading" in check(heading)[0][2], heading
+    assert check("<br>\n-->x\n+ a\n1. b\n==x\n= =\n") == []   # none of these is one
+    assert check("<!-- a\n# b\n===\n-->\n") == []             # nor in a comment block
+    # a list, a quote or an indent ends, and its closer, landing inside a block its HTML
+    # left open, can be ignored, so no block may stay open there, on any of its lines
+    for contained in ("- <br> <table><tr><td>x\n", "> <table><tr><td>x\n",
+                      "- item\n\n  <div>x\n", "1. <p>x\n", "+ <table><tr><td>x\n",
+                      "1) <p>x\n", "- item\n\n\t<div>x\n",
+                      "- <br>\ntext <table><tr><td>\n", "<br> x\n- <table><tr><td>y\n",
+                      "<br> x\n> <div>y\n"):
+        assert "list, a quote" in check(contained)[0][2], contained
+    for inline in ("- <b>x\n", "> <h2>x\n"):                   # and no inline one
+        assert left_open in check(inline)[0][2], inline
+    stays_open = "div p table tbody td th thead tr".split()
+    assert _STAYS_OPEN == set(stays_open)
+    for tag in stays_open:
+        assert "list, a quote" in check(f"- <{tag}>x\n")[0][2], tag
+    assert "list, a quote" in check("- <div><b>x\n")[0][2]   # the first one left open
+    assert check("- <table><tr><td>x</td></tr></table>\n> <div><p>x</p></div>\n") == []
+    assert check("- <br>\n\n<div>\n\n</div>\n") == []      # a new HTML block, at the top
+    assert check("<b>x</b><div>y</div>\n") == []             # once the element is closed
+    assert check("<table><tr><td>\n\n- x\n\n</td></tr></table>\n") == []
+    # a comment block, from `<!--` at column 0 to the line holding its `-->`, is not
+    # Markdown, and the lines after it are Markdown again
+    assert check("<!-- a_b *c* [d] -->\n| `info` | x |\n```\ncode\n```\n") == []
+    assert check("<!-- a\n*b* `c`\nd_e --> *f*\n```\ncode\n```\n") == []
+    assert kinds("<!-- a --> <b>x\n") == ["unsupported"]    # its HTML is still checked
+    for marker in ("* <b>note</b> the flags\n", "[^1]: <br> see\n",
+                   "<br> <table><tr><td>b\n[^a*]: </td></tr></table>\n"):
+        assert "`*` bullet or a footnote" in check(marker)[0][2], marker
+    assert "or for a comment block to its `-->`" in check("<!-- a\n\n```\n-->\n")[0][2]
+    assert kinds("<br> <!-- a -->\n```\nx\n```\n") == ["nested", "nested"]
+    assert kinds("<div>\n<!-- a -->\n```\nx\n```\n") == ["nested", "nested"]
+    assert "unquoted" in check("<!-- a --> <img alt=`x>\n")[0][2]
+    assert check("> - <b>x</b>\n> + 1. <br>y\n") == []   # no syntax in these markers
+    assert check('<h1 align="center"><img src="a.png" alt="J" width="600"></h1>\n') == []
+    assert check('<img alt="Jadart logo" src="a.png">\n') == []   # a quoted value spans
+    assert check("<br/>\n") == []
+    assert check("x\n\n<div>\n```\n")[0][:2] == (4, "nested")
+    assert check("a\n\n<p>\n<select>\n")[0][:2] == (4, "unsupported")
+    assert check("# T\n\n<!-- open\n")[0][:2] == (3, "unsupported")
+    assert "attribute quote" in check('<p align="center\n')[0][2]
+    assert "'b\\x0bx'" in check("<b\vx>\n")[0][2]      # a name from the file is escaped
+    assert "unsupported" in kinds('<b title="x"\valt="y">\n')    # \v is not whitespace
+    assert "unsupported" in kinds('<b alt=\u00a0"><select>">\n')  # nor is NBSP
+    assert "unquoted" in check('<div align=center\u00a0x>\n')[0][2]   # a space to some
+    assert "cannot read" in check("<div align=>\n")[0][2]
+    assert "cannot read" in check("<div =x>\n")[0][2]
+    assert "'\\x0b'" in check("<b \v>\n")[0][2]         # an attribute name is escaped too
+    assert check('<img src="a.png" / alt="x">\n') == []   # a `/` does not end a tag
+    assert check("<img alt=\"it's\" src=\"a.png\">\n") == []   # ends at its own quote
+    assert check("<!-- bench:start -->\n") == []
+    assert check("<img width=600 src=a.png>\n") == []           # a plain unquoted value
+    assert check("<img alt='Jadart logo' src=a.png>\n") == []   # single quotes read too
+    assert "unquoted" in check("<b alt=x\vy>\n")[0][2]         # \v is a space to cmark
+    assert "unquoted" in check("<b alt=x=y>\n")[0][2]
+    assert check("a\nb\x00c\n")[0][:2] == (2, "unsupported")   # GitHub drops Markdown
+    assert kinds("<div>\n```x``` y\n</div>\n") == ["unsupported"]   # code, no fence
+
+    # beyond a short list of plain tags, HTML is refused: renderers disagree on where the
+    # rest starts or ends, and one left open hides everything after it, fences included
+    for other in ("<pre>\nsample output\n\n## Workflows\n", "<PRE>\n", "<pre class=x>\n",
+                  "<script>\n", "<SCRIPT src=a.js>\n", '<style type="text/css">\n',
+                  "<textarea rows=3>\n", "<select>\n", "<div> <title>\n", "<x-y>\n",
+                  "<search>\n", "<source src=a.mp4> x\n", "<?php\n", "<!DOCTYPE html>\n",
+                  "<!doctype html>\n", "<![CDATA[\n", "<div> <![CDATA[ x ]]>\n",
+                  "<div> <script><!--<script></script>\n",
+                  '<p align="center"><select>\n\n```bash\njadart info x\n```\n',
+                  "<details>\n\n## Install\n", "<summary>S</summary>\n", "<div\n",
+                  '<img src="a.png"\n', "<div hidden>\n", '<p style="display:none">\n',
+                  "<div onclick=x>\n", "<div class=x>\n", "<div>\n</ x\n",
+                  "<script\nsrc=a.js>\n", "<textarea\frows=3>\n",
+                  '<p align="center"><img alt="<!--" width="6"><select> -->\n',
+                  '<div title="<!--"><script> -->\n', "<img alt='<!--'><textarea> -->\n",
+                  "<div title=<!--x><select> -->\n", "<div\n\n<!-- a>\n<select>\n-->\n",
+                  '<p align="center\n\n## Install\n', "<!-- a --> <textarea> -->\n",
+                  "<!-- a --!> <textarea> -->\n", "<style>\n", "<select/>\n",
+                  # a browser reads the whole run to whitespace, `/` or `>` as the tag
+                  # name, and only space, tab, LF, FF and CR as whitespace
+                  '<div><x:y alt="<b title=">x<!--">\n', "<div><x:y hidden>\n",
+                  "<https://example.com>\n", "<a@b.c> mail\n", "<div> <a=\thidden>\n",
+                  'intro\n\n<b\vtitle="><select>">\n', '<b\u00a0alt="><select>">\n',
+                  '<img\u3000src="a.png"\u3000alt="><script>">\n',
+                  # attributes: unquoted values end at whitespace, both quotes close
+                  "<div align=center hidden>\n", "<p align='center>\n",
+                  '</div title="x>\n', "<div align hidden>\n", "<div \"a='b>\n",
+                  "<div align=>\n",
+                  # a comment ends at its first `-->` whatever quotes it holds
+                  '<!-- <img alt="--> <select>">\n', "<!---!> <textarea> -->\n",
+                  "<div / hidden>\n", "<div align=center / hidden>\n",
+                  "<b alt=\"x' title=\"><select>'>\n", '<img alt=""><select>">\n',
+                  # a line opening with an inline tag and going on past it is a
+                  # paragraph, where CommonMark's grammar, code spans and escapes decide
+                  # which `<` are tags, so no `<` may sit inside a tag or a comment, and
+                  # an unquoted value keeps to CommonMark's grammar, with no character
+                  # one reader takes as a space and another does not
+                  "Intro.\n\n<b>note</b> <!-- <select> --->\n",
+                  '<b title="x"alt="<details>">\n', '<b>`<b title="`<select>">\n',
+                  '<img src="a.png"> <!-- was: <details> --->\n',
+                  '</b title="<select>">\n', '<div/title="<select>">\n',
+                  '<b/title="<select>">\n', "<b title=a<select>>\n",
+                  '<b>x</b> \\<b title="<select>">\n',
+                  '<b title="x"alt="y><select>">\n', '<b/title="><select>">\n',
+                  "<b>note</b> <!--<select> --->\n",
+                  "intro\n\n<img alt=\u00a0'x\" title=\"'>tail\">\n",
+                  "intro\n\n<img alt=\v'x\" title=\"'>tail\">\n",
+                  "intro\n\n<img alt=\u3000'x\" title=\"'>tail\">\n",
+                  '<img alt=x"y>\n', "<img alt=x'y>\n", "<img alt=x=y>\n",
+                  "<img alt=`x>\n",
+                  # U+FEFF is a space to JavaScript markdown-it, not to a browser, and
+                  # U+0080 is a control character
+                  "intro\n\n<img alt=\ufeff'x\" title=\"'>tail\">\n",
+                  "<img alt=x\ufeffy>\n", "<img alt=x\x80y>\n",
+                  # a `<` that starts no tag is text, and the scan goes on past it
+                  "<div>a <<select>\n", "<td>1 < 2</td> <select>\n"):
+        assert "unsupported" in kinds(other), other
+
+    # a comment closes on the line that opens it, except one that starts a new HTML
+    # block at column 0, which every renderer runs to its first `-->`, blank lines
+    # included; tags in it are not scanned, but a fence or a `--!>` in it is refused
+    assert check("<!-- note -->\n\n```\nx\n```\n") == []
+    assert check("<!-->\n\n```\nx\n```\n") == []
+    assert check("<!-- a\nb\n\n-->\n\n```\nx\n```\n") == []
+    assert check("text\n<!-- a\nb -->\n\n```\nx\n```\n") == []
+    assert check("<!-- a\nb <script> -->\n\n```\nx\n```\n") == []   # commented out
+    assert kinds("<!--\n\n```\n-->\n\n```\nleft open\n") == ["nested", "unclosed"]
+    for left_open in ("<div> <!-- note\n\n```\nx\n```\n",
+                      "<div>\nnote <!-- hidden\n\n```\nx\n",
+                      "<!-- a --> <!--\n\n```\nx\n```\n",
+                      "<!-- a\nb --> <!-- c\n\n```\nx\n```\n",
+                      "<!-- a\nb -->\n<div> <!-- x\n\n```\ny\n```\n",
+                      "<!-- a\n\n<!-- x --><!-- c\nd -->\n\n```\ncode\n```\n",
+                      '<p align="center"><img src="a.png"></p> <!-- logo\n\n'
+                      "## Install\n\n```bash\npip install jadart\n```\n",
+                      '<p align="center"><img src="a.png"></p>\n<!-- Badges are off\n'
+                      "[![a](b)](c)\n\n[![d](e)](f)\n-->\n## Install\n\n```\nx\n```\n",
+                      "<!-- logo --> <!-- badges,\ngenerated -->\n\n## Install\n\n"
+                      "```\nx\n```\n",
+                      "- <!-- hidden note\n-->\n\n```\ncode\n```\n",
+                      "> <!-- note\n-->\n\n```\nx\n```\n",
+                      "  <!-- indented\n-->\n\n```\nx\n```\n",
+                      "- step one\n\n  <!-- TODO: explain\nthe flags -->\n\n"
+                      "```\nx\n```\n",
+                      "- item\n  <!-- a\n\n  b -->\n\n```\ncode\n```\n",
+                      "<div> 1 < 2 <!-- note\n\n```\nx\n```\n",
+                      "<div>\n<!-- a\nb -->\n\n```\nx\n```\n",
+                      "<br>\n<!--\n\n<div>\n-->\n```\nx\n\n```\ny\n",
+                      "<!-- a --!> <textarea>\nc -->\n\n```\ncode\n```\n",
+                      "<!-- a\nb --!> <select>\nc -->\n\n```\ncode\n```\n",
+                      "<!-- a\nb --> <textarea> -->\n\n```\nx\n```\n",
+                      "<!-- a\nb --!> <textarea> -->\n\n```\nx\n```\n",
+                      "# Title\n\n<!-- TODO: the next section\n\n## Workflows\n"):
+        assert "unsupported" in kinds(left_open), left_open
+
+    assert kinds("```x``` inline\n\n```\nleft open\n") == ["unclosed"]
+    assert check("```text\nx\n")[0][2].endswith("or to an earlier block")
+    assert "<select>" in check("<!-- note --><select>\n")[0][2]
+    assert kinds("```\ncode\n```\u00a0\n\n## Heading\n") == ["unclosed", "opener"]
+    assert kinds("```\ncode\ntext\u2028```\n\n## Heading\n") == ["unclosed"]
+    assert kinds("```\ncode\n```\f\n\n## Heading\n") == ["unclosed", "opener"]
+    assert kinds("```\ncode\n```\v\n\n## Heading\n") == ["unclosed", "opener"]
+    assert kinds("```\ncode\ntext\x85```\n\n## Heading\n") == ["unclosed"]
+    assert kinds("\ufeff```\na\n") == ["unclosed", "unsupported"]   # a byte order mark
+    assert kinds("```\nx\n```\n\nprose\r```\n\n## H\n") == ["unclosed"]  # a lone CR
+    assert check("```\r\nx\r\n```\r\n") == []            # ends a line, and so does CRLF
+    assert check("a\r\n```\r\nx\r\n")[0][:2] == (2, "unclosed")      # as one line end
+    assert kinds("<div>\r\n```\r\nx\r\n```\r\n") == ["nested", "nested"]
+
+    good, bad, gone = tmp_path / "good.md", tmp_path / "bad.md", tmp_path / "gone.md"
+    latin, folder = tmp_path / "latin.md", tmp_path / "folder.md"
+    bom = tmp_path / "bom.md"
+    good.write_text("```\nx\n```\n")
+    bad.write_text("```text\nx\n")
+    latin.write_bytes(b"caf\xe9\n")
+    bom.write_bytes(b"\xef\xbb\xbf# T\n")
+    folder.mkdir()
+    assert main([str(good)]) == 0
+    capsys.readouterr()
+    listed = [str(p) for p in (good, bad, gone, latin, folder, bom)]
+    assert main(listed) == 1
+    out = capsys.readouterr().out
+    for line in (f"{bad}:1: unclosed", f"{gone}:0: missing", f"{latin}:0: unreadable",
+                 f"{folder}:0: unreadable", f"{bom}:1: unsupported"):
+        assert line in out, out
+    assert main([]) == 2                 # nothing to check is a failure, not a pass
+
+
+def test_fencecheck_runs_in_linear_time_on_container_markers():
+    """check.sh runs the check on every Markdown file, so no line may make it slow. Two
+    alternatives of the container pattern once matched the same spaces, and a 114-byte
+    line of footnote markers took ten seconds, each marker tripling it."""
+    import time
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from fencecheck import check
+    start = time.perf_counter()
+    check("[^a]:  " * 14 + "x\n")
+    check("[^a]:" + " " * 20000 + "x\n")
+    check("- " * 5000 + "x\n")
+    check("<b>" * 20000 + "</i>" * 20000 + "\n")    # the open tags kept per name
+    check("<b>" * 40000 + "</b>" * 40000 + "\n")    # and popped per name
+    check("<br>" + " x<" * 100000 + "\n")           # a `<` that starts no tag
+    check("<br>\n" + "- " * 20000 + "x\n")          # list markers against an underline
+    check("- " * 20000 + "<br>\n")
+    check("<br>\n" + "1. - " * 10000 + "x\n")
+    assert time.perf_counter() - start < 1.0
+
+
+def test_fencecheck_tracked_covers_the_docs_check_sh_names():
+    """check.sh runs `fencecheck.py --tracked`, so the files it reads are the ones #39
+    asks for: README, CONTRIBUTING, CHANGELOG, the docs and the skill file."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from fencecheck import tracked
+    import shutil
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    with open(os.path.join(root, "check.sh")) as f:
+        step = r'^step "[^"]*" "\$PY" framework/tools/fencecheck\.py --tracked$'
+        assert re.search(step, f.read(), re.M), "check.sh no longer runs the fence check"
+    if not os.path.exists(os.path.join(root, ".git")) or shutil.which("git") is None:
+        _skip("  SKIP test_fencecheck_tracked_covers_the_docs_check_sh_names "
+              "(not a git checkout, or no git)")
+    listed = {os.path.relpath(p, root) for p in tracked()}
+    assert {"skills/flutter-reverse-engineering/SKILL.md", "docs/usage.md", "README.md",
+            "CONTRIBUTING.md", "CHANGELOG.md"} <= listed, sorted(listed)
+
+
+def test_fencecheck_tracked_includes_a_doc_not_yet_added(tmp_path, monkeypatch):
+    """A contributor runs check.sh before committing a new doc, so --tracked has to read
+    the Markdown git would track once added, not only what it tracks already, and skip a
+    tracked one they have deleted but not yet staged."""
+    import shutil
+    import subprocess
+    import importlib.util
+    if shutil.which("git") is None:
+        _skip("  SKIP test_fencecheck_tracked_includes_a_doc_not_yet_added (no git)")
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    repo = tmp_path / "repo"
+    tools = repo / "framework" / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy(os.path.join(os.path.dirname(__file__), "..", "tools", "fencecheck.py"),
+                tools / "fencecheck.py")
+    (repo / "new.md").write_text("```\nnever closed\n")
+    (repo / ".gitignore").write_text("ignored.md\n")
+    (repo / "ignored.md").write_text("```\n")
+    (repo / "gone.md").write_text("x\n")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "gone.md"], check=True)
+    (repo / "gone.md").unlink()          # deleted, not staged: not reported as missing
+    spec = importlib.util.spec_from_file_location("fencecheck_new",
+                                                  tools / "fencecheck.py")
+    copy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(copy)
+    listed = {os.path.basename(p) for p in copy.tracked()}
+    assert "new.md" in listed and "ignored.md" not in listed, listed
+    assert "gone.md" not in listed, listed
+
+
+def test_fencecheck_tracked_refuses_a_copy_inside_another_repository(tmp_path,
+                                                                      monkeypatch):
+    """A copy of the tree inside some other git repository must not be read as this one:
+    git would apply that repository's index and ignore rules, so a copy whose Markdown it
+    ignores in part would pass on the rest."""
+    import shutil
+    import subprocess
+    import importlib.util
+    if shutil.which("git") is None:
+        _skip("  SKIP test_fencecheck_tracked_refuses_a_copy_inside_another_repository "
+              "(no git)")
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)      # a hook's GIT_INDEX_FILE must not receive the add
+    outer = tmp_path / "outer"
+    tools = outer / "inner" / "framework" / "tools"
+    tools.mkdir(parents=True)
+    shutil.copy(os.path.join(os.path.dirname(__file__), "..", "tools", "fencecheck.py"),
+                tools / "fencecheck.py")
+    (outer / "inner" / "good.md").write_text("```\nx\n```\n")
+    (outer / "inner" / "bad.md").write_text("```\nnever closed\n")
+    (outer / ".gitignore").write_text("inner/bad.md\n")
+    subprocess.run(["git", "init", "-q", str(outer)], check=True)
+    subprocess.run(["git", "-C", str(outer), "add", "inner/good.md"], check=True)
+    spec = importlib.util.spec_from_file_location("fencecheck_copy",
+                                                  tools / "fencecheck.py")
+    copy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(copy)
+    try:
+        copy.tracked()
+    except SystemExit as exc:
+        assert "not a git checkout of this repository" in str(exc)
+    else:
+        raise AssertionError("tracked() read part of another repository as this one")
+
+
 def test_an_extending_addressing_operand_carries_its_shift():
     # `sxtw #2` scales by four exactly as `lsl #2` does (A5.1.4 spells the amount the same
     # way), and reading only the lsl spelling recorded a stride of one for every frame

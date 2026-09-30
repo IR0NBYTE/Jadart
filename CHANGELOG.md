@@ -134,6 +134,68 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The skill file and the usage guide render as written again.** The `xrefs` examples
+  that #22 added to `SKILL.md` and `docs/usage.md` opened a code block and never closed
+  it. Under CommonMark the next fence closed it instead, and the fences after it were
+  inverted: examples rendered as prose and prose as code. In `SKILL.md`, which coding
+  agents read, that ran to the end of the file, the last 62 lines became one code block
+  and 8 of its 13 headings stopped being headings; in `docs/usage.md` it ran until a fence
+  with an info string realigned the pairing, and 3 of 11 headings were lost. One closing
+  fence in each file puts every heading back, checked with markdown-it in CommonMark mode.
+  Closes #39.
+  - `check.sh` now runs `tools/fencecheck.py` over every `.md` file in the repository,
+    including one not yet added. It walks the fences the way CommonMark pairs them rather
+    than counting them, because a fence with an info string cannot close a block, so one
+    standing where a closing fence was needed passes a count whenever the total stays
+    even. It also reports that fence, which is what `docs/usage.md:291` was before this
+    fix. Neither report knows which block lost its closing fence, so both list the blocks
+    before it.
+  - It checks a small dialect the docs already keep to, and refuses anything outside it
+    rather than guess: three-backtick fences, opening at column 0 (a closing one may be
+    indented, as CommonMark allows), not in a list, a quote or a footnote, not in HTML,
+    and no byte order mark or NUL. A longer or a tilde fence could close a block that a
+    missing fence left open and hide it. Any line opening with `<` starts HTML that runs
+    to the next blank line, or for a comment block at column 0 to the line holding its
+    `-->`, where no fence may stand. HTML other than a comment block starts after a blank
+    line or a comment block, and it keeps to a short list of plain tags and attributes,
+    closes every tag, quote and comment on its line, writes each closing tag as its name
+    and spaces or tabs, leaves no inline or heading element open past it or holding a
+    block tag, leaves no block open in a list, a quote or an indent, has no line
+    CommonMark can read as a heading, holds none of Markdown's inline syntax (`*`, `_`,
+    `~`, `[`, `]`, backslash, backtick) on any of its lines outside a comment block, holds
+    no `<` inside a tag or a comment, and quotes any attribute value that is not a run of
+    plain characters. A comment may run on only where it starts a new HTML block at column
+    0, which every renderer reads to its first `-->`. Renderers disagree about which lines
+    start an HTML block (GitHub's follows CommonMark 0.29, markdown-it the 0.31 tags) and
+    where some end; a line that starts one is copied into the page as it is, where a
+    comment, `<script>`, `<select>`, `<details>` or an open quote hides everything after
+    it, and a line that opens with an inline tag and goes on past it is read as a
+    paragraph, where CommonMark decides which `<` are tags and a character one reader
+    takes as a space and another does not can move where a tag ends. HTML is checked on a
+    line that opens with `<` and on the lines after it up to a blank line, or for a
+    comment block up to the line holding its `-->`, not later in other lines.
+  - Compared with markdown-it on 600,000 generated documents built from fence, list,
+    quote, HTML, inline code and invisible-character lines: fencecheck passed 12,993 of
+    them, and markdown-it leaves a block open in none. On the 2,031 generated documents in
+    the dialect that it passes, deleting any one of their 2,769 closing fences made it
+    fail every time. Of 180,000 more, built around HTML, attributes and comments and
+    ending in a code block and a paragraph, it passed 15,857; of 600,000 single HTML lines
+    built from tag fragments, quotes and invisible characters, 36,811; of 600,000 lines
+    opening with an inline tag, 15,143; and of 300,000 tags whose attributes mix quotes,
+    `>` and characters some readers take as spaces, 2,186. Parsed as a browser parses
+    markdown-it's page, none lost the code block or the paragraph, and neither did any of
+    150 of the documents rendered by GitHub. Of 400,000 lines opening with an inline,
+    heading or block tag and followed by a heading, a paragraph and a code block, it
+    passed 22,281, and of 200,000 paragraphs of two to five HTML and prose lines holding
+    emphasis, link and code delimiters, 28,070; none of them left the heading, the
+    paragraph or the code block inside an inline or heading element on markdown-it's page,
+    nor did any of 100 of the lines rendered by GitHub. Of 120,000 documents mixing prose,
+    comment blocks, lists, quotes, headings and HTML lines, it passed 24,313 that hold no
+    HTML inside a Markdown heading line, and none of those wrapped, lost or moved a code
+    block on markdown-it's page; of 240,000 more putting HTML lines in lists, quotes and
+    indents among headings and prose, it passed 32,828, and none of the 31,590 of those
+    that hold HTML only on lines the check reads left the rest inside a list, a quote, an
+    inline or a heading element.
 - **arm32 conditional branches print their target as an address.** Since addresses became
   virtual addresses, a branch target is rebased to match the column beside it, but which
   operands were branch targets was decided from the mnemonic: a list that knew arm64's

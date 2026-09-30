@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 265](https://img.shields.io/badge/tests-265-brightgreen.svg)](#tests)
+[![tests: 270](https://img.shields.io/badge/tests-270-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -384,7 +384,8 @@ framework/            jadart itself, plus its test suite
                       ssa, lower), the gates (verify), and the CLI (cli, console,
                       export, errors)
   tools/              gen_cids, gen_epoch, sdk_source, build_corpus, measure,
-                      cfgcheck, irfuzz, appsweep, ctfbench, bench, quality, semdiff
+                      cfgcheck, irfuzz, appsweep, ctfbench, bench, quality, semdiff,
+                      fencecheck
   tests/test_core.py  validation against the FluBench corpus
 flubench/             the controlled corpus: a labelled construct app and its harness
   app/                the Flutter app whose declared symbols are exact ground truth
@@ -396,7 +397,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 265 tests
+cd framework && python3 -m pytest tests -q     # 270 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```

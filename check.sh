@@ -43,6 +43,11 @@ done
 # The measured claims in EVAL.md, against what the tool actually reports.
 step "measured claims still hold" "$PY" framework/tools/measure.py --check
 
+# One unclosed fence inverts the fences after it until something realigns them, and the
+# file still looks right in an editor (#39). The skill file is read by agents, so the docs
+# are on the release path too. It asks git for the files, so it needs a git checkout.
+step "Markdown code fences close" "$PY" framework/tools/fencecheck.py --tracked
+
 # The package has to work without the disasm extra, or that claim is only true untested.
 step "parses with no capstone" "$PY" - <<'PYEOF'
 import sys
