@@ -48,7 +48,9 @@ renderers mark matched names so a reader can see which is which.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import re
+import stat
 
 from .disasm import (MAX_INSNS, MissingDisassembler, UnsupportedArch, build_pool_map,
                      disassemble_range, function_name_by_pc, pool_byte_offset,
@@ -388,7 +390,7 @@ FORMAT = "jadart-signatures-1"
 
 
 def save(lib: Library, path: str) -> None:
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(f"# {FORMAT}\n")
         for src, dart, n in lib.sources:
             f.write(f"# from\t{dart}\t{n}\t{src}\n")
@@ -397,20 +399,63 @@ def save(lib: Library, path: str) -> None:
                 f.write(f"{tag}\t{h:016x}\t{nm}\n")
 
 
+#: A body line as save() writes it: a table tag, the shape hash as 16 hex digits, a name.
+#: int(h, 16) alone would also take `+1`, ` 1` or `1_0`, which save() never writes. A name
+#: can be empty: build() keeps base_name(), which is '' for a name that is only
+#: `@<digits>`.
+_ENTRY = re.compile(r"([cpb])\t([0-9a-f]{16})\t(.*)")
+#: A `# from` line. The count is bounded because int() refuses a string of more than
+#: 4300 digits with a ValueError of its own.
+_SOURCE = re.compile(r"# from\t([^\t]*)\t([0-9]{1,18})\t(.*)")
+
+
 def load(path: str) -> Library:
+    """Read a library save() wrote. A `--sigs` path is user input, so anything wrong with
+    it is an InputError naming the path, and the line, rather than a builtin exception
+    the CLI would report as a bug in jadart."""
+    from .errors import InputError
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        raise InputError(f"{path}: no such file or directory") from None
+    except OSError as exc:
+        raise InputError(f"{path}: cannot read this file: {exc.strerror}") from exc
+    if stat.S_ISDIR(st.st_mode):
+        raise InputError(f"{path}: is a directory, not a signature file")
     lib = Library()
     tables = {"c": lib.by_ctx, "p": lib.by_pooled, "b": lib.by_body}
-    with open(path) as f:
-        head = f.readline().strip()
-        if head != f"# {FORMAT}":
-            raise ValueError(f"{path}: not a jadart signature file (got {head!r})")
-        for line in f:
-            if line.startswith("# from\t"):
-                _, dart, n, src = line.rstrip("\n").split("\t", 3)
-                lib.sources.append((src, dart, int(n)))
-                continue
-            if line.startswith("#") or not line.strip():
-                continue
-            tag, h, nm = line.rstrip("\n").split("\t", 2)
-            tables[tag][int(h, 16)] = nm
+    header = f"# {FORMAT}".encode()
+    try:
+        # Bytes, decoded a line at a time, so a line that is not UTF-8 can be named. A
+        # pipe (`--sigs <(zcat lib.sig.gz)`) reads like a file.
+        with open(path, "rb") as f:
+            # No more of the first line than the header and its line end: a file that
+            # does not start with the header, even /dev/zero or a large one with no
+            # newline, is refused without being read to its end.
+            head = f.readline(len(header) + 2)
+            if head.rstrip(b"\r\n") != header:
+                raise InputError(f"{path}: not a jadart signature file (it starts "
+                                 f"{head!r}, not '# {FORMAT}')")
+            for n, raw in enumerate(f, 2):
+                try:
+                    line = raw.rstrip(b"\r\n").decode("utf-8")
+                except UnicodeDecodeError:
+                    raise InputError(f"{path}:{n}: not UTF-8 text") from None
+                if line.startswith("# from\t"):
+                    m = _SOURCE.fullmatch(line)
+                    if m is None:
+                        raise InputError(f"{path}:{n}: a '# from' line needs a Dart "
+                                         f"version, a count and a source, tab separated")
+                    lib.sources.append((m.group(3), m.group(1), int(m.group(2))))
+                    continue
+                if line.startswith("#") or not line.strip():
+                    continue
+                m = _ENTRY.fullmatch(line)
+                if m is None:
+                    raise InputError(f"{path}:{n}: not a signature line: it needs a tag "
+                                     f"(c, p or b), 16 hex digits and a name, tab "
+                                     f"separated (got {line[:40]!r})")
+                tables[m.group(1)][int(m.group(2), 16)] = m.group(3)
+    except OSError as exc:
+        raise InputError(f"{path}: cannot read this file: {exc.strerror}") from exc
     return lib
