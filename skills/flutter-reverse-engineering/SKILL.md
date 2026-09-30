@@ -141,6 +141,7 @@ jadart xrefs <path> string <pattern> --exact
 jadart xrefs <path> pool <offset>
 jadart xrefs <path> function <name-or-address>
 jadart xrefs <path> string <pattern> --class <Class>
+```
 
 `jadart` takes an APK, an IPA, a directory or a bare `libapp.so` / `App.framework/App`.
 You do not need to unzip anything first.

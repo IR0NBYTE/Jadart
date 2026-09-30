@@ -192,6 +192,7 @@ jadart xrefs libapp.so pool 0xb618
 jadart xrefs libapp.so function Licence.check
 jadart xrefs libapp.so function 0x1a2b40
 jadart xrefs libapp.so string sourdough --class Licence
+```
 
 `jadart xrefs` used to resolve ObjectPool entries only. On the corpus binary that is 349
 pool references against **34,979 direct calls**, so it answered about one call site in a
