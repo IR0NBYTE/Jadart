@@ -15,11 +15,12 @@ capstone over all 2^32 words of each instruction set, each decoded at two bases:
 decodable word of a byte the table names prints an address that moves with the base, and
 no word of any other byte does (536,870,912 such words on each set, no exception). That
 proves it for one capstone build, the 5.0.9 wheel. For any other, each target is also
-checked per row against the `#0x` number capstone printed, and a disagreement leaves the
+checked per row against the last number capstone printed, and a disagreement leaves the
 operand exactly as printed rather than trusting either side.
 """
 from __future__ import annotations
 
+import re
 import struct
 
 NONE, JUMP, CJUMP, CALL, CCALL, B54, ADR, ADRP, LIT = range(9)
@@ -101,23 +102,34 @@ def word_target(arch: str, w: int, pc: int, cls: int) -> int:
     return pc + (_sx((w >> 5) & 0x7FFFF, 19) << 2)              # B.cond, CBZ, literal
 
 
+#: The last `#` number of an operand, in hex or in decimal. A code target is decimal only
+#: below 10 (`bl #8` for 8, `bl #0xc` for 12, on arm64 and arm alike). A shift amount is
+#: decimal at any size (`lsl #12`); only the word's class keeps it out of code_target and
+#: row_kinds.
+_NUMBER = re.compile(r"0x([0-9a-f]+)|([0-9]+)")
+
+
+def printed_number(op: str):
+    """(the operand before it, the value) of the last `#` number capstone printed in `op`,
+    or None when it ends in anything else."""
+    head, sep, tail = op.rpartition("#")
+    m = _NUMBER.fullmatch(tail) if sep else None
+    if m is None:
+        return None
+    return head, int(m.group(1), 16) if m.group(1) is not None else int(m.group(2))
+
+
 def _agrees(op: str, t: int, arch: str, size: int) -> bool:
-    """Whether the last `#0x` number capstone printed is `t`, and `t` is in the image."""
-    _head, sep, tail = op.rpartition("#0x")
-    if not sep:
-        return False
-    try:
-        printed = int(tail, 16)
-    except ValueError:
-        return False
-    return printed == t & _MASK[arch] and 0 <= t < size
+    """Whether the last number capstone printed is `t`, and `t` is in the image."""
+    printed = printed_number(op)
+    return printed is not None and printed[1] == t & _MASK[arch] and 0 <= t < size
 
 
 def code_target(image, pc_offset: int, op: str):
     """The pc_offset the operand of the instruction at `pc_offset` names as a code address,
     or None. None unless all three agree: the word is a PC-relative branch (or `adr`), the
-    target its immediate field gives is the `#0x` number capstone printed, and it lies inside
-    the image."""
+    target its immediate field gives is the last number capstone printed, and it lies
+    inside the image."""
     arch = arch_name(image)
     tab = _CODE.get(arch)
     if tab is None or pc_offset < 0:
