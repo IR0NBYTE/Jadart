@@ -7254,6 +7254,52 @@ def test_code_target_arm64_forms():
     assert rebase_operand(image, 0x40, "x1, #0x41") == "x1, 0x136ac1"
 
 
+def test_a_branch_to_pc_offset_0_to_9_is_rebased_and_labelled():
+    """capstone prints a target below 10 in decimal (`bl #8`, `b.ne #4`) and the rest in
+    hex, and the check against the word read only `#0x` numbers, so a branch, call or
+    `adr` into pc_offset 0 to 9 kept its pc_offset among virtual addresses, got
+    `target_va: null` under -j, and lost its tier 1 callee name and block label (#46)."""
+    if not _capstone_available():
+        _skip("  SKIP test_a_branch_to_pc_offset_0_to_9_is_rebased_and_labelled"
+              " (no capstone)")
+    from jadart.branches import row_kinds
+    from jadart.disasm import disassemble_range, rebase_operand, render_body, target_va
+    a64 = [0xD503201F, 0xD503201F,
+           0x97FFFFFE,   # 0x08 bl    #0
+           0x54FFFFC1,   # 0x0c b.ne  #4
+           0x3607FFA0,   # 0x10 tbz   w0, #0, #4
+           0x30FFFF61,   # 0x14 adr   x1, #1
+           0xD503201F, 0xD65F03C0]
+    a32 = [0xE320F000, 0xE320F000,
+           0xEBFFFFFC,   # 0x08 bl    #0
+           0x1AFFFFFC,   # 0x0c bne   #4
+           0xE320F000, 0xE12FFF1E]
+    for arch, words, anchor, want in (
+            ("arm64", a64, 0x136A80,
+             {0x08: ("call", 0, "0x136a80"), 0x0C: ("cjump", 4, "0x136a84"),
+              0x10: ("cjump", 4, "w0, #0, 0x136a84"),
+              0x14: (None, None, "x1, 0x136a81")}),
+            ("arm", a32, 0x154E00,
+             {0x08: ("call", 0, "0x154e00"), 0x0C: ("cjump", 4, "0x154e04")})):
+        image = _word_image(words, arch, anchor)
+        dis = disassemble_range(image, image.all_ranges[0])
+        kinds = dict(zip((pc for pc, _mn, _op in dis), row_kinds(image, dis)))
+        ops = {pc: op for pc, _mn, op in dis}
+        for pc, (kind, t, rebased) in want.items():
+            if kind is not None:
+                assert kinds[pc] == (kind, t), (arch, hex(pc), kinds[pc])
+            assert rebase_operand(image, pc, ops[pc]) == rebased, (arch, hex(pc))
+            va = int(rebased.rpartition(" ")[2], 16)     # the address it now prints
+            assert target_va(image, pc, ops[pc]) == va, (arch, hex(pc))
+        body = [" ".join(line.split()) for line in
+                render_body(dis, {0: "entry"}, None, kinds=row_kinds(image, dis))]
+        assert "bl #0 ; -> entry" in body, (arch, body)
+        assert ("b.ne L0" if arch == "arm64" else "bne L0") in body, (arch, body)
+        assert "L0:" in body, (arch, body)
+        if arch == "arm64":
+            assert "tbz w0, #0, L0" in body, body
+
+
 def test_row_kinds_reads_b_al_as_a_jump_with_its_b_cond_target():
     """`b.al` and `b.nv` always branch, so they are jumps, but their word is B.cond's.
 

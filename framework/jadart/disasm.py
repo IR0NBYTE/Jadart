@@ -37,7 +37,7 @@ except Exception as exc:                       # noqa: BLE001 - reported, not sw
     _CAPSTONE_IMPORT_ERROR = exc
 
 from .macho import open_container
-from .branches import code_target
+from .branches import code_target, printed_number
 from .fill import printable
 from .stream import ReadStream
 from . import versions
@@ -510,7 +510,10 @@ def rebase_operand(image: InstrImage, pc_offset: int, op: str) -> str:
     if image.anchor_va is None:
         return op
     t = code_target(image, pc_offset, op)
-    return op if t is None else f"{op.rpartition('#0x')[0]}0x{image.anchor_va + t:x}"
+    if t is None:
+        return op
+    # the text before capstone's number, which is decimal below 10 (`w0, #0, #4`)
+    return f"{printed_number(op)[0]}0x{image.anchor_va + t:x}"
 
 
 def _parse_addr(text: str, image: "InstrImage | None" = None):

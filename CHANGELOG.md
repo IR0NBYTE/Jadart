@@ -134,6 +134,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A branch into pc_offset 0 to 9 prints its target as an address.** capstone prints a
+  target below 10 in decimal (`bl #8`) and the rest in hex (`bl #0xc`), and the check that
+  a target read from the instruction word matches the operand looked only for a `#0x`
+  number. So a branch, call or `adr` into the first ten bytes of the instructions image
+  kept its pc_offset among virtual addresses in `disasm`, got `target_va: null` under
+  `-j`, and since #41 lost its tier 1 callee name and block label. The check now reads the
+  last number in either spelling, and the rebase keeps what comes before it (`tbz w0, #0,
+  #4`). No compiled binary branches there, since pc_offset 0 is the image header, so on
+  the fixtures and the arm32 corpus builds every row and every `export` file is unchanged;
+  the case needs a crafted binary. Closes #46.
 - **A bad `--sigs` file is a typed input error, exit 2.** A missing path, a directory, a
   file that is not a signature library, one that cannot be read, and a malformed line in
   one each escaped `signatures.load()` as a builtin exception (such as
