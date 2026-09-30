@@ -267,6 +267,7 @@ def cmd_lift(args) -> int:
     """Tier 3 for a single function, including top-level ones that belong to no class."""
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                          build_pool_map, addr_label, va_of)
+    from .branches import row_kinds
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
@@ -300,7 +301,8 @@ def cmd_lift(args) -> int:
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        body = lift_function(annotate(dis, pc_to_name, pool_map), pool_map,
+        body = lift_function(annotate(dis, pc_to_name, pool_map,
+                                      kinds=row_kinds(image, dis)), pool_map,
                              receiver=receiver_for(cr.owner_ref, static_refs),
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),
@@ -837,6 +839,7 @@ def cmd_ffi(args) -> int:
     from .disasm import addr_label, va_of
     from .disasm import (load_instructions, build_pool_map, pool_xrefs, disassemble_range,
                          annotate)
+    from .branches import row_kinds
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
@@ -870,7 +873,8 @@ def cmd_ffi(args) -> int:
             if not dis:
                 continue
             try:
-                body = lift_function(annotate(dis, pc_to_name, pool), pool,
+                body = lift_function(annotate(dis, pc_to_name, pool,
+                                              kinds=row_kinds(image, dis)), pool,
                                      receiver=receiver_for(cr.owner_ref, static_refs),
                                      arity=arity, selectors=selectors,
                                      arch=getattr(image, "arch", None),

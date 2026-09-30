@@ -134,6 +134,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Tier 2 names arm32's conditional calls, as tier 1 does.** Since #41 a callee is found
+  from the instruction word, which names `blls` to the stack-overflow stub and `bleq` to
+  the null-error stubs, but only where `annotate` was handed the word's row kinds, and the
+  tier 2 callers were not. They kept the mnemonic test (`bl` and `b` only), so `export -t
+  2` of arm32-2.19.6 named 0 of the 8,375 conditional calls it prints, each a bare
+  pc_offset inside the image window. It names 7,046 now, and arm32-3.11.5 7,234 of 8,724,
+  each with the note `-t 1` gives the same call; the rest go into a stub past its first
+  instruction, which no tier names. A conditional call keeps its condition (`blls ... ; ->
+  stub ...`) rather than becoming a `call` that reads as unconditional. `annotate` now
+  requires the row kinds, so no caller, tier 3 and the tools included, can fall back to
+  the mnemonic test. arm64 output is unchanged: `export -t 2` and `-t 3` of both fixtures
+  are byte-identical. Closes #42.
 - **A branch into pc_offset 0 to 9 prints its target as an address.** capstone prints a
   target below 10 in decimal (`bl #8`) and the rest in hex (`bl #0xc`), and the check that
   a target read from the instruction word matches the operand looked only for a `#0x`

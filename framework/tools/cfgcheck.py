@@ -92,6 +92,7 @@ def check_function(blocks, stmts):
 
 def run(path):
     from jadart.cfg import build_cfg, structure
+    from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc)
     from jadart.expr import strip_boilerplate
@@ -104,7 +105,8 @@ def run(path):
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        blocks, entry = build_cfg(strip_boilerplate(annotate(dis, pc_to_name, pool_map)))
+        ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+        blocks, entry = build_cfg(strip_boilerplate(ann))
         if not blocks:
             continue
         n += 1

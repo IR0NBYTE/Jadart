@@ -285,7 +285,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
         lines.append(f"  {disp}() {{  // {addr_label(image, cr.pc_offset)}, "
                      f"{cr.size} bytes{note}")
         if lvl >= 3:
-            ann = annotate(dis, pc_to_name, pool_map)
+            ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
             lines.extend(lift_function(ann, pool_map,
                                        receiver=receiver_for(ref, static_refs),
                                        arity=arity, indent="  ", depth=2,
@@ -293,7 +293,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                                        arch=getattr(image, "arch", None),
                                        fields=layout.for_function(ref)))
         elif lvl == 2:
-            ann = annotate(dis, pc_to_name, pool_map)
+            ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
             blocks, entry = build_cfg(ann)
             lines.extend(render_cfg(blocks, structure(blocks, entry), indent="  ", depth=2))
         else:

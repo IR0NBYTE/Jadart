@@ -92,6 +92,7 @@ CHECKS = [
 
 def lift_named(path, symbol):
     """Lifted lines for every function with this name, or None when it is absent."""
+    from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                                function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
@@ -112,7 +113,8 @@ def lift_named(path, symbol):
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        out.extend(lift_function(annotate(dis, pc_to_name, pool_map), pool_map,
+        ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+        out.extend(lift_function(ann, pool_map,
                                  receiver={"x1": "this"}, arity=arity, selectors=selectors,
                                  arch=getattr(image, "arch", None),
                                  fields=layout.for_function(cr.owner_ref)))
