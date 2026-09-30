@@ -7259,6 +7259,36 @@ def test_tier2_names_arm32_conditional_calls(monkeypatch, tmp_path):
         assert False, "annotate ran without the row kinds"
 
 
+def test_callgraph_draws_arm32_conditional_calls():
+    """A call is what the instruction word says, in the graph as in disasm.
+
+    The decoded walk drew an edge only for `mn == "bl"`, so arm32's `blls`, `bleq` and
+    `blne`, and any other spelling of a call such as `blgt` or `blx #imm`, were dropped:
+    a quarter of arm32's direct edges, and 0 callers for a stub 5,310 functions call
+    (#44). A call into the middle of a range is counted as unresolved, not dropped."""
+    if not _capstone_available():
+        _skip("  SKIP test_callgraph_draws_arm32_conditional_calls (no capstone)")
+    from jadart.callgraph import build_index
+    from jadart.disasm import CodeRange
+    nop, ret = 0xE320F000, 0xE12FFF1E
+    words = [nop, 0x9B000009, ret, nop,     # 0x00  blls #0x30
+             nop, 0xCB000005, ret, nop,     # 0x10  blgt #0x30
+             nop, 0xFA000001, ret, nop,     # 0x20  blx  #0x30
+             ret, nop,                      # 0x30  the callee
+             nop, 0x1BFFFFFC,               # 0x38  blne #0x34, inside the callee
+             nop, 0xBAFFFFF9,               # 0x40  blt  #0x30, a jump that is no call
+             nop, 0xEB7FFFFF]               # 0x48  bl   past the image end
+    image = _word_image(words, "arm", _A32_ANCHOR)
+    image.all_ranges = [CodeRange(pc_offset=o, size=n, owner_ref=-1)
+                        for o, n in ((0, 16), (0x10, 16), (0x20, 16), (0x30, 8),
+                                     (0x38, 8), (0x40, 8), (0x48, 8))]
+    idx = build_index(image, None, virtual=False)
+    assert sorted(idx.callers.get(0x30, [])) == [0, 0x10, 0x20], idx.callers
+    # the blne into the callee and the bl past the end are counted, the blt is no call
+    assert idx.unresolved == 2, idx.unresolved
+    assert not {0x38, 0x40, 0x48} & set(idx.callees), idx.callees
+
+
 def test_code_target_refuses_when_capstone_token_disagrees():
     """A printed target that the word does not give is left exactly as printed."""
     from jadart.disasm import rebase_operand, target_va

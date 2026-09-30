@@ -134,6 +134,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The call graph draws arm32's conditional calls.** Its decoded walk, which every arm32
+  range goes through, drew a direct edge only for a `bl`, so `blls`, `bleq` and `blne`,
+  and any other spelling of a call such as `blgt` or `blx #imm`, were dropped without
+  being counted: a quarter of arm32's direct edges. `functions` showed `in 0` for the
+  stack-overflow stub that 5,310 functions call on arm32-2.19.6, and `xrefs function` said
+  nothing called it. The walk now takes a call from the instruction word, as `disasm` has
+  since #41. On all 13 arm32 corpus builds the graph holds every direct call
+  `branches.row_kinds` finds, 25,527 edges on arm32-2.19.6 where it held 18,537; a call
+  into the middle of a range, such as the write-barrier stub's per-register entries, still
+  draws no edge, as a plain `bl` to such a target does on arm64. The graphs of both arm64
+  fixtures are unchanged. Closes #44.
 - **Tier 2 names arm32's conditional calls, as tier 1 does.** Since #41 a callee is found
   from the instruction word, which names `blls` to the stack-overflow stub and `bleq` to
   the null-error stubs, but only where `annotate` was handed the word's row kinds, and the
