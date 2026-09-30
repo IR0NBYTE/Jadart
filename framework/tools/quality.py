@@ -57,6 +57,7 @@ def is_raw_asm(line: str) -> bool:
 
 
 def measure(path):
+    from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc)
     from jadart.expr import lift_function, make_arity_resolver
@@ -78,7 +79,8 @@ def measure(path):
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        body = lift_function(annotate(dis, pc_to_name, pool_map), pool_map,
+        ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+        body = lift_function(ann, pool_map,
                              receiver=receiver_for(cr.owner_ref, static_refs),
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),

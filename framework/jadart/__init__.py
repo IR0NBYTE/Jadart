@@ -156,6 +156,7 @@ def decompile(path: str, symbol: str) -> list:
     Returns [{"name", "pc_offset", "size", "body": [str, ...]}, ...]."""
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                          function_name_by_pc, build_pool_map)
+    from .branches import row_kinds
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
     from .fields import recover_fields
@@ -177,7 +178,8 @@ def decompile(path: str, symbol: str) -> list:
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        body = lift_function(annotate(dis, pc_to_name, pool_map), pool_map,
+        body = lift_function(annotate(dis, pc_to_name, pool_map,
+                                      kinds=row_kinds(image, dis)), pool_map,
                              # NOT {"x1": "this"}. x1 holds the receiver in an INSTANCE
                              # method and something else entirely in a static one, so
                              # hardcoding it renames a live value after the fact, a

@@ -305,6 +305,13 @@ def _skip(reason):
     raise unittest.SkipTest(reason)
 
 
+def _ann(image, dis, pc_to_name, pool_map=None):
+    """annotate() with the row kinds it requires, read from the same image."""
+    from jadart.branches import row_kinds
+    from jadart.disasm import annotate
+    return annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+
+
 def _capstone_available():
     try:
         import capstone  # noqa: F401
@@ -332,12 +339,12 @@ def test_tier1_call_targets_resolve_to_recovered_names():
     if not _capstone_available():
         _skip("  SKIP test_tier1_call_targets (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate)
+                               function_name_by_pc)
     image, fr, _ = load_instructions(CLEAN)
     refs = [ref for ref, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchRunAll"]
     assert refs, "benchRunAll not recovered"
     dis = disassemble_function(image, refs[0])
-    ann = annotate(dis, function_name_by_pc(image, fr))
+    ann = _ann(image, dis, function_name_by_pc(image, fr))
     called = {note.split("-> ")[1] for _a, _m, _o, note in ann if "-> " in note}
     # benchRunAll invokes the bench functions in sequence
     for expect in ("benchWithdraw", "benchCheckSecret", "benchComputeChecksum"):
@@ -378,14 +385,14 @@ def test_tier1_objectpool_loads_resolve_to_strings():
     if not _capstone_available():
         _skip("  SKIP test_tier1_objectpool_loads (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     image, fr, _ = load_instructions(CLEAN)
     pool_map = build_pool_map(fr)
     assert len(pool_map) > 100, "ObjectPool string/function map suspiciously small"
     refs = [ref for ref, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchCheckSecret"]
     assert refs, "benchCheckSecret not recovered"
     dis = disassemble_function(image, refs[0])
-    ann = annotate(dis, function_name_by_pc(image, fr), pool_map)
+    ann = _ann(image, dis, function_name_by_pc(image, fr), pool_map)
     notes = " ".join(note for _a, _m, _o, note in ann)
     assert '"FLUBENCH{str_literal_compare}"' in notes, \
         "far ObjectPool string load did not resolve to the unique flag literal"
@@ -410,12 +417,12 @@ def test_tier2_control_flow_reconstruction():
     if not _capstone_available():
         _skip("  SKIP test_tier2_control_flow_reconstruction (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.cfg import build_cfg, structure, render
     image, fr, _ = load_instructions(CLEAN)
     refs = [ref for ref, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchWithdraw"]
-    ann = annotate(disassemble_function(image, refs[0]),
-                   function_name_by_pc(image, fr), build_pool_map(fr))
+    ann = _ann(image, disassemble_function(image, refs[0]),
+               function_name_by_pc(image, fr), build_pool_map(fr))
     blocks, entry = build_cfg(ann)
     body = "\n".join(render(blocks, structure(blocks, entry)))
     assert "if (x2 > x3) {" in body
@@ -430,7 +437,7 @@ def test_tier1_tier2_no_crash_over_sample():
     if not _capstone_available():
         _skip("  SKIP test_tier1_tier2_no_crash_over_sample (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.cfg import build_cfg, structure, render
     image, fr, _ = load_instructions(CLEAN)
     pc_to_name = function_name_by_pc(image, fr)
@@ -440,7 +447,7 @@ def test_tier1_tier2_no_crash_over_sample():
         dis = disassemble_function(image, ref)
         if not dis:
             continue
-        ann = annotate(dis, pc_to_name, pool_map)
+        ann = _ann(image, dis, pc_to_name, pool_map)
         blocks, entry = build_cfg(ann)
         render(blocks, structure(blocks, entry))
         ran += 1
@@ -457,13 +464,13 @@ def test_tier2_loop_body_is_reconstructed():
     if not _capstone_available():
         _skip("  SKIP test_tier2_loop_body_is_reconstructed (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.cfg import build_cfg, structure, render
     image, fr, _ = load_instructions(CLEAN)
     refs = [ref for ref, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchComputeChecksum"]
     assert refs, "benchComputeChecksum not recovered"
-    ann = annotate(disassemble_function(image, refs[0]),
-                   function_name_by_pc(image, fr), build_pool_map(fr))
+    ann = _ann(image, disassemble_function(image, refs[0]),
+               function_name_by_pc(image, fr), build_pool_map(fr))
     blocks, entry = build_cfg(ann)
     body = "\n".join(render(blocks, structure(blocks, entry)))
     assert "while (true) {" in body
@@ -486,13 +493,13 @@ def test_tier2_decompile_view_is_structured():
 
 def _lift(name):
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function
     image, fr, _ = load_instructions(CLEAN)
     refs = [ref for ref, nr, ow, kt in fr.functions if fr.strings.get(nr) == name]
     assert refs, f"{name} not recovered"
-    ann = annotate(disassemble_function(image, refs[0]),
-                   function_name_by_pc(image, fr), build_pool_map(fr))
+    ann = _ann(image, disassemble_function(image, refs[0]),
+               function_name_by_pc(image, fr), build_pool_map(fr))
     return "\n".join(lift_function(ann, build_pool_map(fr)))
 
 
@@ -589,7 +596,7 @@ def test_tier3_reconstructs_call_arguments():
     if not _capstone_available():
         _skip("  SKIP test_tier3_reconstructs_call_arguments (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver, entry_arity
     image, fr, _ = load_instructions(CLEAN)
     pc_to_name = function_name_by_pc(image, fr)
@@ -606,7 +613,7 @@ def test_tier3_reconstructs_call_arguments():
     assert arity_of("benchFirstOrDefault") is None  # stack convention -> unknown register arity
 
     refs = [r for r, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchRunAll"]
-    ann = annotate(disassemble_function(image, refs[0]), pc_to_name, pool_map)
+    ann = _ann(image, disassemble_function(image, refs[0]), pc_to_name, pool_map)
     body = "\n".join(lift_function(ann, pool_map, arity=make_arity_resolver(image)))
     import re
     assert "benchCheckSecret(x1)" in body                  # one register arg reconstructed
@@ -647,8 +654,8 @@ def test_argument_reconstruction_does_not_depend_on_the_callee_having_a_name():
     if not _capstone_available():
         _skip("  SKIP test_argument_reconstruction_does_not_depend_on_the_callee_having_a_name")
     import re
-    from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc)
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
     from jadart.expr import lift_function, make_arity_resolver
 
     for lib in (CLEAN, OBF):
@@ -660,7 +667,7 @@ def test_argument_reconstruction_does_not_depend_on_the_callee_having_a_name():
             dis = disassemble_range(image, cr)
             if not dis:
                 continue
-            for ln in lift_function(annotate(dis, pc_to_name, pool_map), pool_map,
+            for ln in lift_function(_ann(image, dis, pc_to_name, pool_map), pool_map,
                                     arity=arity):
                 for m in re.finditer(r"\bsub_0x[0-9a-f]+\(([^)]*)\)", ln):
                     anon += 1
@@ -787,8 +794,8 @@ def test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology():
     # comparison that can never fail and the throw behind it as dead code.
     if not _capstone_available():
         _skip("  SKIP test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology")
-    from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc)
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
     from jadart.expr import lift_function, make_arity_resolver
     image, fr, _hdr = load_instructions(CLEAN)
     p2n = function_name_by_pc(image, fr)
@@ -800,7 +807,7 @@ def test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology():
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        body = "\n".join(lift_function(annotate(dis, p2n, pm), pm,
+        body = "\n".join(lift_function(_ann(image, dis, p2n, pm), pm,
                                        receiver={"x1": "this"}, arity=ar))
         checked += 1
         # Shape, not spelling: no comparison anywhere may have the same text on both
@@ -828,10 +835,12 @@ def test_the_lifted_output_does_not_depend_on_the_hash_seed():
         "from jadart.disasm import load_instructions, disassemble_range, annotate,"
         " build_pool_map, function_name_by_pc;"
         "from jadart.expr import lift_function, make_arity_resolver;"
+        "from jadart.branches import row_kinds;"
         "image, fr, hdr = load_instructions(%r);" % CLEAN +
         "p2n = function_name_by_pc(image, fr); pm = build_pool_map(fr);"
         "ar = make_arity_resolver(image); h = hashlib.sha256();"
-        "[h.update(('\\n'.join(lift_function(annotate(d, p2n, pm), pm, arity=ar))).encode())"
+        "[h.update(('\\n'.join(lift_function(annotate(d, p2n, pm, kinds=row_kinds(image, d)),"
+        " pm, arity=ar))).encode())"
         " for d in (disassemble_range(image, cr) for cr in list(image.all_ranges)[::5]) if d];"
         "print(h.hexdigest())")
     digests = set()
@@ -863,13 +872,13 @@ def test_tier3_strips_smi_box_idiom():
         _skip("  SKIP test_tier3_strips_smi_box_idiom (no capstone)")
     import re
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
     image, fr, _ = load_instructions(CLEAN)
     refs = [r for r, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchRunAll"]
     body = "\n".join(lift_function(
-        annotate(disassemble_function(image, refs[0]),
-                 function_name_by_pc(image, fr), build_pool_map(fr)),
+        _ann(image, disassemble_function(image, refs[0]),
+             function_name_by_pc(image, fr), build_pool_map(fr)),
         build_pool_map(fr), arity=make_arity_resolver(image)))
     assert "sbfiz" not in body, "Smi tag (sbfiz) leaked as raw arm64"
     assert not re.search(r"if \((\w[\w.]*) != \1\)", body), "Smi overflow-check leaked as `x != x`"
@@ -884,7 +893,7 @@ def test_tier3_renders_runtime_stubs_semantically():
         _skip("  SKIP test_tier3_renders_runtime_stubs_semantically "
               "(set JADART_REALAPP_LIB to an unstripped dwarf-mode libapp.so)")
     from jadart.disasm import (load_instructions, disassemble_range,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
     image, fr, _ = load_instructions(lib)
     p2n = function_name_by_pc(image, fr)
@@ -895,7 +904,7 @@ def test_tier3_renders_runtime_stubs_semantically():
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        body = "\n".join(lift_function(annotate(dis, p2n, pm), pm, arity=ar))
+        body = "\n".join(lift_function(_ann(image, dis, p2n, pm), pm, arity=ar))
         if "_iso_stub_" in body:
             leaked += 1
         throws += body.count("throw ")
@@ -911,12 +920,12 @@ def test_tier3_attributes_virtual_dispatch():
     if not _capstone_available():
         _skip("  SKIP test_tier3_attributes_virtual_dispatch (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, detect_dispatch, strip_boilerplate
     image, fr, _ = load_instructions(CLEAN)
     refs = [r for r, nr, ow, kt in fr.functions if fr.strings.get(nr) == "benchCheckSecret"]
-    ann = annotate(disassemble_function(image, refs[0]),
-                   function_name_by_pc(image, fr), build_pool_map(fr))
+    ann = _ann(image, disassemble_function(image, refs[0]),
+               function_name_by_pc(image, fr), build_pool_map(fr))
     # detection recovers (receiver register, selector offset) for the dispatch blr
     d = detect_dispatch(strip_boilerplate(ann))
     assert d, "no X21 dispatch call detected in benchCheckSecret"
@@ -2772,8 +2781,8 @@ def test_arm32_target_table_is_right_where_it_is_checkable():
     if not os.path.exists(arm32):
         _skip("  SKIP test_arm32_target_table_is_right_where_it_is_checkable (no arm32)")
     from jadart import expr as E
-    from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc)
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
     from jadart.program import static_function_refs, receiver_for
 
     assert E.ARM32.roles["r10"] == "THR" and E.ARM32.consts_base == "THR"
@@ -2787,7 +2796,7 @@ def test_arm32_target_table_is_right_where_it_is_checkable():
     pool_map = build_pool_map(fr)
     pc = next(pc for pc, n in pc_to_name.items() if n == "benchWithdraw")
     cr = next(c for c in image.all_ranges if c.pc_offset == pc)
-    ann = annotate(disassemble_range(image, cr), pc_to_name, pool_map)
+    ann = _ann(image, disassemble_range(image, cr), pc_to_name, pool_map)
     with E.use_target(E.ARM32):
         body = "\n".join(E._lift_function(
             ann, pool_map, receiver_for(cr.owner_ref, static_function_refs(fr)),
@@ -3128,8 +3137,8 @@ def test_tier34_names_virtual_calls_in_bodies():
     # selector name instead of sel_0x<off>.
     if not _capstone_available():
         _skip("  SKIP test_tier34_names_virtual_calls_in_bodies (no capstone)")
-    from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               function_name_by_pc, build_pool_map)
+    from jadart.disasm import (load_instructions, disassemble_range, function_name_by_pc,
+                               build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
     from jadart.dispatch import recover_selectors
     image, fr, hdr = load_instructions(CLEAN)
@@ -3144,7 +3153,7 @@ def test_tier34_names_virtual_calls_in_bodies():
     for ref, cr in image.code_ranges.items():
         if fname.get(ref) == "findRenderObject":
             hit = "\n".join(lift_function(
-                annotate(disassemble_range(image, cr), pc_to_name, pool_map),
+                _ann(image, disassemble_range(image, cr), pc_to_name, pool_map),
                 pool_map, receiver={"x1": "this"}, arity=arity, selectors=sel))
             break
     assert hit is not None, "findRenderObject not present in the corpus"
@@ -3168,7 +3177,7 @@ def test_tier3_no_crash_over_sample():
     if not _capstone_available():
         _skip("  SKIP test_tier3_no_crash_over_sample (no capstone)")
     from jadart.disasm import (load_instructions, disassemble_function,
-                               function_name_by_pc, annotate, build_pool_map)
+                               function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver
     from jadart.dispatch import recover_selectors
     image, fr, hdr = load_instructions(CLEAN)
@@ -3181,7 +3190,7 @@ def test_tier3_no_crash_over_sample():
         dis = disassemble_function(image, ref)
         if not dis:
             continue
-        lift_function(annotate(dis, pc_to_name, pool_map), pool_map, arity=arity,
+        lift_function(_ann(image, dis, pc_to_name, pool_map), pool_map, arity=arity,
                       selectors=selectors)
         ran += 1
         if ran >= 1500:
@@ -3234,8 +3243,8 @@ def test_every_goto_has_a_label_and_no_block_is_dropped():
     # instructions had gone missing, which is exactly the failure mode this project
     # claims not to have.
     import re
-    from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc)
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
     from jadart.expr import lift_function, strip_boilerplate
     from jadart.cfg import build_cfg, structure
 
@@ -3258,7 +3267,7 @@ def test_every_goto_has_a_label_and_no_block_is_dropped():
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        ann = annotate(dis, pc_to_name, pool_map)
+        ann = _ann(image, dis, pc_to_name, pool_map)
         blocks, entry = build_cfg(strip_boilerplate(ann))
         if not blocks:
             continue
@@ -3841,7 +3850,7 @@ def test_no_printed_phi_assigns_a_machine_register_anywhere_in_the_corpus():
     register, read off the real rendering rather than off the method."""
     if not _capstone_available():
         _skip("  SKIP test_no_printed_phi_assigns_a_machine_register_anywhere_in_the_corpus")
-    from jadart.disasm import (load_instructions, disassemble_function, annotate,
+    from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function
     from jadart import expr
@@ -3860,7 +3869,7 @@ def test_no_printed_phi_assigns_a_machine_register_anywhere_in_the_corpus():
         for ref, _nr, _ow, _kt in fr.functions[:1500]:
             dis = disassemble_function(image, ref)
             if dis:
-                lift_function(annotate(dis, pc_to_name, pool), pool)
+                lift_function(_ann(image, dis, pc_to_name, pool), pool)
     finally:
         expr.Lifter._phi_name = real
     assert len(seen) > 100, f"only {len(seen)} joins rendered, so this proved nothing"
@@ -3972,7 +3981,7 @@ def test_every_printed_write_to_a_machine_register_comes_from_a_pinned_bump():
     if not _capstone_available():
         _skip("  SKIP test_every_printed_write_to_a_machine_register_comes_from_a_pinned_bump")
     from jadart import expr
-    from jadart.disasm import (load_instructions, disassemble_function, annotate,
+    from jadart.disasm import (load_instructions, disassemble_function,
                                function_name_by_pc, build_pool_map)
 
     image, fr, _hdr = load_instructions(CLEAN)
@@ -3993,7 +4002,7 @@ def test_every_printed_write_to_a_machine_register_comes_from_a_pinned_bump():
             if not dis:
                 continue
             printed.extend(l.strip() for l in
-                           expr.lift_function(annotate(dis, pc_to_name, pool), pool)
+                           expr.lift_function(_ann(image, dis, pc_to_name, pool), pool)
                            if asn.match(l))
     finally:
         expr.Lifter._bump = real
@@ -5248,8 +5257,8 @@ def test_entry_arity_refuses_when_the_args_descriptor_is_live():
     NOT pass in registers. Counting instead of refusing produced a fabricated argument."""
     if not _capstone_available():
         _skip("  SKIP test_entry_arity_refuses_when_the_args_descriptor_is_live")
-    from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc)
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
     from jadart.expr import entry_arity, ARG_REGS
     image, fr, _ = load_instructions(CLEAN)
     names, pool = function_name_by_pc(image, fr), build_pool_map(fr)
@@ -5261,7 +5270,7 @@ def test_entry_arity_refuses_when_the_args_descriptor_is_live():
             continue
         if not dis:
             continue
-        k = entry_arity(annotate(dis, names, pool))
+        k = entry_arity(_ann(image, dis, names, pool))
         if k is None:
             continue
         seen += 1
@@ -7203,6 +7212,51 @@ def test_tier1_labels_arm32_conditional_branches():
     assert "beq L1" in body and "b L1" in body and "bne L0" in body, body
     assert "L0:" in body and "L1:" in body, body
     assert not any(line.startswith("blls L") for line in body), body
+
+
+def test_tier2_names_arm32_conditional_calls(monkeypatch, tmp_path):
+    """Tier 2 names a conditional call, as tier 1 does, and keeps its condition.
+
+    #41 found callees from the instruction word only where `annotate` was given the row
+    kinds, and the tier 2 callers did not pass them: `export -t 2` of arm32-2.19.6 named
+    0 of the 8,375 conditional calls it prints, 7,046 of which `-t 1` names (#42).
+    `annotate` requires them now. This goes through decompile_class and export, over a
+    one-method class on the synthetic image."""
+    import importlib
+    import types
+    if not _capstone_available():
+        _skip("  SKIP test_tier2_names_arm32_conditional_calls (no capstone)")
+    program, disasm = importlib.import_module("jadart.program"), importlib.import_module(
+        "jadart.disasm")
+    image = _word_image(_A32_WORDS, "arm", _A32_ANCHOR)
+    image.symbol_names = {0x28: "callee"}              # the target of `blls` at 0x14
+    image.code_ranges = {7: image.all_ranges[0]}
+    fr = types.SimpleNamespace(functions=[(7, 1, 3, 0)], strings={1: "run"}, pool=[],
+                               arrays={}, smi_values={}, codes=[], field_meta=None)
+    box = types.SimpleNamespace(name="Box", ref=3, super_name="Object", members=[])
+    prog = types.SimpleNamespace(user_classes=lambda: [box], classes=[box],
+                                 libraries=lambda: {"package:app/box.dart": [box]},
+                                 epoch_name="e", dart="2.19.6")
+    hdr = types.SimpleNamespace(arch="arm")
+    monkeypatch.setattr(disasm, "load_instructions", lambda path: (image, fr, hdr))
+    monkeypatch.setattr(program, "build_program", lambda fr, hdr: prog)
+    export = importlib.import_module("jadart.export")
+    for tier in (1, 2):
+        out = program.decompile_class("synthetic", "Box", tier=tier)
+        tree = tmp_path / f"t{tier}"
+        export.export("synthetic", str(tree), tier=tier)
+        sources = (tree / "sources").rglob("*")
+        out += "".join(f.read_text() for f in sources if f.is_file())
+        body = [" ".join(line.split()) for line in out.splitlines()]
+        # once from decompile_class and once from the exported source
+        assert body.count("blls #0x28 ; -> callee") == 2, (tier, out)
+        assert not any(line.startswith("call callee") for line in body), out
+    try:
+        disasm.annotate([(0x14, "blls", "#0x28")], {0x28: "callee"})
+    except TypeError:
+        pass                               # no caller can fall back to the mnemonic test
+    else:
+        assert False, "annotate ran without the row kinds"
 
 
 def test_code_target_refuses_when_capstone_token_disagrees():

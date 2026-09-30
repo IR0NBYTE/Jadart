@@ -796,34 +796,27 @@ def _mem_base_disp(op: str):
     return m.group(1), (_parse_imm(m.group(2)) or 0)
 
 
-def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, kinds=None) -> list:
+def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> list:
     """Annotate direct BL/B call targets with the callee name, and PP-relative pool
     loads with the referenced string/function. Handles both direct loads
     (`ldr xN, [x27, #off]`) and far loads (`add xD, x27, #hi; ldr xN, [xD, #lo]`,
     used when the pool offset exceeds the 12-bit scaled ldr range ~0x7ff8).
 
-    `kinds` is branches.row_kinds for the same rows. With it a callee is found from the
-    word, so arm32's conditional calls are named too: `blls` to the stack-overflow stub
-    and `bleq` to the null-error stubs, 9,554 of them over every range of arm32-2.19.6
-    that the mnemonic test (`bl` and `b` only) passed over. Without it the mnemonic test
-    is kept."""
+    `kinds` is branches.row_kinds for the same rows, and is required. A callee is found
+    from the word, so arm32's conditional calls are named too: `blls` to the
+    stack-overflow stub and `bleq` to the null-error stubs, 9,554 of them over every range
+    of arm32-2.19.6 that the mnemonic test it replaced (`bl` and `b` only) passed over.
+    That test stayed as a fallback for a caller that left `kinds` out, and tier 2 did, so
+    `export -t 2` named none of them (#42)."""
     ann = []
     far_base = {}   # reg -> pp-relative byte offset established by `add reg, x27, #hi`
     for i, (addr, mn, op) in enumerate(dis):
         note = ""
-        if kinds is not None:
-            kind, target = kinds[i]
-            if kind in _NAMED and target is not None:
-                nm = pc_to_name.get(target)
-                if nm:
-                    note = f"  ; -> {nm}"
-        elif mn in ("bl", "b") and op.startswith("#"):
-            try:
-                nm = pc_to_name.get(int(op[1:], 16))
-                if nm:
-                    note = f"  ; -> {nm}"
-            except ValueError:
-                pass
+        kind, target = kinds[i]
+        if kind in _NAMED and target is not None:
+            nm = pc_to_name.get(target)
+            if nm:
+                note = f"  ; -> {nm}"
         # A branch is never a load, so this and the callee name above cannot both apply.
         if pool_map and mn in ("ldr", "ldur"):
             off = None
@@ -861,7 +854,8 @@ def render_body(dis, pc_to_name: dict, pool_map: dict | None = None, indent: str
     labels = label_blocks(dis, kinds)
     lo, hi = dis[0][0], dis[-1][0] + 4
     lines = []
-    for i, (addr, mn, op, note) in enumerate(annotate(dis, pc_to_name, pool_map, kinds)):
+    ann = annotate(dis, pc_to_name, pool_map, kinds=kinds)
+    for i, (addr, mn, op, note) in enumerate(ann):
         if addr in labels:
             lines.append(f"  {labels[addr]}:")
         # rewrite an intra-function branch operand to its label
