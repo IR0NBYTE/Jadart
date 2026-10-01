@@ -134,6 +134,20 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A function with no name is labelled by its address, and the label reads back.** An
+  anonymous range printed as `sub_0x<pc_offset>` beside a column of virtual addresses, and
+  no command accepted the label as input. Its number was the only handle a lifted body
+  gave for the call, and pasted back it was read as an address: 799 of the clean fixture's
+  2,254 such labels fell inside the image window and reached a different function, exit 0.
+  The label is now `sub_0x<va>`, the address the rest of the output prints, or the
+  pc_offset when the binary has no anchor symbol, and every command that takes a symbol
+  reads it back: over all 2,254 anonymous ranges of the clean fixture and 7,987 of the obf
+  one, the label and the number in it reach the range they name. This moves output bytes,
+  and nothing else: the `name` column of `functions` and its `-j` `label` field, an
+  unnamed call in a lifted body, a `goto` out of a function, the header of `disasm`,
+  `lift` or `xrefs` and the `name` of `xrefs -j` for an anonymous range, and the functions
+  `ffi` lists under a library. Named ranges, the `symbols` exports and every `pc_offset`
+  and `va` field are unchanged. Closes #40.
 - **Tier 2 ends an arm32 function where it returns.** The control-flow graph ended a block
   only at `b`, `ret`, `br`, `bx` and the conditional branches, so arm32's usual return,
   `pop {fp, pc}`, got an edge to whatever code followed it, and `decompile -t 2` and

@@ -7438,6 +7438,64 @@ def test_cfgcheck_judges_exits_by_capstone_not_by_build_cfg():
     assert good == 0 and broken == len(_A32_RANGES), (good, broken)
 
 
+def test_a_range_with_no_name_is_labelled_by_its_address_and_read_back():
+    """`sub_0x<n>` carries the address the rest of the output prints for the range, and
+    the label, or the number in it, reaches that range.
+
+    It carried the pc_offset, so a label whose number fell inside the image window named a
+    different function when pasted back: 799 of the clean fixture's 2,254 (#40). With no
+    anchor every address prints as a pc_offset, and so does the label."""
+    from jadart.disasm import CodeRange, _parse_addr, rebaser, sub_label
+    image = _word_image([0xD503201F] * 64, "arm64", 0x40)   # the window: 0x40 to 0x140
+    image.all_ranges = [CodeRange(pc_offset=o, size=0x20, owner_ref=-1)
+                        for o in range(0, 0x100, 0x20)]
+    for cr in image.all_ranges:
+        label = sub_label(image, cr.pc_offset)
+        assert label == f"sub_0x{0x40 + cr.pc_offset:x}"
+        assert rebaser(image).label(cr.pc_offset) == label
+        assert _parse_addr(label, image) == cr.pc_offset, label
+        assert _parse_addr(label[len("sub_"):], image) == cr.pc_offset, label
+        shouted = label.upper().replace("SUB_0X", "sub_0X")    # any case reads back
+        assert _parse_addr(shouted, image) == cr.pc_offset
+    # the old label of the range at 0x60 was sub_0x60, which the window reads as 0x20
+    assert _parse_addr("0x60", image) == 0x20
+    image.anchor_va = None
+    assert sub_label(image, 0x60) == "sub_0x60" and _parse_addr("sub_0x60", image) == 0x60
+
+
+def test_the_function_table_and_lifted_bodies_name_an_anonymous_range_alike():
+    """The issue's own example on the clean fixture: the table row at 0x136b08 and a call
+    the lifter prints carry the same `sub_0x<va>`, and both resolve (#40)."""
+    import io
+    import contextlib
+    if not _capstone_available() or not os.path.exists(CLEAN):
+        _skip("  SKIP test_the_function_table_and_lifted_bodies_name_an_anonymous_range_"
+              "alike (no capstone, or no clean fixture)")
+    from jadart import cli
+    from jadart.callgraph import function_table
+    from jadart.disasm import _parse_addr, load_instructions
+    image, fr, hdr = load_instructions(CLEAN)
+    rows = {f.pc_offset: f for f in function_table(image, fr, hdr)[0]}
+    row = rows[0x136B08 - image.anchor_va]
+    assert row.label == "sub_0x136b08" and not row.name, row
+    anon = [f for f in rows.values() if not f.name]
+    assert all(_parse_addr(f.label, image) == f.pc_offset for f in anon)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["lift", CLEAN, "mapToString"]) == 0
+    called = re.search(r"\b(sub_0x[0-9a-f]+)\(\)", buf.getvalue()).group(1)
+    assert rows[_parse_addr(called, image)].label == called, called
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["disasm", CLEAN, called]) == 0
+    head = f"// {called}  @ {called[len('sub_'):]}"
+    assert buf.getvalue().startswith(head), buf.getvalue()
+    buf = io.StringIO()                    # hook takes it too, as every command does
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["hook", CLEAN, "sub_0x136b08"]) == 0
+    assert "Frida hooks: 1 function(s)" in buf.getvalue(), buf.getvalue()[:400]
+
+
 def test_code_target_refuses_when_capstone_token_disagrees():
     """A printed target that the word does not give is left exactly as printed."""
     from jadart.disasm import rebase_operand, target_va
@@ -7647,9 +7705,11 @@ def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
 #: change is meant to alter arm64 disasm output, regenerate these and say so in the
 #: CHANGELOG, which is the rule these exist to enforce. Recorded with the capstone 5.0.9
 #: wheel, whose `capstone.__version__` reads 5.0.7; another build may print differently.
+#: Regenerated for #40, which moved only the label of a range with no name, from
+#: `sub_0x<pc_offset>` to `sub_0x<va>`: 514 and 512 lines of the samples, nothing else.
 _ARM64_DISASM_SAMPLE_SHA = {
-    "clean": "fc26a0bdb32c0e33f34858d7dccfa8b726c943785af412bd236962ce83749ea8",
-    "obf": "2f79c6b0392f44fcc98a731d5ee053cbe7a9e4fc93e65e9cd32242e8a08dabb4",
+    "clean": "130188ac8cf4bc8b26e5ed28f5ab8c5dce246543aa2d89c428607f18c7082956",
+    "obf": "2c53e444c07fab06d470f2b7dffc4d83ecc1dfdf36c0c38e71ee4b66fa3ca7dd",
 }
 
 

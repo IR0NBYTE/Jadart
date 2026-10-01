@@ -139,9 +139,11 @@ The prefixes mean the pc_offset, for anything written against the older output.
 
 In `-j`, every record that has a `pc_offset` also has the `va` for it.
 
-Two things still carry the offset, both synthetic names rather than addresses: a range
-with no name prints as `sub_0x<pc_offset>`, spelled the same way in the function table and
-in lifted bodies, and a block label in tiers 2 and 3 is `L_0x<pc_offset>`.
+A range with no name prints as `sub_0x<address>`, the virtual address it is printed at,
+spelled the same way in the function table, in lifted bodies and in a `goto`, and every
+command that takes a symbol accepts it back. One thing still carries the offset: a block
+label in tiers 2 and 3 is `L_0x<pc_offset>`, a name inside one function rather than an
+address.
 
 ## The function table, and what calls what
 
@@ -405,6 +407,9 @@ jadart signatures corpus/3.3.4/libapp.so corpus/3.2.6/libapp.so corpus/3.4.4/lib
 # apply it to an obfuscated app
 jadart lift TheTimer.apk 0x739c8 --sigs dart33.sig
 ```
+
+This output predates the change that labels an unnamed range by its virtual address, so
+the `sub_0x` numbers in the left column are pc_offsets.
 
 ```
   while (true) {                          |    while (true) {

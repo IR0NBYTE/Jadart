@@ -1066,7 +1066,8 @@ class Lifter:
                  selectors=None, entry=None, fields=None):
         self.blocks = blocks
         self.pool_map = pool_map or {}
-        #: Prints an operand kept as is; see lift_function.
+        #: Prints an operand kept as is, and names a range with no name; see
+        #: lift_function.
         self.show = None
         # optional register aliases (e.g. {"x1": "this"} for an instance method)
         self.alias = dict(receiver or {})
@@ -1194,6 +1195,11 @@ class Lifter:
         if reg in self.alias and reg not in st.reg:
             return V(self.alias[reg], P_ATOM)
         return st.get(reg)
+
+    def _sub(self, pc_offset: int) -> str:
+        """A range with no name, as every other surface names it (disasm.sub_label)."""
+        label = getattr(self.show, "label", None)
+        return label(pc_offset) if label is not None else f"sub_0x{pc_offset:x}"
 
     def _raw(self, st: State, dst: str, mn: str, op: str) -> list:
         """Emit the instruction verbatim and forget what its destination held.
@@ -1664,7 +1670,7 @@ class Lifter:
                     return self._result(st, f"new {label}()")
                 terse = label.replace("stub ", "").replace("_iso_stub_", "")
                 return self._result(st, f"{terse}(...)")   # terse, without the stub prefix
-            call = name or f"sub_0x{target or 0:x}"
+            call = name or self._sub(target or 0)
             args = self._call_args(name, target, st)
             # after the arguments are read, not before: they live in the very registers the
             # call is about to destroy, and reading them afterwards would print the bare
@@ -2606,7 +2612,7 @@ class Lifter:
                 # fall through: leaving it unsaid ended the body with no explanation, or
                 # let the carried state run on into a block control never reaches from
                 # here. 997 sites on the clean fixture did exactly that.
-                out.append(pad + (f"goto sub_0x{s[1]:x};" if s[1] >= 0
+                out.append(pad + (f"goto {self._sub(s[1])};" if s[1] >= 0
                                   else "goto <unresolved>;"))
                 falls = alive = False
         return out, falls

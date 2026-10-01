@@ -38,7 +38,8 @@ from .branches import row_kinds
 from .errors import JadartError
 
 from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassemble_range,
-                     build_pool_map, _mem_base_disp, _add_imm_from_pp, require_decoder,
+                     va_of, build_pool_map, _mem_base_disp, _add_imm_from_pp,
+                     require_decoder,
                      MAX_INSNS, A64Words, A64_BL, A64_BLR, A64_DISPATCH, _PP, _word_load,
                      _word_add_pp, _word_loadstore, _word_loads_x)
 
@@ -431,10 +432,12 @@ class Func:
     indirect: int = 0
     virtual_callers: int = 0    # call sites that could reach this through the dispatch table
     overloads: int = 0          # how many functions share its selector; 1 means unambiguous
+    #: The virtual address, which names the range when it has no name; see sub_label.
+    va: int | None = None
 
     @property
     def label(self) -> str:
-        return self.name or f"sub_0x{self.pc_offset:x}"
+        return self.name or f"sub_0x{self.pc_offset if self.va is None else self.va:x}"
 
 
 #: Where a name came from, strongest evidence first. `snapshot` was serialised into the
@@ -528,6 +531,7 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
         else:
             origin = "snapshot" if nm else "anonymous"
         out.append(Func(pc_offset=pc, size=cr.size, name=nm, origin=origin,
+                        va=va_of(image, pc),
                         library=lib_by_pc.get(pc, ""),
                         callers=len(idx.callers.get(pc, ())),
                         callees=len(idx.callees.get(pc, ())),

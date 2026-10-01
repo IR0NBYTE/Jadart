@@ -96,8 +96,11 @@ def select(syms: list, targets: list, all_matches: bool = False):
     indistinguishable from a real candidate to the person or the agent reading it."""
     chosen, problems, seen = [], [], set()
     for t in targets:
-        if re.fullmatch(r"0x[0-9a-fA-F]+", t):
-            addr = int(t, 16)
+        # A range with no name is labelled by its address (disasm.sub_label), and the
+        # label reads back as that address.
+        a = t[len("sub_"):] if t[:6].lower() == "sub_0x" else t
+        if re.fullmatch(r"0x[0-9a-fA-F]+", a):
+            addr = int(a, 16)
             hit = [s for s in syms if addr in (s.va, s.entry_va)]
             if not hit:
                 inside = next((s for s in syms if s.va <= addr < s.va + s.size), None)
