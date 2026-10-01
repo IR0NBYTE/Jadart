@@ -748,7 +748,10 @@ def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None, *, show)
                 out.append(f"{pad}return;")
             elif s[1] == EXIT_INDIRECT:
                 out.append(f"{pad}{s[2]}")
+            elif s[1] < 0:
+                out.append(f"{pad}goto <unresolved>;")
             else:
-                out.append(f"{pad}goto sub_0x{s[1]:x};" if s[1] >= 0
-                           else f"{pad}goto <unresolved>;")
+                label = getattr(show, "label", None)
+                name = label(s[1]) if label is not None else f"sub_0x{s[1]:x}"
+                out.append(f"{pad}goto {name};")
     return out

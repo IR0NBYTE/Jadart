@@ -842,7 +842,7 @@ def cmd_ffi(args) -> int:
     from .disasm import (load_instructions, build_pool_map, pool_xrefs, disassemble_range,
                          annotate)
     from .branches import row_kinds
-    from .disasm import rebaser
+    from .disasm import rebaser, sub_label
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
@@ -924,7 +924,7 @@ def cmd_ffi(args) -> int:
             print(dim("    no direct loads found "
                       "(reached through a closure, or built at runtime)"))
         for r in e["referenced_by"]:
-            nm = r["name"] or f"sub_0x{r['pc_offset']:x}"
+            nm = r["name"] or sub_label(image, r["pc_offset"])
             print(f"  {heading(nm)}  {addr_label(image, r['pc_offset'])}  "
                   f"{dim(str(r['size']) + ' bytes')}")
             for ln in r["lines"]:

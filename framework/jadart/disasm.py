@@ -441,8 +441,8 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
         if cr is None:                     # inside a range rather than at its start
             cr = next((c for c in image.all_ranges
                        if c.pc_offset <= addr < c.pc_offset + (c.size or 1)), None)
-        # same spelling the lifter already uses for an unnamed call target
-        return [(f"sub_0x{cr.pc_offset:x}", cr)] if cr else []
+        # the spelling every surface uses for a range with no name
+        return [(sub_label(image, cr.pc_offset), cr)] if cr else []
 
     def collect(pred):
         for ref, nr, ow, kt in fr.functions:
@@ -516,11 +516,35 @@ def rebase_operand(image: InstrImage, pc_offset: int, op: str) -> str:
     return f"{printed_number(op)[0]}0x{image.anchor_va + t:x}"
 
 
-def rebaser(image: InstrImage):
-    """(pc_offset, operand) -> the operand as `disasm` prints it, with a code address it
-    names written as a virtual address. Every tier of the decompiler prints through this,
-    so none keeps capstone's pc_offset under a virtual-address header (#43)."""
-    return lambda pc_offset, op: rebase_operand(image, pc_offset, op)
+def sub_label(image: InstrImage, pc_offset: int) -> str:
+    """The name of a range that has none: `sub_` and the address the rest of the output
+    prints for it, the virtual address when there is an anchor and the pc_offset when
+    there is not. It used to carry the pc_offset either way, and 799 of the clean
+    fixture's 2,254 such labels named a number inside the image window, which, pasted
+    back, reached a different function (#40). _parse_addr reads the label back."""
+    va = va_of(image, pc_offset)
+    return f"sub_0x{pc_offset if va is None else va:x}"
+
+
+class Printer:
+    """How the decompiler writes a code address. Called as (pc_offset, operand), it gives
+    the operand as `disasm` prints it, a code address it names written as a virtual
+    address (#43); `.label(pc_offset)` names a range with no name (sub_label). Every tier
+    prints through one, so no surface keeps capstone's pc_offset."""
+
+    def __init__(self, image: InstrImage):
+        self.image = image
+
+    def __call__(self, pc_offset: int, op: str) -> str:
+        return rebase_operand(self.image, pc_offset, op)
+
+    def label(self, pc_offset: int) -> str:
+        return sub_label(self.image, pc_offset)
+
+
+def rebaser(image: InstrImage) -> Printer:
+    """The Printer for this image; see Printer."""
+    return Printer(image)
 
 
 def _parse_addr(text: str, image: "InstrImage | None" = None):
@@ -536,6 +560,9 @@ def _parse_addr(text: str, image: "InstrImage | None" = None):
       is the form every command prints now, so anything Jadart printed can be pasted back
       and reach what it named. Outside that window it can only be a pc_offset, and is read
       as one.
+    - `sub_0x1234`, the name of a range with no name (sub_label), read as its number. It
+      carries the virtual address, or the pc_offset when there is no anchor, so it reaches
+      the range it names.
 
     The two readings overlap, because the image is longer than the address it starts at.
     Preferring the pc_offset there meant an address Jadart had just printed came back as a
@@ -546,6 +573,8 @@ def _parse_addr(text: str, image: "InstrImage | None" = None):
     anything written against the older output.
     """
     t = text.strip()
+    if t[:6].lower() == "sub_0x":
+        t = t[len("sub_"):]
     forced_va = False
     for prefix in ("va+", "va:"):
         if t.startswith(prefix):

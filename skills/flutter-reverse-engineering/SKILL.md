@@ -46,7 +46,7 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | `field_0x8` | an instance field at byte offset 8; its name is not in the snapshot | "the `balance` field" |
 | `(...)` | a call whose arguments were not reconstructed | "called with the user id" |
 | `pool_0x1234` | an object pool slot that resolved to no name | "the HTTP client" |
-| `sub_0x1234` | a call to an unnamed function at that offset | "the validation routine" |
+| `sub_0x1234` | a call to an unnamed function at that address | "the validator" |
 | `dispatch(...)` | a virtual call whose target depends on runtime type | "calls `List.add`" |
 | a raw `ldur x0, [x1, #7]` line | an instruction the lifter does not model | anything about its meaning |
 | `const[47] @0xb9b0{...}` | a const list, shown truncated | guess the rest; run `constants` |
