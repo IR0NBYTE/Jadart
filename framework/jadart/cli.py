@@ -268,6 +268,7 @@ def cmd_lift(args) -> int:
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                          build_pool_map, addr_label, va_of)
     from .branches import row_kinds
+    from .disasm import rebaser
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
@@ -306,7 +307,8 @@ def cmd_lift(args) -> int:
                              receiver=receiver_for(cr.owner_ref, static_refs),
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),
-                             fields=layout.for_function(cr.owner_ref))
+                             fields=layout.for_function(cr.owner_ref),
+                             show=rebaser(image))
         if getattr(args, "json", False):
             out.append({"name": nm, "pc_offset": cr.pc_offset,
                         "va": va_of(image, cr.pc_offset), "size": cr.size,
@@ -840,6 +842,7 @@ def cmd_ffi(args) -> int:
     from .disasm import (load_instructions, build_pool_map, pool_xrefs, disassemble_range,
                          annotate)
     from .branches import row_kinds
+    from .disasm import rebaser
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
@@ -878,7 +881,8 @@ def cmd_ffi(args) -> int:
                                      receiver=receiver_for(cr.owner_ref, static_refs),
                                      arity=arity, selectors=selectors,
                                      arch=getattr(image, "arch", None),
-                                     fields=layout.for_function(cr.owner_ref))
+                                     fields=layout.for_function(cr.owner_ref),
+                                     show=rebaser(image))
             except JadartError:
                 # Tier 3 declines on a target it has no register model for (UnsupportedArch
                 # is a JadartError). The pool and xref halves still hold, so the library is

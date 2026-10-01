@@ -233,7 +233,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     structured=False forces tier 1."""
     from .branches import row_kinds
     from .disasm import (load_instructions, disassemble_function, build_pool_map,
-                         render_body, annotate, truncated_by, addr_label)
+                         render_body, annotate, truncated_by, addr_label, rebaser)
     from .signatures import names_with_signatures
     from .cfg import build_cfg, structure, render as render_cfg
     from .expr import lift_function, make_arity_resolver
@@ -291,14 +291,16 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                                        arity=arity, indent="  ", depth=2,
                                        selectors=selectors,
                                        arch=getattr(image, "arch", None),
-                                       fields=layout.for_function(ref)))
+                                       fields=layout.for_function(ref),
+                                       show=rebaser(image)))
         elif lvl == 2:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
             blocks, entry = build_cfg(ann)
-            lines.extend(render_cfg(blocks, structure(blocks, entry), indent="  ", depth=2))
+            lines.extend(render_cfg(blocks, structure(blocks, entry), indent="  ",
+                                    depth=2, show=rebaser(image)))
         else:
             lines.extend(render_body(dis, pc_to_name, pool_map, indent="      ",
-                                     kinds=row_kinds(image, dis)))
+                                     kinds=row_kinds(image, dis), show=rebaser(image)))
         lines.append("  }")
     lines.append("}")
     return "\n".join(lines)

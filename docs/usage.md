@@ -139,9 +139,9 @@ The prefixes mean the pc_offset, for anything written against the older output.
 
 In `-j`, every record that has a `pc_offset` also has the `va` for it.
 
-One thing still carries the offset: a range with no name prints as `sub_0x<pc_offset>`,
-which is a synthetic name rather than an address, and it is spelled the same way in the
-function table and in lifted bodies.
+Two things still carry the offset, both synthetic names rather than addresses: a range
+with no name prints as `sub_0x<pc_offset>`, spelled the same way in the function table and
+in lifted bodies, and a block label in tiers 2 and 3 is `L_0x<pc_offset>`.
 
 ## The function table, and what calls what
 

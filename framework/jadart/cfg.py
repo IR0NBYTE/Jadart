@@ -639,9 +639,10 @@ def label_targets(stmts, acc=None) -> set:
     return acc
 
 
-def _asm_lines(blk, indent):
+def _asm_lines(blk, indent, show):
     """Render a block's instructions as pseudo-statements, dropping the terminator
-    branch (represented structurally) and rendering ret as `return`."""
+    branch (represented structurally) and rendering ret as `return`. `show` prints an
+    operand; see render."""
     lines = []
     for k, (a, mn, op, note) in enumerate(blk.insns):
         last = (k == len(blk.insns) - 1)
@@ -652,11 +653,16 @@ def _asm_lines(blk, indent):
         elif mn == "bl" and note:
             lines.append(f"{indent}call{note.replace('  ; -> ', ' ')}();")
         else:
-            lines.append(f"{indent}{mn} {op}{note}")
+            lines.append(f"{indent}{mn} {show(a, op) if show is not None else op}{note}")
     return lines
 
 
-def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None) -> list:
+def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None, *, show) -> list:
+    """The structured statements as lines. `show` prints an instruction's operand,
+    rebaser(image) from disasm so that a code address reads as a virtual address, as in
+    `disasm`; it is required, and None prints the operand as capstone did. Only the
+    output is rebased: the blocks keep capstone's text, which their targets are read
+    from."""
     if labels is None:
         labels, done = label_targets(stmts), set()
     pad = indent * depth
@@ -671,22 +677,23 @@ def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None) -> list:
     for s in stmts:
         if s[0] == "asm":
             label(s[1])
-            out.extend(_asm_lines(blocks[s[1]], pad))
+            out.extend(_asm_lines(blocks[s[1]], pad, show))
         elif s[0] == "label":
             label(s[1])
         elif s[0] == "if":
             _, cond, then, els = s
             out.append(f"{pad}if ({cond}) {{")
-            out.extend(render(blocks, then, indent, depth + 1, labels, done))
+            out.extend(render(blocks, then, indent, depth + 1, labels, done, show=show))
             if els:
                 out.append(f"{pad}}} else {{")
-                out.extend(render(blocks, els, indent, depth + 1, labels, done))
+                out.extend(render(blocks, els, indent, depth + 1, labels, done,
+                                  show=show))
             out.append(f"{pad}}}")
         elif s[0] == "loop":
             _, header, body = s
             label(header)
             out.append(f"{pad}while (true) {{")
-            out.extend(render(blocks, body, indent, depth + 1, labels, done))
+            out.extend(render(blocks, body, indent, depth + 1, labels, done, show=show))
             out.append(f"{pad}}}")
         elif s[0] == "break":
             out.append(f"{pad}break;")

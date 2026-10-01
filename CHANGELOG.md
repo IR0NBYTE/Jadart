@@ -134,6 +134,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`decompile`, `export` and `lift` print code addresses as virtual addresses.** Since
+  #34 each method's header is a virtual address, and `disasm` rebases every branch, call
+  and `adr` target, but the body under the header printed capstone's operand, a pc_offset:
+  `bl #0x19ebf0` under `// 0x1ee6a8`. Inside the image window such a number is read back
+  as a virtual address, so pasting it answered with a different function and exit 0, and
+  another tool landed short by the anchor. Tier 1 did this for every call, every branch
+  leaving the function and every `adr`, tier 2 for every call it does not name and every
+  `adr`, and tier 3 for `adr`, in the text and `-j` forms. All three now print through the
+  rebase `disasm` uses: `bl 0x2d5670`, `blne 0x355514`, `adr x10, 0x2d93f8`. Over `export`
+  of both fixtures at every tier and of arm32-2.19.6 at tiers 1 and 2, the 83,897 such
+  operands are rewritten, 0 remain, and every other line, block labels included, is
+  unchanged. Closes #43.
 - **The call graph draws arm32's conditional calls.** Its decoded walk, which every arm32
   range goes through, drew a direct edge only for a `bl`, so `blls`, `bleq` and `blne`,
   and any other spelling of a call such as `blgt` or `blx #imm`, were dropped without

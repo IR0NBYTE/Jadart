@@ -516,6 +516,13 @@ def rebase_operand(image: InstrImage, pc_offset: int, op: str) -> str:
     return f"{printed_number(op)[0]}0x{image.anchor_va + t:x}"
 
 
+def rebaser(image: InstrImage):
+    """(pc_offset, operand) -> the operand as `disasm` prints it, with a code address it
+    names written as a virtual address. Every tier of the decompiler prints through this,
+    so none keeps capstone's pc_offset under a virtual-address header (#43)."""
+    return lambda pc_offset, op: rebase_operand(image, pc_offset, op)
+
+
 def _parse_addr(text: str, image: "InstrImage | None" = None):
     """An address a person typed -> a pc_offset into the instructions image, else None.
 
@@ -844,11 +851,13 @@ def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> l
 
 
 def render_body(dis, pc_to_name: dict, pool_map: dict | None = None, indent: str = "    ",
-                *, kinds) -> list:
+                *, kinds, show) -> list:
     """Render a function body as annotated, block-labelled lines. Branch operands to
     intra-function targets are rewritten to the block label; calls and pool loads are
     named. `kinds` is branches.row_kinds for the same rows, and is required; see
-    label_blocks."""
+    label_blocks. `show` prints any other operand, rebaser(image) so that a code address
+    reads as a virtual address, as in `disasm`; it is required too, and None prints the
+    operand as capstone did."""
     if not dis:
         return []
     labels = label_blocks(dis, kinds)
@@ -860,9 +869,10 @@ def render_body(dis, pc_to_name: dict, pool_map: dict | None = None, indent: str
             lines.append(f"  {labels[addr]}:")
         # rewrite an intra-function branch operand to its label
         t = _block_target(kinds[i], lo, hi)
-        shown = op
         if t is not None and t in labels:
             shown = op.rsplit("#", 1)[0] + labels[t]
+        else:
+            shown = show(addr, op) if show is not None else op
         lines.append(f"{indent}{mn:<7} {shown}{note}")
     return lines
 
