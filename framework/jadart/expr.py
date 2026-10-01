@@ -1066,6 +1066,8 @@ class Lifter:
                  selectors=None, entry=None, fields=None):
         self.blocks = blocks
         self.pool_map = pool_map or {}
+        #: Prints an operand kept as is; see lift_function.
+        self.show = None
         # optional register aliases (e.g. {"x1": "this"} for an instance method)
         self.alias = dict(receiver or {})
         # arity: pc -> callee register-argument count (None if unknown); enables call-site
@@ -2105,10 +2107,13 @@ class Lifter:
                                  _num(pad), P_SHIFT))
             return []
 
-        # not modelled: emit the raw arm64 (never wrong, no information lost)
+        # not modelled: emit the raw arm64 (never wrong, no information lost). Of what
+        # reaches here only `adr` names a code address, and `show` writes it as a virtual
+        # address; the loads, stores and arithmetic kept raw above name none.
         if dst:
             st.set(dst, V(dst, P_ATOM))
-        return [f"{mn} {op}".rstrip()]
+        shown = self.show(addr, op) if self.show is not None else op
+        return [f"{mn} {shown}".rstrip()]
 
     def _elem_access(self, base_reg, index_reg, scale, st: State, disp: int = 0) -> V:
         """`base[index]` for a computed address, with the displacement folded in where it
@@ -3067,13 +3072,17 @@ def _inline_single_use(lines: list, names: set) -> list:
 
 
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
-                  indent="  ", depth=1, selectors=None, arch=None, fields=None) -> list:
+                  indent="  ", depth=1, selectors=None, arch=None, fields=None,
+                  show=None) -> list:
     """Annotated disasm -> pseudo-Dart body lines (Tier 3). `receiver` is an optional
     register-alias map, e.g. {"x1": "this"} for an instance method; `arity` is an optional
     `pc -> int` resolver (see make_arity_resolver) enabling call-argument reconstruction;
     `selectors` maps a dispatch-call immediate to its source name (see dispatch.py);
     `fields` maps a byte offset to the receiver's field name at that offset (see
     fields.py), and only the receiver's, so an unresolved base still prints its offset.
+    `show` prints the operand of an instruction kept as it is, rebaser(image) from disasm
+    so that an `adr` target reads as a virtual address; without it the operand is
+    capstone's.
 
     `arch` is the resolved target. Passing one whose roles are not modelled refuses; see
     LIFTABLE_ARCHS. Omitting it keeps the arm64 assumption every caller had before the
@@ -3088,7 +3097,7 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
             f"Tier 1 (`disasm`) does decode it, and the snapshot layer is unaffected.")
     with use_target(TARGETS[name] if name else ARM64):
         return _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                              fields)
+                              fields, show)
 
 
 @contextlib.contextmanager
@@ -3149,7 +3158,7 @@ def use_target(tgt: Target):
 
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                   fields=None) -> list:
+                   fields=None, show=None) -> list:
     stripped = strip_boilerplate(ann)
     blocks, entry = build_cfg(stripped)
     if not blocks:
@@ -3158,6 +3167,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     dispatch = detect_dispatch(stripped)
     lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                     dispatch=dispatch, selectors=selectors, entry=entry, fields=fields)
+    lifter.show = show
     lifter.labels = label_targets(stmts)
     lines, _falls = lifter.walk(stmts, State(), indent, depth)
     return _inline_single_use(lines, lifter.results)

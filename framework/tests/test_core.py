@@ -424,7 +424,7 @@ def test_tier2_control_flow_reconstruction():
     ann = _ann(image, disassemble_function(image, refs[0]),
                function_name_by_pc(image, fr), build_pool_map(fr))
     blocks, entry = build_cfg(ann)
-    body = "\n".join(render(blocks, structure(blocks, entry)))
+    body = "\n".join(render(blocks, structure(blocks, entry), show=None))
     assert "if (x2 > x3) {" in body
     assert "} else {" in body
     assert body.count("return;") == 2   # return false / return true
@@ -449,7 +449,7 @@ def test_tier1_tier2_no_crash_over_sample():
             continue
         ann = _ann(image, dis, pc_to_name, pool_map)
         blocks, entry = build_cfg(ann)
-        render(blocks, structure(blocks, entry))
+        render(blocks, structure(blocks, entry), show=None)
         ran += 1
         if ran >= 1500:
             break
@@ -472,7 +472,7 @@ def test_tier2_loop_body_is_reconstructed():
     ann = _ann(image, disassemble_function(image, refs[0]),
                function_name_by_pc(image, fr), build_pool_map(fr))
     blocks, entry = build_cfg(ann)
-    body = "\n".join(render(blocks, structure(blocks, entry)))
+    body = "\n".join(render(blocks, structure(blocks, entry), show=None))
     assert "while (true) {" in body
     # the multiply-by-31 accumulate (mul + #0x1f) must live INSIDE the loop body
     loop = body.split("while (true) {", 1)[1]
@@ -7207,7 +7207,7 @@ def test_tier1_labels_arm32_conditional_branches():
     image = _word_image(_A32_WORDS, "arm", _A32_ANCHOR)
     dis = disassemble_range(image, image.all_ranges[0])
     body = [" ".join(line.split()) for line in
-            render_body(dis, {}, None, kinds=row_kinds(image, dis))]
+            render_body(dis, {}, None, kinds=row_kinds(image, dis), show=None)]
     # beq and b both land on 0x20, the backward bne on 0x10; blls is a call, no label
     assert "beq L1" in body and "b L1" in body and "bne L0" in body, body
     assert "L0:" in body and "L1:" in body, body
@@ -7221,7 +7221,8 @@ def test_tier2_names_arm32_conditional_calls(monkeypatch, tmp_path):
     kinds, and the tier 2 callers did not pass them: `export -t 2` of arm32-2.19.6 named
     0 of the 8,375 conditional calls it prints, 7,046 of which `-t 1` names (#42).
     `annotate` requires them now. This goes through decompile_class and export, over a
-    one-method class on the synthetic image."""
+    one-method class on the synthetic image, and also checks that no call or branch
+    operand in either tier is left a pc_offset (#43)."""
     import importlib
     import types
     if not _capstone_available():
@@ -7248,9 +7249,13 @@ def test_tier2_names_arm32_conditional_calls(monkeypatch, tmp_path):
         sources = (tree / "sources").rglob("*")
         out += "".join(f.read_text() for f in sources if f.is_file())
         body = [" ".join(line.split()) for line in out.splitlines()]
-        # once from decompile_class and once from the exported source
-        assert body.count("blls #0x28 ; -> callee") == 2, (tier, out)
+        # once from decompile_class and once from the exported source, and written as
+        # a virtual address (#43)
+        assert body.count("blls 0x154e28 ; -> callee") == 2, (tier, out)
         assert not any(line.startswith("call callee") for line in body), out
+        if tier == 1:                       # an unnamed call, and a backward call
+            assert "bl 0x154e24" in body and "blls 0x154e10" in body, out
+        assert not any(re.match(r"b\w* #0x", line) for line in body), out
     try:
         disasm.annotate([(0x14, "blls", "#0x28")], {0x28: "callee"})
     except TypeError:
@@ -7287,6 +7292,54 @@ def test_callgraph_draws_arm32_conditional_calls():
     # the blne into the callee and the bl past the end are counted, the blt is no call
     assert idx.unresolved == 2, idx.unresolved
     assert not {0x38, 0x40, 0x48} & set(idx.callees), idx.callees
+
+
+def test_the_decompiler_prints_code_addresses_as_virtual_addresses():
+    """Tiers 1, 2 and 3 print a call, branch or `adr` target as the virtual address
+    `disasm` prints, not capstone's pc_offset (#43).
+
+    Every method header is a virtual address since #34, and the body under it printed
+    `bl #0x19ebf0`, a pc_offset inside the image window: pasted back, it answers with a
+    different function, exit 0. These are the issue's own examples on the clean
+    fixture."""
+    import io
+    import contextlib
+    if not _capstone_available() or not os.path.exists(CLEAN):
+        _skip("  SKIP test_the_decompiler_prints_code_addresses_as_virtual_addresses"
+              " (no capstone, or no clean fixture)")
+    from jadart import cli
+    from jadart.program import decompile_class
+    for tier, want in ((1, ("bl 0x2d5670", "bl 0x1ee6e0 ; -> _run@310063981")),
+                       (2, ("bl 0x2d5670",))):
+        out = decompile_class(CLEAN, "_FluBenchPageState@310063981", tier=tier)
+        body = {" ".join(line.split()) for line in out.splitlines()}
+        missing = [w for w in want if w not in body]
+        assert not missing, (tier, missing, out)
+        assert "bl #0x19ebf0" not in body, (tier, out)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["lift", CLEAN, "0x2d933c"]) == 0
+    lines = {" ".join(line.split()) for line in buf.getvalue().splitlines()}
+    assert "adr x10, 0x2d93f8" in lines, buf.getvalue()
+
+
+def test_tier3_writes_an_adr_target_as_a_virtual_address():
+    """The lifter keeps an `adr` as the instruction, and prints its target through the
+    same rebaser as tiers 1 and 2 and `disasm` (#43)."""
+    if not _capstone_available():
+        _skip("  SKIP test_tier3_writes_an_adr_target_as_a_virtual_address (no capstone)")
+    from jadart.branches import row_kinds
+    from jadart.disasm import annotate, disassemble_range, rebaser
+    from jadart.expr import lift_function
+    words = [0xD503201F, 0x10000040, 0xD65F03C0, 0xD503201F]   # nop; adr x0, #0xc; ret
+    image = _word_image(words, "arm64", 0x136A80)
+    dis = disassemble_range(image, image.all_ranges[0])
+    ann = annotate(dis, {}, None, kinds=row_kinds(image, dis))
+    shown = [line.strip() for line in lift_function(ann, arch=image.arch,
+                                                    show=rebaser(image))]
+    assert "adr x0, 0x136a8c" in shown, shown
+    raw = [line.strip() for line in lift_function(ann)]       # without show, as printed
+    assert "adr x0, #0xc" in raw, raw
 
 
 def test_code_target_refuses_when_capstone_token_disagrees():
@@ -7376,7 +7429,8 @@ def test_a_branch_to_pc_offset_0_to_9_is_rebased_and_labelled():
             va = int(rebased.rpartition(" ")[2], 16)     # the address it now prints
             assert target_va(image, pc, ops[pc]) == va, (arch, hex(pc))
         body = [" ".join(line.split()) for line in
-                render_body(dis, {0: "entry"}, None, kinds=row_kinds(image, dis))]
+                render_body(dis, {0: "entry"}, None, kinds=row_kinds(image, dis),
+                            show=None)]
         assert "bl #0 ; -> entry" in body, (arch, body)
         assert ("b.ne L0" if arch == "arm64" else "bne L0") in body, (arch, body)
         assert "L0:" in body, (arch, body)

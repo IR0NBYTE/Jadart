@@ -136,7 +136,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     wants, so they are unpacked too. See container.py for the layout."""
     from .branches import row_kinds
     from .disasm import (load_instructions, disassemble_function, build_pool_map,
-                         render_body, annotate, truncated_by, addr_label)
+                         render_body, annotate, truncated_by, addr_label, rebaser)
     from .signatures import names_with_signatures
     from .cfg import build_cfg, structure, render as render_cfg
     from .expr import lift_function, make_arity_resolver
@@ -201,14 +201,17 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
                                          arity=arity, indent="  ", depth=2,
                                          selectors=selectors,
                                          arch=getattr(image, "arch", None),
-                                         fields=layout.for_function(ref)))
+                                         fields=layout.for_function(ref),
+                                         show=rebaser(image)))
             elif tier == 2:
                 ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
                 blocks, entry = build_cfg(ann)
-                out.extend(render_cfg(blocks, structure(blocks, entry), indent="  ", depth=2))
+                out.extend(render_cfg(blocks, structure(blocks, entry), indent="  ",
+                                      depth=2, show=rebaser(image)))
             else:
                 out.extend(render_body(dis, pc_to_name, pool_map, indent="      ",
-                                       kinds=row_kinds(image, dis)))
+                                       kinds=row_kinds(image, dis),
+                                       show=rebaser(image)))
             out.append("  }")
         out.append("}")
         return out
