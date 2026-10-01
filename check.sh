@@ -64,6 +64,19 @@ if [ "$FULL" = 1 ]; then
   for f in "$CLEAN" "$OBF"; do
     step "no function claims an edge its CFG lacks" "$PY" framework/tools/cfgcheck.py "$f"
   done
+  # That compares the rendering with the CFG, so it passes a wrong CFG rendered
+  # faithfully: arm32's `pop {fp, pc}` ran on into the code after it in a quarter of its
+  # functions and it read 0 (#45). Its exit check reads the words through capstone
+  # instead, on fixed arm32 words always and on the issue's arm32 corpus build when it is
+  # present (none is committed).
+  step "arm32 returns end their block" "$PY" framework/tools/cfgcheck.py --synthetic
+  a32=flubench/corpus/arm32-2.19.6/libapp.so
+  if [ -e "$a32" ]; then
+    step "no arm32 function runs on past a return" \
+      "$PY" framework/tools/cfgcheck.py "$a32"
+  else
+    printf '\n== no arm32 function runs on past a return\n   skipped: no %s\n' "$a32"
+  fi
 
   # Python randomises string hashing per process, and a set iterated in hash order has
   # reached the output here before: two runs, two different names, about one run in five.

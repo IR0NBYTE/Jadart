@@ -175,3 +175,71 @@ def row_kinds(image, rows) -> list:
         t = word_target(arch, _U32(text, pc)[0], pc, cls)
         out.append((kind, t if _agrees(op, t, arch, size) else None))
     return out
+
+
+#: arm32 condition codes, by the value of bits 31:28. 14 is "always"; 15 is the
+#: unconditional instruction space, which holds no exit a function body uses.
+_A32_CC = ("eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt",
+           "le")
+
+
+def a32_exit(w: int):
+    """(condition, is_return) when the A32 word `w` writes PC and is not a call or a
+    PC-relative branch, else None. condition is "" for one that always does.
+
+    These end a block with no successor in the function: a return (`pop {fp, pc}`,
+    `bx lr`, `mov pc, lr`, `ldr pc, [sp], #4`) or an indirect jump (`ldr pc, [r4, #3]`,
+    `bx r2`). Read off the word, because the mnemonic test this replaced knew `bx` and
+    not `pop {fp, pc}`, arm32's usual return, nor any conditional form (#45).
+
+    - BX: 0x012FFF1m. A return when m is lr. (BLX rm, 0x012FFF3m, is a call.)
+    - LDM with PC in the register list. A return when the base is sp, as `pop` is.
+    - LDR (word, not byte) with Rt = 15, outside the media space. A return from sp.
+    - A data-processing instruction with Rd = 15, other than the compares, which write
+      no register, and the miscellaneous and multiply spaces that share its encoding.
+      `mov pc, lr` is a return."""
+    cond = w >> 28
+    if cond == 15:
+        return None
+    cc = "" if cond == 14 else _A32_CC[cond]
+    if (w & 0x0FFFFFF0) == 0x012FFF10:                     # bx
+        return cc, (w & 0xF) == 14
+    op = (w >> 25) & 7
+    if op == 0b100:                                        # ldm / pop
+        if w & (1 << 20) and w & (1 << 15):
+            return cc, (w >> 16) & 0xF == 13
+        return None
+    if op in (0b010, 0b011):                               # ldr / str
+        if op == 0b011 and w & 0x10:
+            return None                                    # media instructions
+        if w & (1 << 20) and not w & (1 << 22) and (w >> 12) & 0xF == 15:
+            return cc, (w >> 16) & 0xF == 13
+        return None
+    if op in (0b000, 0b001):                               # data processing
+        if op == 0b000 and w & 0x90 == 0x90:
+            return None                                    # multiply, extra loads/stores
+        opcode, s = (w >> 21) & 0xF, (w >> 20) & 1
+        if 8 <= opcode <= 11:
+            return None                                    # compares, or misc (bx above)
+        if (w >> 12) & 0xF != 15:
+            return None
+        mov_lr = opcode == 13 and op == 0b000 and (w & 0xFFF) == 14
+        return cc, mov_lr
+    return None
+
+
+def exits(image, rows) -> dict:
+    """{pc_offset: (condition, is_return)} for every row of one range that leaves the
+    function without being a call or a PC-relative branch; see a32_exit. arm32 only:
+    arm64's `ret` and `br` are mnemonics of their own, which cfg reads directly."""
+    if arch_name(image) != "arm":
+        return {}
+    text = image.text
+    out = {}
+    for pc, _mn, _op in rows:
+        if pc < 0 or pc + 4 > len(text):
+            continue
+        ex = a32_exit(_U32(text, pc)[0])
+        if ex is not None:
+            out[pc] = ex
+    return out

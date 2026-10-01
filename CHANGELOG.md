@@ -134,6 +134,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Tier 2 ends an arm32 function where it returns.** The control-flow graph ended a block
+  only at `b`, `ret`, `br`, `bx` and the conditional branches, so arm32's usual return,
+  `pop {fp, pc}`, got an edge to whatever code followed it, and `decompile -t 2` and
+  `export -t 2` rendered that code as if it ran after the return, in a quarter of the
+  functions of every arm32 build. An indirect jump (`ldr pc, [r4, #3]`) and every
+  conditional form (`popne`, `bxeq lr`, `ldrne pc, [sl, #imm]`) were missed the same way.
+  Which instruction leaves the function is now read off its word (`branches.a32_exit`),
+  which agrees with capstone on every one of the 131,382 such words in the 13 arm32 corpus
+  builds: an unconditional one ends its block with no successor, a conditional one with an
+  exit beside the fallthrough. A return prints `return;`, a conditional one `if (cond) {
+  return; }`. `tools/cfgcheck.py` passed the wrong graph, because it compares the
+  rendering against the graph it is handed; it now also judges the graph itself by
+  capstone's reading of each word, which finds 3,434 violations on arm32-2.19.6 on the old
+  graph and 0 now, and `check.sh --full` runs it on fixed arm32 words and on that build
+  when present. arm64 output is unchanged. Closes #45.
 - **`decompile`, `export` and `lift` print code addresses as virtual addresses.** Since
   #34 each method's header is a virtual address, and `disasm` rebases every branch, call
   and `adr` target, but the body under the header printed capstone's operand, a pc_offset:

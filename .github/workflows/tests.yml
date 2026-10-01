@@ -78,16 +78,16 @@ jobs:
 
       # A rendered edge the CFG does not have is the worst defect this tool can ship: the
       # output stays plausible and says control goes somewhere it cannot. Nothing was
-      # watching it between releases. 1.7s on the 8,194-function fixture.
+      # watching it between releases. cfgcheck exits 1 on any violation, the exit check
+      # included, which judges the CFG itself by capstone's reading of each word (#45).
       - name: no function claims an edge its CFG does not have
         working-directory: framework
         run: |
           for f in ../flubench/artifacts/clean/lib/arm64-v8a/libapp.so \
                    ../flubench/artifacts/obf/lib/arm64-v8a/libapp.so; do
-            out=$(python tools/cfgcheck.py "$f")
-            echo "$out"
-            case "$out" in *"0 edge violations"*) ;; *) exit 1 ;; esac
+            python tools/cfgcheck.py "$f"
           done
+          python tools/cfgcheck.py --synthetic
 
       # Python randomises string hashing per process, and a set of register names iterated
       # in hash order has already shipped here once: two runs over the same binary named
