@@ -231,7 +231,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
       tier 2:           control-flow skeleton with annotated arm64 bodies
       tier 1:           block-labelled annotated arm64 (structured=False)
     structured=False forces tier 1."""
-    from .branches import row_kinds
+    from .branches import exits, row_kinds
     from .disasm import (load_instructions, disassemble_function, build_pool_map,
                          render_body, annotate, truncated_by, addr_label, rebaser)
     from .signatures import names_with_signatures
@@ -295,7 +295,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                                        show=rebaser(image)))
         elif lvl == 2:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
-            blocks, entry = build_cfg(ann)
+            blocks, entry = build_cfg(ann, exits=exits(image, dis))
             lines.extend(render_cfg(blocks, structure(blocks, entry), indent="  ",
                                     depth=2, show=rebaser(image)))
         else:

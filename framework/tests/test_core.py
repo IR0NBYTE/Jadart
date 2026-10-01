@@ -4840,10 +4840,11 @@ def test_structured_output_claims_exactly_the_edges_the_cfg_has():
     # Over the whole image, not a sample: 8,194 functions, and the answer has to be zero.
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import cfgcheck
-    n, badfn, edges, dropped, twice, worst = cfgcheck.run(CLEAN)
+    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first = cfgcheck.run(CLEAN)
     assert n > 8000, f"only {n} functions structured; the fixture is not the whole image"
-    assert (edges, dropped, twice) == (0, 0, 0), (
-        f"{edges} edge violations, {dropped} dropped, {twice} duplicated: {worst}")
+    assert (edges, dropped, twice, exit_bad) == (0, 0, 0, 0), (
+        f"{edges} edge violations, {dropped} dropped, {twice} duplicated: {worst}; "
+        f"{exit_bad} exit violations: {exit_first}")
 
 
 def test_a_conditional_whose_arms_both_return_still_gets_a_follow_node():
@@ -7340,6 +7341,101 @@ def test_tier3_writes_an_adr_target_as_a_virtual_address():
     assert "adr x0, 0x136a8c" in shown, shown
     raw = [line.strip() for line in lift_function(ann)]       # without show, as printed
     assert "adr x0, #0xc" in raw, raw
+
+
+def test_a32_exit_reads_returns_and_indirect_jumps_off_the_word():
+    """Which arm32 words leave the function: the forms of return and indirect jump, with
+    their condition, and not calls, compares or ordinary data processing (#45)."""
+    from jadart.branches import a32_exit
+    want = {0xE8BD8800: ("", True),      # pop {fp, pc}
+            0x08BD8800: ("eq", True),    # popeq {fp, pc}
+            0xE12FFF1E: ("", True),      # bx lr
+            0x012FFF1E: ("eq", True),    # bxeq lr
+            0xE12FFF12: ("", False),     # bx r2
+            0xE49DF004: ("", True),      # ldr pc, [sp], #4, printed pop {pc}
+            0xE590F000: ("", False),     # ldr pc, [r0]
+            0x159AF01C: ("ne", False),   # ldrne pc, [sl, #0x1c]
+            0xE8908000: ("", False),     # ldm r0, {pc}
+            0xE1A0F00E: ("", True),      # mov pc, lr
+            0xE08FF100: ("", False),     # add pc, pc, r0, lsl #2
+            0xE12FFF32: None,            # blx r2, a call
+            0xEB000000: None,            # bl
+            0xEA000000: None,            # b, a direct branch row_kinds reads
+            0xE3500000: None,            # cmp r0, #0
+            0xE1A00001: None,            # mov r0, r1
+            0xE5D0F000: None,            # ldrb pc, [r0], not a word load
+            0xE8BD0800: None}            # pop {fp}
+    for w, ex in want.items():
+        assert a32_exit(w) == ex, (hex(w), a32_exit(w), ex)
+
+
+def test_arm32_returns_and_indirect_jumps_end_their_block():
+    """A return or indirect jump ends its block with no successor, and a conditional one
+    ends it with an exit as well as the fallthrough.
+
+    build_cfg ended a block only at `b`, `ret`, `br`, `bx` and the conditional branches,
+    so arm32's usual return, `pop {fp, pc}`, got an edge to the code after it, and tier 2
+    rendered that code as if it ran after the return: in a quarter of the functions of
+    every arm32 build (#45)."""
+    if not _capstone_available():
+        _skip("  SKIP test_arm32_returns_and_indirect_jumps_end_their_block"
+              " (no capstone)")
+    from jadart.branches import exits, row_kinds
+    from jadart.cfg import build_cfg, render, structure
+    from jadart.disasm import annotate, disassemble_range
+
+    def cfg(words):
+        image = _word_image(words, "arm", _A32_ANCHOR)
+        dis = disassemble_range(image, image.all_ranges[0])
+        ann = annotate(dis, {}, None, kinds=row_kinds(image, dis))
+        blocks, entry = build_cfg(ann, exits=exits(image, dis))
+        body = [line.strip() for line in render(blocks, structure(blocks, entry),
+                                                show=None)]
+        return blocks, body
+
+    # cmp r0, #0; bne #0x10; mov r0, #1; pop {fp, pc}; mov r0, #2; pop {fp, pc}
+    blocks, body = cfg([0xE3500000, 0x1A000001, 0xE3A00001, 0xE8BD8800,
+                        0xE3A00002, 0xE8BD8800])
+    assert blocks[0x8].succ == [] and blocks[0x8].exit == "return", blocks[0x8]
+    assert body.count("return;") == 2 and not any("pop" in line for line in body), body
+    # each of these ends its block; on main each one stayed in the middle of it
+    for word, exit_kind, conditional in ((0x012FFF1E, "return", True),   # bxeq lr
+                                         (0x18BD8800, "return", True),   # popne {fp, pc}
+                                         (0xE49DF004, "return", False),  # pop {pc}
+                                         (0xE8908000, "jump", False),    # ldm r0, {pc}
+                                         (0xE1A0F00E, "return", False),  # mov pc, lr
+                                         (0x159AF01C, "jump", True)):    # ldrne pc, [...]
+        blocks, body = cfg([0xE3500000, word, 0xE3A00001, 0xE12FFF1E])
+        blk = blocks[0]
+        assert blk.insns[-1][0] == 4 and blk.exit == exit_kind, (hex(word), blk)
+        assert blk.cexit == conditional, (hex(word), blk)
+        assert blk.succ == ([8] if conditional else []), (hex(word), blk.succ)
+        if conditional:
+            leave = "return;" if exit_kind == "return" else "ldrne pc, [sl, #0x1c]"
+            i = body.index("if (r0 != 0) {" if word == 0x18BD8800 or word == 0x159AF01C
+                           else "if (r0 == 0) {")
+            assert body[i + 1] == leave, (hex(word), body)
+    # at a loop header too, where the header went the unconditional way and its exit
+    # was dropped, so the loop read as having no way out
+    for word, leave in ((0x159AF01C, "ldrne pc, [sl, #0x1c]"), (0x012FFF1E, "return;")):
+        # mov r0, #1; cmp r0, #0; <exit>; add r0, r0, #1; b #4; bx lr
+        blocks, body = cfg([0xE3A00001, 0xE3500000, word, 0xE2800001, 0xEAFFFFFB,
+                            0xE12FFF1E])
+        assert "while (true) {" in body and leave in body, (hex(word), body)
+        assert body[body.index(leave) - 1].startswith("if ("), (hex(word), body)
+
+
+def test_cfgcheck_judges_exits_by_capstone_not_by_build_cfg():
+    """cfgcheck compared the rendering against the CFG and so passed a wrong CFG rendered
+    faithfully. Its exit check reads each word through capstone instead: 0 violations on
+    the synthetic arm32 ranges with the exits, and every range flagged without them."""
+    if not _capstone_available():
+        _skip("  SKIP test_cfgcheck_judges_exits_by_capstone_not_by_build_cfg"
+              " (no capstone)")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from cfgcheck import _A32_RANGES, synthetic
+    good, broken = synthetic()
+    assert good == 0 and broken == len(_A32_RANGES), (good, broken)
 
 
 def test_code_target_refuses_when_capstone_token_disagrees():

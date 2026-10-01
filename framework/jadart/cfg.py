@@ -8,7 +8,9 @@ already resolved. Expression reconstruction (recovering `balance -= amount` from
 sub/stur) is Tier 3 and lives in expr.py. Irreducible regions fall back to `goto Ln`
 (honest, never wrong).
 
-CFG terminators: b, b.<cond>, cbz/cbnz/tbz/tbnz, ret, br. Calls (bl/blr) fall through.
+CFG terminators: b, b.<cond>, cbz/cbnz/tbz/tbnz, ret, br, bx, and on arm32 every other
+instruction that writes PC without being a call, read off its word (branches.exits).
+Calls (bl/blr) fall through.
 Structuring uses forward dominators (loop back edges) + post-dominators (if merge
 points), both via the Cooper-Harvey-Kennedy iterative algorithm.
 """
@@ -57,6 +59,10 @@ def _target(op: str):
         return None
 
 
+#: exit_target for an exit that names no address: a return, or an indirect jump.
+EXIT_RETURN, EXIT_INDIRECT = -2, -3
+
+
 @dataclass
 class Block:
     addr: int
@@ -70,6 +76,11 @@ class Block:
     #: the structurer happened to place next: 997 such sites on the clean fixture.
     #: Recording the address lets the renderer say `goto sub_0x...` instead of nothing.
     exit_target: int = -1
+    #: "return" or "jump" when the last instruction leaves the function some other way
+    #: than a direct branch: arm32's `pop {fp, pc}` or `ldr pc, [r4, #3]`, say. cexit
+    #: when it does so only under a condition, and otherwise falls through to succ.
+    exit: str = ""
+    cexit: bool = False
 
 
 _NEG = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<="}
@@ -210,16 +221,22 @@ def _shifted(parts):
     return None
 
 
-def build_cfg(dis) -> tuple[dict, int]:
+def build_cfg(dis, exits=None) -> tuple[dict, int]:
     """Return ({addr: Block}, entry_addr) for a function's disasm
-    (list of (addr, mn, op, note))."""
+    (list of (addr, mn, op, note)).
+
+    `exits` is branches.exits for the same rows: on arm32 the instructions that leave the
+    function without being a call or a direct branch. Without it only `ret`, `br` and
+    `bx` do, and arm32's usual return, `pop {fp, pc}`, ran on into the code after it in a
+    quarter of its functions (#45)."""
     if not dis:
         return {}, 0
+    exits = exits or {}
     addrs = [d[0] for d in dis]
     lo, hi = addrs[0], addrs[-1] + 4
     leaders = {lo}
     for i, (a, mn, op, _n) in enumerate(dis):
-        if _is_term(mn):
+        if _is_term(mn) or a in exits:
             if i + 1 < len(dis):
                 leaders.add(dis[i + 1][0])
             if _is_cond(mn) or mn == "b":
@@ -238,9 +255,21 @@ def build_cfg(dis) -> tuple[dict, int]:
         if insns:
             a, mn, op, _n = insns[-1]
             blk.term = mn
+            ex = exits.get(a)
+            if ex is not None:
+                cc, is_return = ex
+                blk.exit = "return" if is_return else "jump"
+                if cc:
+                    # Leaves only when the condition holds, so it also falls through.
+                    blk.cexit = True
+                    prev = insns[-2] if len(insns) >= 2 else None
+                    blk.cond = _cond_text(prev, "b" + cc, op)
+                    blk.succ = [end] if end < hi else []
+                else:
+                    blk.succ = []
             # `bx` covers both of arm32's uses of it: `bx lr` returns and `bx rN` is
             # an indirect branch. Either way the successor is not in this function.
-            if mn in ("ret", "br", "bx"):
+            elif mn in ("ret", "br", "bx"):
                 blk.succ = []
             elif mn == "b":
                 t = _target(op)
@@ -500,6 +529,14 @@ def structure(blocks, entry):
 
     def emit_cond(cur, stop, ctx, cont):
         blk = blocks[cur]
+        if blk.cexit:
+            # A conditional return or indirect jump: the `if` holds the exit, and the
+            # fallthrough is what follows it.
+            a, mn, op, _n = blk.insns[-1]
+            leave = (("exit", EXIT_RETURN) if blk.exit == "return"
+                     else ("exit", EXIT_INDIRECT, f"{mn} {op}".rstrip()))
+            return [("asm", cur), ("if", blk.cond, [leave], [])], (
+                blk.succ[0] if blk.succ else None)
         if blk.exit_target >= 0:
             # The taken arm leaves the function, so succ holds only the fallthrough. Read
             # positionally that fallthrough looked like the TAKEN arm and the rendered
@@ -534,8 +571,9 @@ def structure(blocks, entry):
         visited.add(header)
         blk = blocks[header]
         # Running off the end of a loop body is the back edge, so that is what the body
-        # falls through to.
-        if _is_cond(blk.term):
+        # falls through to. A header that leaves under a condition is a conditional too,
+        # or its exit would be dropped and the loop read as having no way out.
+        if _is_cond(blk.term) or blk.cexit:
             body, merge = emit_cond(header, set(), ctx, header)
             if merge is not None:
                 body = body + region(merge, set(), ctx, header)
@@ -586,7 +624,7 @@ def structure(blocks, entry):
                 out.append(loopstmt)
                 cur = ex
                 continue
-            if _is_cond(blk.term):
+            if _is_cond(blk.term) or blk.cexit:
                 cstmts, merge = emit_cond(cur, stop, ctx, cont)
                 out.extend(cstmts)
                 cur = merge
@@ -646,9 +684,10 @@ def _asm_lines(blk, indent, show):
     lines = []
     for k, (a, mn, op, note) in enumerate(blk.insns):
         last = (k == len(blk.insns) - 1)
-        if last and (mn == "b" or _is_cond(mn)):
+        if last and (mn == "b" or _is_cond(mn) or blk.cexit):
             continue                                   # branch is structural
-        if mn == "ret" or (mn == "bx" and op.strip() == "lr"):
+        if mn == "ret" or (mn == "bx" and op.strip() == "lr") or (
+                last and blk.exit == "return"):
             lines.append(f"{indent}return;{note}")
         elif mn == "bl" and note:
             lines.append(f"{indent}call{note.replace('  ; -> ', ' ')}();")
@@ -703,7 +742,13 @@ def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None, *, show)
             out.append(f"{pad}goto L_0x{s[1]:x};")
         elif s[0] == "exit":
             # Outside this function, so not a local label: name it the way the rest of the
-            # output names an address it has no name for.
-            out.append(f"{pad}goto sub_0x{s[1]:x};" if s[1] >= 0
-                       else f"{pad}goto <unresolved>;")
+            # output names an address it has no name for. A return or an indirect jump
+            # names none, and says what it is instead.
+            if s[1] == EXIT_RETURN:
+                out.append(f"{pad}return;")
+            elif s[1] == EXIT_INDIRECT:
+                out.append(f"{pad}{s[2]}")
+            else:
+                out.append(f"{pad}goto sub_0x{s[1]:x};" if s[1] >= 0
+                           else f"{pad}goto <unresolved>;")
     return out
