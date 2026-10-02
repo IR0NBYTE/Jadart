@@ -31,6 +31,8 @@ goes through the dispatch-table register, and jadart already recovers the select
 it, so those sites are attributed by selector rather than left as "indirect". What remains
 genuinely unresolvable is a closure call through a captured context.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
