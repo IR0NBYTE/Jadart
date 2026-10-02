@@ -7496,6 +7496,37 @@ def test_the_function_table_and_lifted_bodies_name_an_anonymous_range_alike():
     assert "Frida hooks: 1 function(s)" in buf.getvalue(), buf.getvalue()[:400]
 
 
+def test_no_module_needs_python_3_10_to_import():
+    """The package claims Python 3.9. `int | None` in an annotation is evaluated when its
+    class or function is defined, and 3.9 cannot evaluate it, unless the module defers
+    annotations with `from __future__ import annotations`. #59 put `va: int | None` in
+    callgraph.py, which had no such import, and every command that builds the call graph
+    exited 3 on 3.9 while the suite here, on a newer Python, passed. This reads the source, so it
+    fails on any Python. feature_version also refuses newer syntax such as `match`."""
+    import ast
+    import glob
+    root = os.path.join(os.path.dirname(__file__), "..")
+    bad = []
+    for path in sorted(glob.glob(os.path.join(root, "jadart", "*.py"))
+                       + glob.glob(os.path.join(root, "tools", "*.py"))):
+        tree = ast.parse(open(path, encoding="utf-8").read(), feature_version=(3, 9))
+        deferred = any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
+                       and any(a.name == "annotations" for a in n.names)
+                       for n in tree.body)
+        if deferred:
+            continue
+        nodes = list(ast.walk(tree))
+        notes = [n.annotation for n in nodes if isinstance(n, (ast.AnnAssign, ast.arg))]
+        notes += [n.returns for n in nodes
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        for note in notes:
+            if note is not None and any(isinstance(x, ast.BinOp)
+                                        and isinstance(x.op, ast.BitOr)
+                                        for x in ast.walk(note)):
+                bad.append(f"{os.path.basename(path)}:{note.lineno}")
+    assert not bad, f"PEP 604 annotations without the __future__ import: {bad}"
+
+
 def test_code_target_refuses_when_capstone_token_disagrees():
     """A printed target that the word does not give is left exactly as printed."""
     from jadart.disasm import rebase_operand, target_va
