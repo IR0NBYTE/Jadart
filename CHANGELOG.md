@@ -9,7 +9,30 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
-## Unreleased
+## 1.2.0 - 2026-10-03
+
+Upgrading from 1.1.0. The `--json` shape is unchanged and only gains fields, but some
+values a script may hold on to are different now:
+
+- Every printed address is a virtual address, `_kDartIsolateSnapshotInstructions` plus the
+  pc_offset, where 1.1.0 printed `.text+0x..`.
+- A bare number given as an address is read as a virtual address when it lands inside the
+  image. `.text+`, `isolate+` and `+` keep the pc_offset reading.
+- A range with no name is labelled `sub_0x<va>`, where it was `sub_0x<pc_offset>`.
+- A bug in jadart exits 3, where it exited 2 as though the input were bad.
+- `verify` prints two lines when every gate passes; `-v` prints the table.
+- A selector name that rested on a tied vote is no longer printed.
+- `xrefs` on a string or a pool entry lists only the entries some code loads directly.
+  1.1.0 also listed the matching ones with no direct load, under "no direct loads found":
+  on the clean fixture `xrefs FILE e -j` counted 1,444 and counts 1,113, and a pattern
+  only such entries match, such as `ifAbsent`, exits 1 where it exited 0. On arm32 the
+  same query exits 1 with the reason. A pattern spelled `string`, `pool` or `function` is
+  read as the kind now, and exits 2 without a pattern.
+- From Python, a path that does not exist raises `InputError`, a `JadartError`, where
+  1.1.0 let `FileNotFoundError` through, so code catching `OSError` there has to catch
+  `jadart.JadartError`. A crafted file raises a `JadartError` too, not a builtin.
+- `--json` names a container's member in `"file"` (`app.apk!lib/arm64-v8a/libapp.so`)
+  where 1.1.0 gave a temp path that was already deleted.
 
 ### Added
 
@@ -95,6 +118,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   the obfuscated arm64 fixture, the only obfuscated build here. The register convention
   was confirmed by a def-use scan over every range of 3.3.4, 3.4.4 and 3.12.2, and the
   class-id shift and width by disassembling the real prologues.
+- **`xrefs` takes the kind to look for.** `jadart xrefs FILE KIND PATTERN`, with `KIND`
+  one of `string`, `pool` or `function`, so a pattern that is both a string in the pool
+  and a function name, such as `Future.` on the clean fixture, answers the question asked.
+  `--exact` matches a pool string whole rather than as a substring, and for a string or a
+  pool entry `--class NAME` keeps only the references from code owned by that class. The
+  1.1.0 form, `xrefs FILE PATTERN`, still works and says which kind it took
+  (`// resolved as string`). An unknown kind is an input error, exit 2. A pool entry no
+  code loads directly is no longer listed; see the list above. (#22)
+- **Exit code 3 means a bug in jadart, not in the file.** Sixteen handlers caught every
+  exception and reported it as a problem with the input, so pointing a command at
+  `libflutter.so` printed a symbol name and exited 2. They catch `JadartError` only now;
+  anything else exits 3, names the exception type, and points at `JADART_DEBUG=1` for the
+  traceback. Under `-j` it is still one JSON document, with `"internal": true`.
+- **An agent skill that installs with one copy.** `skills/flutter-reverse-engineering/`
+  holds `SKILL.md` in the layout agent runtimes look for, and the README says how to wire
+  it into Claude Code or any other runtime. A test checks its frontmatter, because a skill
+  whose name does not match its directory is never offered to the agent.
 
 ### Changed
 
@@ -128,9 +168,82 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
     sit in the window where the two readings overlap. `.text+`, `isolate+` and `+` still
     mean the pc_offset, for anything written against the older output, and `va+` forces the
     address reading.
-  - A range with no name still prints as `sub_0x<pc_offset>`. That is a synthetic name
-    rather than an address, and it is spelled the same way everywhere, so it is left alone
-    here rather than made to disagree between the function table and a lifted body.
+- **`jadart functions` is twice as fast, and draws the same graph.** Building the call
+  graph ran every code range through capstone and parsed the operand text back into
+  numbers, about 0.73 s of the 0.89 s the command took on the clean fixture. A `bl` is
+  one fixed opcode with its target in the low 26 bits, so direct edges now come off the
+  raw instruction words, found with byte slicing and a regex in about 10 ms for the whole
+  image. Capstone still reads the ranges that need operand text, and only those: a `blr`
+  in a range that also loads from the dispatch table, since that is the only kind of
+  `blr` the dispatch detector can name, and a pool load that could name a function,
+  including the two instruction far form. A range decoded for dispatch alone stops at its
+  last `blr`. That leaves 17 to 20% of the ranges and 28 to 34% of the instructions for
+  capstone across the corpus, and the median `functions` run goes from 0.905 s to 0.458 s
+  with peak memory unchanged; `xrefs` on a function name takes the same path. Pool loads
+  are read with `_word_load` and `_word_add_pp`, the decoders `xrefs` gained in #27, so
+  there is one reading of a pool access rather than two; both agree with capstone's own
+  text on every one of the 7,755,621 instructions in the corpus, and a test holds that
+  on the fixtures. The graph was compared field by field, list order included, against
+  the full decode on sixteen arm64 binaries from Dart 2.19.6 to 3.12.2, with virtual
+  sites on and off and with no snapshot names, and every one matches. It is exact because
+  capstone decodes every word of every range on all of them, so the words read here are
+  the words it would have printed. That premise is about real code. On crafted input it
+  can fail: capstone stops at the first word it cannot decode and drops everything after
+  it without saying so, while the word reader carries on, so a `bl` placed after a junk
+  word now appears in the graph where it used to vanish. A range that still goes to
+  capstone keeps the old stopping point. The silent stop itself predates this and is
+  filed as #29. An arm32 image keeps the full sweep; the report said
+  arm32 raises instead, but capstone's arm backend decodes it, and its graph is unchanged.
+  The benchmark baseline was retaken with this, and it is also the first to record #27:
+  `xrefs` on a string went from 0.666 s to 0.158 s there. Closes #17.
+- **A container is read in place, and nothing is written to disk.** Pointing any command
+  at an APK or IPA used to copy the snapshot member into a `jadart-` temp directory, read
+  the copy back, and remove the directory from an `atexit` hook. Since Android Gradle
+  Plugin 3.6 a release APK stores native libraries uncompressed so the loader can map them,
+  so `libapp.so` now comes straight out of the central directory: 1 ms for 4.2 MB, and a
+  container that does deflate its libraries still works because zipfile inflates into
+  memory just the same. Three things follow. A killed process leaves nothing behind, where
+  before every SIGKILL leaked a full copy of someone's app into the temp directory, because
+  `atexit` does not run; there was a fortnight old orphan in the temp directory here when
+  this was written. No command asks for a temp file at all now, so nothing depends on
+  finding a writable one. And `verify` reads the member once rather than twice, because the
+  bytes are read once and handed to both readers instead of each opening the file for
+  itself. The process wide cache that stopped one APK being unpacked three times is gone
+  with the unpacking: a second call re-reads the member for about a millisecond, against
+  the seventy the parse behind it takes, and holds no state between calls in exchange.
+  `jadart.source` holds the new reader; `export.resolve_input` and `export.resolve_cached`
+  are gone, both implementation under `jadart.*`. Closes #18.
+- **A container member is inflated under a bound, not after one.** The size a zip declares
+  for a member was checked before reading it, and then `ZipExtFile.read()` with no
+  argument asked zlib for up to a gigabyte before truncating the result to that declared
+  size, so the check was consulted only after the memory had been spent. A 199 KB archive
+  declaring a four byte member and holding a 200 MB deflate stream reached 422 MB of
+  resident memory. The member is now read a megabyte at a time and never past the size it
+  declared, so the same archive reaches 22 MB and fails on its own bad CRC, which is the
+  right answer for an archive that lies about a member. A test measures the peak against a
+  control container of the same shape holding nothing, and fails on the unbounded read.
+- **`--json` reports the file it actually read.** `jadart -j info app.apk` used to put the
+  temp path in `"file"`, which named a directory that no longer existed by the time the
+  caller read the document. It now names the container and the member it picked, as
+  `app.apk!lib/arm64-v8a/libapp.so`. A binary named directly, or found inside a directory
+  the user named, still reports its own path, so the field stays openable wherever a file
+  exists to open. A path that does not exist now says "no such file or directory" from
+  every entry point; the CLI and the library used to answer that with two different
+  sentences.
+- **`xrefs` on a string or a pool entry reads the instruction words.** It found pool loads
+  by disassembling every code range; it now reads the near `ldr` off `x27` and the far
+  `add` off `x27` from the raw words, and drops the base when a later word writes that
+  register. Output is identical on every pool entry of both fixtures, and the `xrefs`
+  workload went from 1.32 s to 0.35 s on that change's own measurement. On arm32 it
+  refuses with the reason: 1.1.0 looked for `x27` there too, which arm32 code never uses,
+  and answered "no direct loads found" for strings the code does load. Closes #16.
+- **`verify` says it once.** A pass printed 22 lines; it prints the tally and the verdict
+  now, `-v` prints every gate, and a failure always prints in full and names the gate.
+- **The repository.** CI is off, and `./check.sh` runs what CI ran: the suite, the
+  acceptance gates on both fixtures, the measured claims and an install with no capstone,
+  with `--full` adding the CFG checks, the determinism diff across two hash seeds and the
+  benchmark. `tools/bench.py --check` holds every guarded workload to a committed baseline
+  (#23). Pull requests need the maintainer's review (#21).
 
 ### Fixed
 
@@ -397,72 +510,41 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   seventeen kinds in the same order, so the numbers are right everywhere the tool parses.
   A test pins the derived values, and the comment carries the two-line check to repeat
   when a newer release is registered. Closes #6.
-
-### Changed
-
-- **`jadart functions` is twice as fast, and draws the same graph.** Building the call
-  graph ran every code range through capstone and parsed the operand text back into
-  numbers, about 0.73 s of the 0.89 s the command took on the clean fixture. A `bl` is
-  one fixed opcode with its target in the low 26 bits, so direct edges now come off the
-  raw instruction words, found with byte slicing and a regex in about 10 ms for the whole
-  image. Capstone still reads the ranges that need operand text, and only those: a `blr`
-  in a range that also loads from the dispatch table, since that is the only kind of
-  `blr` the dispatch detector can name, and a pool load that could name a function,
-  including the two instruction far form. A range decoded for dispatch alone stops at its
-  last `blr`. That leaves 17 to 20% of the ranges and 28 to 34% of the instructions for
-  capstone across the corpus, and the median `functions` run goes from 0.905 s to 0.458 s
-  with peak memory unchanged; `xrefs` on a function name takes the same path. Pool loads
-  are read with `_word_load` and `_word_add_pp`, the decoders `xrefs` gained in #27, so
-  there is one reading of a pool access rather than two; both agree with capstone's own
-  text on every one of the 7,755,621 instructions in the corpus, and a test holds that
-  on the fixtures. The graph was compared field by field, list order included, against
-  the full decode on sixteen arm64 binaries from Dart 2.19.6 to 3.12.2, with virtual
-  sites on and off and with no snapshot names, and every one matches. It is exact because
-  capstone decodes every word of every range on all of them, so the words read here are
-  the words it would have printed. That premise is about real code. On crafted input it
-  can fail: capstone stops at the first word it cannot decode and drops everything after
-  it without saying so, while the word reader carries on, so a `bl` placed after a junk
-  word now appears in the graph where it used to vanish. A range that still goes to
-  capstone keeps the old stopping point. The silent stop itself predates this and is
-  filed as #29. An arm32 image keeps the full sweep; the report said
-  arm32 raises instead, but capstone's arm backend decodes it, and its graph is unchanged.
-  The benchmark baseline was retaken with this, and it is also the first to record #27:
-  `xrefs` on a string went from 0.666 s to 0.158 s there. Closes #17.
-
-- **A container is read in place, and nothing is written to disk.** Pointing any command
-  at an APK or IPA used to copy the snapshot member into a `jadart-` temp directory, read
-  the copy back, and remove the directory from an `atexit` hook. Since Android Gradle
-  Plugin 3.6 a release APK stores native libraries uncompressed so the loader can map them,
-  so `libapp.so` now comes straight out of the central directory: 1 ms for 4.2 MB, and a
-  container that does deflate its libraries still works because zipfile inflates into
-  memory just the same. Three things follow. A killed process leaves nothing behind, where
-  before every SIGKILL leaked a full copy of someone's app into the temp directory, because
-  `atexit` does not run; there was a fortnight old orphan in the temp directory here when
-  this was written. No command asks for a temp file at all now, so nothing depends on
-  finding a writable one. And `verify` reads the member once rather than twice, because the
-  bytes are read once and handed to both readers instead of each opening the file for
-  itself. The process wide cache that stopped one APK being unpacked three times is gone
-  with the unpacking: a second call re-reads the member for about a millisecond, against
-  the seventy the parse behind it takes, and holds no state between calls in exchange.
-  `jadart.source` holds the new reader; `export.resolve_input` and `export.resolve_cached`
-  are gone, both implementation under `jadart.*`. Closes #18.
-- **A container member is inflated under a bound, not after one.** The size a zip declares
-  for a member was checked before reading it, and then `ZipExtFile.read()` with no
-  argument asked zlib for up to a gigabyte before truncating the result to that declared
-  size, so the check was consulted only after the memory had been spent. A 199 KB archive
-  declaring a four byte member and holding a 200 MB deflate stream reached 422 MB of
-  resident memory. The member is now read a megabyte at a time and never past the size it
-  declared, so the same archive reaches 22 MB and fails on its own bad CRC, which is the
-  right answer for an archive that lies about a member. A test measures the peak against a
-  control container of the same shape holding nothing, and fails on the unbounded read.
-- **`--json` reports the file it actually read.** `jadart -j info app.apk` used to put the
-  temp path in `"file"`, which named a directory that no longer existed by the time the
-  caller read the document. It now names the container and the member it picked, as
-  `app.apk!lib/arm64-v8a/libapp.so`. A binary named directly, or found inside a directory
-  the user named, still reports its own path, so the field stays openable wherever a file
-  exists to open. A path that does not exist now says "no such file or directory" from
-  every entry point; the CLI and the library used to answer that with two different
-  sentences.
+- **Four places the decompiler stated something it had not established.**
+  - Gate G4 could not fail: it passed whenever the alloc pass recorded any length, and
+    nothing compared those lengths with what the fill pass read. It compares them one by
+    one now, and a single altered length fails it.
+  - A selector name was accepted on a tied vote, which `Counter.most_common` breaks by
+    insertion order, so 46 of 246 accepted names on the clean fixture were a coin flip
+    printed as a method name. A tie is a rejection now: 168 names where there were 209,
+    and 28.7% of dispatch sites named where it was 40.2%. The rest print as `sel_0x<off>`.
+  - A compare with a shifted operand dropped the shift, so `cmp w5, w16, lsl #1` read as
+    `w5 != w16`, on 134 sites. It prints the shift, and a shift outside 0 to 63 prints a
+    `?`.
+  - A branch out of the function had no successor, so the body stopped there or ran into
+    an unrelated block, and a conditional one inverted its condition. Both render
+    `goto sub_0x...` now, in 967 of the 970 functions that had one.
+- **A crafted file raises a `JadartError`, never a builtin exception.** It could reach a
+  caller as `struct.error`, `KeyError`, `ValueError`, `OverflowError`, `RecursionError`,
+  `BadZipFile` or `FileExistsError`, none of which the documented except clause names. The
+  varint reader stops at ten groups, the widest the format encodes, where a 1.28 MB run
+  took 57 s and now fails in 0.1 ms. `NOTICES.Z` is inflated under a 64 MB ceiling, where
+  a 400 KB member reached 1.68 GB. `AssetManifest.bin` nesting stops at 64 levels. A zip
+  failure is a `ContainerError`, and a missing symbol is the new `MissingSymbol`, a
+  `ContainerError`, so absence is told apart from corruption. `ContainerError` and
+  `InputError` moved to `jadart.errors` and are still importable from where they were.
+  In 1,500 runs over 500 corrupted binaries through `header`, `program` and `verify`, no
+  untyped exception escapes.
+- **A fully stripped `.so` parses.** An ELF with no section headers failed with
+  `list index out of range` before the magic scan meant for it could run. It is read
+  through its `PT_LOAD` program headers now, which is what the loader uses.
+- **`export` keeps every path inside the output directory on Windows too.** Library urls
+  were split on `/` only, so `package:foo\..\..\evil` kept its `..` inside one component
+  and escaped once Windows read the backslash. They split on both now, lose trailing dots
+  and spaces, replace the characters Windows forbids and rename its reserved device names.
+- **Output is UTF-8 whatever the console.** Text files are written as UTF-8 with `\n` line
+  ends, and stdout is reconfigured the same way, where a cp1252 console stopped an
+  `export` partway through and a recovered string could crash a print.
 
 ## 1.1.0 - 2026-09-06
 

@@ -5,8 +5,8 @@ type: software
 authors:
   - alias: ir0nbyte
 repository-code: "https://github.com/IR0NBYTE/Jadart"
-version: 1.1.0
-date-released: "2026-09-06"
+version: 1.2.0
+date-released: "2026-10-03"
 abstract: >-
   Jadart recovers the class tree, method bodies as pseudo-Dart, the string pool,
   embedded const data and virtual-call names from a stripped Flutter AOT snapshot

@@ -84,7 +84,7 @@ from .source import open_source as _resolve
 #: `--json`, and the names in `__all__`. Everything under `jadart.*` is implementation.
 #: A new format epoch is a minor release: it only ever adds binaries that parse.
 #: ../../CHANGELOG.md is the record, and a test pins the two together.
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __all__ = [
     "header", "program", "verify", "export", "decompile", "strings", "selectors",
