@@ -320,6 +320,15 @@ def _capstone_available():
         return False
 
 
+def _needs_capstone():
+    """Skip the calling test, by name, when capstone is not installed. CI runs the suite
+    with no capstone, and every test that decodes an instruction has to skip there, not
+    fail. The two-line form the older tests use does not fit the longer names in 90
+    columns."""
+    if not _capstone_available():
+        _skip(f"  SKIP {sys._getframe(1).f_code.co_name} (no capstone)")
+
+
 def test_tier1_disassembles_benchwithdraw():
     if not _capstone_available():
         _skip("  SKIP test_tier1_disassembles_benchwithdraw (no capstone)")
@@ -1334,6 +1343,7 @@ def test_a_container_asks_for_no_temp_file_and_answers_the_same_as_the_binary():
     # them. Every command then has to answer exactly what it answers for the binary on its
     # own, byte for byte. The member is STORED, which is how a real release apk carries a
     # .so and the reason it can be read in place at all.
+    _needs_capstone()
     import subprocess
     import tempfile
     import zipfile
@@ -2061,6 +2071,7 @@ def test_xrefs_explicit_pool_kind():
 
 
 def test_xrefs_explicit_function_kind():
+    _needs_capstone()
     import json
     import io
     import contextlib
@@ -2085,6 +2096,7 @@ def test_xrefs_explicit_function_kind():
 
 
 def test_xrefs_legacy_function_kind(xrefs_cli, capsys):
+    _needs_capstone()
     import json
     import io
     import contextlib
@@ -2111,6 +2123,7 @@ def test_xrefs_legacy_function_kind(xrefs_cli, capsys):
 
 
 def test_xrefs_ambiguous_pattern_requires_explicit_kind():
+    _needs_capstone()
     import json
     import io
     import contextlib
@@ -6172,6 +6185,7 @@ def test_export_takes_every_input_the_other_commands_take():
     # for the same reason, because it is only reached when the asset count is zero. A bare
     # .so was never affected, since the CLI passes no container for one at all, and it is
     # here to keep it that way.
+    _needs_capstone()
     import subprocess
     import tempfile
     import zipfile
@@ -6240,6 +6254,7 @@ def test_the_call_graph_read_off_words_is_the_one_the_full_decode_builds():
     # the same one, so every field of the index, in order, is compared against the full
     # sweep it replaced, with and without virtual sites. Making A64Words return nothing
     # is how the full sweep is asked for: it is the path any non-arm64 image takes.
+    _needs_capstone()
     from jadart import callgraph
     from jadart.disasm import load_instructions
     for path in (CLEAN, OBF):
@@ -6268,6 +6283,7 @@ def test_capstone_decodes_every_word_the_word_reader_reads():
     # every range: were it to stop early, a `bl` after that point would be in the words and
     # missing from the old graph. And _word_load and _word_add_pp say exactly what the
     # decoded path reads out of capstone's text, for every instruction, in both directions.
+    _needs_capstone()
     import struct
     from jadart.disasm import (load_instructions, disassemble_range, MAX_INSNS, _word_load,
                                _word_add_pp, _mem_base_disp, _add_imm_from_pp)
@@ -6381,6 +6397,7 @@ def test_printed_address_is_the_virtual_address_not_a_text_offset():
     that section also holds the VM instructions image in front of the isolate one, so the
     label named code 0x16a80 earlier on the clean fixture, inside a different function.
     Pasting it into IDA, Ghidra, radare2 or Frida landed in the wrong place."""
+    _needs_capstone()
     import io
     import contextlib
     from jadart import cli
@@ -6433,6 +6450,7 @@ def test_a_printed_address_reads_back_as_the_thing_it_named():
     `FormatException.` and pasting it back returned `sub_0x13ee74`, a different function,
     with nothing saying so. That is the defect this whole change exists to remove, so the
     address reading wins inside the image and the prefixes keep meaning the pc_offset."""
+    _needs_capstone()
     import io
     import contextlib
     import re as _re
@@ -6514,6 +6532,7 @@ def test_info_does_not_import_the_disassembler():
 def test_json_carries_va_beside_every_pc_offset():
     """Anything with a `pc_offset` also has the `va` for it, so a caller never has to know
     about the anchor to get an address."""
+    _needs_capstone()
     import io
     import json as _json
     import contextlib
