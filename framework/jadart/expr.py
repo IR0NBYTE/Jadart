@@ -2894,7 +2894,7 @@ def entry_arity(ann: list):
     Still never over-counts: float arguments in V registers are simply not seen.
     """
     stripped = strip_boilerplate(ann)
-    blocks, entry = build_cfg(stripped)
+    blocks, entry = build_cfg(stripped, traps=())        # as _lift_function, see there
     if not blocks or entry not in blocks:
         return 0
     for b in blocks.values():
@@ -3166,7 +3166,12 @@ def use_target(tgt: Target):
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None) -> list:
     stripped = strip_boilerplate(ann)
-    blocks, entry = build_cfg(stripped)
+    # No traps: tier 3 keeps the edge past a `brk` that tier 2 dropped in #57. Ending the
+    # block there takes away a join that, by accident, kept a frame slot from reading as
+    # the field it was loaded from, and `forEach`'s concurrent modification guard then
+    # prints as `this.field_0xc != this.field_0xc`. Naming frame slots across a call is
+    # what fixes that, and it is its own change (#64).
+    blocks, entry = build_cfg(stripped, traps=())
     if not blocks:
         return []
     stmts = structure(blocks, entry)
