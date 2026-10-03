@@ -4764,6 +4764,20 @@ def test_fencecheck_reports_fences_that_do_not_pair_up(tmp_path, capsys):
     assert main([]) == 2                 # nothing to check is a failure, not a pass
 
 
+def test_fencecheck_reads_a_heading_after_a_quote_in_a_list():
+    """A quote marker after a list marker, `- > # x`, still makes the line a heading,
+    which holds what the HTML above it left open. _HEADING skipped quote markers only
+    before a list marker, so it passed (#48)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from fencecheck import check
+    for line in ("- > # x", "1. > # x", "- > - > # x", "- >> ===", "+ > ---"):
+        found = check(f"<br> x\n{line}\n")
+        assert [(n, k) for n, k, _m in found] == [(2, "unsupported")], (line, found)
+        assert "heading" in found[0][2], (line, found)
+    assert check("<br> x\n- # x\n") != []                  # as before
+    assert check("<br> x\n\n- > x\n") == []                # not a heading
+
+
 def test_fencecheck_runs_in_linear_time_on_container_markers():
     """check.sh runs the check on every Markdown file, so no line may make it slow. Two
     alternatives of the container pattern once matched the same spaces, and a 114-byte
@@ -4781,6 +4795,8 @@ def test_fencecheck_runs_in_linear_time_on_container_markers():
     check("<br>\n" + "- " * 20000 + "x\n")          # list markers against an underline
     check("- " * 20000 + "<br>\n")
     check("<br>\n" + "1. - " * 10000 + "x\n")
+    check("<br>\n" + "- > " * 10000 + "x\n")       # quote markers after list markers
+    check("<br>\n" + "1. >> " * 10000 + "-" * 10000 + "\n")
     assert time.perf_counter() - start < 1.0
 
 
@@ -4822,6 +4838,8 @@ def test_fencecheck_tracked_includes_a_doc_not_yet_added(tmp_path, monkeypatch):
     (repo / ".gitignore").write_text("ignored.md\n")
     (repo / "ignored.md").write_text("```\n")
     (repo / "gone.md").write_text("x\n")
+    (repo / "Guide.MD").write_text("x\n")          # GitHub renders both of these (#48)
+    (repo / "notes.markdown").write_text("x\n")
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     subprocess.run(["git", "-C", str(repo), "add", "gone.md"], check=True)
     (repo / "gone.md").unlink()          # deleted, not staged: not reported as missing
@@ -4832,6 +4850,7 @@ def test_fencecheck_tracked_includes_a_doc_not_yet_added(tmp_path, monkeypatch):
     listed = {os.path.basename(p) for p in copy.tracked()}
     assert "new.md" in listed and "ignored.md" not in listed, listed
     assert "gone.md" not in listed, listed
+    assert {"Guide.MD", "notes.markdown"} <= listed, listed
 
 
 def test_fencecheck_tracked_refuses_a_copy_inside_another_repository(tmp_path,
