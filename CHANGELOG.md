@@ -13,6 +13,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The fence check reads `.MD` and `.markdown` files, and a heading after a quote in a
+  list.** `--tracked` asked git for `*.md`, which it matches case sensitively, so
+  `Guide.MD` and `notes.markdown`, which GitHub renders, were never checked; it asks for
+  both extensions in any case now. And a quote marker after a list marker (`- > # x`)
+  under HTML was not read as the heading line it is, which holds what the HTML above it
+  left open; it is refused now, as `- # x` was. The docs in the repository still pass.
+  #48 keeps the two cases left: HTML later in a line that does not open with `<`, and a
+  top-level table, div or p left open to the end of the file. Part of #48.
 - **A signature library survives a crafted reference, and its lines are read to a bound.**
   `save()` wrote each name raw after a tab, so a name holding a line break split its entry
   and `load()` refused the library it had just written, and a name ending in `\r` came

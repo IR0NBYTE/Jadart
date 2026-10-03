@@ -76,8 +76,9 @@ other line, in a paragraph, a heading, a list item or a quote, is not. The docs 
 keep to the dialect.
 
     python3 tools/fencecheck.py FILE.md ...     # 0 problems is the contract
-    python3 tools/fencecheck.py --tracked       # every `.md` file git tracks or
-                                                # would, once added
+    python3 tools/fencecheck.py --tracked       # every `.md` or `.markdown` file, in
+                                                # any case, git tracks or would once
+                                                # added
 """
 from __future__ import annotations
 
@@ -111,14 +112,16 @@ _NESTED = re.compile(r"^" + _MARKER + r"+(`{3,}|~{3,})(.*)$")
 _HTML = re.compile(r"^" + _MARKER + r"*<")
 
 #: A line CommonMark can read as a heading, after an indent and quote markers and then
-#: `-`, `+` or ordered list markers (a `*` bullet or a footnote label is refused as
-#: Markdown syntax anyway): an ATX `#` line, a heading of what it holds, or a setext
-#: underline of `=` or `-`, which makes the paragraph above it one. Either heading holds
-#: any block its HTML leaves open and, its closer lost inside that block, can wrap
-#: everything after it. An underline has no inner spaces (`- - -` is a thematic break),
-#: and none of its dashes can be taken for a list marker as well, so a line of them
-#: costs time linear in its length.
-_HEADING = re.compile(r"[ \t>]*(?:(?:[-+]|\d+[.)])[ \t]+)*(?:#|=+[ \t]*$|-+[ \t]*$)")
+#: `-`, `+` or ordered list markers, each of them followed by quote markers or not
+#: (`- > # x`, #48); a `*` bullet or a footnote label is refused as Markdown syntax
+#: anyway. That is an ATX `#` line, a heading of what it holds, or a setext underline of
+#: `=` or `-`, which makes the paragraph above it one. Either heading holds any block its
+#: HTML leaves open and, its closer lost inside that block, can wrap everything after it.
+#: An underline has no inner spaces (`- - -` is a thematic break), and none of its dashes
+#: can be taken for a list marker as well, so a line of them costs time linear in its
+#: length.
+_HEADING = re.compile(r"[ \t>]*(?:(?:[-+]|\d+[.)])[ \t]+(?:>[ \t]*)*)*"
+                      r"(?:#|=+[ \t]*$|-+[ \t]*$)")
 
 #: The HTML tags and attributes an HTML block in the docs may use: the ones they use today
 #: (h1, img, table, tr, th, td, code; align, src, alt, width), block tags like them and
@@ -470,8 +473,10 @@ def tracked() -> list:
     if top is None or not os.path.samefile(top.strip(), ROOT):
         raise SystemExit("fencecheck: not a git checkout of this repository; "
                          "name the Markdown files")
+    # Either extension, in any case: GitHub renders `Guide.MD` and `notes.markdown` as
+    # Markdown, and `*.md` alone, which git matches case sensitively, missed both (#48).
     listed = git("ls-files", "-z", "--cached", "--others", "--exclude-standard",
-                 "--", "*.md") or ""
+                 "--", ":(icase)*.md", ":(icase)*.markdown") or ""
     paths = (os.path.join(ROOT, p) for p in listed.split("\0") if p)
     return [p for p in paths if os.path.lexists(p)]      # not one deleted but not staged
 
