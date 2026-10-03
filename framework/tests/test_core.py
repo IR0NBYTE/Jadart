@@ -7507,6 +7507,23 @@ def test_code_after_a_trap_is_still_shown():
     assert not any(ln.startswith("goto") for ln in body), body
 
 
+def test_a_goto_out_of_the_function_leaves_the_labels_after_it():
+    """`render` printed `goto sub_0x..` for a branch out of the function by rebinding the
+    name of its own label printer, so every `L_0x..:` after it in the same body printed
+    nothing while the goto naming it stayed: 17 gotos to a missing label in the clean
+    fixture's `export -t 2` (#66)."""
+    from jadart.cfg import build_cfg, render
+    from jadart.disasm import Printer
+    blocks, _ = build_cfg([(0, "b", "#0x100", ""), (4, "mov", "x0, #1", ""),
+                           (8, "ret", "", "")])
+    stmts = [("goto", 4), ("exit", 0x100), ("label", 4), ("asm", 4)]
+    for show in (Printer(_word_image([0xD503201F] * 3, "arm64", 0x1000)), None):
+        body = [ln.strip() for ln in render(blocks, stmts, show=show)]
+        assert body[:2] == ["goto L_0x4;", "goto sub_0x100;" if show is None
+                            else "goto sub_0x1100;"], body
+        assert body[2:] == ["L_0x4:", "mov x0, #1", "return;"], body
+
+
 def test_a_range_with_no_name_is_labelled_by_its_address_and_read_back():
     """`sub_0x<n>` carries the address the rest of the output prints for the range, and
     the label, or the number in it, reaches that range.

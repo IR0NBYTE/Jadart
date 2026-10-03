@@ -781,7 +781,10 @@ def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None, *, show)
             elif s[1] < 0:
                 out.append(f"{pad}goto <unresolved>;")
             else:
-                label = getattr(show, "label", None)
-                name = label(s[1]) if label is not None else f"sub_0x{s[1]:x}"
+                # Not `label`: that is the function above, and rebinding it here made
+                # every later `L_0x..:` in this body print nothing while its goto stayed
+                # (#66).
+                sub = getattr(show, "label", None)
+                name = sub(s[1]) if sub is not None else f"sub_0x{s[1]:x}"
                 out.append(f"{pad}goto {name};")
     return out
