@@ -13,6 +13,12 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Tier 2 prints every label a goto names again.** Since 1.2.0 a branch out of the
+  function printed `goto sub_0x...` by rebinding the name of `render`'s own label printer,
+  so every `L_0x...:` after it in the same body printed nothing while the goto naming it
+  stayed: 17 such gotos in the clean fixture's `export -t 2` and 4 on arm32-2.19.6, none
+  now. On top of the trap fix below, which already removed one of the 17, the only lines
+  that change are the 16 and the 4 labels put back. Closes #66.
 - **Tier 2 stops at a trap.** `build_cfg` ended a block only at a branch or a return, so a
   `brk` (arm64) or `bkpt` (arm32) inside a range had an edge to the instruction after it,
   and tier 2 printed the code there as what runs next: 939 `brk` on the clean fixture and
