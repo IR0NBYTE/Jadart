@@ -13,6 +13,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A conditional branch at the 4,000-instruction cut keeps its taken edge.** When the
+  last instruction decoded was a conditional branch whose target lay past the cut,
+  `build_cfg` recorded the target neither as a successor nor as the block's exit, so tier
+  2 printed an `if` with both arms empty, as if the branch went nowhere. It is the block's
+  exit now, and prints as `if (cond) { goto sub_0x...; }`. One range is cut this way in
+  the corpus: dart:core's top-level `_createTables` on arm32-3.6.2, 23,680 bytes, which
+  `export` does not render, so no export changes. `tools/cfgcheck.py` reported it as the
+  one edge violation of that build; it now also checks every branch target capstone reads
+  against the graph, which flags that range and nothing else on main's graph across both
+  fixtures and the 13 arm32 builds, and 0 now. Closes #58.
 - **Tier 2 prints every label a goto names again.** Since 1.2.0 a branch out of the
   function printed `goto sub_0x...` by rebinding the name of `render`'s own label printer,
   so every `L_0x...:` after it in the same body printed nothing while the goto naming it

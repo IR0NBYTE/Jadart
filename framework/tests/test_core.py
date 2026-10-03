@@ -7524,6 +7524,50 @@ def test_a_goto_out_of_the_function_leaves_the_labels_after_it():
         assert body[2:] == ["L_0x4:", "mov x0, #1", "return;"], body
 
 
+def test_a_conditional_at_the_cut_keeps_its_taken_edge():
+    """A conditional branch that is the last instruction decoded, with its target past
+    the cut, was recorded neither as a successor nor as an exit: tier 2 printed an `if`
+    with both arms empty, which says the branch goes nowhere. One range of arm32-3.6.2
+    ends this way at the MAX_INSNS cut (#58). The target is the block's exit now, and
+    cfgcheck checks every branch target capstone reads against the graph."""
+    _needs_capstone()
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import copy
+    import cfgcheck
+    from jadart.branches import exits, row_kinds
+    from jadart.cfg import build_cfg, render, structure
+    from jadart.disasm import Printer, annotate, disassemble_range
+    # cmp #0; b.gt/bgt 0x14; three movs; return. Decoded only as far as the branch.
+    for arch, words, cond in (
+            ("arm64", [0xF100007F, 0x5400008C, 0xD2800020, 0xD2800040, 0xD2800060,
+                       0xD65F03C0], "if (x3 > 0) {"),
+            ("arm", [0xE3530000, 0xCA000002, 0xE3A00001, 0xE3A00002, 0xE3A00003,
+                     0xE12FFF1E], "if (r3 > 0) {")):
+        image = _word_image(words, arch, 0x1000)
+        cr = image.all_ranges[0]
+        dis = disassemble_range(image, cr, max_insns=2)
+        assert [r[0] for r in dis] == [0, 4], (arch, dis)
+        ann = annotate(dis, {}, None, kinds=row_kinds(image, dis))
+        blocks, entry = build_cfg(ann, exits=exits(image, dis))
+        assert blocks[0].succ == [] and blocks[0].exit_target == 0x14, (arch, blocks[0])
+        stmts = structure(blocks, entry)
+        body = [ln.strip() for ln in render(blocks, stmts, show=Printer(image))]
+        assert body[-3:] == [cond, "goto sub_0x1014;", "}"], (arch, body)
+        assert cfgcheck.check_function(blocks, stmts)[0] == [], arch
+        assert cfgcheck.exit_violations(image, cr, blocks) == [], arch
+        lost = copy.deepcopy(blocks)
+        lost[0].exit_target = -1
+        assert cfgcheck.exit_violations(image, cr, lost) == [(4, "exit not recorded")]
+        # decoded whole, the target is in the code, and a graph without it is caught too
+        dis = disassemble_range(image, cr)
+        ann = annotate(dis, {}, None, kinds=row_kinds(image, dis))
+        blocks, _ = build_cfg(ann, exits=exits(image, dis))
+        assert 0x14 in blocks[0].succ, (arch, blocks[0])
+        assert cfgcheck.exit_violations(image, cr, blocks) == [], arch
+        blocks[0].succ.remove(0x14)
+        assert cfgcheck.exit_violations(image, cr, blocks) == [(4, "taken edge missing")]
+
+
 def test_a_range_with_no_name_is_labelled_by_its_address_and_read_back():
     """`sub_0x<n>` carries the address the rest of the output prints for the range, and
     the label, or the number in it, reaches that range.
