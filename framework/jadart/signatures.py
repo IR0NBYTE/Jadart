@@ -231,7 +231,11 @@ _GENERATED = ("dyn:",)
 
 
 def is_signable(name: str) -> bool:
-    return not name.startswith(_GENERATED)
+    # A name holding a line break cannot be written on its line of the library: save()
+    # puts each name raw after a tab, so `\n` split the entry and load() refused the whole
+    # file. Names come from the reference binary, so only a crafted one has such a name,
+    # and leaving that one function unsigned costs nothing (#49).
+    return not name.startswith(_GENERATED) and "\n" not in name and "\r" not in name
 
 
 def base_name(n: str) -> str:
@@ -393,6 +397,11 @@ def save(lib: Library, path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"# {FORMAT}\n")
         for src, dart, n in lib.sources:
+            # The source is a path, shown and never matched on, so a line break in it is
+            # spelled out rather than allowed to end the line, and so is a byte that is
+            # not UTF-8, which raised UnicodeEncodeError, a bug report, from the path.
+            src = src.encode("utf-8", "backslashreplace").decode("utf-8")
+            src = src.replace("\r", "\\r").replace("\n", "\\n")
             f.write(f"# from\t{dart}\t{n}\t{src}\n")
         for tag, table in (("c", lib.by_ctx), ("p", lib.by_pooled), ("b", lib.by_body)):
             for h, nm in sorted(table.items()):
@@ -407,6 +416,10 @@ _ENTRY = re.compile(r"([cpb])\t([0-9a-f]{16})\t(.*)")
 #: A `# from` line. The count is bounded because int() refuses a string of more than
 #: 4300 digits with a ValueError of its own.
 _SOURCE = re.compile(r"# from\t([^\t]*)\t([0-9]{1,18})\t(.*)")
+#: The longest line load() reads. A name or a path is far shorter, and without a bound a
+#: line with no newline after a valid header, `<(printf '# jadart-signatures-1\n'; cat
+#: /dev/zero)` say, was read until memory ran out (#49).
+MAX_LINE = 1 << 20
 
 
 def load(path: str) -> Library:
@@ -436,7 +449,15 @@ def load(path: str) -> Library:
             if head.rstrip(b"\r\n") != header:
                 raise InputError(f"{path}: not a jadart signature file (it starts "
                                  f"{head!r}, not '# {FORMAT}')")
-            for n, raw in enumerate(f, 2):
+            n = 1
+            while True:
+                raw = f.readline(MAX_LINE + 1)
+                if not raw:
+                    break
+                n += 1
+                if len(raw) > MAX_LINE and not raw.endswith(b"\n"):
+                    raise InputError(f"{path}:{n}: a line longer than {MAX_LINE} bytes, "
+                                     f"which no signature library holds")
                 try:
                     line = raw.rstrip(b"\r\n").decode("utf-8")
                 except UnicodeDecodeError:

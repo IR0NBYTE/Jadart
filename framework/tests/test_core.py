@@ -5545,6 +5545,45 @@ def test_signature_load_reads_a_pipe_and_refuses_an_endless_file(tmp_path):
     assert r.stdout.startswith("InputError /dev/zero: not a jadart signature file"), r
 
 
+def test_signature_load_bounds_a_line_after_the_header(tmp_path):
+    """A line after a valid header was read whole, so one with no newline, as in
+    `<(printf '# jadart-signatures-1\\n'; cat /dev/zero)`, was read until memory ran out.
+    Lines are read to a bound and a longer one is refused with its number (#49)."""
+    from jadart.errors import InputError
+    from jadart.signatures import MAX_LINE, load
+    long = tmp_path / "long.sig"
+    long.write_bytes(b"# jadart-signatures-1\nb\t0000000000000007\tok\n"
+                     + b"a" * (4 * MAX_LINE))
+    try:
+        load(str(long))
+    except InputError as e:
+        assert f"{long}:3: a line longer than {MAX_LINE} bytes" in str(e), e
+    else:
+        raise AssertionError("a line four times the bound loaded")
+    fits = tmp_path / "fits.sig"
+    fits.write_bytes(b"# jadart-signatures-1\nb\t0000000000000007\t"
+                     + b"n" * (MAX_LINE - 40) + b"\n")
+    assert len(load(str(fits)).by_body[7]) == MAX_LINE - 40
+
+
+def test_a_line_break_in_a_name_or_source_does_not_break_the_library(tmp_path):
+    """save() writes each name raw after a tab, so a name holding a line break split its
+    entry and load() refused the library it had just written, and a name ending in `\\r`
+    came back without it. Names come from the reference binary, so build() leaves such a
+    function unsigned; a source path, which is only shown, is spelled out (#49)."""
+    from jadart.signatures import Library, is_signable, load, save
+    assert is_signable("plain") and is_signable("a\tb")
+    assert not is_signable("two\nlines") and not is_signable("ends\r")
+    lib = Library(by_body={7: "kept"}, sources=[("ref\n.so", "3.12.2", 1),
+                                                 ("ref\udcff.so", "3.12.2", 1)])
+    path = tmp_path / "lib.sig"
+    save(lib, str(path))
+    back = load(str(path))
+    assert back.by_body == {7: "kept"}, back.by_body
+    assert back.sources == [("ref\\n.so", "3.12.2", 1),
+                            ("ref\\udcff.so", "3.12.2", 1)], back.sources
+
+
 def test_signature_library_is_utf8_whatever_the_locale(tmp_path):
     """save() and load() used the locale's encoding. Under a Latin-1 locale a name with
     a character Latin-1 lacks could not be saved, and a library written under another

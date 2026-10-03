@@ -13,6 +13,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A signature library survives a crafted reference, and its lines are read to a bound.**
+  `save()` wrote each name raw after a tab, so a name holding a line break split its entry
+  and `load()` refused the library it had just written, and a name ending in `\r` came
+  back without it. Names come from the reference binary, so only a crafted one has such a
+  name: `build()` now leaves that function unsigned, and a `# from` source path, which is
+  only shown, has its line breaks spelled out, as well as any byte that is not UTF-8,
+  which raised an untyped error from `save()`. And after a valid header a line with no
+  newline was read whole, so `--sigs <(printf '# jadart-signatures-1\n'; cat /dev/zero)`
+  read until memory ran out; a line longer than 1 MiB is now refused with its path and
+  number, an input error, in 0.15 s for that command. A library built from the clean
+  fixture is byte-identical to before. Closes #49.
 - **`xrefs` says which matching entries no code loads, instead of dropping them.** #22
   listed only the pool entries with a direct load, so `xrefs FILE string e` counted 1,113
   of the 1,444 entries 1.1.0 reported, with nothing said about the 331 left out, and
