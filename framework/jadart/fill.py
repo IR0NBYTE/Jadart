@@ -15,6 +15,9 @@ little-endian bytes per unit for TwoByteString. The hash is computed, not stored
 """
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from . import cids as C
 from .stream import ReadStream
 from .clusters import Cluster
@@ -83,8 +86,57 @@ def printable(s: str) -> str:
         elif (ch < " " or ch == "\x7f" or "\ud800" <= ch <= "\udfff"
               # NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR are not ASCII newlines but
               # several tools still break lines on them, which would undo the point of this.
-              or ch in "  "):
+              or ch in "\u0085\u2028\u2029"):
             out.append(f"\\x{ord(ch):02x}" if ord(ch) < 256 else f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+#: Code points that are not in a C* or Z* category but still render as nothing, so a name
+#: carrying them looks like a different name. Unicode calls most of these
+#: Default_Ignorable_Code_Point; HANGUL FILLER and HALFWIDTH HANGUL FILLER are letters by
+#: category, and BRAILLE PATTERN BLANK is a symbol, which is exactly why they get through
+#: a category test. The variation selectors and the Mongolian range are here for the same
+#: reason. A combining solidus is not blank but stacks onto its neighbour, so it goes too.
+_BLANKS = frozenset(
+    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u3164\u2800\ufeff\uffa0\u0338"
+    + "".join(chr(c) for c in range(0x180B, 0x180F))
+    + "".join(chr(c) for c in range(0x200B, 0x2010))
+    + "".join(chr(c) for c in range(0x2060, 0x2070))
+    + "".join(chr(c) for c in range(0xFE00, 0xFE10))
+    + "".join(chr(c) for c in range(0xFFF0, 0xFFF9))
+)
+#: What visible() escapes that str.isprintable() lets through.
+_ODD = re.compile("[" + re.escape("".join(sorted(_BLANKS))) + "]")
+
+
+def visible(text: str, backslash: bool = True) -> str:
+    """`text` with every character that renders as nothing, or changes how its neighbours
+    render, written as a \\u escape: controls, bidi overrides, zero width and other
+    format characters, line and paragraph separators, unassigned code points, and the
+    blank-rendering letters and symbols in `_BLANKS`. A name holding U+202E shows reversed
+    in a disassembler, and one padded with U+3164 looks like a shorter name, so either can
+    pass for another one.
+
+    It is how a name from the binary reaches output, where printable() is how a string
+    literal does: a name has to read as one token, so it escapes more (#74). A backslash
+    is escaped too, so the result reads back unambiguously, unless `backslash` is False,
+    for text that may already be the output of this function and must not be escaped
+    twice.
+
+    A name that needs none of it, which is every name a compiler wrote, costs an
+    isprintable() and a regex search: isprintable() refuses exactly categories C* and Z*
+    but the space."""
+    if text.isprintable() and not _ODD.search(text) and not (backslash and "\\" in text):
+        return text
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        if (cat[0] == "C" or cat in ("Zl", "Zp") or (cat == "Zs" and ch != " ")
+                or ch in _BLANKS or (backslash and ch == "\\")):
+            out.append("\\\\" if ch == "\\" else
+                       f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}")
         else:
             out.append(ch)
     return "".join(out)

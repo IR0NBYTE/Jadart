@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from .errors import JadartError
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from . import cids as C
@@ -145,6 +146,42 @@ class FillResult:
     # `host_bitmap.Set(host_offset / kCompressedWordSize)`), the same unit a Field's
     # target_offset_ is in, so the two index each other directly.
     class_unboxed: dict = field(default_factory=dict)     # class_id -> unboxed-fields bitmap
+    _names: object = field(default=None, repr=False, compare=False)
+
+    @property
+    def names(self) -> "_Names":
+        """`strings` read as names: each through fill.visible() when it is looked up.
+
+        A function, class, field or library name comes out of the same string clusters as
+        a literal, so a crafted snapshot can put a control character, a line break or a
+        bidi override in one, and every surface that prints names printed it raw (#74).
+        `strings` stays as it was read, for the commands that print literals and escape
+        them with printable(). Rebuilt if `strings` is replaced, so a copy of this result
+        never reads another one's names."""
+        if self._names is None or self._names.strings is not self.strings:
+            self._names = _Names(self.strings)
+        return self._names
+
+
+class _Names(Mapping):
+    """A read-only view of a strings dict, with each value escaped once, on first use."""
+
+    def __init__(self, strings: dict):
+        self.strings = strings
+        self._seen = {}
+
+    def __getitem__(self, ref):
+        out = self._seen.get(ref)
+        if out is None:
+            from .fill import visible
+            out = self._seen[ref] = visible(self.strings[ref])
+        return out
+
+    def __iter__(self):
+        return iter(self.strings)
+
+    def __len__(self):
+        return len(self.strings)
 
 
 def _td_element_size(cid: int, epoch) -> int:

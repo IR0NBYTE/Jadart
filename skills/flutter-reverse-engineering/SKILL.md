@@ -52,6 +52,13 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | `const[47] @0xb9b0{...}` | a const list, shown truncated | guess the rest; run `constants` |
 | `goto L_0x1234` | an edge the structurer could not nest | "a loop" without checking |
 
+A name holding `\u202e`, `\u001b`, `\u200b` or another `\u` escape is a name the binary
+really carries, with a character in it that would reorder, hide or colour the text around
+it if printed: a bidi override, a control, a zero width space. Jadart writes it as the
+escape, and takes it back that way; a backslash in a name prints as `\\`. Quote it as
+written; it says the binary was crafted or tampered with, not that it was decoded wrong.
+On a name ending in `~`, which a `--sigs` library supplied, it says that library was.
+
 Two examples, so the distinction is concrete.
 
 > Body: `var t0 = pool_0xb968.field_0x7(...);`

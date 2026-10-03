@@ -111,7 +111,7 @@ def recover_fields(fr, arch) -> FieldLayout:
     cws = arch.compressed_word_size
     hw = arch.instance_header_words
 
-    S = fr.strings
+    S = fr.names                         # class and field names, as printed (#74)
     by_cid = {}
     cls_super = {}
     for ref, name_ref, cid, super_ref in fr.classes:

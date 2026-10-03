@@ -13,6 +13,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Names from the binary print escaped, and read back that way.** Function, class,
+  field and library names come out of the same strings as literals, so a crafted snapshot
+  can put an escape sequence, a carriage return, a bidi override or a zero width space in
+  one, and so can a hand-written `--sigs` library or the ELF symbol table. Literals were
+  escaped with `printable()`; names reached every text surface raw, so a terminal ran the
+  escape sequence and an agent read the bytes. Every name is now escaped the way `symbols`
+  and `hook` already escaped theirs (`fill.visible`, moved from `interop`), as a `\u`
+  escape, and the escaped spelling is what `decompile`, `xrefs`, `disasm`, `lift`, `hook`
+  and `symbols -f` take back. `-j` carries the escaped names too, and so do the names the
+  Python API returns (`program()`, `selectors()`, `decompile()`); `program().strings`
+  stays the raw literals. `symbols -j` and the hook and symbol scripts keep a name as
+  written, as they did, and escape it where they print it. A name the compiler wrote
+  needs no escape and costs an `isprintable()` and a regex search, and the output of
+  `functions`, `classes`, `libraries`, `selectors`, `strings`, `symbols` and `export -t 2`
+  on both fixtures and arm32-2.19.6 is byte-identical to before. Closes #74.
 - **The fence check reads `.MD` and `.markdown` files, and a heading after a quote in a
   list.** `--tracked` asked git for `*.md`, which it matches case sensitively, so
   `Guide.MD` and `notes.markdown`, which GitHub renders, were never checked; it asks for

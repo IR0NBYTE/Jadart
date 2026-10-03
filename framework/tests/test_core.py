@@ -7247,7 +7247,7 @@ def _disasm_cli(monkeypatch, image, *extra):
     import types
     import contextlib
     from jadart import cli, disasm
-    fr = types.SimpleNamespace(functions=[], strings={}, pool=[], arrays={},
+    fr = types.SimpleNamespace(functions=[], strings={}, names={}, pool=[], arrays={},
                                smi_values={}, codes=[])
     monkeypatch.setattr(disasm, "load_instructions", lambda p: (image, fr, None))
     buf = io.StringIO()
@@ -7351,8 +7351,9 @@ def test_tier2_names_arm32_conditional_calls(monkeypatch, tmp_path):
     image = _word_image(_A32_WORDS, "arm", _A32_ANCHOR)
     image.symbol_names = {0x28: "callee"}              # the target of `blls` at 0x14
     image.code_ranges = {7: image.all_ranges[0]}
-    fr = types.SimpleNamespace(functions=[(7, 1, 3, 0)], strings={1: "run"}, pool=[],
-                               arrays={}, smi_values={}, codes=[], field_meta=None)
+    fr = types.SimpleNamespace(functions=[(7, 1, 3, 0)], strings={1: "run"},
+                               names={1: "run"}, pool=[], arrays={}, smi_values={},
+                               codes=[], field_meta=None)
     box = types.SimpleNamespace(name="Box", ref=3, super_name="Object", members=[])
     prog = types.SimpleNamespace(user_classes=lambda: [box], classes=[box],
                                  libraries=lambda: {"package:app/box.dart": [box]},
@@ -7687,6 +7688,90 @@ def test_a_conditional_at_the_cut_keeps_its_taken_edge():
         assert cfgcheck.exit_violations(image, cr, blocks) == [], arch
         blocks[0].succ.remove(0x14)
         assert cfgcheck.exit_violations(image, cr, blocks) == [(4, "taken edge missing")]
+
+
+def test_a_name_from_the_binary_prints_escaped_and_reads_back(monkeypatch):
+    """Function, class and field names come out of the same strings as literals, so a
+    crafted snapshot can put an escape sequence, a carriage return, a bidi override or a
+    zero width space in one. Literals went through printable(); names reached every
+    surface raw, and a terminal ran the escape sequence (#74). They print escaped now,
+    and the escaped spelling is what a command takes back."""
+    _needs_capstone()
+    import io
+    import importlib
+    import contextlib
+    import unicodedata
+    from jadart import cli, fillwalk
+    program_module = importlib.import_module("jadart.program")
+    real = fillwalk.walk_fill
+
+    def crafted(*a, **k):
+        fr = real(*a, **k)
+        for ref, s in list(fr.strings.items()):
+            if s in ("BenchAccount", "benchWithdraw"):
+                fr.strings[ref] = s + "\x1b[31m\r\u202e\u200b"
+        return fr
+    monkeypatch.setattr(fillwalk, "walk_fill", crafted)
+    monkeypatch.setattr(program_module, "walk_fill", crafted)
+    shown = "\\u001b[31m\\u000d\\u202e\\u200b"
+    for argv, want in ((["functions", CLEAN, "-n", "100000"], "benchWithdraw"),
+                       (["classes", CLEAN], "BenchAccount"),
+                       (["decompile", CLEAN, "BenchAccount" + shown], "benchWithdraw"),
+                       (["xrefs", CLEAN, "function", "benchWithdraw" + shown],
+                        "benchWithdraw"),
+                       (["disasm", CLEAN, "benchWithdraw" + shown], "benchWithdraw"),
+                       # the script holds it in a JavaScript string, backslash doubled
+                       (["hook", CLEAN, "benchWithdraw" + shown], None)):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(argv)
+        text = out.getvalue() + err.getvalue()
+        assert rc == 0, (argv[0], rc, err.getvalue()[:200])
+        raw = {hex(ord(c)) for c in text
+               if unicodedata.category(c)[0] == "C" and c not in "\n\t"}
+        assert not raw, (argv[0], sorted(raw))
+        assert want is None or want + shown in text, (argv[0], want)
+
+
+def test_visible_escapes_what_hides_a_character_and_leaves_a_name_alone():
+    """The escaping names get: controls, format characters such as a bidi override,
+    separators, blank-rendering letters, and a backslash so that the result reads back.
+    A plain name comes back as the same object. `backslash=False` is for text that may
+    already be escaped. `FillResult.names` is `strings` through it, and is rebuilt when
+    `strings` is replaced, so a copy never reads another's cache (#74)."""
+    import copy
+    from jadart.fill import visible
+    from jadart.fillwalk import FillResult
+    plain = "_FluBenchPageState@310063981.build"
+    assert visible(plain) is plain
+    assert visible("a b") == "a b"                       # a space is no escape
+    assert visible("x\x1by") == "x\\u001by"
+    assert visible("x\u202ey\u200bz\u3164") == "x\\u202ey\\u200bz\\u3164"
+    assert visible("a\\b") == "a\\\\b" and visible("a\\b", backslash=False) == "a\\b"
+    assert visible("\U000e0001") == "\\U000e0001"            # a tag character, astral
+    fr = FillResult(strings={1: "ok", 2: "bad\x1b"}, functions=[], fields=[], classes=[],
+                    types={}, codes=[], pool=[], end_pos=0)
+    assert dict(fr.names) == {1: "ok", 2: "bad\\u001b"} and fr.names.get(3, "") == ""
+    other = copy.copy(fr)
+    other.strings = {2: "fine"}
+    assert other.names[2] == "fine" and fr.names[2] == "bad\\u001b"
+
+
+def test_a_signature_library_name_is_escaped_once_where_it_prints(tmp_path):
+    """A `--sigs` library is a file anyone can write, and a name from one prints beside
+    the binary's own names. It loads as written and is escaped where it is printed, like
+    a name from the binary, so it is escaped exactly once: loading escaped it as well,
+    and symbols and hook, which escape what they print, showed it twice (#74)."""
+    from jadart.signatures import MARK, Match, load, merge
+    lib = tmp_path / "lib.sig"
+    lib.write_bytes("# jadart-signatures-1\n"
+                    "b\t0000000000000007\tfoo\x1b[31m\u202e\n"
+                    "b\t0000000000000008\tbar\\x\n".encode())
+    names = load(str(lib)).by_body
+    assert names == {7: "foo\x1b[31m\u202e", 8: "bar\\x"}, names
+    merged, added = merge({}, {pc: Match(nm, "shape", 20) for pc, nm in names.items()})
+    assert added == 2 and merged == {7: "foo\\u001b[31m\\u202e" + MARK,
+                                     8: "bar\\\\x" + MARK}, merged
 
 
 def test_a_range_with_no_name_is_labelled_by_its_address_and_read_back():

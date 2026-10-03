@@ -532,7 +532,10 @@ def cmd_symbols(args) -> int:
 
     rows = syms
     if args.filter:
-        rows = [s for s in rows if args.filter.lower() in s.qualified.lower()]
+        # as written, or as printed: a name is escaped where it is shown (#74)
+        want = args.filter.lower()
+        rows = [s for s in rows if want in s.qualified.lower()
+                or want in interop.visible(s.qualified).lower()]
     if args.named:
         rows = [s for s in rows if s.name]
     shown = rows if args.limit <= 0 else rows[:args.limit]

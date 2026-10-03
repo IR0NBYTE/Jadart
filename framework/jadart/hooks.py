@@ -111,9 +111,16 @@ def select(syms: list, targets: list, all_matches: bool = False):
         else:
             # A private name carries its library key (_State@1234.build); the key is
             # optional in the target, since nobody types it.
+            # And a name is matched as written or as every surface prints it, escaped
+            # (fill.visible, #74), so a name copied out of the output finds its function.
             bare = _PRIVATE_KEY.sub("", t)
-            hit = [s for s in syms if s.name and (t in (s.name, s.qualified) or
-                   bare in (_PRIVATE_KEY.sub("", s.name), _PRIVATE_KEY.sub("", s.qualified)))]
+
+            def spelled(s):
+                names = (s.name, s.qualified)
+                return names + tuple(visible(n) for n in names)
+
+            hit = [s for s in syms if s.name and (t in spelled(s) or
+                   bare in {_PRIVATE_KEY.sub("", n) for n in spelled(s)})]
             if not hit:
                 problems.append(f"no function named {visible(_capped(t))}")
             elif len(hit) > 1 and not all_matches:

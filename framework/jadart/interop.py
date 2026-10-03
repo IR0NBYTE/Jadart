@@ -28,11 +28,11 @@ from __future__ import annotations
 import base64
 import json
 import re
-import unicodedata
 from dataclasses import dataclass
 
 from .disasm import ISOLATE_INSTRUCTIONS
 from .errors import InputError
+from .fill import visible            # hooks imports it from here too
 
 #: Bumped whenever a field of the `symbols` JSON changes meaning or goes away.
 FORMAT_VERSION = 1
@@ -102,7 +102,8 @@ def code_symbols(image, fr, hdr, sigs: str | None = None, notes: list | None = N
     from .program import build_program, static_bit, _FUNCTION_KINDS
     from .signatures import MARK
 
-    names = function_name_by_pc(image, fr)
+    # As written: each is escaped where it is printed, and the original travels in base64.
+    names = function_name_by_pc(image, fr, raw=True)
     snapshot_pcs = set()
     for ref, name_ref, _ow, _kt in fr.functions:
         cr = image.code_ranges.get(ref)
@@ -114,7 +115,7 @@ def code_symbols(image, fr, hdr, sigs: str | None = None, notes: list | None = N
         from .signatures import load, match
         matched = match(image, fr, load(sigs))
 
-    prog = build_program(fr, hdr)
+    prog = build_program(fr, hdr, raw=True)
     by_ref = {k.ref: k for k in prog.classes}
     func = {ref: (ow, kt) for ref, _nr, ow, kt in fr.functions}
     sbit = static_bit(fr)
@@ -265,41 +266,6 @@ def entry_label(sym: CodeSymbol, prefix: str, sep: str = "_") -> str:
     if sym.name:
         return f"{safe_name(sym, prefix)}{sep}entry"
     return f"{prefix}anon_{sym.va:x}{sep}entry"
-
-
-#: Code points that are not in a C* or Z* category but still render as nothing, so a name
-#: carrying them looks like a different name. Unicode calls most of these
-#: Default_Ignorable_Code_Point; HANGUL FILLER and HALFWIDTH HANGUL FILLER are letters by
-#: category, and BRAILLE PATTERN BLANK is a symbol, which is exactly why they get through a
-#: category test. The variation selectors and the Mongolian range are here for the same
-#: reason. A combining solidus is not blank but stacks onto its neighbour, so it goes too.
-_BLANKS = frozenset(
-    "\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u3164\u2800\ufeff\uffa0\u0338"
-    + "".join(chr(c) for c in range(0x180B, 0x180F))
-    + "".join(chr(c) for c in range(0x200B, 0x2010))
-    + "".join(chr(c) for c in range(0x2060, 0x2070))
-    + "".join(chr(c) for c in range(0xFE00, 0xFE10))
-    + "".join(chr(c) for c in range(0xFFF0, 0xFFF9))
-)
-
-
-def visible(text: str) -> str:
-    """`text` with every character that renders as nothing, or changes how its neighbours
-    render, written as a \\u escape: controls, bidi overrides, zero width and other
-    format characters, line and paragraph separators, unassigned code points, and the
-    blank-rendering letters and symbols in `_BLANKS`. A name holding U+202E shows reversed
-    in a disassembler, and one padded with U+3164 looks like a shorter name, so either can
-    pass for another one."""
-    out = []
-    for ch in text:
-        cat = unicodedata.category(ch)
-        if (cat[0] == "C" or cat in ("Zl", "Zp") or (cat == "Zs" and ch != " ")
-                or ch in _BLANKS or ch == "\\"):
-            out.append("\\\\" if ch == "\\" else
-                       f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}")
-        else:
-            out.append(ch)
-    return "".join(out)
 
 
 def _comment(sym: CodeSymbol) -> str:
