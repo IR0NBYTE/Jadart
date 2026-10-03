@@ -260,7 +260,9 @@ to, and refuses rather than reports when a check cannot be understood.
 The gates run on the committed fixtures, alongside a determinism diff across two
 `PYTHONHASHSEED` values and differential oracles that execute the printed pseudo-Dart
 against an emulated CPU and compare it to the real one. `.github/workflows/tests.yml`
-lists the full set; it is disabled, so run them yourself before a release.
+runs the gates, the determinism diff and the suite on every pull request and every push
+to main. The oracles need unicorn, which it does not install, so run those yourself
+before a release.
 
 The full evaluation, including the comparison against `unflutter`, Blutter, Ghidra and
 radare2, is in [EVAL.md](EVAL.md).

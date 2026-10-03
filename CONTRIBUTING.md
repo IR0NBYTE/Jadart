@@ -29,7 +29,8 @@ convenience, but pytest is the only collector that cannot miss a test.
 fixtures, the measured claims, the code fences of every `.md` and `.markdown` file, added
 or not, and the no-capstone install. `./check.sh --full` adds the CFG edge check, the
 determinism diff and the benchmark against `flubench/bench/baseline.json`. Run it before
-you open a pull request: there is no CI doing it for you.
+you open a pull request. CI runs the same checks on it, all but the benchmark, and a
+merge needs them to pass.
 
 A change that is meant to make something faster, or that has to make something slower,
 retakes the baseline with `python3 tools/bench.py --baseline` from `framework/` and says

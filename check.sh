@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Everything that has to hold before a release, run locally.
 #
-# This is what .github/workflows/tests.yml used to run on every push. That workflow is
-# disabled, so these checks live here instead: same checks, run when you decide to.
+# The same checks .github/workflows/tests.yml runs on every pull request and push to
+# main, plus the benchmark, which needs a quiet machine. Run it before you push.
 #
 #   ./check.sh            the fast set, about a minute
 #   ./check.sh --full     adds the CFG edge check, the determinism diff and the benchmark

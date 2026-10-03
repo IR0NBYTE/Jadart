@@ -1,14 +1,21 @@
 name: tests
 
-# Disabled. The workflow is kept because it encodes what a full check actually is:
-# the suite on three Pythons, the acceptance gates on both fixtures, the CFG edge
-# check, a determinism diff across two hash seeds, and an install with no capstone.
-# Run it by hand with `act`, or re-enable it in Settings > Actions, or from the CLI:
-#   gh api -X PUT repos/IR0NBYTE/Jadart/actions/workflows/351488109/enable
-# If you re-enable it, put the four checks back in the branch ruleset too, or
-# nothing is gating merges.
+# What a full check is: the suite on three Pythons, the acceptance gates on both
+# fixtures, the code fences of the docs, the CFG edge check, a determinism diff across
+# two hash seeds, and an install with no capstone. It runs on every pull request and
+# every push to main, and the branch ruleset requires its four jobs before a merge.
+# `./check.sh --full` runs the same locally, plus the benchmark, which needs a quiet
+# machine rather than a shared runner.
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
+
+# A newer push to the same branch makes the run for the older one moot.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -53,6 +60,11 @@ jobs:
             echo "::error::$skipped tests skipped; expected at most 25 on a CI checkout"
             exit 1
           fi
+
+      # One unclosed fence in SKILL.md, which agents read, turned 8 of its 13 headings
+      # into code (#39). The check walks the fences the way CommonMark pairs them.
+      - name: Markdown code fences close
+        run: python framework/tools/fencecheck.py --tracked
 
       # EVAL.md's numbers were hand-maintained and went stale, so they are generated now
       # and checked here. On a checkout without the (gitignored, regenerable) corpus this
