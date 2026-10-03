@@ -64,6 +64,10 @@ def check_function(blocks, stmts):
     """(edge violations, blocks the tree places) for one structured function."""
     from jadart.cfg import _is_cond
     bad, placed = [], []
+    # Nothing follows the last decoded instruction, so an arm of its block that runs off
+    # the end of the body is that block's fallthrough rather than an edge it lacks: the
+    # code there is past the MAX_INSNS cut, or past the end of the range (#58).
+    final = max((ins[0] for b in blocks.values() for ins in b.insns), default=None)
 
     def walk(seq, cont, brk, cont_of_loop):
         i = 0
@@ -84,7 +88,9 @@ def check_function(blocks, stmts):
                     after = _entry(seq[i + 2:], cont, brk, cont_of_loop)
                     claimed = {_entry(then, after, brk, cont_of_loop),
                                _entry(els, after, brk, cont_of_loop)}
-                    if claimed != set(blk.succ):
+                    real = set(blk.succ)
+                    off_end = blk.insns[-1][0] == final and claimed == real | {None}
+                    if claimed != real and not off_end:
                         bad.append((s[1], sorted(x for x in claimed if x is not None),
                                     sorted(blk.succ)))
                     walk(then, after, brk, cont_of_loop)
@@ -166,11 +172,17 @@ def exit_violations(image, cr, blocks):
     writes PC in the middle of a block, one that always leaves (a return, an indirect
     jump, a branch elsewhere) with the next instruction among its block's successors, and
     a conditional return or indirect jump whose block records no exit. A trap counts as
-    an instruction that always leaves."""
+    an instruction that always leaves.
+
+    And where it loses a branch: the target capstone reads has to be one of the block's
+    successors when it lies in the decoded code, and the block's exit when it does not.
+    A conditional at the MAX_INSNS cut with its target past the cut was neither (#58)."""
     where = {}
     for blk in blocks.values():
         for k, ins in enumerate(blk.insns):
             where[ins[0]] = (blk, k == len(blk.insns) - 1)
+    lo = min(where) if where else 0
+    hi = max(where) + 4 if where else 0
     bad = []
     leaves = _pc_writes(image, cr)
     leaves.update({a: (False, None) for a in _traps(image, cr)})
@@ -185,6 +197,10 @@ def exit_violations(image, cr, blocks):
             bad.append((addr, "falls through"))
         elif cond and direct is None and not blk.cexit:
             bad.append((addr, "no exit"))
+        elif direct is not None and lo <= direct < hi and direct not in blk.succ:
+            bad.append((addr, "taken edge missing"))
+        elif direct is not None and not lo <= direct < hi and blk.exit_target != direct:
+            bad.append((addr, "exit not recorded"))
     return bad
 
 

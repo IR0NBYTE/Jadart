@@ -306,10 +306,12 @@ def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
                 blk.succ = []
                 if t is not None and lo <= t < hi:
                     blk.succ.append(t)      # taken
-                elif ft is not None:
+                else:
                     # The taken arm leaves the function. succ would then hold only the
                     # fallthrough, and emit_cond reads succ[0] as the TAKEN arm, so the
                     # rendered `if` ran its body exactly when the branch was NOT taken.
+                    # With no fallthrough either, at the MAX_INSNS cut, the target was
+                    # recorded nowhere and the `if` printed with both arms empty (#58).
                     blk.exit_target = t if t is not None else -1
                 if ft is not None:
                     blk.succ.append(ft)     # fallthrough
