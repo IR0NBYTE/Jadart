@@ -23,7 +23,7 @@ WHAT A DART AOT FUNCTION TABLE HAS THAT A NATIVE ONE DOES NOT:
 CALL EDGES COME IN THREE KINDS and only the first is a plain `bl`:
 
     direct      bl #target                     34,979 sites on the corpus binary
-    indirect    blr xN                          5,370   closures and virtual dispatch
+    indirect    blr xN (blx rN on arm32)        5,370   closures and virtual dispatch
     pool        ldr xN,[x27,#off] -> a Function    349   torn off and called later
 
 The indirect ones are where a Dart image differs most from native code. A virtual call
@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from .branches import row_kinds
+from .branches import indirect_call, row_kinds
 from .errors import JadartError
 
 from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassemble_range,
@@ -61,7 +61,7 @@ class CallIndex:
     """
     callers: dict = field(default_factory=dict)    # target pc -> [caller pc, ...]
     callees: dict = field(default_factory=dict)    # caller pc -> [target pc, ...]
-    indirect: dict = field(default_factory=dict)   # caller pc -> count of blr sites
+    indirect: dict = field(default_factory=dict)   # caller pc -> register call sites
     unresolved: int = 0                            # a call to no range start
 
     # virtual dispatch, resolved through the serialized dispatch table
@@ -70,7 +70,7 @@ class CallIndex:
     may_be_called_by: dict = field(default_factory=dict)   # target pc -> {caller pc}
     sel_targets: dict = field(default_factory=dict)        # sel off -> {target pc}
     virtual_sites: int = 0                         # blr sites attributed to a selector
-    opaque_sites: int = 0                          # blr sites nothing could attribute
+    opaque_sites: int = 0                          # register calls nothing attributed
     undecodable: list = field(default_factory=list)  # pcs of ranges that would not decode
 
 
@@ -239,14 +239,16 @@ def build_index(image, fr=None, virtual: bool = True,
         # quarter of its direct edges (#44). One whose target the word and capstone do
         # not confirm is counted like one to anything that is not a range.
         far, seen = {}, set()
-        for (_addr, mn, op), (kind, t) in zip(dis, row_kinds(image, dis)):
+        for (addr, mn, op), (kind, t) in zip(dis, row_kinds(image, dis)):
             op = op or ""
             if kind in ("call", "ccall"):
                 if t is None:
                     idx.unresolved += 1
                 else:
                     _direct_edge(idx, src, t, starts, seen)
-            elif mn == "blr":
+            elif indirect_call(image, addr):
+                # Off the word: `mn == "blr"` knew only arm64's name, and every function
+                # of every arm32 build read 0 indirect sites, so 0 opaque ones too (#54).
                 idx.indirect[src] = idx.indirect.get(src, 0) + 1
             elif mn in ("ldr", "ldur") and fn_by_pool:
                 md = _mem_base_disp(op)
@@ -269,9 +271,10 @@ def build_index(image, fr=None, virtual: bool = True,
             elif far:
                 far.pop(op.split(",", 1)[0].strip(), None)
 
-    # Every blr the dispatch detector could not attribute is a closure call or a call
-    # through a captured context. Counting them is the difference between "we resolved
-    # the indirect calls" and knowing how many are left.
+    # Every register call the dispatch detector could not attribute is a closure call or
+    # a call through a captured context, and on arm32, where the detector reads only
+    # arm64's `blr` off x21, a virtual call as well. Counting them is the difference
+    # between "we resolved the indirect calls" and knowing how many are left.
     idx.opaque_sites = sum(idx.indirect.values()) - idx.virtual_sites
 
     if want_virtual and idx.sites:

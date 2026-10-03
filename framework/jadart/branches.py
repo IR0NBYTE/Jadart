@@ -84,6 +84,20 @@ def arch_name(image) -> str:
     return a.name if a is not None else "arm64"
 
 
+def indirect_call(image, pc: int) -> bool:
+    """Whether the word at `pc` calls through a register: `blr xN` on arm64, `blx rN` on
+    arm32 under any condition. Read off the word, as row_kinds reads a direct call, so
+    arm32 is not left out by a mnemonic test that knew only arm64's name (#54). Agrees
+    with capstone on every such word of both fixtures and the 13 arm32 corpus builds."""
+    try:
+        w = _U32(image.text, pc)[0]
+    except struct.error:
+        return False
+    if arch_name(image) == "arm":
+        return w & 0x0FFFFFF0 == 0x012FFF30 and w >> 28 != 0xF     # BLX (register), A1
+    return w & 0xFFFFFC1F == 0xD63F0000                               # BLR
+
+
 def _sx(v: int, bits: int) -> int:
     return (v ^ (1 << (bits - 1))) - (1 << (bits - 1))
 

@@ -13,6 +13,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The call graph counts arm32's register calls.** An indirect call site was counted on
+  `mn == "blr"`, arm64's name, so arm32's `blx rN` never counted: `functions -j` gave
+  `"indirect": 0` for every function of all 13 arm32 corpus builds, and the graph's opaque
+  site count was 0, which reads as every indirect call resolved. The call is read off the
+  instruction word now (`branches.indirect_call`), as #44 did for direct calls, and the
+  word test agrees with capstone on every `blr` of both fixtures and every `blx rN` of the
+  13 arm32 builds. arm32-2.19.6's graph holds 6,332 indirect sites in 2,322 ranges, all
+  opaque, since only arm64's dispatch is attributed to a selector; the 200 functions
+  `functions -j` lists there by default carry 308 of them. Both arm64 fixtures are
+  unchanged, at 5,370 indirect sites on the clean one. Closes #54.
 - **A conditional branch at the 4,000-instruction cut keeps its taken edge.** When the
   last instruction decoded was a conditional branch whose target lay past the cut,
   `build_cfg` recorded the target neither as a successor nor as the block's exit, so tier
