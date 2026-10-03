@@ -467,11 +467,12 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
     printing zeros that read as "nothing calls this".
     """
     from .disasm import function_name_by_pc
+    from .fill import visible
     from .signatures import MARK
 
     snapshot_names = {}
     for ref, name_ref, _ow, _kt in fr.functions:
-        nm = fr.strings.get(name_ref, "")
+        nm = fr.names.get(name_ref, "")
         cr = image.code_ranges.get(ref)
         if nm and cr is not None:
             snapshot_names[cr.pc_offset] = nm
@@ -532,7 +533,7 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
         elif nm and pc in symtab:
             origin = "symtab"
         elif pc in matched:
-            nm, origin = matched[pc].name + MARK, "signature"
+            nm, origin = visible(matched[pc].name) + MARK, "signature"   # a name (#74)
         else:
             origin = "snapshot" if nm else "anonymous"
         out.append(Func(pc_offset=pc, size=cr.size, name=nm, origin=origin,

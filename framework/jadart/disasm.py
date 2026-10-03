@@ -444,15 +444,20 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
         # the spelling every surface uses for a range with no name
         return [(sub_label(image, cr.pc_offset), cr)] if cr else []
 
+    # Matched as printed: a name holding a control character is escaped everywhere it
+    # appears (#74), so the escaped spelling is the one that reads back.
+    from .fill import visible
+
     def collect(pred):
         for ref, nr, ow, kt in fr.functions:
-            nm = fr.strings.get(nr)
+            nm = fr.names.get(nr)
             if nm and pred(nm):
                 cr = image.code_ranges.get(ref)
                 if cr and cr.pc_offset not in seen_pc:
                     seen_pc.add(cr.pc_offset)
                     out.append((nm, cr))
         for pc, nm in (image.symbol_names or {}).items():
+            nm = visible(nm)
             if pred(nm) and pc not in seen_pc and pc in by_pc:
                 seen_pc.add(pc)
                 out.append((nm, by_pc[pc]))
@@ -611,15 +616,22 @@ def _parse_addr(text: str, image: "InstrImage | None" = None):
     return n
 
 
-def function_name_by_pc(image: InstrImage, fr) -> dict:
+def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
     """Map each code's start pc_offset -> owning function name, for call-target naming.
     Snapshot names win; ELF .symtab names (image.symbol_names) backfill the gaps. That
     backfill is what recovers real names on dwarf_stack_traces_mode builds, where the
-    snapshot itself no longer carries them."""
+    snapshot itself no longer carries them.
+
+    Both come from the binary, so they are escaped as names (fill.visible, #74) unless
+    `raw` asks for them as written, which only interop does: it escapes each name where
+    it prints it and carries the original in base64."""
+    from .fill import visible
+    S = fr.strings if raw else fr.names
     fname = {}
     for ref, name_ref, owner_ref, kind_tag in fr.functions:
-        fname[ref] = fr.strings.get(name_ref, "")
-    pc_to_name = dict(image.symbol_names or {})
+        fname[ref] = S.get(name_ref, "")
+    pc_to_name = {pc: (nm if raw else visible(nm))
+                  for pc, nm in (image.symbol_names or {}).items()}
     for owner_ref, cr in image.code_ranges.items():
         nm = fname.get(owner_ref)
         if nm:
@@ -672,7 +684,7 @@ def build_pool_map(fr, arch=None) -> dict:
     untagged); a `ldr xN, [x27, #off]` reads pool entry (off - 0x10)//8. Entries keyed
     here by their true byte offset 0x10 + idx*8. Refs to a String or Function get a
     readable label; other object kinds are left unlabelled."""
-    fname = {ref: fr.strings.get(nr, "") for ref, nr, ow, kt in fr.functions}
+    fname = {ref: fr.names.get(nr, "") for ref, nr, ow, kt in fr.functions}
     m = {}
     for idx, (kind, val) in enumerate(fr.pool):
         if kind != "ref":

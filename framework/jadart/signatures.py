@@ -52,6 +52,7 @@ import os
 import re
 import stat
 
+from .fill import visible
 from .disasm import (MAX_INSNS, MissingDisassembler, UnsupportedArch, build_pool_map,
                      disassemble_range, function_name_by_pc, pool_byte_offset,
                      _add_imm_from_pp, _imm_from, _mem_base_disp)
@@ -285,7 +286,9 @@ def build(paths, window: int = WINDOW, min_score: int = MIN_SCORE,
         if progress:
             progress(path)
         image, fr, hdr = load_instructions(_resolve(path))
-        names = function_name_by_pc(image, fr)
+        # As written: the library holds names as the binary has them, and whatever prints
+        # one escapes it there (merge, the call graph), so it is never escaped twice.
+        names = function_name_by_pc(image, fr, raw=True)
         sigs = signatures(image, fr, window, min_score)
         n = 0
         for cr in image.all_ranges:
@@ -366,7 +369,7 @@ def merge(pc_to_name: dict, matches: dict) -> tuple:
     for pc, m in matches.items():
         if pc in merged:
             continue
-        merged[pc] = m.name + MARK
+        merged[pc] = visible(m.name) + MARK     # escaped as a name (#74); kept raw in m
         added += 1
     return merged, added
 
@@ -476,6 +479,9 @@ def load(path: str) -> Library:
                     raise InputError(f"{path}:{n}: not a signature line: it needs a tag "
                                      f"(c, p or b), 16 hex digits and a name, tab "
                                      f"separated (got {line[:40]!r})")
+                # As written. A name is escaped where it is printed (merge, the call
+                # graph, symbols and hook), so a library anyone can write still prints
+                # only escapes (#74).
                 tables[m.group(1)][int(m.group(2), 16)] = m.group(3)
     except OSError as exc:
         raise InputError(f"{path}: cannot read this file: {exc.strerror}") from exc

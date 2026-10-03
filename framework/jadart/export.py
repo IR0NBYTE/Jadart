@@ -146,7 +146,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
 
     image, fr, hdr = load_instructions(path)
     prog = build_program(fr, hdr)
-    S = fr.strings
+    S = fr.names                         # names, as printed (#74)
 
     # Load once. decompile_class re-reads the whole snapshot per class, which is fine for
     # one class and unusable for seventeen hundred.
@@ -266,7 +266,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     with open(os.path.join(outdir, "strings.txt"), "w", **TEXT_OUT) as fh:
         # Escaped, so one recovered string is one line. Literals contain newlines and NULs,
         # and writing them raw makes the dump binary as far as grep is concerned.
-        for s in sorted(set(S.values())):
+        # The literals as read, not the names view `S` is: printable() escapes them.
+        for s in sorted(set(fr.strings.values())):
             fh.write(printable(s) + "\n")
     with open(os.path.join(outdir, "pool.txt"), "w", **TEXT_OUT) as fh:
         for off, entry in sorted(pool_map.items()):
@@ -294,7 +295,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     stats["classes_anonymous"] = anonymous
     stats["classes_total"] = len(prog.classes)
     stats["orphans"] = len(orphans)
-    stats["strings"] = len(set(S.values()))
+    stats["strings"] = len(set(fr.strings.values()))
     stats["selectors"] = len(selectors or {})
 
     from .container import unpack

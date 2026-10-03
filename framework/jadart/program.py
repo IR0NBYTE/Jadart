@@ -155,17 +155,25 @@ def receiver_for(func_ref: int, static_refs: frozenset) -> dict:
     return {} if func_ref in static_refs else {"x1": "this"}
 
 
-def build_program(fr, hdr) -> Program:
+def build_program(fr, hdr, raw: bool = False) -> Program:
     """Resolve a completed fill-walk result into the Program model (names, owners,
-    fields, superclasses). Shared by recover_program and the decompile view."""
-    S = fr.strings
+    fields, superclasses). Shared by recover_program and the decompile view.
+
+    Names and library urls are escaped as names (fill.visible, #74), since they come out
+    of the binary and are printed; `raw` keeps them as written, for interop, which
+    escapes them itself where it prints them."""
+    from .fill import visible
+    S = fr.strings if raw else fr.names
+
+    def url(ref):
+        u = fr.library_urls.get(fr.class_library.get(ref, -1), "")
+        return u if raw else visible(u)
 
     classes = []
     by_ref = {}
     by_cid = {}
     for ref, name_ref, cid, super_ref in fr.classes:
-        k = Klass(ref=ref, name=S.get(name_ref, ""), class_id=cid,
-                  library=fr.library_urls.get(fr.class_library.get(ref, -1), ""))
+        k = Klass(ref=ref, name=S.get(name_ref, ""), class_id=cid, library=url(ref))
         classes.append(k)
         by_ref[ref] = k
         by_cid[cid & 0xFFFFFFFF] = k
@@ -198,7 +206,7 @@ def build_program(fr, hdr) -> Program:
             owner.members.append(Member(name=nm, kind="field", offset=off,
                                         unboxed=bool(fi and fi.unboxed)))
 
-    return Program(epoch_name=hdr.epoch.name, dart=hdr.epoch.dart, strings=S,
+    return Program(epoch_name=hdr.epoch.name, dart=hdr.epoch.dart, strings=fr.strings,
                    classes=classes, num_objects=hdr.num_objects,
                    num_predefined_cids=hdr.epoch.num_predefined_cids)
 
@@ -241,7 +249,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     from .fields import recover_fields
     image, fr, hdr = load_instructions(path)
     prog = build_program(fr, hdr)
-    S = fr.strings
+    S = fr.names                         # names, as printed (#74)
 
     targets = [k for k in prog.user_classes() if k.name == class_name]
     if not targets:
