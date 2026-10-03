@@ -7314,6 +7314,28 @@ def test_callgraph_draws_arm32_conditional_calls():
     assert not {0x38, 0x40, 0x48} & set(idx.callees), idx.callees
 
 
+def test_callgraph_counts_a_register_call_on_either_instruction_set():
+    """An indirect call is what the word says too. The decoded walk counted `mn == "blr"`,
+    arm64's name, so arm32's `blx rN` never counted and every function of every arm32
+    build read 0 indirect sites, and 0 opaque ones: 6,332 on arm32-2.19.6 (#54). A plain
+    branch through a register (`bx lr`, `br x16`) is no call."""
+    _needs_capstone()
+    from jadart.callgraph import build_index
+    for arch, words in (
+            ("arm", [0xE12FFF32,      # blx r2
+                     0x112FFF33,      # blxne r3
+                     0xE12FFF13,      # bx r3, a jump
+                     0xE12FFF1E]),    # bx lr
+            ("arm64", [0xD63F0040,    # blr x2
+                       0xD63F0060,    # blr x3
+                       0xD61F0200,    # br x16, a jump
+                       0xD65F03C0])):  # ret
+        image = _word_image(words, arch, _A32_ANCHOR if arch == "arm" else 0x1000)
+        idx = build_index(image, None, virtual=False)
+        assert idx.indirect == {0: 2}, (arch, idx.indirect)
+        assert idx.opaque_sites == 2, (arch, idx.opaque_sites)
+
+
 def test_the_decompiler_prints_code_addresses_as_virtual_addresses():
     """Tiers 1, 2 and 3 print a call, branch or `adr` target as the virtual address
     `disasm` prints, not capstone's pc_offset (#43).
