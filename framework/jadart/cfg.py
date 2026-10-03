@@ -43,6 +43,14 @@ def _is_cond(mn: str) -> bool:
     return bool(cond_of(mn)) or mn in _COND_TERMS
 
 
+#: Instructions that trap and never continue at the next one: `brk`, `hlt` and `udf` on
+#: arm64, `bkpt`, `udf` and `trap` on arm32 (capstone's name for the UDF word 0xe7ffdefe).
+#: Dart emits `brk #0` (`bkpt #0` on arm32) after a call that does not return, so the
+#: code after one is reached, when at all, by a branch from somewhere else. None of them
+#: takes a condition, so the mnemonic is the whole test.
+TRAPS = frozenset({"brk", "hlt", "udf", "bkpt", "trap"})
+
+
 def _is_term(mn: str) -> bool:
     # `bx` is arm32's return (`bx lr`) and also its indirect branch, which is the same
     # pair of roles arm64 splits between `ret` and `br`.
@@ -221,14 +229,18 @@ def _shifted(parts):
     return None
 
 
-def build_cfg(dis, exits=None) -> tuple[dict, int]:
+def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
     """Return ({addr: Block}, entry_addr) for a function's disasm
     (list of (addr, mn, op, note)).
 
     `exits` is branches.exits for the same rows: on arm32 the instructions that leave the
     function without being a call or a direct branch. Without it only `ret`, `br` and
     `bx` do, and arm32's usual return, `pop {fp, pc}`, ran on into the code after it in a
-    quarter of its functions (#45)."""
+    quarter of its functions (#45).
+
+    `traps` are the mnemonics that end a block with no successor (#57). Tier 3 passes
+    none, and keeps the edge past a trap it has always had, until it can name a frame
+    slot across a call; see `_lift_function`."""
     if not dis:
         return {}, 0
     exits = exits or {}
@@ -236,7 +248,7 @@ def build_cfg(dis, exits=None) -> tuple[dict, int]:
     lo, hi = addrs[0], addrs[-1] + 4
     leaders = {lo}
     for i, (a, mn, op, _n) in enumerate(dis):
-        if _is_term(mn) or a in exits:
+        if _is_term(mn) or mn in traps or a in exits:
             if i + 1 < len(dis):
                 leaders.add(dis[i + 1][0])
             if _is_cond(mn) or mn == "b":
@@ -270,6 +282,11 @@ def build_cfg(dis, exits=None) -> tuple[dict, int]:
             # `bx` covers both of arm32's uses of it: `bx lr` returns and `bx rN` is
             # an indirect branch. Either way the successor is not in this function.
             elif mn in ("ret", "br", "bx"):
+                blk.succ = []
+            elif mn in traps:
+                # A trap ends its block with no successor. Falling through drew an edge
+                # into the code after it, and tier 2 printed that code as running next:
+                # 939 `brk` on the clean fixture sat mid-range (#57).
                 blk.succ = []
             elif mn == "b":
                 t = _target(op)
@@ -646,19 +663,32 @@ def structure(blocks, entry):
     # instructions in it left the output silently, and nothing in the text said so, because
     # the goto named a label no tier ever defined. Sweep up whatever is left, as labelled
     # sections, until nothing is.
+    #
+    # The code after a trap goes in the same way (#57). Nothing runs on past a trap, yet
+    # that code can be a catch entry, which only an exception edge leads to, and the CFG
+    # does not model those. Placing only what the entry reaches dropped 182 instructions
+    # in 12 sections of the clean fixture without a word, 5 of them opening with
+    # `sub x15, x29, #imm`, the stack reset a catch entry starts with. So the walk also
+    # steps from a reached trap to the block after it, which is exactly the code the old
+    # edge out of the trap brought in.
+    #
+    # One walk and one pass in address order places blocks in the same order as taking the
+    # lowest unplaced one again and again, since placing only ever adds to `visited`, and
+    # in linear time: repeating it took 0.88 s on a crafted range of 4,000 `brk`.
     reachable, stack = set(), [entry]
     while stack:
         n = stack.pop()
         if n in reachable or n not in blocks:
             continue
         reachable.add(n)
-        stack.extend(blocks[n].succ)
-    while True:
-        left = sorted(a for a in reachable if a not in visited)
-        if not left:
-            break
-        out.append(("label", left[0]))
-        out.extend(region(left[0], set(), None, None))
+        blk = blocks[n]
+        stack.extend(blk.succ)
+        if blk.term in TRAPS and blk.insns:
+            stack.append(blk.insns[-1][0] + 4)
+    for a in sorted(reachable):
+        if a not in visited:
+            out.append(("label", a))
+            out.extend(region(a, set(), None, None))
     return out
 
 

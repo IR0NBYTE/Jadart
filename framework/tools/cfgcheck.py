@@ -16,14 +16,15 @@ Reported separately:
   edge      a block whose rendered successors are not its real ones
   dropped   a reachable block that reaches no statement
   twice     a block emitted more than once
-  exit      an instruction that leaves the function or always branches elsewhere, which
-            the tier 2 CFG lets control run on past
+  exit      an instruction that leaves the function, always branches elsewhere or
+            traps, which the tier 2 CFG lets control run on past
 
 The first three compare the rendering against the CFG, so they pass a CFG that is wrong
 and rendered faithfully: arm32's `pop {fp, pc}` once had an edge to the code after it in
 a quarter of its functions, and every function read 0 violations (#45). The exit check
 judges the CFG itself, by capstone's own reading of each word (which registers it writes,
-whether it is a call), not by the rules build_cfg uses.
+whether it is a call), not by the rules build_cfg uses. Traps are read off the word's
+encoding, since build_cfg reads them off capstone's mnemonic (#57).
 """
 from __future__ import annotations
 
@@ -139,17 +140,41 @@ def _pc_writes(image, cr):
     return out
 
 
+#: (mask, value) of the words that trap and never continue at the next one, by the
+#: architecture reference rather than by capstone: BRK, HLT and UDF on arm64, BKPT and the
+#: permanently undefined UDF on arm32 (both of which are unconditional, cond 0b1110).
+_TRAP_WORDS = {
+    "arm64": ((0xFFE0001F, 0xD4200000), (0xFFE0001F, 0xD4400000),
+              (0xFFFF0000, 0x00000000)),
+    "arm": ((0xFFF000F0, 0xE1200070), (0xFFF000F0, 0xE7F000F0)),
+}
+
+
+def _traps(image, cr):
+    """The addresses in the range whose word traps, read from the encoding."""
+    import struct
+    from jadart.disasm import MAX_INSNS
+    pats = _TRAP_WORDS.get(image.arch.name, ())
+    end = min(len(image.text), cr.pc_offset + (cr.size or 512),
+              cr.pc_offset + MAX_INSNS * 4)
+    return {a for a in range(cr.pc_offset, end - 3, 4)
+            if any(struct.unpack_from("<I", image.text, a)[0] & m == v for m, v in pats)}
+
+
 def exit_violations(image, cr, blocks):
     """Where the CFG lets control past an instruction that does not allow it: one that
     writes PC in the middle of a block, one that always leaves (a return, an indirect
     jump, a branch elsewhere) with the next instruction among its block's successors, and
-    a conditional return or indirect jump whose block records no exit."""
+    a conditional return or indirect jump whose block records no exit. A trap counts as
+    an instruction that always leaves."""
     where = {}
     for blk in blocks.values():
         for k, ins in enumerate(blk.insns):
             where[ins[0]] = (blk, k == len(blk.insns) - 1)
     bad = []
-    for addr, (cond, direct) in _pc_writes(image, cr).items():
+    leaves = _pc_writes(image, cr)
+    leaves.update({a: (False, None) for a in _traps(image, cr)})
+    for addr, (cond, direct) in leaves.items():
         if addr not in where:
             continue
         blk, last = where[addr]

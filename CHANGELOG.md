@@ -9,6 +9,30 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
+## Unreleased
+
+### Fixed
+
+- **Tier 2 stops at a trap.** `build_cfg` ended a block only at a branch or a return, so a
+  `brk` (arm64) or `bkpt` (arm32) inside a range had an edge to the instruction after it,
+  and tier 2 printed the code there as what runs next: 939 `brk` on the clean fixture and
+  519 `bkpt` on arm32-2.19.6. Dart puts one after a call that does not return, so that
+  code is reached, when at all, by a branch from somewhere else or by an exception. The
+  clean fixture's `export -t 2` printed a `goto` straight after a trap 497 times, and
+  arm32-2.19.6's 155. A trap now ends its block with no successor (`cfg.TRAPS`: `brk`,
+  `hlt`, `udf`, `bkpt`, and capstone's arm32 `trap`). The code after one is still printed,
+  as its own labelled section, because it can be a catch entry, which only an exception
+  edge leads to: placing only what the entry reaches would have dropped 182 instructions
+  in 12 sections of the clean fixture, 5 of them opening with the stack reset a catch
+  entry starts with. On both fixtures and arm32-2.19.6, tier 2 prints every instruction it
+  printed before and no other. `tools/cfgcheck.py` now reads traps off the instruction
+  word, and finds the 939 and the 519 on the old graph and none now. This changes
+  `decompile -t 2` and `export -t 2` on arm64 as well as arm32: 87 files of the clean
+  fixture's export and 47 of arm32-2.19.6's. Tier 3 keeps the old graph and its output is
+  unchanged: with the rule, the concurrent modification guard in `forEach` printed as a
+  field compared with itself, which is a frame slot it cannot yet name across a call
+  (#64). Closes #57.
+
 ## 1.2.0 - 2026-10-03
 
 Upgrading from 1.1.0. The `--json` shape is unchanged and only gains fields, but some

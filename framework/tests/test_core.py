@@ -7457,6 +7457,56 @@ def test_cfgcheck_judges_exits_by_capstone_not_by_build_cfg():
     assert good == 0 and broken == len(_A32_RANGES), (good, broken)
 
 
+def test_a_trap_ends_its_block_and_nothing_runs_on_past_it():
+    """A `brk` or `bkpt` ends its block with no successor.
+
+    build_cfg ended a block only at a branch or a return, so the code after a trap was an
+    edge from it, and tier 2 printed that code as what runs next: 939 `brk` on the clean
+    fixture and 519 `bkpt` on arm32-2.19.6 sat inside a block (#57). cfgcheck reads a
+    trap off its instruction word, not off capstone's mnemonic as build_cfg does, and it
+    has to flag the graph built without the rule."""
+    _needs_capstone()
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import cfgcheck
+    from jadart.branches import exits, row_kinds
+    from jadart.cfg import build_cfg
+    from jadart.disasm import annotate, disassemble_range
+    # mov #1; <trap> #0; mov #2; return
+    for arch, words, trap in (
+            ("arm64", [0xD2800020, 0xD4200000, 0xD2800040, 0xD65F03C0], "brk"),
+            ("arm", [0xE3A00001, 0xE1200070, 0xE3A00002, 0xE12FFF1E], "bkpt"),
+            ("arm", [0xE3A00001, 0xE7FFDEFE, 0xE3A00002, 0xE12FFF1E], "trap")):
+        image = _word_image(words, arch, 0x1000)
+        cr = image.all_ranges[0]
+        dis = disassemble_range(image, cr)
+        blocks = cfgcheck._tier2_cfg(image, dis, {}, None)
+        assert [ins[1] for ins in blocks[0].insns] == ["mov", trap], (arch, blocks[0])
+        assert blocks[0].succ == [] and not any(8 in b.succ for b in blocks.values())
+        assert cfgcheck.exit_violations(image, cr, blocks) == [], arch
+        ann = annotate(dis, {}, None, kinds=row_kinds(image, dis))
+        old = build_cfg(ann, exits=exits(image, dis), traps=())[0]
+        assert cfgcheck.exit_violations(image, cr, old) == [(4, "mid-block")], arch
+
+
+def test_code_after_a_trap_is_still_shown():
+    """The code after a trap is reached by no edge once the trap ends its block, and it
+    can be a catch entry, which only an exception edge leads to. `structure` placed only
+    what the entry reaches, so ending the block dropped 182 instructions in 12 sections of
+    the clean fixture, 5 of them opening with `sub x15, x29, #imm`, a catch entry's stack
+    reset. It goes in as its own labelled section, and nothing leads into it."""
+    from jadart.cfg import build_cfg, render, structure
+    rows = [("cmp", "x1, #0"), ("b.ne", "#0x10"), ("mov", "x0, #7"), ("ret", ""),
+            ("bl", "#0x100"), ("brk", "#0"), ("sub", "x15, x29, #0x10"),
+            ("mov", "x0, #3"), ("ret", "")]
+    blocks, entry = build_cfg([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    assert blocks[0x10].succ == [] and 0x18 in blocks, blocks
+    body = [ln.strip() for ln in render(blocks, structure(blocks, entry), show=None)]
+    i = body.index("brk #0")
+    assert body[i + 1:] == ["}", "L_0x18:", "sub x15, x29, #0x10", "mov x0, #3",
+                            "return;"], body
+    assert not any(ln.startswith("goto") for ln in body), body
+
+
 def test_a_range_with_no_name_is_labelled_by_its_address_and_read_back():
     """`sub_0x<n>` carries the address the rest of the output prints for the range, and
     the label, or the number in it, reaches that range.
