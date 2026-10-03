@@ -143,6 +143,10 @@ jadart xrefs <path> function <name-or-address>
 jadart xrefs <path> string <pattern> --class <Class>
 ```
 
+A matching string that no code loads directly is reported under `"unloaded"` in `-j`, not
+listed with the loads. No direct load is not proof nothing uses it: a closure or a value
+built at runtime can still reach it.
+
 `jadart` takes an APK, an IPA, a directory or a bare `libapp.so` / `App.framework/App`.
 You do not need to unzip anything first.
 

@@ -2122,6 +2122,47 @@ def test_xrefs_legacy_function_kind(xrefs_cli, capsys):
     assert "resolved as function" in capsys.readouterr().err
 
 
+def test_xrefs_says_which_matching_entries_no_code_loads():
+    """A pool entry that matches but that no code loads directly is said, not dropped.
+
+    #22 listed only the entries with a load, so `xrefs FILE string e` counted 1,113 of
+    the 1,444 entries 1.1.0 reported, and `ifAbsent`, which matches 5 entries none of them
+    loaded directly, answered "nothing matching 'ifAbsent' was referenced" and exited 1.
+    No direct load is not no reference: a closure or a value built at runtime can reach
+    the entry (#62). And a miss on an explicit kind no longer says it looked for a
+    function, which only the 1.1.0 form does."""
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    def run(*argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(["xrefs", CLEAN, *argv])
+        return rc, out.getvalue(), err.getvalue()
+
+    rc, out, _ = run("string", "ifAbsent", "-j")
+    doc = json.loads(out)
+    assert rc == 0 and doc["ok"] and doc["count"] == 0 and doc["entries"] == [], doc
+    assert [u["pool_offset"] for u in doc["unloaded"]] == [0x568, 0x5F40, 0x6BA0, 0x6E00,
+                                                           0xA1F0], doc
+    rc, out, _ = run("string", "ifAbsent")
+    assert rc == 0 and "no code loads any of them directly" in out, out
+    assert "// pool_0x568  \"ifAbsent\"" in out, out
+    rc, out, _ = run("string", "e", "-j")
+    doc = json.loads(out)
+    assert (doc["count"], len(doc["unloaded"])) == (1113, 331), (doc["count"],)
+    rc, out, _ = run("string", "e")
+    assert "and 331 matching entries no code loads directly" in out, out[-400:]
+    rc, out, _ = run("pool", "0x568", "-j")
+    doc = json.loads(out)
+    assert rc == 0 and doc["unloaded"] == [{"pool_offset": 0x568, "entry": '"ifAbsent"'}]
+    rc, _out, err = run("string", "zzqqxx")
+    assert rc == 1 and "no ObjectPool entry holds it" in err, err
+    assert "function" not in err, err
+
+
 def test_xrefs_ambiguous_pattern_requires_explicit_kind():
     _needs_capstone()
     import json

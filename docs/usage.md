@@ -209,6 +209,11 @@ $ jadart xrefs libapp.so benchWithdraw
     0x1ee830       428 bytes
 ```
 
+A string or pool entry can match and still have no load in the code that the scan sees,
+when a closure or a value built at runtime reaches it. Those are not listed with the
+others, and not dropped either: the text output ends with how many there are, `-j` lists
+them under `"unloaded"`, and a pattern that matches only such entries says so and exits 0.
+
 ### ffi: where the Dart stops being the answer
 
 Some apps put nothing interesting in Dart at all. BrunnerCTF 2025's "Brod and Co." is one:
