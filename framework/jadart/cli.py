@@ -1125,16 +1125,23 @@ def cmd_xrefs(args) -> int:
     )
 
     if not matches:
+        # Only the 1.1.0 form went on to look for a function; an explicit kind did not.
+        tail = ", and no function goes by that name or address" if legacy else ""
         return _xrefs_miss(
             args,
             needle,
             resolved_kind,
-            f"nothing matching {needle!r}: no ObjectPool entry holds it, "
-            "and no function goes by that name or address",
+            f"nothing matching {needle!r}: no ObjectPool entry holds it{tail}",
             exact=_xrefs_exact(args, resolved_kind, legacy),
         )
 
     refs = pool_xrefs(image, matches)
+    # A matching entry no code loads directly is still in the pool: a closure, or a value
+    # built at runtime, can reach it without a load this scan sees. The listing keeps to
+    # the entries with loads, and these are said, not dropped: on the clean fixture `e`
+    # matches 1,444 entries and 331 of them have no direct load (#62).
+    unloaded = [{"pool_offset": off, "entry": matches[off]}
+                for off in sorted(matches) if not refs.get(off)]
 
     if legacy:
         print(comment(f"// resolved as {resolved_kind}"), file=sys.stderr)
@@ -1154,6 +1161,19 @@ def cmd_xrefs(args) -> int:
             )
 
     entries = _xrefs_entries(matches, refs, image)
+
+    if not entries and unloaded and not class_name:
+        if getattr(args, "json", False):
+            result = {"ok": True, "pattern": needle, "kind": resolved_kind, "count": 0,
+                      "entries": []}
+            if resolved_kind == "string" and not legacy:
+                result["exact"] = exact
+            result["unloaded"] = unloaded
+            return emit(result)
+        print(comment(_xrefs_unloaded_note(len(unloaded), alone=True)))
+        for u in unloaded:
+            print(comment(f"// pool_0x{u['pool_offset']:x}  {u['entry']}"))
+        return EXIT_OK
 
     if not entries:
         if class_name and unattributed:
@@ -1191,6 +1211,8 @@ def cmd_xrefs(args) -> int:
             result["exact"] = exact
         if class_name:
             result["unattributed"] = unattributed
+        if unloaded and not class_name:
+            result["unloaded"] = unloaded
         return emit(result)
 
     for entry in entries:
@@ -1211,8 +1233,22 @@ def cmd_xrefs(args) -> int:
                 "attributed to a class"
             )
         )
+    if unloaded and not class_name:
+        print(comment(_xrefs_unloaded_note(len(unloaded), alone=False)))
 
     return EXIT_OK
+
+
+def _xrefs_unloaded_note(n, alone):
+    """What to say about matching pool entries no code loads directly."""
+    what = "1 matching entry" if n == 1 else f"{n} matching entries"
+    it = "it" if n == 1 else "them"
+    if alone:
+        return (f"// {what} in the ObjectPool, and no code loads "
+                f"{'it' if n == 1 else 'any of them'} directly: a closure or a value "
+                f"built at runtime can still reach {it}")
+    return (f"// and {what} no code loads directly (a closure or a value built at "
+            f"runtime can still reach {it}); -j lists {it} under \"unloaded\"")
 
 
 def cmd_verify(args) -> int:

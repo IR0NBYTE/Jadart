@@ -13,6 +13,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`xrefs` says which matching entries no code loads, instead of dropping them.** #22
+  listed only the pool entries with a direct load, so `xrefs FILE string e` counted 1,113
+  of the 1,444 entries 1.1.0 reported, with nothing said about the 331 left out, and
+  `ifAbsent`, which matches 5 entries none of them loaded directly, answered "nothing
+  matching 'ifAbsent' was referenced" and exited 1. No direct load is not no reference: a
+  closure or a value built at runtime can reach the entry. The listing still keeps to the
+  entries with loads; the text output then says how many matched with none, `-j` lists
+  them under `"unloaded"`, and a pattern or pool offset that matches only such entries
+  lists them, says so and exits 0, as 1.1.0 did; its `-j` is `"ok": true` with
+  `"count": 0`, where 1.2.0 gave `"ok": false`. With `--class` nothing changes, and no
+  `"unloaded"` is reported. A miss on an explicit `string` or `pool` kind no longer says
+  it looked for a function, which only the 1.1.0 form does. Closes #62.
 - **The call graph counts arm32's register calls.** An indirect call site was counted on
   `mn == "blr"`, arm64's name, so arm32's `blx rN` never counted: `functions -j` gave
   `"indirect": 0` for every function of all 13 arm32 corpus builds, and the graph's opaque
