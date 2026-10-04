@@ -89,14 +89,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   rest of the page inside a heading and `* [<b>]` left a bold element open over it. No
   HTML may stand in a line of Markdown now, outside a code span, an autolink or an
   escape. Code spans are read a line at a time, which is how a renderer reads them when
-  no earlier line of the paragraph leaves a run of backticks to pair with a later one, so
-  `<` markup in a code span after such a run is refused, and a table row is read cell by
-  cell too. A top-level table, row, cell, div or p left open to the end of the file held
-  the rest of the page and was not reported. Each now ends with its own end tag, in the
-  order they opened, read with one stack of open elements, which a `<div></div>` in a
-  list cannot pop for one left open at the top. Three code spans in EVAL.md and
-  FINDINGS.md that went on to a second line now fit on one, and the docs pass. Closes
-  #48.
+  no earlier line of the paragraph leaves a run of backticks to pair with a later one and
+  no link's destination or title takes one first, so `<` markup in a code span after
+  either is refused, and a table row is read cell by cell too. YAML front matter is read
+  as Markdown, since markdown-it and cmark render it. A top-level table, row, cell, div
+  or p left open to the end of the file held the rest of the page and was not reported.
+  Each now ends with its own end tag, in the order they opened, read with one stack of
+  open elements, which a `<div></div>` in a list cannot pop for one left open at the
+  top; HTML in a list, a quote or an indent closes none, since `    </div>` there is an
+  indented code block. Three code spans in EVAL.md and FINDINGS.md that went on to a
+  second line now fit on one, the issue template's title says `VERSION` where it said
+  `<version>`, and the docs pass. Closes #48.
 - **A signature library survives a crafted reference, and its lines are read to a bound.**
   `save()` wrote each name raw after a tab, so a name holding a line break split its entry
   and `load()` refused the library it had just written, and a name ending in `\r` came
