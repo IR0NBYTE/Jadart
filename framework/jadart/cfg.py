@@ -94,13 +94,42 @@ class Block:
 _NEG = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<="}
 
 
+def _balanced(text: str) -> bool:
+    depth = 0
+    for ch in text:
+        depth += (ch == "(") - (ch == ")")
+        if depth < 0:
+            return False
+    return depth == 0
+
+
 def negate_cond(cond: str) -> str:
-    """Negate a `lhs OP rhs` condition (then-branch is the fallthrough = branch not taken)."""
-    parts = cond.split(" ")
+    """Negate a condition (then-branch is the fallthrough = branch not taken).
+
+    `a == b && c == d`, the `cmp; cmpeq` arm32 tests a 64-bit value with, negates to
+    `a != b || c != d`. Flipping only the first operator printed `a != b && c == d`, and
+    2,821 of the 2,827 such conditions in arm32-2.19.6's tier 2 read that way (#70). Only
+    an operator outside every parenthesis is the condition's own: the one inside
+    `(x >> 1)` or a call belongs to an operand."""
+    if cond.startswith("!(") and cond.endswith(")") and _balanced(cond[2:-1]):
+        return cond[2:-1]
+    for op, dual in ((" && ", " || "), (" || ", " && ")):
+        if op in cond:
+            sides = cond.split(op)
+            # a quote may hold the `&&` or `||`, in a string literal tier 3 substituted
+            quoted = '"' in cond or "'" in cond
+            if dual in cond or quoted or not all(map(_balanced, sides)):
+                return f"!({cond})"
+            sides = [negate_cond(s) for s in sides]
+            if any(s.startswith("!(") for s in sides):
+                return f"!({cond})"
+            return dual.join(sides)
+    parts, depth = cond.split(" "), 0
     for i, tok in enumerate(parts):
-        if tok in _NEG:
+        if depth == 0 and tok in _NEG:
             parts[i] = _NEG[tok]
             return " ".join(parts)
+        depth += tok.count("(") - tok.count(")")
     return f"!({cond})"
 
 
@@ -138,6 +167,43 @@ _LOGICAL_FLAGS = ("tst", "ands", "bics")
 _Z_N_ONLY = frozenset({"eq", "ne", "mi", "pl"})
 
 
+def _cond_for(ctx, mn, op) -> str:
+    """The condition of a branch, given the instructions before it on its one path.
+
+    _cond_text reads the instruction right before the branch. On arm32 the compare is
+    often a step further back, or is two compares (#70), and these are read here:
+    `vcmp.f64; vmrs APSR_nzcv, fpscr` compares two doubles like `fcmp`, `cmp a, b;
+    cmpeq c, d; beq` is `a == b && c == d` (and `bne` its negation), and `asrs rD, rS,
+    #n` leaves the bit it shifted out in C and the shifted value in N and Z."""
+    cc = cond_of(mn)
+    last = ctx[-1] if ctx else None
+    if last is None:
+        return _cond_text(None, mn, op)
+    _a, lm, lo_, _n = last
+    if lm == "vmrs" and len(ctx) >= 2 and ctx[-2][1].startswith(("vcmp", "vcmpe")):
+        a2, _m, vo, n2 = ctx[-2]
+        return _cond_text((a2, "fcmp", vo, n2), mn, op)
+    if lm == "cmpeq" and len(ctx) >= 2 and ctx[-2][1] == "cmp" and cc in ("eq", "ne"):
+        one = _cond_text(ctx[-2], "b" + cc, "")
+        two = _cond_text((last[0], "cmp", lo_, last[3]), "b" + cc, "")
+        if "?" in one or "?" in two:
+            return "?"
+        return f"{one} && {two}" if cc == "eq" else f"{one} || {two}"
+    if lm == "asrs":
+        parts = [_tok(p) for p in lo_.split(",")]
+        n = _int(parts[2]) if len(parts) == 3 else None
+        # `asrs r0, r0, #1` overwrites its source, so a condition naming r0 would name
+        # the shifted value rather than the one the flags came from; 2 of 1,316.
+        if n is not None and n > 0 and parts[0] != parts[1]:
+            src = parts[1]
+            if cc in ("cc", "lo", "cs", "hs"):
+                bit = f"{src} & 1" if n == 1 else f"({src} >> {n - 1}) & 1"
+                return f"({bit}) {'==' if cc in ('cc', 'lo') else '!='} 0"
+            if cc in _REL and cc in ("eq", "ne", "mi", "pl"):
+                return f"({src} >> {n}) {_REL[cc]} 0"
+    return _cond_text(last, mn, op)
+
+
 def _cond_text(prev_cmp, mn, op) -> str:
     """Best-effort condition for a conditional terminator, from the preceding flag-setting
     instruction and the branch. Approximate (registers, not source names).
@@ -171,6 +237,12 @@ def _cond_text(prev_cmp, mn, op) -> str:
     if prev_cmp:
         _a, pm, po, _n = prev_cmp
         parts = [_tok(p) for p in po.split(",")]
+        if pm in ("fcmp", "fcmpe") and cc in ("vs", "vc") and len(parts) >= 2:
+            # V after a floating-point compare is "unordered": one side is NaN. Printed
+            # as `d0 vs d1` it named no predicate at all (#70).
+            nan = (f"isNaN({parts[0]})" if parts[1] in ("0", "0.0", parts[0]) else
+                   f"isNaN({parts[0]}) || isNaN({parts[1]})")
+            return nan if cc == "vs" else f"!({nan})"
         if pm in ("cmp", "fcmp", "fcmpe") and len(parts) >= 2:
             lhs = parts[0]
             rhs = parts[1] if len(parts) == 2 else _shifted(parts[1:])
@@ -274,8 +346,7 @@ def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
                 if cc:
                     # Leaves only when the condition holds, so it also falls through.
                     blk.cexit = True
-                    prev = insns[-2] if len(insns) >= 2 else None
-                    blk.cond = _cond_text(prev, "b" + cc, op)
+                    blk.cond = _cond_for(insns[:-1], "b" + cc, op)
                     blk.succ = [end] if end < hi else []
                 else:
                     blk.succ = []
@@ -301,8 +372,7 @@ def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
             elif _is_cond(mn):
                 t = _target(op)
                 ft = end if end < hi else None
-                prev = insns[-2] if len(insns) >= 2 else None
-                blk.cond = _cond_text(prev, mn, op)
+                blk.cond = _cond_for(insns[:-1], mn, op)
                 blk.succ = []
                 if t is not None and lo <= t < hi:
                     blk.succ.append(t)      # taken
@@ -318,7 +388,45 @@ def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
             else:
                 blk.succ = [end] if end < hi else []
         blocks[la] = blk
+    _conditions_from_the_block_before(blocks)
     return blocks, lo
+
+
+def _conditions_from_the_block_before(blocks) -> None:
+    """A branch alone in its block reads the flags its one predecessor left.
+
+    `cmp r0, r1; blt X; bgt Y` is two branches on one compare, and the second starts a
+    block of its own, so it had no compare in front of it and printed `? > ?`: 4,344
+    conditions of arm32-2.19.6 (#70). When the block has a single predecessor that falls
+    into it and that ends in a conditional branch or exit, which set no flags, the
+    flags are that block's, so its instructions are the context; a chain of such blocks
+    is followed up, a few steps at most."""
+    preds = {}
+    for a, b in blocks.items():
+        for s in b.succ:
+            preds.setdefault(s, []).append(a)
+    for a, blk in blocks.items():
+        if not blk.cond or "?" not in blk.cond or len(blk.insns) != 1 or blk.cexit:
+            continue
+        at, ctx = a, []
+        for _ in range(8):
+            p = preds.get(at, [])
+            if len(p) != 1:
+                break
+            pb = blocks[p[0]]
+            if not pb.insns or pb.insns[-1][0] + 4 != at:
+                break                                   # not the block falling into it
+            if not (_is_cond(pb.term) or pb.cexit):
+                break                       # its last instruction may set flags
+            ctx = pb.insns[:-1]
+            if ctx:
+                break
+            at = p[0]
+        if ctx:
+            _a, mn, op, _n = blk.insns[-1]
+            cond = _cond_for(ctx, mn, op)
+            if "?" not in cond:
+                blk.cond = cond
 
 
 def _idoms(blocks, entry, succ):
