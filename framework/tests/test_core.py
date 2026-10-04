@@ -5013,9 +5013,9 @@ def test_structured_output_claims_exactly_the_edges_the_cfg_has():
     # Over the whole image, not a sample: 8,194 functions, and the answer has to be zero.
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import cfgcheck
-    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first = cfgcheck.run(CLEAN)
+    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep = cfgcheck.run(CLEAN)
     assert n > 8000, f"only {n} functions structured; the fixture is not the whole image"
-    assert (edges, dropped, twice, exit_bad) == (0, 0, 0, 0), (
+    assert (edges, dropped, twice, exit_bad, deep) == (0, 0, 0, 0, 0), (
         f"{edges} edge violations, {dropped} dropped, {twice} duplicated: {worst}; "
         f"{exit_bad} exit violations: {exit_first}")
 
@@ -7862,6 +7862,30 @@ def test_a_goto_out_of_the_function_leaves_the_labels_after_it():
         assert body[:2] == ["goto L_0x4;", "goto sub_0x100;" if show is None
                             else "goto sub_0x1100;"], body
         assert body[2:] == ["L_0x4:", "mov x0, #1", "return;"], body
+
+
+def test_a_function_nested_too_deeply_prints_its_rows():
+    """`structure` and the renderers recurse once per level of nesting, and a range of
+    500 conditionals nested in each other ran out of Python's stack: RecursionError,
+    which `export`, `decompile` and `lift` let out as exit 3, a bug in jadart, on a
+    crafted binary (#81). Such a function prints its rows at their addresses instead,
+    under a note saying why, at tiers 2 and 3; a shallower one is structured as before."""
+    from jadart.cfg import TOO_DEEP, render_function
+    from jadart.expr import lift_function
+
+    def chain(k):                     # cbz x0, R_i; mov ...; ret; R_0: ret; R_1: ret; ...
+        rows = []
+        for i in range(k):
+            rows += [(8 * i, "cbz", f"x0, #{0x100000 + 4 * i:#x}", ""),
+                     (8 * i + 4, "mov", "x1, #1", "")]
+        rows.append((8 * k, "ret", "", ""))
+        return rows + [(0x100000 + 4 * i, "ret", "", "") for i in range(k)]
+    for lines in (render_function(chain(2000), show=None), lift_function(chain(2000))):
+        assert lines[0].strip() == f"// {TOO_DEEP}" and len(lines) == 1 + 6001, lines[:3]
+        assert lines[1].strip() == "0x0  cbz x0, #0x100000", lines[1]
+    shallow = render_function(chain(50), show=None)
+    assert shallow[0].strip() == "if (x0 != 0) {", shallow[:2]
+    assert lift_function(chain(50))[0].strip() == "if (x0 != 0) {"
 
 
 def test_a_function_cut_short_says_where_it_goes_on():

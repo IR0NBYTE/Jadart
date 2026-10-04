@@ -923,6 +923,42 @@ def _asm_lines(blk, indent, show):
     return lines
 
 
+#: The note over a function whose control flow nests too deeply to structure (#81).
+TOO_DEEP = ("nested too deeply to structure; its instructions follow as they are, in "
+            "address order")
+
+
+def flat(rows, indent="  ", depth=1, *, show) -> list:
+    """`rows` as they are, each at its address, under a note saying why: what tier 2 and
+    tier 3 print for a function `structure` cannot nest (#81)."""
+    pad = indent * depth
+    at = getattr(show, "address", None)
+    out = [f"{pad}// {TOO_DEEP}"]
+    for a, mn, op, note in rows:
+        where = at(a) if at is not None else f"0x{a:x}"
+        shown = show(a, op) if show is not None else op
+        out.append(f"{pad}{where}  {mn} {shown}".rstrip() + note)
+    return out
+
+
+def render_function(rows, *, exits=None, cut_end=None, indent="  ", depth=1,
+                    show) -> list:
+    """Tier 2 for one function: its graph, structured with the code no edge reaches, as
+    lines.
+
+    `structure` and `render` recurse once for each level of nesting, so a range of a few
+    hundred conditionals nested in each other, which only a crafted binary holds, ran out
+    of Python's stack: 500 raised RecursionError, and `export -t 2` and `decompile -t 2`
+    exited 3, a bug in jadart (#81). Such a function prints its rows instead (`flat`),
+    and the rest of the output goes on."""
+    blocks, entry = build_cfg(rows, exits=exits, cut_end=cut_end)
+    try:
+        return render(blocks, structure(blocks, entry, orphans=True), indent, depth,
+                      show=show)
+    except RecursionError:
+        return flat(rows, indent, depth, show=show)
+
+
 def cut_goto(addr: int, show) -> str:
     """The jump to `addr`, in the part of this function the instruction cut left out: an
     address inside it, and not the `sub_0x...` that names another function (#70)."""

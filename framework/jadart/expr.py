@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from sys import intern
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, _idoms, cut_goto)
+                  cond_of, _idoms, cut_goto, flat)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -3106,8 +3106,14 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
             f"{' and '.join(sorted(LIFTABLE_ARCHS))}, and this snapshot is {name}. "
             f"Tier 1 (`disasm`) does decode it, and the snapshot layer is unaffected.")
     with use_target(TARGETS[name] if name else ARM64):
-        return _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                              fields, show, cut_end)
+        try:
+            return _lift_function(ann, pool_map, receiver, arity, indent, depth,
+                                  selectors, fields, show, cut_end)
+        except RecursionError:
+            # The structurer and the walk recurse once per level of nesting (#81); see
+            # cfg.render_function. The caches hold parses only, and each lift builds its
+            # own Lifter, so nothing a half-finished lift touched outlives it.
+            return flat(ann, indent, depth, show=show)
 
 
 @contextlib.contextmanager

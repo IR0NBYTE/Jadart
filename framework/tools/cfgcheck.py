@@ -231,7 +231,7 @@ def run(path):
 
     image, fr, _hdr = load_instructions(path)
     pc_to_name, pool_map = function_name_by_pc(image, fr), build_pool_map(fr, getattr(image, "arch", None))
-    n = edges = dropped = twice = badfn = 0
+    n = edges = dropped = twice = badfn = deep = 0
     worst = None
     exit_bad, exit_first = 0, None
     for cr in image.all_ranges:
@@ -249,9 +249,14 @@ def run(path):
                                   cut_end=end)
         if not blocks:
             continue
-        n += 1
         # with the sections tier 2 adds for what no edge reaches (#67)
-        bad, placed = check_function(blocks, structure(blocks, entry, orphans=True))
+        try:
+            stmts = structure(blocks, entry, orphans=True)
+        except RecursionError:
+            deep += 1           # printed flat, which claims no edge (cfg.render_function)
+            continue
+        n += 1
+        bad, placed = check_function(blocks, stmts)
         reach, stack = set(), [entry]
         while stack:
             b = stack.pop()
@@ -268,7 +273,7 @@ def run(path):
         edges += len(bad)
         dropped += len(miss)
         twice += dup
-    return n, badfn, edges, dropped, twice, worst, exit_bad, exit_first
+    return n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep
 
 
 #: arm32 words for --synthetic: each range ends at a return or an indirect jump that the
@@ -319,7 +324,9 @@ def main(argv=None):
         print(f"{len(_A32_RANGES)} synthetic arm32 ranges: {good} exit violations; "
               f"{broken} without the exits, which the check has to see")
         return 0 if good == 0 and broken > 0 else 1
-    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first = run(a.lib)
+    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep = run(a.lib)
+    if deep:
+        print(f"{deep} functions nest too deeply to structure and print flat")
     print(f"{n} functions: {edges} edge violations, {dropped} dropped blocks, "
           f"{twice} blocks emitted twice ({badfn} functions affected), "
           f"{exit_bad} exit violations")

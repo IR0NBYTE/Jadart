@@ -244,7 +244,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                          render_body, annotate, truncated_by, addr_label, rebaser,
                          cut_end)
     from .signatures import names_with_signatures
-    from .cfg import build_cfg, structure, render as render_cfg
+    from .cfg import render_function
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
     from .fields import recover_fields
@@ -304,11 +304,9 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                                        show=rebaser(image), cut_end=cut_end(cr, dis)))
         elif lvl == 2:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
-            blocks, entry = build_cfg(ann, exits=exits(image, dis),
-                                      cut_end=cut_end(cr, dis))
-            stmts = structure(blocks, entry, orphans=True)
-            lines.extend(render_cfg(blocks, stmts, indent="  ", depth=2,
-                                    show=rebaser(image)))
+            lines.extend(render_function(ann, exits=exits(image, dis),
+                                         cut_end=cut_end(cr, dis), indent="  ", depth=2,
+                                         show=rebaser(image)))
         else:
             lines.extend(render_body(dis, pc_to_name, pool_map, indent="      ",
                                      kinds=row_kinds(image, dis), show=rebaser(image)))
