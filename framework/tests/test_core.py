@@ -7640,6 +7640,39 @@ def test_an_unreached_tangle_too_deep_to_structure_is_counted_not_a_crash():
     assert notes and "nested too deeply to structure; `disasm` lists them" in notes[-1]
 
 
+def test_a_condition_reads_the_compare_arm32_puts_further_back():
+    """On arm32 the flags a branch reads were often set a step further back than the
+    instruction before it, and 8,606 of arm32-2.19.6's tier 2 conditions printed as
+    `? op ?` (#70): a double compared with `vcmp.f64` then `vmrs`, the 64-bit equality
+    `cmp; cmpeq`, the Smi tag test `asrs rD, rS, #1; blo`, and a second branch on the same
+    compare, which starts a block of its own. A float `vs` is a NaN test, and printed as
+    `d0 vs d1` it named no predicate at all."""
+    from jadart.cfg import _cond_for, build_cfg
+
+    def rows(*t):
+        return [(i * 4, mn, op, "") for i, (mn, op) in enumerate(t)]
+    vcmp = ("vcmp.f64", "d0, d1"), ("vmrs", "APSR_nzcv, fpscr")
+    assert _cond_for(rows(*vcmp), "bgt", "#0x40") == "d0 > d1"
+    assert _cond_for(rows(*vcmp), "bvs", "#0x40") == "isNaN(d0) || isNaN(d1)"
+    against_zero = rows(("vcmp.f64", "d0, #0"), vcmp[1])
+    assert _cond_for(against_zero, "bvc", "#0x40") == "!(isNaN(d0))"
+    assert _cond_for(rows(("fcmp", "d2, d2")), "b.vs", "#0x40") == "isNaN(d2)"
+    chain = ("cmp", "r1, #0"), ("cmpeq", "r0, #0")
+    assert _cond_for(rows(*chain), "beq", "#0x40") == "r1 == 0 && r0 == 0"
+    assert _cond_for(rows(*chain), "bne", "#0x40") == "r1 != 0 || r0 != 0"
+    assert "?" in _cond_for(rows(*chain), "bgt", "#0x40")     # not one compare's flags
+    smi = rows(("asrs", "r1, r0, #1"))
+    assert _cond_for(smi, "blo", "#0x40") == "(r0 & 1) == 0"
+    assert _cond_for(smi, "beq", "#0x40") == "(r0 >> 1) == 0"
+    blocks, _ = build_cfg(rows(("cmp", "r0, r1"), ("blt", "#0x10"), ("bgt", "#0x14"),
+                               ("mov", "r0, #0"), ("bx", "lr"), ("bx", "lr")))
+    assert blocks[0].cond == "r0 < r1" and blocks[8].cond == "r0 > r1", blocks
+    # a second predecessor could have set other flags, so it stays unread
+    blocks, _ = build_cfg(rows(("cmp", "r0, r1"), ("blt", "#0x8"), ("bgt", "#0x14"),
+                               ("b", "#0x8"), ("bx", "lr"), ("bx", "lr")))
+    assert "?" in blocks[8].cond, blocks
+
+
 def test_a_trap_ends_its_block_and_nothing_runs_on_past_it():
     """A `brk` or `bkpt` ends its block with no successor.
 

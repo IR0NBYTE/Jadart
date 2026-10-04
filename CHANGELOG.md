@@ -13,6 +13,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A branch's condition reads the compare arm32 puts further back.** The condition was
+  read from the instruction right before the branch, and on arm32 that is often not the
+  compare: 8,606 of arm32-2.19.6's tier 2 conditions printed as `? op ?`. It now reads a
+  double compared with `vcmp.f64` then `vmrs`, the 64-bit equality `cmp; cmpeq` as
+  `a == b && c == d` (and `bne` as its negation), the Smi tag test `asrs rD, rS, #1; blo`
+  as `(rS & 1) == 0`, and a second branch on the same compare, which starts a block of its
+  own, from its one predecessor when that falls into it on a branch that sets no flags. A
+  floating-point `vs` is the NaN test it is, `isNaN(d0) || isNaN(d1)`, where it printed
+  `d0 vs d1`. On arm32-2.19.6's `export -t 2` 47 `?` conditions are left where there were
+  8,606, and on the clean fixture 31 at tier 2 and 51 at tier 3 where there were 105 and
+  125. Only condition lines change, 8,559 on arm32-2.19.6, 291 and 244 on the clean
+  fixture at tiers 2 and 3; the obfuscated fixture's export is unchanged. Part of #70.
 - **Tier 2 prints the code no edge reaches.** It placed only the blocks the entry reaches,
   so a block that only an exception edge, a jump through a register or a second entry
   leads to was in no statement, and nothing in the output said so: in 1.2.0, 8,580 of the
