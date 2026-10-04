@@ -13,6 +13,26 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Literals, two header fields and container listings print escaped too.** #74 escaped
+  names; string literals went through `printable()`, which escaped C0 controls, DEL,
+  surrogates and NEL/LS/PS and let C1 controls and format characters through, so a literal
+  holding U+202E reversed the line it was printed on. On the clean fixture `strings.txt`
+  carried 150 raw C1 characters, three bidi embedding characters, two soft hyphens and two
+  no-break spaces. `printable()` now escapes what a name does (`fill._hides`): `\xNN`
+  below 0x100, `\uNNNN`, and `\UNNNNNNNN` past the BMP, where `\u` would read ambiguously;
+  a string that needs no escape is returned without a walk over it. `info` escapes the
+  header's `features`, and its version hash, which `--lenient` prints unvetted. A
+  container's member paths in `assets.txt` and in `summary.txt`'s "worth a look", its ABI
+  directories in `container.txt` and the NOTICES package names in `dependencies.txt` are
+  escaped like names. A pool label is the string as printed, so these strings print
+  escaped in `disasm`, `decompile`, `xrefs` and the pool listings as well; on the clean,
+  obfuscated and arm32-2.19.6 binaries, across `functions`, `classes`, `libraries`,
+  `selectors`, `symbols`, `strings`, `info`, `constants` and `export -t 2`, that is 54
+  lines, each the old line with only the new escapes. `xrefs string`, `strings -g` and
+  `libraries -g` take a pattern as typed or as printed. An emoji built with U+200D or
+  U+FE0F shows those as escapes. A signature library hashes pool labels, so one built
+  before this may miss a function whose first instructions load such a string; on both
+  fixtures the libraries come out identical. Closes #78.
 - **Names from the binary print escaped, and read back that way.** Function, class,
   field and library names come out of the same strings as literals, so a crafted snapshot
   can put an escape sequence, a carriage return, a bidi override or a zero width space in

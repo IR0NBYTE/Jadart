@@ -7774,6 +7774,111 @@ def test_a_signature_library_name_is_escaped_once_where_it_prints(tmp_path):
                                      8: "bar\\\\x" + MARK}, merged
 
 
+def test_a_literal_escapes_what_a_name_does():
+    """printable() escaped C0 controls, DEL, surrogates and NEL/LS/PS, and let C1 controls
+    and format characters through: 150 C1 characters and a bidi embedding went out raw in
+    the clean fixture's strings.txt, and a literal holding U+202E reversed the line it was
+    printed on (#78). It escapes what a name does now, in its own spelling."""
+    from jadart.fill import printable
+    plain = "Withdraw $1,000 now"
+    assert printable(plain) is plain
+    assert printable("a\nb\tc\rd\\e") == "a\\nb\\tc\\rd\\\\e"           # as before
+    assert printable("\x00\x7f\x85\x9f") == "\\x00\\x7f\\x85\\x9f"
+    assert printable("\u202ehi\u200b") == "\\u202ehi\\u200b"
+    assert printable("1\u00a0000\u3164") == "1\\xa0000\\u3164"
+    assert printable("\U000e0001x\ud800") == "\\U000e0001x\\ud800"
+    assert printable("\U0001f600 caf\u00e9") == "\U0001f600 caf\u00e9"    # text stays
+
+
+def test_a_string_is_found_as_typed_and_as_printed():
+    """A literal is printed escaped, so `xrefs string` and `strings -g` take a pattern as
+    printed or as the raw characters alike. The clean fixture's U+202B is printed as
+    `\\u202b`: after #78 xrefs matched only that spelling and `strings -g` only the raw
+    character."""
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+    if not os.path.exists(CLEAN):
+        _skip("  SKIP test_a_string_is_found_as_typed_and_as_printed (no fixture)")
+
+    def run(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = cli.main(list(argv))
+        return rc, out.getvalue()
+    for pattern in ("\u202b", "\\u202b"):
+        for exact in ((), ("--exact",)):
+            rc, out = run("xrefs", CLEAN, "string", pattern, "-j", *exact)
+            doc = json.loads(out)
+            offsets = [e["pool_offset"] for e in doc["entries"] + doc.get("unloaded", [])]
+            assert rc == 0 and 0x3878 in offsets, (ascii(pattern), exact, doc)
+        rc, out = run("strings", CLEAN, "-p", "-g", pattern)
+        assert rc == 0 and "\\u202b" in out.splitlines(), (ascii(pattern), out[:200])
+        rc, out = run("strings", CLEAN, "-g", pattern)        # the default view too
+        assert rc == 0 and "  \\u202b" in out.splitlines(), (ascii(pattern), out[-300:])
+
+
+def test_info_prints_the_header_fields_escaped(monkeypatch, capsys):
+    """`info` printed the snapshot header's features, and under --lenient its version
+    hash, as the file had them, so a crafted header put an escape sequence on the
+    terminal of a strict, supported binary (#78)."""
+    import unicodedata
+    from jadart import cli, snapshot
+    real = snapshot.parse_libapp_with_anchor
+
+    def crafted(*a, **k):
+        snaps, anchor = real(*a, **k)
+        for h in snaps.values():
+            h.features = "\x1b[31m\u202e " + h.features
+        return snaps, anchor
+    monkeypatch.setattr(snapshot, "parse_libapp_with_anchor", crafted)
+    assert cli.main(["info", CLEAN]) == 0
+    out = capsys.readouterr().out
+    assert not [c for c in out if unicodedata.category(c)[0] == "C" and c not in "\n\t"]
+    assert "features        \\u001b[31m\\u202e " in out, out
+
+
+def test_a_container_listing_escapes_the_names_it_was_given(tmp_path):
+    """A container's member paths, its ABI directories and the package names in NOTICES
+    are the container's to choose, and assets.txt, container.txt and dependencies.txt
+    listed them as they were (#78)."""
+    import gzip
+    import zipfile
+    import unicodedata
+    from jadart import cli
+    _needs_capstone()                    # export decodes the code as well
+    if not os.path.exists(CLEAN):
+        _skip("  SKIP test_a_container_listing_escapes_the_names_it_was_given"
+              " (no fixture)")
+    apk = tmp_path / "app.apk"
+    notices = ("pkg\x1b[31m\u202e\n\nlicence\n" + "-" * 80 + "\nother\n\nlicence\n")
+    with zipfile.ZipFile(apk, "w") as z:
+        z.write(CLEAN, "lib/arm64-v8a/libapp.so")
+        z.writestr("lib/x86\u202e_64/libapp.so", b"not read")
+        z.writestr("assets/flutter_assets/evil\x1b[31m.txt", b"hello")
+        # a key by its header, so summary.txt lists it under "worth a look"
+        z.writestr("assets/flutter_assets/a\u202egnp.key\x1b[31m",
+                   b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")
+        z.writestr("assets/flutter_assets/NOTICES.Z", gzip.compress(notices.encode()))
+    out = tmp_path / "out"
+    assert cli.main(["export", str(apk), "-o", str(out), "-q", "-t", "1"]) == 0
+    listed = {}
+    for path in out.rglob("*.txt"):
+        if path.name in ("assets.txt", "container.txt", "dependencies.txt",
+                         "summary.txt"):
+            listed[path.name] = path.read_text(encoding="utf-8")
+    assert set(listed) == {"assets.txt", "container.txt", "dependencies.txt",
+                           "summary.txt"}, sorted(listed)
+    for name, text in listed.items():
+        assert not [c for c in text if unicodedata.category(c)[0] == "C"
+                    and c not in "\n\t"], name
+    assert "evil\\u001b[31m.txt" in listed["assets.txt"], listed["assets.txt"]
+    assert "x86\\u202e_64" in listed["container.txt"], listed["container.txt"]
+    assert "pkg\\u001b[31m\\u202e" in listed["dependencies.txt"]
+    assert "a\\u202egnp.key\\u001b[31m" in listed["summary.txt"], listed["summary.txt"]
+
+
 def test_a_range_with_no_name_is_labelled_by_its_address_and_read_back():
     """`sub_0x<n>` carries the address the rest of the output prints for the range, and
     the label, or the number in it, reaches that range.

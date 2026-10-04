@@ -39,6 +39,7 @@ Matching it means output from the two tools can be diffed directly.
 from __future__ import annotations
 
 from .errors import JadartError
+from .fill import visible
 
 import os
 import re
@@ -350,7 +351,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
                     fh.write(f"  packages    {c['packages']} third-party packages named in "
                              f"NOTICES -> assets/dependencies.txt\n")
             if c["notable"]:
-                fh.write(f"  worth a look: {', '.join(c['notable'][:6])}"
+                notable = ", ".join(visible(n) for n in c["notable"][:6])   # (#78)
+                fh.write(f"  worth a look: {notable}"
                          f"{' ...' if len(c['notable']) > 6 else ''}\n")
             fh.write(f"  the rest    left in the container and attributed to the tool "
                      f"that reads it -> container.txt\n")

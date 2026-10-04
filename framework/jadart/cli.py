@@ -95,6 +95,7 @@ def cmd_info(args) -> int:
     # image sits, so a caller can turn any pc_offset jadart prints into an address itself.
     # Reading it separately would hold the file twice, which `info` cannot afford: being
     # fast and small is the whole point of this command.
+    from .fill import visible
     from .snapshot import parse_libapp_with_anchor
     try:
         snaps, anchor = parse_libapp_with_anchor(args.libapp, strict=not args.lenient)
@@ -128,12 +129,13 @@ def cmd_info(args) -> int:
     for which, h in snaps.items():
         print(heading(f"[{which}] snapshot"))
         print(f"  kind            {h.kind_name}")
-        print(f"  version_hash    {h.version_hash}")
+        print(f"  version_hash    {visible(h.version_hash)}")
         epoch = h.epoch.name if h.epoch else "UNKNOWN (lenient)"
         dart = h.epoch.dart if h.epoch else "?"
         print(f"  epoch           {epoch}  (dart {dart})")
         print(f"  target          {h.arch if h.arch else 'unresolved'}")
-        print(f"  features        {h.features[:72]}"
+        # Both come out of the file, and --lenient prints a hash nothing has vetted (#78).
+        print(f"  features        {visible(h.features[:72])}"
               f"{'...' if len(h.features) > 72 else ''}")
         print(f"  base_objects    {h.num_base_objects}")
         print(f"  objects         {h.num_objects}")
@@ -248,7 +250,9 @@ def cmd_libraries(args) -> int:
         from .export import is_framework
         rows = [(u, k) for u, k in rows if not is_framework(u)]
     if args.grep:
-        rows = [(u, k) for u, k in rows if args.grep in u]
+        # a url is printed escaped (#74), so a pattern matches as typed or escaped alike
+        from .fill import visible
+        rows = [(u, k) for u, k in rows if args.grep in u or visible(args.grep) in u]
     if getattr(args, "json", False):
         return emit({"ok": True, "epoch": prog.epoch_name, "dart": prog.dart,
                      "libraries": [{"url": u, "classes": len(ks),
@@ -688,19 +692,20 @@ def cmd_strings(args) -> int:
         return _fail(e)
 
     h, strings = r["header"], r["strings"]
+
+    def wanted(s):
+        # as typed, or as printed: a string is escaped where it is shown (#78)
+        return not args.grep or args.grep in s or args.grep in printable(s)
     if getattr(args, "json", False):
-        vals = sorted(set(strings))
-        if args.grep:
-            vals = [v for v in vals if args.grep in v]
+        vals = [v for v in sorted(set(strings)) if wanted(v)]
         return emit({"ok": True, "epoch": h.epoch.name if h.epoch else None,
                      "count": len(vals), "strings": vals})
     if args.plain:
         # One string per line and nothing else, so the output composes with grep, sort and
         # wc. The inventory below is for reading; this is for piping.
         for s in sorted(set(strings)):
-            if args.grep and args.grep not in s:
-                continue
-            print(printable(s))
+            if wanted(s):
+                print(printable(s))
         return EXIT_OK
     print(f"epoch {h.epoch.name} (dart {h.epoch.dart}); {h.num_clusters} clusters, "
           f"{h.num_objects} objects; {len(strings)} interned strings recovered")
@@ -715,7 +720,7 @@ def cmd_strings(args) -> int:
     for s in idents[:40]:
         print(f"  {printable(s)}")
     if args.grep:
-        hits = sorted(s for s in strings if args.grep in s)
+        hits = sorted(s for s in strings if wanted(s))
         print("\n" + heading(f"grep '{args.grep}': {len(hits)} hits"))
         for s in hits[:40]:
             print(f"  {printable(s)}")
@@ -978,16 +983,20 @@ def _xrefs_pool_matches(pool, kind, needle, exact=False):
         return {off: lab for off, lab in pool.items() if off == addr}, addr
 
     if kind == "string":
+        # A label is the string as printed (fill.printable), so a pattern matches as
+        # typed or as printed: escaping it the same way covers the raw spelling (#78).
+        from .fill import printable
+        spellings = {needle, printable(needle)}
         if exact:
             return (
                 {
                     off: lab for off, lab in pool.items()
-                    if lab == needle or lab == f'"{needle}"'
+                    if any(lab in (n, f'"{n}"') for n in spellings)
                 },
                 None,
             )
         return (
-            {off: lab for off, lab in pool.items() if needle in lab},
+            {off: lab for off, lab in pool.items() if any(n in lab for n in spellings)},
             None,
         )
 
@@ -1489,9 +1498,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-g", "--grep", metavar="PATTERN",
                    help="keep only strings containing PATTERN")
     p.add_argument("-p", "--plain", action="store_true",
-                   help="one string per line and nothing else, for piping. Control "
-                        "characters and backslashes are escaped so each string stays on "
-                        "one line; decode with unicode_escape to get the exact bytes back")
+                   help="one string per line and nothing else, for piping. A character "
+                        "that would break the line, or hide or reorder text, is written "
+                        "as \\xNN, \\uNNNN or \\UNNNNNNNN, and a backslash as two, "
+                        "so each string stays on one line and shows what it holds")
     p.set_defaults(func=cmd_strings)
 
     p = _add(sub, common, "xrefs", "what references a string, a pool entry or a function")
