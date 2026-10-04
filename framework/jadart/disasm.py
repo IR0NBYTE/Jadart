@@ -554,7 +554,8 @@ class Printer:
         return sub_label(self.image, pc_offset)
 
     def address(self, pc_offset: int) -> str:
-        """A code address inside a range, as `disasm` prints it."""
+        """A code address inside a range: the virtual address, or the pc_offset when
+        there is no anchor, as sub_label spells it, so it reads back the same way."""
         va = va_of(self.image, pc_offset)
         return f"0x{pc_offset if va is None else va:x}"
 

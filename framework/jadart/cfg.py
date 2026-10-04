@@ -403,10 +403,11 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
             else:
                 blk.succ = [end] if end < hi else []
             # The last decoded instruction, when it can fall through, falls into the part
-            # the cut left out.
+            # the cut left out. A trap never does, though tier 3 keeps the edge past one
+            # inside the function (`traps`).
             if cut is not None and end == hi and (
                     _is_cond(mn) or blk.cexit or not (
-                        mn in ("b", "ret", "br", "bx") or mn in traps or blk.exit)):
+                        mn in ("b", "ret", "br", "bx") or mn in TRAPS or blk.exit)):
                 blk.cut_next = hi
         blocks[la] = blk
     _conditions_from_the_block_before(blocks)

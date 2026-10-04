@@ -7915,6 +7915,10 @@ def test_a_function_cut_short_says_where_it_goes_on():
         # A target past the end of the range is another function's, as it was.
         far = build_cfg(ann, exits=exits(image, dis), cut_end=0x10)[0]
         assert not far[0].past_cut and far[0].cut_next == 8, far
+    # A trap does not run on past the cut, though tier 3 keeps the edge past one.
+    trap = [(0, "bl", "#0x100", ""), (4, "brk", "#0", "")]
+    assert build_cfg(trap, traps=(), cut_end=0x40)[0][0].cut_next == -1
+    assert not any("TRUNCATED" in ln for ln in lift_function(trap, cut_end=0x40))
 
 
 def test_a_conditional_at_the_cut_keeps_its_taken_edge():

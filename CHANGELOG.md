@@ -15,9 +15,9 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 - **A function cut short says where it goes on.** The instruction cut stops a long
   function after 4,000 instructions. A conditional there whose target is earlier had its
-  not-taken arm recorded nowhere, so `mov; cmp; b.gt #0x0` printed as `while (true) { }`,
-  an infinite loop, at tiers 2 and 3, and a last instruction that falls through ended the
-  body with nothing said. A branch into the part left out printed as `goto sub_0x...`,
+  not-taken arm recorded nowhere, so `mov; cmp; b.gt #0x0` printed as a loop with no way
+  out, `while (true) { }` at tier 3 and an `if` with an empty arm inside one at tier 2,
+  and a last instruction that falls through ended the body with nothing said. A branch into the part left out printed as `goto sub_0x...`,
   which names another function, though the address is inside this one: 2,679 lines in
   the 46 cut ranges of the corpus's 26 builds. Each now reads
   `goto 0x...;  // TRUNCATED: past the instruction cut`, the address as `disasm` prints
