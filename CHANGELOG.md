@@ -13,6 +13,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Tier 2 prints the code no edge reaches.** It placed only the blocks the entry reaches,
+  so a block that only an exception edge, a jump through a register or a second entry
+  leads to was in no statement, and nothing in the output said so: in 1.2.0, 8,580 of the
+  clean fixture's 457,622 instructions, many of them catch entries that open with
+  `sub x15, x29, #imm` right after a `ret` or a `b`. `decompile -t 2` and `export -t 2`
+  now place every block, the unreached ones after everything else. A section that no block
+  branches into, including the code after a trap that #57 places, follows a note,
+  `// reached by no edge in this graph`, that lists what it can be: a catch entry, another
+  entry point, a jump through a register, or dead code. An unreached tangle too deeply
+  nested to structure is counted in a note instead, so that placing it cannot turn a
+  crafted binary into a crash (#81 is the same limit on reachable code). Every decoded
+  instruction of the clean fixture and arm32-2.19.6 is now in tier 2. The export only
+  gains lines: 7,305 with 221 notes on the clean fixture, 2,964 with 70 on the obfuscated
+  one, 2,001 with 56 on arm32-2.19.6. Tier 3 is unchanged, since `strip_boilerplate`
+  leaves the stack check's slow path unreached on purpose. Closes #67.
 - **Literals, two header fields and container listings print escaped too.** #74 escaped
   names; string literals went through `printable()`, which escaped C0 controls, DEL,
   surrogates and NEL/LS/PS and let C1 controls and format characters through, so a literal

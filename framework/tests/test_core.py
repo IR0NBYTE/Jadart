@@ -7579,6 +7579,67 @@ def test_cfgcheck_judges_exits_by_capstone_not_by_build_cfg():
     assert good == 0 and broken == len(_A32_RANGES), (good, broken)
 
 
+def test_tier2_places_a_block_no_edge_reaches_and_says_so():
+    """Tier 2 placed only what the entry reaches, so a catch entry after a `ret` or a `b`,
+    which only an exception edge leads to, was in no statement: 8,580 instructions of the
+    clean fixture, and nothing in the output said so (#67). `orphans` places every block,
+    the unreached ones last, each after a note that no edge of the graph leads there."""
+    from jadart.cfg import UNREACHED, build_cfg, render, structure
+    # f(x1) { if (x1 == 0) return 7; return; } then a catch entry after the last `ret`
+    rows = [("cmp", "x1, #0"), ("b.ne", "#0x10"), ("mov", "x0, #7"), ("ret", ""),
+            ("ret", ""), ("sub", "x15, x29, #0x20"), ("mov", "x0, #3"), ("ret", "")]
+    blocks, entry = build_cfg([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    plain = [ln.strip() for ln in render(blocks, structure(blocks, entry), show=None)]
+    assert "sub x15, x29, #0x20" not in plain, plain
+    body = [ln.strip() for ln in render(blocks, structure(blocks, entry, orphans=True),
+                                         show=None)]
+    assert body[:len(plain)] == plain, body            # only ever added at the end
+    assert body[len(plain):] == ["// " + UNREACHED, "L_0x14:", "sub x15, x29, #0x20",
+                                 "mov x0, #3", "return;"], body
+
+
+def test_the_unreached_note_goes_only_where_no_edge_leads_in():
+    """The note says no edge of the graph leads into a section, so a section another
+    unreached section jumps to, or the code after a trap that one jumps back into, does
+    not get it: the `goto` printed into it would say otherwise. On the clean fixture a
+    catch body's own continuation was marked as maybe dead (#67 review)."""
+    from jadart.cfg import UNREACHED, build_cfg, render, structure
+
+    def body(rows):
+        ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+        blocks, entry = build_cfg(ann)
+        stmts = structure(blocks, entry, orphans=True)
+        return [ln.strip() for ln in render(blocks, stmts, show=None)]
+    note = "// " + UNREACHED
+    # ret | mov; ret @0x8 | sub; b 0x8 @0x10: only the last is reached by nothing
+    out = body([("ret", ""), ("ret", ""), ("mov", "x0, #2"), ("ret", ""),
+                ("sub", "x15, x29, #0x20"), ("b", "#0x8")])
+    assert out.count(note) == 2 and out[out.index("L_0x8:") - 1] != note, out
+    assert out[out.index("L_0x10:") - 1] == note and "goto L_0x8;" in out, out
+    # brk | mov; ret @0x4 | sub; b 0x4: the code after the trap is jumped to
+    out = body([("brk", "#0"), ("mov", "x0, #1"), ("ret", ""),
+                ("sub", "x15, x29, #0x20"), ("b", "#0x4")])
+    assert out[out.index("L_0x4:") - 1] != note, out
+    assert out[out.index("L_0xc:") - 1] == note and "goto L_0x4;" in out, out
+
+
+def test_an_unreached_tangle_too_deep_to_structure_is_counted_not_a_crash():
+    """structure() recurses with the nesting, and a chain of conditionals each to its own
+    `ret` raises RecursionError at a few hundred (#81). Main never placed unreached code,
+    so placing it must not turn a crafted binary into a crash: what cannot be structured
+    is counted in a note instead."""
+    from jadart.cfg import build_cfg, structure
+    n = 2000
+    rows = [("ret", "")]
+    for i in range(n):
+        rows += [("cbz", f"x0, #{(1 + 2 * n + 1 + i) * 4:#x}"), ("mov", f"x1, #{i}")]
+    rows += [("ret", "")] + [("ret", "")] * n
+    blocks, entry = build_cfg([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    stmts = structure(blocks, entry, orphans=True)
+    notes = [s[1] for s in stmts if s[0] == "note"]
+    assert notes and "nested too deeply to structure; `disasm` lists them" in notes[-1]
+
+
 def test_a_trap_ends_its_block_and_nothing_runs_on_past_it():
     """A `brk` or `bkpt` ends its block with no successor.
 
@@ -7616,7 +7677,7 @@ def test_code_after_a_trap_is_still_shown():
     what the entry reaches, so ending the block dropped 182 instructions in 12 sections of
     the clean fixture, 5 of them opening with `sub x15, x29, #imm`, a catch entry's stack
     reset. It goes in as its own labelled section, and nothing leads into it."""
-    from jadart.cfg import build_cfg, render, structure
+    from jadart.cfg import UNREACHED, build_cfg, render, structure
     rows = [("cmp", "x1, #0"), ("b.ne", "#0x10"), ("mov", "x0, #7"), ("ret", ""),
             ("bl", "#0x100"), ("brk", "#0"), ("sub", "x15, x29, #0x10"),
             ("mov", "x0, #3"), ("ret", "")]
@@ -7624,8 +7685,8 @@ def test_code_after_a_trap_is_still_shown():
     assert blocks[0x10].succ == [] and 0x18 in blocks, blocks
     body = [ln.strip() for ln in render(blocks, structure(blocks, entry), show=None)]
     i = body.index("brk #0")
-    assert body[i + 1:] == ["}", "L_0x18:", "sub x15, x29, #0x10", "mov x0, #3",
-                            "return;"], body
+    assert body[i + 1:] == ["}", "// " + UNREACHED, "L_0x18:", "sub x15, x29, #0x10",
+                            "mov x0, #3", "return;"], body
     assert not any(ln.startswith("goto") for ln in body), body
 
 
