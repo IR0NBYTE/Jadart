@@ -173,8 +173,8 @@ Name recall vs FluBench ground truth (equal to unflutter, the prior best):
   _FluBenchPageState, benchRunAll, and the source URI package:flubench_corpus/constructs.dart.
 - obf:   classes 0/1, functions 0/9, strings 1/1 (the literal survives; identifiers are gone).
 Recovered identifier pool: 8990 canonical strings clean, 6025 obf (the ~2965 difference is the
-stripped identifier names). Reproduce: `python3 flubench/score.py --truth
-flubench/artifacts/ground_truth.json --jadart-lib <libapp.so>`.
+stripped identifier names). Reproduce:
+`python3 flubench/score.py --truth flubench/artifacts/ground_truth.json --jadart-lib <libapp.so>`.
 
 Version-drift found and fixed (the C3 version-robustness thesis, demonstrated): the SDK source is
 checked out at main (3.13-dev), one version ahead of the 3.12.2 binary. Three format drifts had to

@@ -23,8 +23,10 @@ before it runs on. This walks the fences the way CommonMark does and reports:
                block tag inside an inline or heading element (_INLINE) or Markdown's
                inline syntax (_SYNTAX), a block left open in a list, a quote or an
                indent, HTML going on from a line of Markdown or followed by a line
-               CommonMark can read as a heading (_HEADING), or a comment block never
-               closed or holding `--!>`
+               CommonMark can read as a heading (_HEADING), a comment block never
+               closed or holding `--!>`, a table, row, cell, div or p closed out of
+               order or never, HTML in a line of Markdown outside a code span, or a
+               code span going on to the next line before one holding `<` markup
   missing      a file that was listed but is not there
   unreadable   a file that cannot be read as UTF-8 text
 
@@ -66,14 +68,24 @@ or an indent, and it refuses anything outside the dialect rather than guess:
   disagree on. A comment need not close on its line only where it starts a new HTML
   block at column 0, which every renderer reads as a comment block running to its first
   `-->`.
+- Every table, row, cell, div and p ends with its own end tag, in the order they
+  opened. A browser closes some of them on its own and lets others hold the rest of
+  the page, which one rule saves telling apart.
+- No HTML stands in a line of Markdown, a heading, a list item, a paragraph or a table
+  row, outside a code span, an autolink or an escape: a block tag there holds the rest
+  of the page, and a link, an image's alt text or a code span can take an inline tag's
+  closer. Code spans are read a line at a time, which is how a renderer reads them
+  only when no run of backticks on an earlier line of the paragraph is left to pair
+  with a later one, so `<` markup in a code span after such a run is refused, and a
+  table row is read cell by cell as well.
 - The file does not start with a byte order mark, which GitHub drops and markdown-it
   keeps as text, so the two pair the fences after it differently, and holds no NUL, with
   which GitHub renders none of it as Markdown.
 
-HTML is checked on a line that opens with `<` and on the lines after it up to a blank
-line, or for a comment block up to the line holding its `-->`; inline HTML later in any
-other line, in a paragraph, a heading, a list item or a quote, is not. The docs already
-keep to the dialect.
+An HTML block is a line that opens with `<` and the lines after it up to a blank line,
+or for a comment block up to the line holding its `-->`. Every other line outside a
+fence, but for YAML front matter, which GitHub shows as a table of text, is a line of
+Markdown. The docs keep to the dialect.
 
     python3 tools/fencecheck.py FILE.md ...     # 0 problems is the contract
     python3 tools/fencecheck.py --tracked       # every `.md` or `.markdown` file, in
@@ -82,6 +94,7 @@ keep to the dialect.
 """
 from __future__ import annotations
 
+import bisect
 import os
 import re
 import subprocess
@@ -363,6 +376,158 @@ def _earlier(starts: list) -> str:
     return f" (earlier blocks opened at lines {shown})"
 
 
+#: An autolink, `<https://...>` or `<a@b.c>`, which is a link and not HTML. Wherever a
+#: `<` stands, CommonMark reads one before it tries a tag.
+_AUTOLINK = re.compile(
+    r"<[A-Za-z][A-Za-z0-9.+-]{1,31}:[^<>\x00-\x20]*>"
+    r"|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*>")
+#: Where HTML can start in a line of Markdown: a tag, a closing tag, a comment, a
+#: declaration or a processing instruction. A `<` before anything else is text.
+_MARKUP_START = re.compile(r"<[A-Za-z/!?]")
+#: What a backslash escapes, which is then text: ASCII punctuation.
+_ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_BACKTICKS = re.compile(r"`+")
+#: A line that starts a block of its own wherever it stands, so no code span runs into it
+#: from the line before: a bullet list item at column 0, which leaves any container whose
+#: content is indented, or an ATX heading there. A `>` line may go on with a quote's
+#: paragraph and an ordered item with a paragraph, so neither is one.
+_OWN_BLOCK = re.compile(r"[-*+][ \t]+[^ \t]|#{1,6}(?:[ \t]|$)")
+#: A cell boundary in a GFM table row: a `|` that no backslash escapes.
+_CELL = re.compile(r"(?<!\\)\|")
+#: A tag on a line of HTML, its name read the way a browser reads it, for the elements
+#: that may stay open across lines.
+_ANY_TAG = re.compile(r"<(/?)([A-Za-z][^ \t\n\f\r/>]*)")
+
+
+def _inline(text: str):
+    """Where `text`, read as one line of Markdown on its own, holds the start of HTML:
+    (outside, inside, unpaired). `outside` lists the positions of the `<` that start HTML
+    outside a code span, an autolink and an escape; `inside` is True when one stands in a
+    code span; `unpaired` when a run of backticks finds no closer on the line, which
+    another line of the paragraph can then give it.
+
+    It reads left to right as CommonMark does, an escape, a code span or an autolink
+    taking whatever starts first, and a code span ending at the next run of exactly as
+    many backticks, escapes and all. The runs are found once, so a line of many costs
+    time linear in its length."""
+    runs = {}                                    # length: starts of the runs that long
+    for m in _BACKTICKS.finditer(text):
+        runs.setdefault(m.end() - m.start(), []).append(m.start())
+    outside, inside, unpaired = [], False, False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in _ESCAPABLE:
+            i += 2
+        elif ch == "`":
+            end = i
+            while end < n and text[end] == "`":
+                end += 1
+            later = runs.get(end - i, ())
+            k = bisect.bisect_left(later, end)
+            if k == len(later):
+                unpaired, i = True, end          # no closer: the backticks are text
+                continue
+            inside = inside or _MARKUP_START.search(text, end, later[k]) is not None
+            i = later[k] + (end - i)
+        elif ch == "<":
+            link = _AUTOLINK.match(text, i)
+            if link:
+                i = link.end()
+                continue
+            if _MARKUP_START.match(text, i):
+                outside.append(i)
+            i += 1
+        else:
+            i += 1
+    return outside, inside, unpaired
+
+
+def _markdown_problems(para: list) -> list:
+    """Problems with HTML in one run of lines of Markdown, [(line, kind, message), ...].
+
+    No HTML may stand in a line of Markdown, a heading, a list item, a paragraph or a
+    table row, outside a code span (#48). There a block tag starts at the line and holds
+    the rest of the page (`# <br> <table>`), and an inline one can lose its closer to a
+    link, an image's alt text or a code span (`* [<b>]`), which this check does not
+    model, and wrap everything after it. A code span is read on its line. A renderer reads
+    it the same way unless a run of backticks on an earlier line of the paragraph found
+    no closer there, and can pair with one on this line instead, so a code span holding
+    `<` markup after such a run is refused too. The runs after it change nothing before
+    them. A table row is also read cell by cell, since GFM splits it before it reads code
+    spans."""
+    out, unpaired = [], None
+    for n, line in para:
+        outside, hidden, open_run = _inline(line)
+        if not outside and "|" in line:
+            start = 0
+            for cut in [c.start() for c in _CELL.finditer(line)] + [len(line)]:
+                outside += [start + p for p in _inline(line[start:cut])[0]]
+                start = cut + 1
+        if outside:
+            at = outside[0]
+            name = _TAG_NAME.match(line, at + 1 + (line[at + 1] == "/"))
+            shown = line[at:name.end()] if name else line[at:at + 2]
+            out.append((n, "unsupported", (
+                f"`{_shown(shown)}` in a line of Markdown, outside a code span, where "
+                f"a block tag holds the rest of the page and a link or a code span can "
+                f"take an inline tag's closer; put HTML on lines of its own, or write "
+                f"`&lt;`")))
+        if hidden and unpaired:
+            out.append((unpaired, "unsupported", (
+                f"a code span going on to another line of a paragraph that holds `<` "
+                f"markup in a code span at line {n}, which this check reads a line at a "
+                f"time; close each code span on the line that opens it")))
+            return out                           # one per paragraph
+        if open_run and not unpaired:
+            unpaired = n
+    return out
+
+
+def _without_comments(text: str) -> str:
+    """`text` less its comments, each ended where a browser ends it: at the first `-->`
+    after `<!--`, which makes `<!-->` a whole comment."""
+    out, i = [], 0
+    while True:
+        j = text.find("<!--", i)
+        if j < 0:
+            return "".join(out) + text[i:]
+        out.append(text[i:j])
+        k = text.find("-->", j + 2)
+        if k < 0:
+            return "".join(out)
+        i = k + 3
+
+
+def _nest(text: str, n: int, stack: list, problems: list) -> None:
+    """Open and close the table, div and p elements on line `n` of HTML.
+
+    Each has to close with its own end tag, in the order they opened, and the ones still
+    open at the end of the file are reported. A browser closes some on its own, a `p`
+    before a table, a cell before the next, and lets others hold the rest of the page,
+    and it ignores a `</div>` while a table is open; one rule for all of them leaves
+    nothing to tell apart. A line in a list, a quote or an indent is read the same way:
+    it has to close what it opens anyway, and a closer on it ends an element opened
+    above it."""
+    for m in _ANY_TAG.finditer(_without_comments(text)):
+        closing, tag = m.group(1), m.group(2).lower()
+        if tag not in _STAYS_OPEN:
+            continue
+        if not closing:
+            stack.append((tag, n))
+        elif stack and stack[-1][0] == tag:
+            stack.pop()
+        else:
+            last = (f"the `<{stack[-1][0]}>` opened at line {stack[-1][1]} is still open"
+                    if stack else "nothing is open")
+            problems.append((n, "unsupported",
+                             f"a `</{tag}>` that does not close the element opened last; "
+                             f"{last}. Close the table structure, div and p in the order "
+                             f"they open"))
+            return                               # one per line
+
+
 def check(text: str) -> list:
     """(line, kind, message) for every problem in one Markdown text, sorted by line."""
     problems = []
@@ -380,8 +545,27 @@ def check(text: str) -> list:
     comment = 0                      # line of the comment block the walk is inside
     contained = False                # this HTML has a line in a list, quote or indent
     after_break = True               # the line before was blank or ended a comment block
-    for n, line in enumerate(_LINES.split(text), 1):
+    para = []                        # the run of lines of Markdown being read
+    stack = []                       # (tag, line) of the table, div and p elements open
+    lines = _LINES.split(text)
+    # GitHub shows YAML front matter, which an issue template opens with, as a table of
+    # text, so its lines are not read as Markdown; the fences are walked all the same.
+    front = 0
+    if lines and lines[0] == "---":
+        ends = (k + 1 for k in range(1, len(lines)) if lines[k] in ("---", "..."))
+        front = next(ends, 0)
+    for n, line in enumerate(lines, 1):
         at_break, after_break = after_break, not line.strip(" \t")
+        if (n > front and open_at is None and not (html or comment or _HTML.match(line))
+                and line.strip(" \t") and not _fence_at(_FENCE, line)
+                and not _fence_at(_NESTED, line)):
+            if para and _OWN_BLOCK.match(line):
+                problems.extend(_markdown_problems(para))
+                para = []
+            para.append((n, line))
+        elif para:
+            problems.extend(_markdown_problems(para))
+            para = []
         if open_at is None and (html or comment or _HTML.match(line)):
             fence = _fence_at(_FENCE, line) or _fence_at(_NESTED, line)
             if fence:
@@ -395,9 +579,11 @@ def check(text: str) -> list:
             contained = contained and not new_block or bool(re.match(_MARKER, line))
             if new_block and not block_comment and not at_break:
                 problems.append((n, "unsupported", _WHY["joined"]))
+                _nest(line, n, stack, problems)
                 continue
             if not block_comment and _HEADING.match(line):
                 problems.append((n, "unsupported", _WHY["heading"]))
+                _nest(line, n, stack, problems)
                 continue
             scan = line
             if comment:
@@ -421,6 +607,8 @@ def check(text: str) -> list:
                 # A comment block ends at the line holding its `-->`, which this one
                 # does, and the lines after it are Markdown again.
                 html, after_break = False, True
+            if not comment:
+                _nest(scan, n, stack, problems)
             continue
         m = _FENCE.match(line)
         if open_at is None and (m is None or m.group(1)) and _fence_at(_NESTED, line):
@@ -449,6 +637,13 @@ def check(text: str) -> list:
                              f"earlier one" + _earlier(starts)))
             continue
         open_at = None
+    problems.extend(_markdown_problems(para))
+    for k, (tag, n) in enumerate(stack):
+        if k == 0 or stack[k - 1][1] != n:      # one per line
+            problems.append((n, "unsupported", (
+                f"a `<{tag}>` with no end tag. A browser closes some elements on its own "
+                f"and lets others hold the rest of the page, so every table, row, cell, "
+                f"div and p here ends with its own")))
     if comment:
         problems.append((comment, "unsupported", "comment block never closed; it hides "
                                                  "everything after it"))
