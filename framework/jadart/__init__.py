@@ -157,7 +157,7 @@ def decompile(path: str, symbol: str) -> list:
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                          function_name_by_pc, build_pool_map)
     from .branches import row_kinds
-    from .disasm import rebaser
+    from .disasm import rebaser, cut_end
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
     from .fields import recover_fields
@@ -193,7 +193,7 @@ def decompile(path: str, symbol: str) -> list:
                              arity=arity, selectors=sels,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             show=rebaser(image))
+                             show=rebaser(image), cut_end=cut_end(cr, dis))
         out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
                     "body": [ln.strip() for ln in body]})
     return out

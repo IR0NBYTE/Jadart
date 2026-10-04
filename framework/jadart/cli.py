@@ -272,7 +272,7 @@ def cmd_lift(args) -> int:
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                          build_pool_map, addr_label, va_of)
     from .branches import row_kinds
-    from .disasm import rebaser
+    from .disasm import rebaser, cut_end
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver
     from .dispatch import recover_selectors
@@ -312,7 +312,7 @@ def cmd_lift(args) -> int:
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             show=rebaser(image))
+                             show=rebaser(image), cut_end=cut_end(cr, dis))
         if getattr(args, "json", False):
             out.append({"name": nm, "pc_offset": cr.pc_offset,
                         "va": va_of(image, cr.pc_offset), "size": cr.size,
