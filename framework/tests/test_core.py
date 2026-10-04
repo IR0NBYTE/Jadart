@@ -7694,6 +7694,7 @@ def test_a_compound_condition_negates_as_a_whole():
     assert negate_cond("!(a) || !(b)") == "a && b"
     assert negate_cond("isNaN(a < b)") == "!(isNaN(a < b))"     # an operand's own `<`
     assert negate_cond("(r0 & 1) == 0") == "(r0 & 1) != 0"
+    assert negate_cond('x0 == "a || b == c"') == '!(x0 == "a || b == c")'
 
 
 def test_a_trap_ends_its_block_and_nothing_runs_on_past_it():

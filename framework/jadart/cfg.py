@@ -116,7 +116,9 @@ def negate_cond(cond: str) -> str:
     for op, dual in ((" && ", " || "), (" || ", " && ")):
         if op in cond:
             sides = cond.split(op)
-            if dual in cond or not all(_balanced(s) for s in sides):
+            # a quote may hold the `&&` or `||`, in a string literal tier 3 substituted
+            quoted = '"' in cond or "'" in cond
+            if dual in cond or quoted or not all(map(_balanced, sides)):
                 return f"!({cond})"
             sides = [negate_cond(s) for s in sides]
             if any(s.startswith("!(") for s in sides):
