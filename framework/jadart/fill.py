@@ -72,10 +72,20 @@ def printable(s: str) -> str:
     at which point grep skips it silently and the answer looks absent rather than unreadable.
     Escaping keeps one string on one line and keeps the dump greppable, which is the entire
     point of having it.
+
+    It escapes what a name escapes (`_hides`): every control character, C1 included, every
+    format character such as a bidi override or a zero width space, separators other than
+    the space, and the blank-rendering letters in `_BLANKS`. A literal holding U+202E
+    reversed the line it was printed on, and 0x80 to 0x9f went out raw (#78). An emoji
+    built with U+200D or U+FE0F shows those as escapes too, which costs a dump read to
+    find things nothing. Spelled `\\n`, `\\r`, `\\t` and `\\\\`, `\\xNN` below 0x100,
+    `\\uNNNN`, and `\\UNNNNNNNN` past the BMP, where `\\u1f600` would read ambiguously.
     """
+    if s.isprintable() and "\\" not in s and not _ODD.search(s):
+        return s
     out = []
     for ch in s:
-        if ch in "\\":
+        if ch == "\\":
             out.append("\\\\")
         elif ch == "\n":
             out.append("\\n")
@@ -83,11 +93,10 @@ def printable(s: str) -> str:
             out.append("\\r")
         elif ch == "\t":
             out.append("\\t")
-        elif (ch < " " or ch == "\x7f" or "\ud800" <= ch <= "\udfff"
-              # NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR are not ASCII newlines but
-              # several tools still break lines on them, which would undo the point of this.
-              or ch in "\u0085\u2028\u2029"):
-            out.append(f"\\x{ord(ch):02x}" if ord(ch) < 256 else f"\\u{ord(ch):04x}")
+        elif _hides(ch):
+            o = ord(ch)
+            out.append(f"\\x{o:02x}" if o < 256 else
+                       f"\\u{o:04x}" if o <= 0xFFFF else f"\\U{o:08x}")
         else:
             out.append(ch)
     return "".join(out)
@@ -111,6 +120,16 @@ _BLANKS = frozenset(
 _ODD = re.compile("[" + re.escape("".join(sorted(_BLANKS))) + "]")
 
 
+def _hides(ch: str) -> bool:
+    """Whether `ch` renders as nothing or changes how its neighbours render: a control or
+    format character, a surrogate, an unassigned or private code point, a line or
+    paragraph separator, a space other than U+0020, or one of `_BLANKS`. What
+    isprintable() refuses, plus `_BLANKS`."""
+    cat = unicodedata.category(ch)
+    return (cat[0] == "C" or cat in ("Zl", "Zp") or (cat == "Zs" and ch != " ")
+            or ch in _BLANKS)
+
+
 def visible(text: str, backslash: bool = True) -> str:
     """`text` with every character that renders as nothing, or changes how its neighbours
     render, written as a \\u escape: controls, bidi overrides, zero width and other
@@ -132,9 +151,7 @@ def visible(text: str, backslash: bool = True) -> str:
         return text
     out = []
     for ch in text:
-        cat = unicodedata.category(ch)
-        if (cat[0] == "C" or cat in ("Zl", "Zp") or (cat == "Zs" and ch != " ")
-                or ch in _BLANKS or (backslash and ch == "\\")):
+        if _hides(ch) or (backslash and ch == "\\"):
             out.append("\\\\" if ch == "\\" else
                        f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}")
         else:

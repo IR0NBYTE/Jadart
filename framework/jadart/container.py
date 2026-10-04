@@ -37,6 +37,7 @@ binary is the ONLY index of what the app declares as an asset.
 from __future__ import annotations
 
 from .errors import ContainerError, JadartError
+from .fill import visible
 
 import gzip
 import json
@@ -425,7 +426,8 @@ def _write_container_map(outdir: str, container: str, stats: dict):
             out.append(f"  {label:<19} {n:>4} {plural(n)} {b / 1e6:>6.1f} MB"
                        f"{'  ' + note if note else ''}\n")
     if len(stats["abis"]) > 1:
-        out.append(f"\nABIs present: {', '.join(stats['abis'])}. They carry the same Dart "
+        abis = ", ".join(visible(a) for a in stats["abis"])    # directory names (#78)
+        out.append(f"\nABIs present: {abis}. They carry the same Dart "
                    f"compiled for\ndifferent targets; jadart read the arm64 one.\n")
     with open(os.path.join(outdir, "container.txt"), "w", **TEXT_OUT) as fh:
         fh.writelines(out)
@@ -467,7 +469,7 @@ def _expand_notices(adir: str) -> int:
         fh.write(f"# {len(names)} packages named in NOTICES: everything this build links.\n")
         fh.write("# Decompressed from NOTICES.Z, which ships gzipped and unreadable.\n\n")
         for n in names:
-            fh.write(n + "\n")
+            fh.write(visible(n) + "\n")      # read out of NOTICES, as names are (#78)
     return len(names)
 
 
@@ -498,6 +500,9 @@ def _expand_manifest(adir: str) -> int:
 def _write_inventory(outdir: str, inventory: list):
     """One line per asset: what it is, how big, and whether it is worth opening."""
     inventory.sort(key=lambda r: (not r[3], r[0]))
+    # A member's path is the container's to choose, so it is listed escaped (#78).
+    inventory = [(visible(rel), size, kind, notable)
+                 for rel, size, kind, notable in inventory]
     width = min(max((len(r[0]) for r in inventory), default=10), 68)
     with open(os.path.join(outdir, "assets.txt"), "w", **TEXT_OUT) as fh:
         fh.write(f"{len(inventory)} files in the Flutter asset bundle. "
