@@ -96,8 +96,9 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   div or p left open to the end of the file held the rest of the page and was not
   reported. Each now ends with its own end tag, in the order they opened, read with one
   stack of open elements, which a `<div></div>` in a list cannot pop for one left open at
-  the top; HTML in a list, a quote or an indent closes none, nor does a line a list item
-  or a quote opens, since `    </div>` and `-     </div>` there are indented code blocks.
+  the top. An end tag closes one opened on an earlier line only where it is sure to be
+  HTML, on the first line of a block at column 0 or in a block a block tag opens, since
+  `    </div>` after a blank line or `-     </div>` after a paragraph is code.
   Three code spans in EVAL.md and FINDINGS.md that went on to a second line now fit on
   one, the issue template's title says `VERSION` where it said `<version>`, and the docs
   pass. Closes #48.

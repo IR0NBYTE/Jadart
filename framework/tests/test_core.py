@@ -4865,8 +4865,9 @@ def test_fencecheck_refuses_a_block_element_left_open():
     the order they opened, since a browser closes some on its own (a cell at the next, a
     `p` at a block) and ignores others (a `</div>` while a table is open). One stack of
     open elements keeps that linear: a stack per name let a balanced `<div></div>` in a
-    list cancel a `<div>` left open at the top. HTML in a list, a quote or an indent does
-    not close one either, since `    </div>` there is an indented code block."""
+    list cancel a `<div>` left open at the top. An end tag closes one opened on an earlier
+    line only where it is sure to be HTML, since `    </div>` after a blank line, or a
+    list item after a paragraph opening with `<b>`, is an indented code block."""
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     from fencecheck import check
 
@@ -4881,10 +4882,13 @@ def test_fencecheck_refuses_a_block_element_left_open():
     for closer in ("    </div>", "\t</div>", "- a\n\n      </div>", "-     </div>",
                    "- </div>", "> </div>"):
         assert lines(f"<div>\n\n{closer}\n\nrest\n") == [(1, "unsupported")], closer
-    # `<b>x</b> <div>` is a paragraph, which a list item or a quote breaks into.
-    for closer in ("-     </div>", "1.     </div>", ">     </div>"):
+    # `<b>x</b> <div>` is a paragraph, which a list item, a quote or a comment breaks
+    # into, and then the closer is code. A block a block tag opens is HTML to its end.
+    for closer in ("-     </div>", "1.     </div>", ">     </div>",
+                   "-     y\n      </div>", ">     y\n    </div>", "<!-- c -->\n    </div>"):
         found = lines(f"<b>x</b> <div>\n{closer}\n\nrest\n")
         assert (1, "unsupported") in found, (closer, found)
+    assert check("<div>\n-     y\n      </div>\n") == []
     for text in ("<table>\n<tr><td>a<td>b</tr>\n</table>\n", "</div>\n",
                  "<div><table></div></table>\n", "<div>\n\n<table>\n</div>\n</table>\n"):
         found = check(text)

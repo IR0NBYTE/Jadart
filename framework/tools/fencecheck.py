@@ -70,11 +70,12 @@ or an indent, and it refuses anything outside the dialect rather than guess:
   block at column 0, which every renderer reads as a comment block running to its first
   `-->`.
 - Every table, row, cell, div and p ends with its own end tag, in the order they
-  opened, in HTML that opens at column 0. A browser closes some of them on its own and
-  lets others hold the rest of the page, which one rule saves telling apart. HTML in a
-  list, a quote or an indent ends none opened above it, nor does a line of the block
-  that a list item, a quote or a footnote opens: there `    </div>` and `-     </div>`
-  are indented code blocks.
+  opened. A browser closes some of them on its own and lets others hold the rest of
+  the page, which one rule saves telling apart. An end tag closes an element opened on
+  an earlier line only on a line sure to be HTML: the first of a block at column 0, or
+  any of one a block tag opens. Elsewhere it may be text, as `    </div>` and
+  `-     </div>` are indented code blocks after a blank line or after a paragraph that
+  opens with `<b>`.
 - No HTML stands in a line of Markdown, a heading, a list item, a paragraph or a table
   row, outside a code span, an autolink or an escape: a block tag there holds the rest
   of the page, and a link, an image's alt text or a code span can take an inline tag's
@@ -398,11 +399,13 @@ _BACKTICKS = re.compile(r"`+")
 #: content is indented, or an ATX heading there. A `>` line may go on with a quote's
 #: paragraph and an ordered item with a paragraph, so neither is one.
 _OWN_BLOCK = re.compile(r"[-*+][ \t]+[^ \t]|#{1,6}(?:[ \t]|$)")
-#: A line that a list item, a quote or a footnote can open, after spaces or tabs. It can
-#: break into a paragraph, so even on a line of a block opening at column 0 its HTML
-#: may be text: after `<b>x</b> <div>`, which is a paragraph and not an HTML block,
-#: `-     </div>` is a list item holding an indented code block.
-_CONTAINER = re.compile(r"[ \t]*(?:>|[-*+](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)|\[\^)")
+#: The first line of an HTML block of CommonMark's type 6, among the tags this check
+#: allows: `<` or `</` and a block tag's name. That block runs to the next blank line
+#: whatever its lines hold, so each of them is HTML. Any other line opening with `<`,
+#: `<b>x</b> <div>` say, starts a paragraph, which a list item, a quote or a comment can
+#: break into, and after that `    </div>` is an indented code block, not an end tag.
+_BLOCK_START = re.compile(
+    r"</?(?:div|h[1-6]|hr|p|table|tbody|td|th|thead|tr)(?:[ \t>]|/>|$)", re.IGNORECASE)
 #: A cell boundary in a GFM table row: a `|` that no backslash escapes.
 _CELL = re.compile(r"(?<!\\)\|")
 #: A tag on a line of HTML, its name read the way a browser reads it, for the elements
@@ -589,28 +592,34 @@ def _without_comments(text: str) -> str:
         i = k + 3
 
 
-def _nest(text: str, n: int, stack: list, problems: list) -> None:
-    """Open and close the table, div and p elements on line `n` of an HTML block that
-    opens at column 0.
+def _nest(text: str, n: int, stack: list, problems: list, certain: bool) -> None:
+    """Open and close the table, div and p elements on line `n` of HTML.
 
     Each has to close with its own end tag, in the order they opened, and the ones still
     open at the end of the file are reported. A browser closes some on its own, a `p`
     before a table, a cell before the next, and lets others hold the rest of the page,
     and it ignores a `</div>` while a table is open; one rule for all of them leaves
-    nothing to tell apart. HTML in a list, a quote or an indent is not read here, nor a
-    line of a column-0 block that a list item, a quote or a footnote opens (_CONTAINER).
-    It has to close on its line what it opens anyway, and a closer there may be text:
-    after four spaces it is an indented code block, `    </div>`, or after a list marker
-    and five, `-     </div>`, which closes nothing, so one is never taken for the end tag
-    of an element left open above it."""
+    nothing to tell apart.
+
+    Every opener counts, but a closer ends an element opened on an earlier line only
+    when the line is `certain` to be HTML: the first line of a block at column 0, or any
+    line of one a block tag opens (_BLOCK_START). Elsewhere it may be text, `    </div>`
+    as an indented code block after a blank line, or `-     </div>` as a list item
+    holding one after a paragraph such as `<b>x</b> <div>`, so it ends only what its own
+    line opened."""
+    own = 0                                      # elements this line opened, still open
     for m in _ANY_TAG.finditer(_without_comments(text)):
         closing, tag = m.group(1), m.group(2).lower()
         if tag not in _STAYS_OPEN:
             continue
         if not closing:
             stack.append((tag, n))
+            own += 1
+        elif not certain and not own:
+            continue                             # may be text; the element stays open
         elif stack and stack[-1][0] == tag:
             stack.pop()
+            own = max(0, own - 1)
         else:
             last = (f"the `<{stack[-1][0]}>` opened at line {stack[-1][1]} is still open"
                     if stack else "nothing is open")
@@ -641,6 +650,8 @@ def check(text: str) -> list:
     para = []                        # the run of lines of Markdown being read
     stack = []                       # (tag, line) of the table, div and p elements open
     top = False                      # this HTML block opens at column 0, in no container
+    whole = False                    # and with a block tag, so that each line is HTML
+    first = 0                        # the line it opens on
     # YAML front matter is read as Markdown too: GitHub shows it as a table of text, but
     # markdown-it and cmark render it, `---` as a rule and what follows as a heading.
     for n, line in enumerate(_LINES.split(text), 1):
@@ -663,19 +674,20 @@ def check(text: str) -> list:
                                               "its `-->`; this check refuses fences "
                                               "there"))
             new_block = not (html or comment)
-            top = top and not new_block or new_block and not re.match(_MARKER, line)
+            if new_block:
+                top, first = not re.match(_MARKER, line), n
+                whole = top and bool(_BLOCK_START.match(line))
+            certain = top and (whole or n == first)
             block_comment = comment or new_block and line.startswith("<!--")
             html = bool(line.strip(" \t"))
             contained = contained and not new_block or bool(re.match(_MARKER, line))
             if new_block and not block_comment and not at_break:
                 problems.append((n, "unsupported", _WHY["joined"]))
-                if top and not _CONTAINER.match(line):
-                    _nest(line, n, stack, problems)
+                _nest(line, n, stack, problems, certain)
                 continue
             if not block_comment and _HEADING.match(line):
                 problems.append((n, "unsupported", _WHY["heading"]))
-                if top and not _CONTAINER.match(line):
-                    _nest(line, n, stack, problems)
+                _nest(line, n, stack, problems, certain)
                 continue
             scan = line
             if comment:
@@ -699,8 +711,8 @@ def check(text: str) -> list:
                 # A comment block ends at the line holding its `-->`, which this one
                 # does, and the lines after it are Markdown again.
                 html, after_break = False, True
-            if top and not comment and not _CONTAINER.match(line):
-                _nest(scan, n, stack, problems)
+            if not comment:
+                _nest(scan, n, stack, problems, certain)
             continue
         m = _FENCE.match(line)
         if open_at is None and (m is None or m.group(1)) and _fence_at(_NESTED, line):
