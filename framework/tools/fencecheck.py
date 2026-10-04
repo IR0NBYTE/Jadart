@@ -72,15 +72,17 @@ or an indent, and it refuses anything outside the dialect rather than guess:
 - Every table, row, cell, div and p ends with its own end tag, in the order they
   opened, in HTML that opens at column 0. A browser closes some of them on its own and
   lets others hold the rest of the page, which one rule saves telling apart. HTML in a
-  list, a quote or an indent ends none opened above it: there `    </div>` is an
-  indented code block.
+  list, a quote or an indent ends none opened above it, nor does a line of the block
+  that a list item, a quote or a footnote opens: there `    </div>` and `-     </div>`
+  are indented code blocks.
 - No HTML stands in a line of Markdown, a heading, a list item, a paragraph or a table
   row, outside a code span, an autolink or an escape: a block tag there holds the rest
   of the page, and a link, an image's alt text or a code span can take an inline tag's
   closer. Code spans are read a line at a time, which is how a renderer reads them
   only when no run of backticks on an earlier line of the paragraph is left to pair
-  with a later one and no link's destination or title takes one first, so `<` markup
-  in a code span after either is refused, and a table row is read cell by cell as well.
+  with a later one and no link's destination, title or reference label takes one first,
+  so `<` markup in a code span after either is refused, and a table row is read cell by
+  cell as well.
 - The file does not start with a byte order mark, which GitHub drops and markdown-it
   keeps as text, so the two pair the fences after it differently, and holds no NUL, with
   which GitHub renders none of it as Markdown.
@@ -396,6 +398,11 @@ _BACKTICKS = re.compile(r"`+")
 #: content is indented, or an ATX heading there. A `>` line may go on with a quote's
 #: paragraph and an ordered item with a paragraph, so neither is one.
 _OWN_BLOCK = re.compile(r"[-*+][ \t]+[^ \t]|#{1,6}(?:[ \t]|$)")
+#: A line that a list item, a quote or a footnote can open, after spaces or tabs. It can
+#: break into a paragraph, so even on a line of a block opening at column 0 its HTML
+#: may be text: after `<b>x</b> <div>`, which is a paragraph and not an HTML block,
+#: `-     </div>` is a list item holding an indented code block.
+_CONTAINER = re.compile(r"[ \t]*(?:>|[-*+](?:[ \t]|$)|\d{1,9}[.)](?:[ \t]|$)|\[\^)")
 #: A cell boundary in a GFM table row: a `|` that no backslash escapes.
 _CELL = re.compile(r"(?<!\\)\|")
 #: A tag on a line of HTML, its name read the way a browser reads it, for the elements
@@ -446,6 +453,15 @@ def _link_end(text: str, i: int) -> int:
     return j + 1 if j < n and text[j] == ")" else -1
 
 
+def _label_end(text: str, i: int) -> int:
+    """Just past the `]` closing the link label whose `[` is at `i`, or -1 when it does
+    not close on this line, where a label may go on."""
+    j, n = i + 1, len(text)
+    while j < n and text[j] != "]":
+        j += 2 if text[j] == "\\" else 1
+    return j + 1 if j < n else -1
+
+
 def _inline(text: str):
     """Where `text`, read as one line of Markdown on its own, holds the start of HTML:
     (outside, inside, unpaired, link). `outside` lists the positions of the `<` that
@@ -453,7 +469,8 @@ def _inline(text: str):
     of the last one in a code span, or -1; `unpaired` is True when a run of backticks
     finds no closer on the line, which another line of the paragraph can then give it;
     `link` is where the first `](` stands outside a code span whose destination and
-    title hold a backtick or may go on to the next line, or -1.
+    title hold a backtick or may go on to the next line, or the first `][` whose label
+    does, or -1.
 
     It reads left to right as CommonMark does, an escape, a code span or an autolink
     taking whatever starts first, and a code span ending at the next run of exactly as
@@ -476,6 +493,14 @@ def _inline(text: str):
             if link < 0:
                 tails += 1
                 end = _link_end(text, i) if tails <= 64 else -1
+                if end < 0 or "`" in text[i:end]:
+                    link = i
+            i += 2
+        elif ch == "]" and text.startswith("][", i):
+            # A full reference link: GitHub reads the label `[a`b]` raw, as a tail.
+            if link < 0:
+                tails += 1
+                end = _label_end(text, i + 1) if tails <= 64 else -1
                 if end < 0 or "`" in text[i:end]:
                     link = i
             i += 2
@@ -572,11 +597,12 @@ def _nest(text: str, n: int, stack: list, problems: list) -> None:
     open at the end of the file are reported. A browser closes some on its own, a `p`
     before a table, a cell before the next, and lets others hold the rest of the page,
     and it ignores a `</div>` while a table is open; one rule for all of them leaves
-    nothing to tell apart. HTML in a list, a quote or an indent is not read here. It
-    has to close on its line what it opens anyway, and a closer there may be text: after
-    four spaces it is an indented code block, `    </div>`, or after a list marker and
-    five, `-     </div>`, which closes nothing, so one is never taken for the end tag of
-    an element left open above it."""
+    nothing to tell apart. HTML in a list, a quote or an indent is not read here, nor a
+    line of a column-0 block that a list item, a quote or a footnote opens (_CONTAINER).
+    It has to close on its line what it opens anyway, and a closer there may be text:
+    after four spaces it is an indented code block, `    </div>`, or after a list marker
+    and five, `-     </div>`, which closes nothing, so one is never taken for the end tag
+    of an element left open above it."""
     for m in _ANY_TAG.finditer(_without_comments(text)):
         closing, tag = m.group(1), m.group(2).lower()
         if tag not in _STAYS_OPEN:
@@ -643,12 +669,12 @@ def check(text: str) -> list:
             contained = contained and not new_block or bool(re.match(_MARKER, line))
             if new_block and not block_comment and not at_break:
                 problems.append((n, "unsupported", _WHY["joined"]))
-                if top:
+                if top and not _CONTAINER.match(line):
                     _nest(line, n, stack, problems)
                 continue
             if not block_comment and _HEADING.match(line):
                 problems.append((n, "unsupported", _WHY["heading"]))
-                if top:
+                if top and not _CONTAINER.match(line):
                     _nest(line, n, stack, problems)
                 continue
             scan = line
@@ -673,7 +699,7 @@ def check(text: str) -> list:
                 # A comment block ends at the line holding its `-->`, which this one
                 # does, and the lines after it are Markdown again.
                 html, after_break = False, True
-            if top and not comment:
+            if top and not comment and not _CONTAINER.match(line):
                 _nest(scan, n, stack, problems)
             continue
         m = _FENCE.match(line)

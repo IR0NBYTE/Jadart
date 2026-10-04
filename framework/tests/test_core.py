@@ -4853,7 +4853,8 @@ def test_fencecheck_refuses_html_in_a_line_of_markdown():
     # line or on the next, and the HTML after it renders.
     for text in ('[x](/u "`") <table><tr><td>`\n', "[x](`) <table>`\n", "[x](<`>) <b>`\n",
                  "![x](/u '`') <div>`\n", '[x](/u "a\n`") <table><tr><td>`\n',
-                 "[x](\n`y`) `<b>`\n"):
+                 "[x](\n`y`) `<b>`\n",
+                 "[x][a`b] <div>`\n\n[a`b]: /u\n"):   # GitHub reads the label raw
         assert lines(text) == [(1, "unsupported")], text
     assert lines("---\ntitle: <table><tr><td>\n---\n\nrest\n") == [(2, "unsupported")]
 
@@ -4880,6 +4881,10 @@ def test_fencecheck_refuses_a_block_element_left_open():
     for closer in ("    </div>", "\t</div>", "- a\n\n      </div>", "-     </div>",
                    "- </div>", "> </div>"):
         assert lines(f"<div>\n\n{closer}\n\nrest\n") == [(1, "unsupported")], closer
+    # `<b>x</b> <div>` is a paragraph, which a list item or a quote breaks into.
+    for closer in ("-     </div>", "1.     </div>", ">     </div>"):
+        found = lines(f"<b>x</b> <div>\n{closer}\n\nrest\n")
+        assert (1, "unsupported") in found, (closer, found)
     for text in ("<table>\n<tr><td>a<td>b</tr>\n</table>\n", "</div>\n",
                  "<div><table></div></table>\n", "<div>\n\n<table>\n</div>\n</table>\n"):
         found = check(text)
