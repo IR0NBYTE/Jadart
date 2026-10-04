@@ -4426,6 +4426,13 @@ def test_fencecheck_reports_fences_that_do_not_pair_up(tmp_path, capsys):
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     from fencecheck import (_ALLOWED, _ALLOWED_ATTRS, _CLOSE_ON_LINE, _INLINE,
                             _STAYS_OPEN, check, main)
+    full_check = check
+
+    def check(text):
+        # Many of these leave a table or a div open on purpose, to test something else;
+        # an element left open to the end of the file is tested on its own (#48).
+        return [p for p in full_check(text)
+                if "with no end tag" not in p[2] and "opened last" not in p[2]]
 
     def kinds(text):
         return [k for _n, k, _m in check(text)]
@@ -4797,7 +4804,100 @@ def test_fencecheck_runs_in_linear_time_on_container_markers():
     check("<br>\n" + "1. - " * 10000 + "x\n")
     check("<br>\n" + "- > " * 10000 + "x\n")       # quote markers after list markers
     check("<br>\n" + "1. >> " * 10000 + "-" * 10000 + "\n")
+    check("<table>" * 20000 + "</div>" * 20000 + "\n")   # one stack of open elements
+    check("x " + "` " * 40000 + "<b>\n")                # backtick runs, each paired once
+    check("x " + "".join("`" * k + " " for k in range(1, 600)) + "<b>\n")
+    check("x " + "| `<b>` " * 30000 + "\n")              # a table row, cell by cell
+    check("x `a\n" + "`<b>`\n" * 20000)                 # one report per paragraph
+    check("x " + "](" * 40000 + "`<b>`\n")               # link tails, each to the end
+    check("x " + "[a](b) " * 20000 + "`<b>`\n")
     assert time.perf_counter() - start < 1.0
+
+
+def test_fencecheck_refuses_html_in_a_line_of_markdown():
+    """HTML was checked only on a line opening with `<`. Later in any other line it was
+    not, so `# <br> <table><tr><td>` put the rest of the page in a heading and `* [<b>]`
+    left a bold element open over it (#48). No HTML may stand in a line of Markdown now,
+    outside a code span, an autolink or an escape. A code span is read on its line, so a
+    paragraph is refused where an earlier line leaves a run of backticks to pair with a
+    later one, or a link's destination or title takes a backtick, before `<` markup in a
+    code span; and a table row is read cell by cell too. YAML front matter is Markdown to
+    markdown-it, so it is read as such."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from fencecheck import check
+
+    def lines(text):
+        return [(n, k) for n, k, _m in check(text)]
+    for text in ("# <br> <table><tr><td>\n\ntext\n", "* [<b>]\n", "x <b>y</b> z\n",
+                 "- x </div>\n", "a <!-- c --> b\n", "a <?x?>\n", "a <!x>\n",
+                 "| a | <table> |\n", "\\\\<b> after an escaped backslash\n",
+                 "`a` <div> `b`\n", "``a`` ` <div>\n",
+                 "\\`` `<div>` ``\n"):    # an escaped backtick, then code `` ` ``
+        assert lines(text) == [(1, "unsupported")], text
+    found = check("# <br> <table>\n")
+    assert "`<br` in a line of Markdown" in found[0][2], found
+    for text in ("`<table>` in code, ``a ` <div> `` too\n", "x <https://a.example/b> y\n",
+                 "mail <a@b.example>\n", "\\<table> is text\n", "a < b and a<1\n",
+                 "`` `<div>` ``\n", "[x](y) `<b>`\n", "[x](/y 't') `<b>`\n",
+                 "[x](a(b)c) `<b>`\n", "`<b>` [x](/u \"`\")\n",   # the code span is first
+                 "- a `x\n- `<div>` b`\n",           # a bullet starts a block of its own
+                 "a `x\n\n`<div>` b`\n"):           # and a blank line ends a paragraph
+        assert check(text) == [], text
+    # The paragraph reads `x\n` as code and `<div>` as HTML, the line alone as code.
+    found = check("a `x\n`<div>` b`\n")
+    assert [(n, k) for n, k, _m in found] == [(1, "unsupported")], found
+    assert "at line 2" in found[0][2], found
+    # A table row: GFM splits cells first, so `<div>` stands outside a code span.
+    assert lines("| `a | <div> | b` |\n") == [(1, "unsupported")]
+    # A link's destination or title takes the backtick this reading would pair, on its
+    # line or on the next, and the HTML after it renders.
+    for text in ('[x](/u "`") <table><tr><td>`\n', "[x](`) <table>`\n", "[x](<`>) <b>`\n",
+                 "![x](/u '`') <div>`\n", '[x](/u "a\n`") <table><tr><td>`\n',
+                 "[x](\n`y`) `<b>`\n",
+                 "[x][a`b] <div>`\n\n[a`b]: /u\n"):   # GitHub reads the label raw
+        assert lines(text) == [(1, "unsupported")], text
+    assert lines("---\ntitle: <table><tr><td>\n---\n\nrest\n") == [(2, "unsupported")]
+
+
+def test_fencecheck_refuses_a_block_element_left_open():
+    """A top-level table, div or p left open to the end of the file holds the rest of the
+    page, and nothing reported it (#48). Each of them now ends with its own end tag, in
+    the order they opened, since a browser closes some on its own (a cell at the next, a
+    `p` at a block) and ignores others (a `</div>` while a table is open). One stack of
+    open elements keeps that linear: a stack per name let a balanced `<div></div>` in a
+    list cancel a `<div>` left open at the top. An end tag closes one opened on an earlier
+    line only where it is sure to be HTML, since `    </div>` after a blank line, or a
+    list item after a paragraph opening with `<b>`, is an indented code block."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from fencecheck import check
+
+    def lines(text):
+        return [(n, k) for n, k, _m in check(text)]
+    assert lines("<div>\n\ntext\n") == [(1, "unsupported")]
+    assert "`<div>` with no end tag" in check("<div>\n\ntext\n")[0][2]
+    assert lines("<div>\n\n- <div></div>\n\npara\n") == [(1, "unsupported")]
+    assert lines("<p>a\n<p>b</p>\n") == [(1, "unsupported")]
+    assert lines("<!--> <table>\n") == [(1, "unsupported")]    # `<!-->` is a comment
+    assert lines("<table><table>\n") == [(1, "unsupported")]   # one report a line
+    for closer in ("    </div>", "\t</div>", "- a\n\n      </div>", "-     </div>",
+                   "- </div>", "> </div>"):
+        assert lines(f"<div>\n\n{closer}\n\nrest\n") == [(1, "unsupported")], closer
+    # `<b>x</b> <div>` is a paragraph, which a list item, a quote or a comment breaks
+    # into, and then the closer is code. A block a block tag opens is HTML to its end.
+    for closer in ("-     </div>", "1.     </div>", ">     </div>",
+                   "-     y\n      </div>", ">     y\n    </div>", "<!-- c -->\n    </div>"):
+        found = lines(f"<b>x</b> <div>\n{closer}\n\nrest\n")
+        assert (1, "unsupported") in found, (closer, found)
+    assert check("<div>\n-     y\n      </div>\n") == []
+    for text in ("<table>\n<tr><td>a<td>b</tr>\n</table>\n", "</div>\n",
+                 "<div><table></div></table>\n", "<div>\n\n<table>\n</div>\n</table>\n"):
+        found = check(text)
+        assert any("opened last" in m for _n, _k, m in found), (text, found)
+    for text in ("<table>\n<tr><td>a</td></tr>\n</table>\n", "<div>\n\ntext\n\n</div>\n",
+                 "<table>\n  <tr><td>x</td></tr>\n    </table>\n",   # one HTML block
+                 "<!-- x --> <div></div>\n", "<!--\n<div>\n-->\n",
+                 "<p>a</p> <br> <b>c</b>\n"):
+        assert check(text) == [], text
 
 
 def test_fencecheck_tracked_covers_the_docs_check_sh_names():

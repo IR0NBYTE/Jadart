@@ -254,12 +254,12 @@ code range's pc_offset back to the covering .symtab symbol. On the real app this
 9666 real function names that the snapshot no longer held, on top of the 7225 string
 literals recovered from the snapshot (which include the app's hardcoded flag), with full
 100% disassembly coverage (11052 ranges). The hardcoded flag is localized to its exact load
-site through a far pool load (the test-phase fix above), and `--disasm
-_FlagCheckPageState._checkFlag` resolves the real name to its code. The backfill needs a
+site through a far pool load (the test-phase fix above), and
+`--disasm _FlagCheckPageState._checkFlag` resolves the real name to its code. The backfill needs a
 .so that still carries a symbol table (an unstripped build intermediate, a debug .so, or a
 matching --split-debug-info file); a fully stripped shipped .so loses the names for every
-tool. Reproduce against any such .so: `JADART_REALAPP_LIB=<libapp.so> python3
-framework/tests/test_core.py`.
+tool. Reproduce against any such .so:
+`JADART_REALAPP_LIB=<libapp.so> python3 framework/tests/test_core.py`.
 
 ## Target resolution: closing a hole in our own fail-loud claim
 

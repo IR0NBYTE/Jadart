@@ -83,8 +83,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   both extensions in any case now. And a quote marker after a list marker (`- > # x`)
   under HTML was not read as the heading line it is, which holds what the HTML above it
   left open; it is refused now, as `- # x` was. The docs in the repository still pass.
-  #48 keeps the two cases left: HTML later in a line that does not open with `<`, and a
-  top-level table, div or p left open to the end of the file. Part of #48.
+  Part of #48.
+- **The fence check reads HTML anywhere in a line, and an element left open to the end.**
+  It checked HTML only on a line opening with `<`, so `# <br> <table><tr><td>` put the
+  rest of the page inside a heading and `* [<b>]` left a bold element open over it. No
+  HTML may stand in a line of Markdown now, outside a code span, an autolink or an escape.
+  Code spans are read a line at a time, which is how a renderer reads them when no earlier
+  line of the paragraph leaves a run of backticks to pair with a later one and no link's
+  destination, title or reference label takes one first, so `<` markup in a code span
+  after either is refused, and a table row is read cell by cell too. YAML front matter is
+  read as Markdown, since markdown-it and cmark render it. A top-level table, row, cell,
+  div or p left open to the end of the file held the rest of the page and was not
+  reported. Each now ends with its own end tag, in the order they opened, read with one
+  stack of open elements, which a `<div></div>` in a list cannot pop for one left open at
+  the top. An end tag closes one opened on an earlier line only where it is sure to be
+  HTML, on the first line of a block at column 0 or in a block a block tag opens, since
+  `    </div>` after a blank line or `-     </div>` after a paragraph is code.
+  Three code spans in EVAL.md and FINDINGS.md that went on to a second line now fit on
+  one, the issue template's title says `VERSION` where it said `<version>`, and the docs
+  pass. Closes #48.
 - **A signature library survives a crafted reference, and its lines are read to a bound.**
   `save()` wrote each name raw after a tab, so a name holding a line break split its entry
   and `load()` refused the library it had just written, and a name ending in `\r` came
