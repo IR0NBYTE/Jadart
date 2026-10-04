@@ -13,6 +13,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A function cut short says where it goes on.** The instruction cut stops a long
+  function after 4,000 instructions. A conditional there whose target is earlier had its
+  not-taken arm recorded nowhere, so `mov; cmp; b.gt #0x0` printed as a loop with no way
+  out, `while (true) { }` at tier 3 and an `if` with an empty arm inside one at tier 2,
+  and a last instruction that falls through ended the body with nothing said. A branch into the part left out printed as `goto sub_0x...`,
+  which names another function, though the address is inside this one: 2,679 lines in
+  the 46 cut ranges of the corpus's 26 builds. Each now reads
+  `goto 0x...;  // TRUNCATED: past the instruction cut`, the address as `disasm` prints
+  it, and cfgcheck checks the fallthrough past the cut is printed. No range of the
+  fixtures is cut, so their output is unchanged; on the corpus, `export -t 2` adds one
+  such line, to `ColorScheme.fromSeed` in five arm32 builds, and changes no other. Closes
+  #70.
 - **A branch's condition reads the compare arm32 puts further back.** The condition was
   read from the instruction right before the branch, and on arm32 that is often not the
   compare: 8,606 of arm32-2.19.6's tier 2 conditions printed as `? op ?`. It now reads a

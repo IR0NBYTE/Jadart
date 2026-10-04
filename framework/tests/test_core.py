@@ -7864,6 +7864,63 @@ def test_a_goto_out_of_the_function_leaves_the_labels_after_it():
         assert body[2:] == ["L_0x4:", "mov x0, #1", "return;"], body
 
 
+def test_a_function_cut_short_says_where_it_goes_on():
+    """The instruction cut stops a long function before its end (#70). A conditional at
+    the cut whose target is earlier had its not-taken arm recorded nowhere, so `mov; cmp;
+    b.gt #0x0` printed as `while (true) { }`, an infinite loop, at tiers 2 and 3. And a
+    branch into the part left out printed as `goto sub_0x...`, the name of another
+    function, where the address is inside this one: 2,679 such lines in the 46 cut
+    ranges of the corpus. Both now go to the address, marked as past the cut, and
+    cfgcheck checks the fallthrough past it is printed."""
+    _needs_capstone()
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import cfgcheck
+    from jadart.branches import exits, row_kinds
+    from jadart.cfg import build_cfg, render, structure
+    from jadart.disasm import Printer, annotate, cut_end, disassemble_range
+    from jadart.expr import lift_function
+    loop = [(0, "mov", "x0, #1", ""), (4, "cmp", "x0, #2", ""), (8, "b.gt", "#0x0", "")]
+    for cut in (None, 0x40):
+        blocks, entry = build_cfg(loop, cut_end=cut)
+        body = [ln.strip() for ln in render(blocks, structure(blocks, entry), show=None)]
+        lifted = [ln.strip() for ln in lift_function(loop, cut_end=cut)]
+        past = "goto 0xc;  // TRUNCATED: past the instruction cut"
+        if cut is None:                       # the rows alone: a function that ends there
+            assert past not in body and lifted == ["while (true) {", "}"], lifted
+        else:
+            assert body[3:5] == ["if (x0 <= 2) {", past], body
+            assert past in lifted, lifted
+    # cmp #0; b.gt/bgt 0x14; three movs; return. Decoded only as far as the branch.
+    for arch, words, cond in (
+            ("arm64", [0xF100007F, 0x5400008C, 0xD2800020, 0xD2800040, 0xD2800060,
+                       0xD65F03C0], "if (x3 > 0) {"),
+            ("arm", [0xE3530000, 0xCA000002, 0xE3A00001, 0xE3A00002, 0xE3A00003,
+                     0xE12FFF1E], "if (r3 > 0) {")):
+        image = _word_image(words, arch, 0x1000)
+        cr = image.all_ranges[0]
+        dis = disassemble_range(image, cr, max_insns=2)
+        end = cut_end(cr, dis, max_insns=2)
+        assert end == 0x18 and cut_end(cr, disassemble_range(image, cr)) is None
+        ann = annotate(dis, {}, None, kinds=row_kinds(image, dis))
+        blocks, entry = build_cfg(ann, exits=exits(image, dis), cut_end=end)
+        stmts = structure(blocks, entry)
+        body = [ln.strip() for ln in render(blocks, stmts, show=Printer(image))]
+        assert body[-4:] == [cond, "goto 0x1014;  // TRUNCATED: past the instruction cut",
+                             "}", "goto 0x1008;  // TRUNCATED: past the instruction cut"]
+        assert cfgcheck.check_function(blocks, stmts)[0] == [], arch
+        assert cfgcheck.exit_violations(image, cr, blocks) == [], arch
+        old, entry = build_cfg(ann, exits=exits(image, dis))
+        assert cfgcheck.check_function(blocks, structure(old, entry))[0] == [
+            (0, ["no cut rendered"], [])], arch
+        # A target past the end of the range is another function's, as it was.
+        far = build_cfg(ann, exits=exits(image, dis), cut_end=0x10)[0]
+        assert not far[0].past_cut and far[0].cut_next == 8, far
+    # A trap does not run on past the cut, though tier 3 keeps the edge past one.
+    trap = [(0, "bl", "#0x100", ""), (4, "brk", "#0", "")]
+    assert build_cfg(trap, traps=(), cut_end=0x40)[0][0].cut_next == -1
+    assert not any("TRUNCATED" in ln for ln in lift_function(trap, cut_end=0x40))
+
+
 def test_a_conditional_at_the_cut_keeps_its_taken_edge():
     """A conditional branch that is the last instruction decoded, with its target past
     the cut, was recorded neither as a successor nor as an exit: tier 2 printed an `if`

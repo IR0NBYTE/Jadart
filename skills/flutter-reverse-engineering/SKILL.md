@@ -52,6 +52,7 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | `const[47] @0xb9b0{...}` | a const list, shown truncated | guess the rest; run `constants` |
 | `goto L_0x1234` | an edge the structurer could not nest | "a loop" without checking |
 | `// reached by no edge ...` | code no branch shown leads to | "it runs after that" |
+| `// TRUNCATED: past the instruction cut` | the function goes on past the 4,000 instructions decoded | "it ends here" |
 
 A name holding `\u202e`, `\u001b`, `\u200b` or another `\u` escape is a name the binary
 really carries, with a character in it that would reorder, hide or colour the text around

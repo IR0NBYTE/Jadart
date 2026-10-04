@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from sys import intern
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, _idoms)
+                  cond_of, _idoms, cut_goto)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -2364,7 +2364,7 @@ class Lifter:
             k = s[0]
             if k in ("asm", "loop", "goto", "label"):
                 return s[1]
-            if k == "exit":
+            if k in ("exit", "cut"):
                 return None
             if k == "if":
                 return self._entry_block(s[2], cont) if s[2] else cont
@@ -2614,6 +2614,9 @@ class Lifter:
                 # here. 997 sites on the clean fixture did exactly that.
                 out.append(pad + (f"goto {self._sub(s[1])};" if s[1] >= 0
                                   else "goto <unresolved>;"))
+                falls = alive = False
+            elif kind == "cut":
+                out.append(pad + cut_goto(s[1], self.show))      # inside this function
                 falls = alive = False
         return out, falls
 
@@ -3079,7 +3082,7 @@ def _inline_single_use(lines: list, names: set) -> list:
 
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
                   indent="  ", depth=1, selectors=None, arch=None, fields=None,
-                  show=None) -> list:
+                  show=None, cut_end=None) -> list:
     """Annotated disasm -> pseudo-Dart body lines (Tier 3). `receiver` is an optional
     register-alias map, e.g. {"x1": "this"} for an instance method; `arity` is an optional
     `pc -> int` resolver (see make_arity_resolver) enabling call-argument reconstruction;
@@ -3088,7 +3091,8 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     fields.py), and only the receiver's, so an unresolved base still prints its offset.
     `show` prints the operand of an instruction kept as it is, rebaser(image) from disasm
     so that an `adr` target reads as a virtual address; without it the operand is
-    capstone's.
+    capstone's. `cut_end` is where the range ends when the instruction cut stopped `ann`
+    short of it (disasm.cut_end); see build_cfg.
 
     `arch` is the resolved target. Passing one whose roles are not modelled refuses; see
     LIFTABLE_ARCHS. Omitting it keeps the arm64 assumption every caller had before the
@@ -3103,7 +3107,7 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
             f"Tier 1 (`disasm`) does decode it, and the snapshot layer is unaffected.")
     with use_target(TARGETS[name] if name else ARM64):
         return _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                              fields, show)
+                              fields, show, cut_end)
 
 
 @contextlib.contextmanager
@@ -3164,14 +3168,14 @@ def use_target(tgt: Target):
 
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                   fields=None, show=None) -> list:
+                   fields=None, show=None, cut_end=None) -> list:
     stripped = strip_boilerplate(ann)
     # No traps: tier 3 keeps the edge past a `brk` that tier 2 dropped in #57. Ending the
     # block there takes away a join that, by accident, kept a frame slot from reading as
     # the field it was loaded from, and `forEach`'s concurrent modification guard then
     # prints as `this.field_0xc != this.field_0xc`. Naming frame slots across a call is
     # what fixes that, and it is its own change (#64).
-    blocks, entry = build_cfg(stripped, traps=())
+    blocks, entry = build_cfg(stripped, traps=(), cut_end=cut_end)
     if not blocks:
         return []
     stmts = structure(blocks, entry)

@@ -83,6 +83,14 @@ def check_function(blocks, stmts):
                     nxt = seq[i + 1] if i + 1 < len(seq) else None
                     if not (nxt and nxt[0] == "if" and nxt[2] and nxt[2][0][0] == "exit"):
                         bad.append((s[1], ["no exit rendered"], sorted(blk.succ)))
+                if blk.cut_next >= 0:
+                    # Where it runs on past the instruction cut (#70): right after it, in
+                    # the `if` after it, or after that `if`.
+                    cut = ("cut", blk.cut_next)
+                    after = seq[i + 1:i + 3]
+                    if cut not in after and not (after and after[0][0] == "if"
+                                                 and cut in after[0][2]):
+                        bad.append((s[1], ["no cut rendered"], sorted(blk.succ)))
                 if i + 1 < len(seq) and seq[i + 1][0] == "if":
                     _, _cond, then, els = seq[i + 1]
                     after = _entry(seq[i + 2:], cont, brk, cont_of_loop)
@@ -204,20 +212,21 @@ def exit_violations(image, cr, blocks):
     return bad
 
 
-def _tier2_cfg(image, dis, pc_to_name, pool_map, with_exits=True):
+def _tier2_cfg(image, dis, pc_to_name, pool_map, with_exits=True, cut_end=None):
     """The CFG tier 2 renders, as decompile and export build it."""
     from jadart.branches import exits, row_kinds
     from jadart.cfg import build_cfg
     from jadart.disasm import annotate
     ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
-    return build_cfg(ann, exits=exits(image, dis) if with_exits else None)[0]
+    return build_cfg(ann, exits=exits(image, dis) if with_exits else None,
+                     cut_end=cut_end)[0]
 
 
 def run(path):
     from jadart.cfg import build_cfg, structure
     from jadart.branches import exits, row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc)
+                               build_pool_map, function_name_by_pc, cut_end)
     from jadart.expr import strip_boilerplate
 
     image, fr, _hdr = load_instructions(path)
@@ -229,12 +238,15 @@ def run(path):
         dis = disassemble_range(image, cr)
         if not dis:
             continue
-        ex = exit_violations(image, cr, _tier2_cfg(image, dis, pc_to_name, pool_map))
+        end = cut_end(cr, dis)
+        ex = exit_violations(image, cr, _tier2_cfg(image, dis, pc_to_name, pool_map,
+                                                   cut_end=end))
         exit_bad += len(ex)
         if ex and exit_first is None:
             exit_first = ex[0]
         ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
-        blocks, entry = build_cfg(strip_boilerplate(ann), exits=exits(image, dis))
+        blocks, entry = build_cfg(strip_boilerplate(ann), exits=exits(image, dis),
+                                  cut_end=end)
         if not blocks:
             continue
         n += 1

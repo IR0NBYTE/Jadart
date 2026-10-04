@@ -89,6 +89,13 @@ class Block:
     #: when it does so only under a condition, and otherwise falls through to succ.
     exit: str = ""
     cexit: bool = False
+    #: The instruction cut (disasm.MAX_INSNS) stops a long function before its end (#70).
+    #: past_cut: exit_target lies in the part left undecoded, inside this function, so it
+    #: is an address there and not another function's `sub_0x...`. cut_next: where this
+    #: block falls through to past the cut, or -1; the not-taken arm of a conditional at
+    #: the cut was recorded nowhere, and a backward one printed as `while (true) { }`.
+    past_cut: bool = False
+    cut_next: int = -1
 
 
 _NEG = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<="}
@@ -301,7 +308,7 @@ def _shifted(parts):
     return None
 
 
-def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
+def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
     """Return ({addr: Block}, entry_addr) for a function's disasm
     (list of (addr, mn, op, note)).
 
@@ -312,12 +319,18 @@ def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
 
     `traps` are the mnemonics that end a block with no successor (#57). Tier 3 passes
     none, and keeps the edge past a trap it has always had, until it can name a frame
-    slot across a call; see `_lift_function`."""
+    slot across a call; see `_lift_function`.
+
+    `cut_end` is where the range ends when the instruction cut stopped `dis` short of it
+    (disasm.cut_end), else None. A target from the end of `dis` up to it is inside this
+    function, in code not decoded, and so is the fallthrough of the last instruction
+    (Block.past_cut, Block.cut_next)."""
     if not dis:
         return {}, 0
     exits = exits or {}
     addrs = [d[0] for d in dis]
     lo, hi = addrs[0], addrs[-1] + 4
+    cut = cut_end if cut_end is not None and cut_end > hi else None
     leaders = {lo}
     for i, (a, mn, op, _n) in enumerate(dis):
         if _is_term(mn) or mn in traps or a in exits:
@@ -369,6 +382,7 @@ def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
                     # silently. `exit_target` is what gets printed.
                     blk.succ = []
                     blk.exit_target = t if t is not None else -1
+                    blk.past_cut = cut is not None and t is not None and hi <= t < cut
             elif _is_cond(mn):
                 t = _target(op)
                 ft = end if end < hi else None
@@ -383,10 +397,18 @@ def build_cfg(dis, exits=None, traps=TRAPS) -> tuple[dict, int]:
                     # With no fallthrough either, at the MAX_INSNS cut, the target was
                     # recorded nowhere and the `if` printed with both arms empty (#58).
                     blk.exit_target = t if t is not None else -1
+                    blk.past_cut = cut is not None and t is not None and hi <= t < cut
                 if ft is not None:
                     blk.succ.append(ft)     # fallthrough
             else:
                 blk.succ = [end] if end < hi else []
+            # The last decoded instruction, when it can fall through, falls into the part
+            # the cut left out. A trap never does, though tier 3 keeps the edge past one
+            # inside the function (`traps`).
+            if cut is not None and end == hi and (
+                    _is_cond(mn) or blk.cexit or not (
+                        mn in ("b", "ret", "br", "bx") or mn in TRAPS or blk.exit)):
+                blk.cut_next = hi
         blocks[la] = blk
     _conditions_from_the_block_before(blocks)
     return blocks, lo
@@ -675,15 +697,25 @@ def structure(blocks, entry, orphans: bool = False):
             a, mn, op, _n = blk.insns[-1]
             leave = (("exit", EXIT_RETURN) if blk.exit == "return"
                      else ("exit", EXIT_INDIRECT, f"{mn} {op}".rstrip()))
-            return [("asm", cur), ("if", blk.cond, [leave], [])], (
-                blk.succ[0] if blk.succ else None)
+            stmts = [("asm", cur), ("if", blk.cond, [leave], [])]
+            if blk.cut_next >= 0:
+                stmts.append(("cut", blk.cut_next))
+            return stmts, blk.succ[0] if blk.succ else None
         if blk.exit_target >= 0:
             # The taken arm leaves the function, so succ holds only the fallthrough. Read
             # positionally that fallthrough looked like the TAKEN arm and the rendered
             # `if` ran its body exactly when the branch was not taken.
             ft = blk.succ[0] if blk.succ else None
-            stmts = [("asm", cur), ("if", blk.cond, [("exit", blk.exit_target)], [])]
+            leave = ("cut" if blk.past_cut else "exit", blk.exit_target)
+            stmts = [("asm", cur), ("if", blk.cond, [leave], [])]
+            if blk.cut_next >= 0:
+                stmts.append(("cut", blk.cut_next))
             return stmts, ft
+        if blk.cut_next >= 0:
+            # At the cut, the not-taken arm runs on past it, and the taken arm is succ[0].
+            stmts = [("asm", cur),
+                     ("if", negate_cond(blk.cond), [("cut", blk.cut_next)], [])]
+            return stmts, blk.succ[0] if blk.succ else None
         taken = blk.succ[0] if len(blk.succ) >= 1 else None
         ft = blk.succ[1] if len(blk.succ) >= 2 else None
         merge = merge_point(cur, ctx)
@@ -773,7 +805,10 @@ def structure(blocks, entry, orphans: bool = False):
             if blk.exit_target >= 0 and not blk.succ:
                 # A `b` leaving the function. Saying so is the whole point: without it the
                 # body just stopped, or the walk continued into an unrelated block.
-                out.append(("exit", blk.exit_target))
+                out.append(("cut" if blk.past_cut else "exit", blk.exit_target))
+                break
+            if blk.cut_next >= 0:
+                out.append(("cut", blk.cut_next))
                 break
             cur = blk.succ[0] if blk.succ else None
         return out
@@ -888,6 +923,14 @@ def _asm_lines(blk, indent, show):
     return lines
 
 
+def cut_goto(addr: int, show) -> str:
+    """The jump to `addr`, in the part of this function the instruction cut left out: an
+    address inside it, and not the `sub_0x...` that names another function (#70)."""
+    at = getattr(show, "address", None)
+    return (f"goto {at(addr) if at is not None else f'0x{addr:x}'};"
+            f"  // TRUNCATED: past the instruction cut")
+
+
 def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None, *, show) -> list:
     """The structured statements as lines. `show` prints an instruction's operand,
     rebaser(image) from disasm so that a code address reads as a virtual address, as in
@@ -934,6 +977,8 @@ def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None, *, show)
             out.append(f"{pad}continue;")
         elif s[0] == "goto":
             out.append(f"{pad}goto L_0x{s[1]:x};")
+        elif s[0] == "cut":
+            out.append(f"{pad}{cut_goto(s[1], show)}")
         elif s[0] == "exit":
             # Outside this function, so not a local label: name it the way the rest of the
             # output names an address it has no name for. A return or an indirect jump

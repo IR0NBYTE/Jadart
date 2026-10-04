@@ -312,6 +312,13 @@ def truncated_by(cr: CodeRange, dis, max_insns: int = MAX_INSNS) -> int:
     return max(0, (cr.size or 0) // 4 - len(dis))
 
 
+def cut_end(cr: CodeRange, dis, max_insns: int = MAX_INSNS):
+    """Where `cr` ends when the cap stopped `dis` short of it, else None: what build_cfg
+    and lift_function take, to tell a branch into the part left out from one to another
+    function (#70)."""
+    return cr.pc_offset + cr.size if truncated_by(cr, dis, max_insns) else None
+
+
 def require_decoder(image: InstrImage) -> str:
     """The architecture name, or the error that says why this image cannot be decoded.
 
@@ -545,6 +552,12 @@ class Printer:
 
     def label(self, pc_offset: int) -> str:
         return sub_label(self.image, pc_offset)
+
+    def address(self, pc_offset: int) -> str:
+        """A code address inside a range: the virtual address, or the pc_offset when
+        there is no anchor, as sub_label spells it, so it reads back the same way."""
+        va = va_of(self.image, pc_offset)
+        return f"0x{pc_offset if va is None else va:x}"
 
 
 def rebaser(image: InstrImage) -> Printer:
