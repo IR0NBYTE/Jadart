@@ -7664,6 +7664,7 @@ def test_a_condition_reads_the_compare_arm32_puts_further_back():
     smi = rows(("asrs", "r1, r0, #1"))
     assert _cond_for(smi, "blo", "#0x40") == "(r0 & 1) == 0"
     assert _cond_for(smi, "beq", "#0x40") == "(r0 >> 1) == 0"
+    assert "?" in _cond_for(rows(("asrs", "r0, r0, #1")), "blo", "#0x40")    # source gone
     blocks, _ = build_cfg(rows(("cmp", "r0, r1"), ("blt", "#0x10"), ("bgt", "#0x14"),
                                ("mov", "r0, #0"), ("bx", "lr"), ("bx", "lr")))
     assert blocks[0].cond == "r0 < r1" and blocks[8].cond == "r0 > r1", blocks

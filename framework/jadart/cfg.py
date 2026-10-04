@@ -163,7 +163,9 @@ def _cond_for(ctx, mn, op) -> str:
     if lm == "asrs":
         parts = [_tok(p) for p in lo_.split(",")]
         n = _int(parts[2]) if len(parts) == 3 else None
-        if n is not None and n > 0:
+        # `asrs r0, r0, #1` overwrites its source, so a condition naming r0 would name
+        # the shifted value rather than the one the flags came from; 2 of 1,316.
+        if n is not None and n > 0 and parts[0] != parts[1]:
             src = parts[1]
             if cc in ("cc", "lo", "cs", "hs"):
                 bit = f"{src} & 1" if n == 1 else f"({src} >> {n - 1}) & 1"
