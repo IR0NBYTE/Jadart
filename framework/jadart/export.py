@@ -207,8 +207,9 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
             elif tier == 2:
                 ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
                 blocks, entry = build_cfg(ann, exits=exits(image, dis))
-                out.extend(render_cfg(blocks, structure(blocks, entry), indent="  ",
-                                      depth=2, show=rebaser(image)))
+                stmts = structure(blocks, entry, orphans=True)
+                out.extend(render_cfg(blocks, stmts, indent="  ", depth=2,
+                                      show=rebaser(image)))
             else:
                 out.extend(render_body(dis, pc_to_name, pool_map, indent="      ",
                                        kinds=row_kinds(image, dis),

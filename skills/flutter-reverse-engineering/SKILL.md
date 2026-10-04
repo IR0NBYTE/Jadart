@@ -51,6 +51,7 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | a raw `ldur x0, [x1, #7]` line | an instruction the lifter does not model | anything about its meaning |
 | `const[47] @0xb9b0{...}` | a const list, shown truncated | guess the rest; run `constants` |
 | `goto L_0x1234` | an edge the structurer could not nest | "a loop" without checking |
+| `// reached by no edge ...` | code no branch shown leads to | "it runs after that" |
 
 A name holding `\u202e`, `\u001b`, `\u200b` or another `\u` escape is a name the binary
 really carries, with a character in it that would reorder, hide or colour the text around

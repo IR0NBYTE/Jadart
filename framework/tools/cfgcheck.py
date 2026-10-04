@@ -238,7 +238,8 @@ def run(path):
         if not blocks:
             continue
         n += 1
-        bad, placed = check_function(blocks, structure(blocks, entry))
+        # with the sections tier 2 adds for what no edge reaches (#67)
+        bad, placed = check_function(blocks, structure(blocks, entry, orphans=True))
         reach, stack = set(), [entry]
         while stack:
             b = stack.pop()

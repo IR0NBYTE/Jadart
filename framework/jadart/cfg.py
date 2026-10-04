@@ -390,13 +390,26 @@ def _rpo(blocks, entry, succ) -> dict:
     return {n: i for i, n in enumerate(reversed(post))}
 
 
-def structure(blocks, entry):
+#: The note over a section no edge of the graph leads into. What it can be is a list, not
+#: a guess: the graph has no exception edges, no targets for a jump through a register,
+#: and no second entry, and dead code is possible too.
+UNREACHED = ("reached by no edge in this graph: a catch entry, another entry point, a "
+             "jump through a register, or dead code")
+
+
+def structure(blocks, entry, orphans: bool = False):
     """Return a list of statements. Each is one of:
       ('asm', block_addr)
       ('if', cond, then_stmts, else_stmts)   (else_stmts may be [])
       ('loop', header_addr, body_stmts)
       ('break',) / ('continue',)
       ('goto', addr)
+      ('label', addr), and ('note', text) before a section nothing leads into
+
+    `orphans` also places every block no edge reaches, each as its own section after a
+    note. Tier 2 asks for it: 8,580 instructions of the clean fixture, many of them catch
+    entries, were in no statement, and nothing said so (#67). Tier 3 does not, because
+    strip_boilerplate makes the stack check's slow path unreachable on purpose.
 
     Loops are reconstructed by structuring the natural-loop body through the same
     recursive if/else machinery (bounded to the loop's nodes), so a conditional inside
@@ -687,10 +700,49 @@ def structure(blocks, entry):
         stack.extend(blk.succ)
         if blk.term in TRAPS and blk.insns:
             stack.append(blk.insns[-1][0] + 4)
+    # Which of them a real edge reaches, so a section that only the step past a trap
+    # brought in is marked as one nothing leads into.
+    edged, stack = set(), [entry]
+    while stack:
+        n = stack.pop()
+        if n in edged or n not in blocks:
+            continue
+        edged.add(n)
+        stack.extend(blocks[n].succ)
+    # What the entry or a trap reaches, then, after all of it, what nothing reaches, so
+    # that asking for the orphans only ever adds sections at the end.
+    tail = sorted(set(blocks) - reachable) if orphans else []
+    # The note says no edge leads into the section, so it goes only where none does: a
+    # block another unreached section jumps to shows that `goto` in the output itself.
+    targeted = {s for b in blocks.values() for s in b.succ}
     for a in sorted(reachable):
         if a not in visited:
+            if a not in edged and a not in targeted:
+                out.append(("note", UNREACHED))
             out.append(("label", a))
             out.extend(region(a, set(), None, None))
+    for a in tail:
+        if a in visited:
+            continue
+        # structure() recurses with the nesting, so a deep enough tangle of conditionals
+        # nothing reaches would raise. Main never placed these at all, so rather than
+        # turn a hostile binary into a crash here, the rest is counted and left to
+        # `disasm`, which lists every instruction.
+        before = set(visited)
+        try:
+            section = region(a, set(), None, None)
+        except RecursionError:
+            visited.clear()
+            visited.update(before)
+            left = sum(len(blocks[b].insns) for b in tail if b not in visited)
+            out.append(("note", f"{left} more instructions no edge in this graph "
+                                "reaches are nested too deeply to structure; `disasm` "
+                                "lists them"))
+            break
+        if a not in targeted:
+            out.append(("note", UNREACHED))
+        out.append(("label", a))
+        out.extend(section)
     return out
 
 
@@ -751,6 +803,8 @@ def render(blocks, stmts, indent="  ", depth=1, labels=None, done=None, *, show)
             out.extend(_asm_lines(blocks[s[1]], pad, show))
         elif s[0] == "label":
             label(s[1])
+        elif s[0] == "note":
+            out.append(f"{pad}// {s[1]}")
         elif s[0] == "if":
             _, cond, then, els = s
             out.append(f"{pad}if ({cond}) {{")
