@@ -7674,6 +7674,28 @@ def test_a_condition_reads_the_compare_arm32_puts_further_back():
     assert "?" in blocks[8].cond, blocks
 
 
+def test_a_compound_condition_negates_as_a_whole():
+    """`structure` prints the branch not taken, the negation of the branch's condition,
+    whenever the body is the fall-through. Flipping only the first operator turned arm32's
+    `cmp; cmpeq; beq` into `r1 != 0 && r0 == 0`, which is false for a value whose low word
+    alone is zero though the CPU then runs the body: 2,821 of the 2,827 `&&` and `||`
+    conditions in arm32-2.19.6's tier 2 (#70)."""
+    from jadart.cfg import build_cfg, negate_cond, render, structure
+    rows = [("cmp", "r1, #0"), ("cmpeq", "r0, #0"), ("beq", "#0x14"), ("mov", "r0, #1"),
+            ("bx", "lr"), ("mov", "r0, #2"), ("bx", "lr")]
+    blocks, entry = build_cfg([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    body = [ln.strip() for ln in render(blocks, structure(blocks, entry), show=None)]
+    assert "if (r1 != 0 || r0 != 0) {" in body, body
+    assert negate_cond("r1 != 0 || r0 != 0") == "r1 == 0 && r0 == 0"
+    assert negate_cond("r2 != (r0 >> 1) || sb != (r0 >> 31)") == \
+        "r2 == (r0 >> 1) && sb == (r0 >> 31)"
+    assert negate_cond("!(isNaN(d0))") == "isNaN(d0)"
+    assert negate_cond("isNaN(d0) || isNaN(d1)") == "!(isNaN(d0) || isNaN(d1))"
+    assert negate_cond("!(a) || !(b)") == "a && b"
+    assert negate_cond("isNaN(a < b)") == "!(isNaN(a < b))"     # an operand's own `<`
+    assert negate_cond("(r0 & 1) == 0") == "(r0 & 1) != 0"
+
+
 def test_a_trap_ends_its_block_and_nothing_runs_on_past_it():
     """A `brk` or `bkpt` ends its block with no successor.
 

@@ -94,13 +94,40 @@ class Block:
 _NEG = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<="}
 
 
+def _balanced(text: str) -> bool:
+    depth = 0
+    for ch in text:
+        depth += (ch == "(") - (ch == ")")
+        if depth < 0:
+            return False
+    return depth == 0
+
+
 def negate_cond(cond: str) -> str:
-    """Negate a `lhs OP rhs` condition (then-branch is the fallthrough = branch not taken)."""
-    parts = cond.split(" ")
+    """Negate a condition (then-branch is the fallthrough = branch not taken).
+
+    `a == b && c == d`, the `cmp; cmpeq` arm32 tests a 64-bit value with, negates to
+    `a != b || c != d`. Flipping only the first operator printed `a != b && c == d`, and
+    2,821 of the 2,827 such conditions in arm32-2.19.6's tier 2 read that way (#70). Only
+    an operator outside every parenthesis is the condition's own: the one inside
+    `(x >> 1)` or a call belongs to an operand."""
+    if cond.startswith("!(") and cond.endswith(")") and _balanced(cond[2:-1]):
+        return cond[2:-1]
+    for op, dual in ((" && ", " || "), (" || ", " && ")):
+        if op in cond:
+            sides = cond.split(op)
+            if dual in cond or not all(_balanced(s) for s in sides):
+                return f"!({cond})"
+            sides = [negate_cond(s) for s in sides]
+            if any(s.startswith("!(") for s in sides):
+                return f"!({cond})"
+            return dual.join(sides)
+    parts, depth = cond.split(" "), 0
     for i, tok in enumerate(parts):
-        if tok in _NEG:
+        if depth == 0 and tok in _NEG:
             parts[i] = _NEG[tok]
             return " ".join(parts)
+        depth += tok.count("(") - tok.count(")")
     return f"!({cond})"
 
 
