@@ -13,6 +13,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A function nested too deeply to structure prints its rows.** `structure` and the
+  renderers recurse once for each level of nesting, so a range of 500 conditionals
+  nested in each other, which only a crafted binary holds, ran out of Python's stack:
+  `export -t 2`, `decompile` and `lift` raised RecursionError and exited 3, a bug in
+  jadart. Such a function now prints its instructions at their addresses, under
+  `// nested too deeply to structure`, and the rest of the output goes on; cfgcheck
+  counts it apart. Nothing in the fixtures or the corpus nests that deep, and their
+  output is unchanged. Closes #81.
 - **A function cut short says where it goes on.** The instruction cut stops a long
   function after 4,000 instructions. A conditional there whose target is earlier had its
   not-taken arm recorded nowhere, so `mov; cmp; b.gt #0x0` printed as a loop with no way
