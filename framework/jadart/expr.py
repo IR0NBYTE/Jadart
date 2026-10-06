@@ -3113,7 +3113,7 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
             # own Lifter, so nothing a half-finished lift touched outlives it.
-            return flat(ann, indent, depth, show=show)
+            return flat(ann, indent, depth, show=show, cut_end=cut_end)
 
 
 @contextlib.contextmanager

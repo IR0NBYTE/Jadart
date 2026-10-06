@@ -7883,6 +7883,10 @@ def test_a_function_nested_too_deeply_prints_its_rows():
     for lines in (render_function(chain(2000), show=None), lift_function(chain(2000))):
         assert lines[0].strip() == f"// {TOO_DEEP}" and len(lines) == 1 + 6001, lines[:3]
         assert lines[1].strip() == "0x0  cbz x0, #0x100000", lines[1]
+    cut = chain(2000)[:4000]                # the first 2,000 rows, cut short of 0x7d00
+    for lines in (render_function(cut, cut_end=0x7d00, show=None),
+                  lift_function(cut, cut_end=0x7d00)):
+        assert lines[-1].strip() == "goto 0x3e80;  // TRUNCATED: past the instruction cut"
     shallow = render_function(chain(50), show=None)
     assert shallow[0].strip() == "if (x0 != 0) {", shallow[:2]
     assert lift_function(chain(50))[0].strip() == "if (x0 != 0) {"

@@ -928,9 +928,11 @@ TOO_DEEP = ("nested too deeply to structure; its instructions follow as they are
             "address order")
 
 
-def flat(rows, indent="  ", depth=1, *, show) -> list:
+def flat(rows, indent="  ", depth=1, *, show, cut_end=None) -> list:
     """`rows` as they are, each at its address, under a note saying why: what tier 2 and
-    tier 3 print for a function `structure` cannot nest (#81)."""
+    tier 3 print for a function `structure` cannot nest (#81). Cut at the instruction
+    limit (`cut_end`), they end with the jump to where it goes on, so that the list does
+    not read as the whole function."""
     pad = indent * depth
     at = getattr(show, "address", None)
     out = [f"{pad}// {TOO_DEEP}"]
@@ -938,6 +940,8 @@ def flat(rows, indent="  ", depth=1, *, show) -> list:
         where = at(a) if at is not None else f"0x{a:x}"
         shown = show(a, op) if show is not None else op
         out.append(f"{pad}{where}  {mn} {shown}".rstrip() + note)
+    if cut_end is not None and rows and cut_end > rows[-1][0] + 4:
+        out.append(f"{pad}{cut_goto(max(r[0] for r in rows) + 4, show)}")
     return out
 
 
@@ -956,7 +960,7 @@ def render_function(rows, *, exits=None, cut_end=None, indent="  ", depth=1,
         return render(blocks, structure(blocks, entry, orphans=True), indent, depth,
                       show=show)
     except RecursionError:
-        return flat(rows, indent, depth, show=show)
+        return flat(rows, indent, depth, show=show, cut_end=cut_end)
 
 
 def cut_goto(addr: int, show) -> str:
