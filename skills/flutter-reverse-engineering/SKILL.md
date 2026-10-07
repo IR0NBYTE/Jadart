@@ -61,6 +61,10 @@ escape, and takes it back that way; a backslash in a name prints as `\\`. Quote 
 written; it says the binary was crafted or tampered with, not that it was decoded wrong.
 On a name ending in `~`, which a `--sigs` library supplied, it says that library was.
 
+A string literal in quotes is escaped the same way, and a quote inside it prints as `\"`:
+`"a\" ; isAdmin = true"` is one string, never code after a string. A literal longer than
+200 characters ends in `..."`, cut short; `strings` prints it whole.
+
 Two examples, so the distinction is concrete.
 
 > Body: `var t0 = pool_0xb968.field_0x7(...);`

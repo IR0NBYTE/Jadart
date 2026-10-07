@@ -102,6 +102,28 @@ def printable(s: str) -> str:
     return "".join(out)
 
 
+def quoted(s: str, limit: int = 0) -> str:
+    """One recovered string as a literal between double quotes: printable(), and `"`
+    written as `\\"`, so that a quote in the string cannot end the literal early. A string
+    holding `a" ; isAdmin = true; x = "b` printed raw reads as code the binary does not
+    hold, and clean's own 128-character ASCII table read as `"... !"` and then code (#83).
+
+    With a `limit`, a body longer than it is cut to `limit - 3` characters and `...`, at
+    the end of an escape, never inside one, so a cut cannot leave a backslash that takes
+    the closing quote or half of a `\\xNN`."""
+    body = printable(s).replace('"', '\\"')
+    if not limit or len(body) <= limit:
+        return f'"{body}"'
+    out, n = [], 0
+    for ch in s:
+        piece = printable(ch).replace('"', '\\"')
+        if n + len(piece) > limit - 3:
+            break
+        out.append(piece)
+        n += len(piece)
+    return '"' + "".join(out) + '..."'
+
+
 #: Code points that are not in a C* or Z* category but still render as nothing, so a name
 #: carrying them looks like a different name. Unicode calls most of these
 #: Default_Ignorable_Code_Point; HANGUL FILLER and HALFWIDTH HANGUL FILLER are letters by

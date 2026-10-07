@@ -8122,6 +8122,56 @@ def test_a_string_is_found_as_typed_and_as_printed():
         assert rc == 0 and "  \\u202b" in out.splitlines(), (ascii(pattern), out[-300:])
 
 
+def test_a_quote_in_a_literal_does_not_end_it():
+    """A literal printed between double quotes kept a `"` in it raw, so the literal ended
+    early on its line: a string `a" ; isAdmin = true; x = "b` lifted to what reads as
+    three statements, and clean's own ASCII table read as `"... !"` and then code (#83).
+    The quote is `\\"` now, wherever a literal is quoted: a pool label in tiers 1 to 3
+    and an element of a const list. A long literal is cut at the end of an escape, where
+    `e[:197]` could leave half of one, and `xrefs string` and `strings -g` take the quote
+    as typed or as printed."""
+    import io
+    import re
+    import types
+    import contextlib
+    from jadart import cli
+    from jadart.disasm import annotate, build_pool_map
+    from jadart.expr import lift_function
+    from jadart.fill import quoted
+    evil = 'a" ; isAdmin = true; x = "b'
+    assert quoted(evil) == '"a\\" ; isAdmin = true; x = \\"b"'
+    assert quoted('\\"') == '"\\\\\\""'           # a backslash, then a quote
+    literal = re.compile(r'"(?:[^"\\]|\\.)*"')       # what cli's literal scan reads
+    for raw in (evil, '\\"', 'x"', '"', '\\'):
+        assert literal.fullmatch(quoted(raw)), raw
+    cut = quoted("x" * 196 + "\x1fz", 200)
+    assert cut == '"' + "x" * 196 + '..."', cut         # not `\\x1...`
+    assert quoted("x" * 196 + '"y', 200) == '"' + "x" * 196 + '\\"y"'
+    fr = types.SimpleNamespace(functions=[], names={}, pool=[("ref", 1), ("ref", 2)],
+                               strings={1: evil, 10: 'x"y'}, arrays={2: [10, 11]},
+                               smi_values={11: 5})
+    pool = build_pool_map(fr)
+    assert pool == {0x10: quoted(evil), 0x18: 'const[2]{"x\\"y", 5}'}, pool
+    ann = annotate([(0, "ldr", "x0, [x27, #0x10]"), (4, "ret", "")], {}, pool,
+                   kinds=[(None, None), (None, None)])
+    assert ann[0][3] == "  ; = " + quoted(evil)
+    assert lift_function(ann, pool) == ['  return "a\\" ; isAdmin = true; x = \\"b";']
+    if not os.path.exists(CLEAN):
+        _skip("  SKIP test_a_quote_in_a_literal_does_not_end_it, CLI half (no fixture)")
+
+    def run(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = cli.main(list(argv))
+        return rc, out.getvalue()
+    # clean's pool 0x108 is `" is not supported by the platform. Refer to ...`
+    for pattern in ('" is not supported', '\\" is not supported'):
+        rc, out = run("xrefs", CLEAN, "string", pattern)
+        assert rc == 0 and '\\" is not supported by the platform' in out, (pattern, out)
+        rc, out = run("strings", CLEAN, "-g", pattern)
+        assert rc == 0 and '" is not supported by the platform' in out, (pattern, out)
+
+
 def test_info_prints_the_header_fields_escaped(monkeypatch, capsys):
     """`info` printed the snapshot header's features, and under --lenient its version
     hash, as the file had them, so a crafted header put an escape sequence on the
