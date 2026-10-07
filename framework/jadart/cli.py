@@ -685,7 +685,7 @@ def cmd_constants(args) -> int:
 
 def cmd_strings(args) -> int:
     """Full M2 pass: walk the alloc, recover the identifier pool, print an inventory."""
-    from .fill import printable
+    from .fill import printable, quoted
     try:
         r = walk_isolate(args.libapp, full=True)
     except JadartError as e:    # UnknownEpoch or AllocError
@@ -694,8 +694,10 @@ def cmd_strings(args) -> int:
     h, strings = r["header"], r["strings"]
 
     def wanted(s):
-        # as typed, or as printed: a string is escaped where it is shown (#78)
-        return not args.grep or args.grep in s or args.grep in printable(s)
+        # As typed, or as printed: a string is escaped where it is shown (#78), and a
+        # quote in it too where it is shown as a literal (#83).
+        return not args.grep or args.grep in s or args.grep in printable(s) or (
+            '"' in s and args.grep in quoted(s)[1:-1])
     if getattr(args, "json", False):
         vals = [v for v in sorted(set(strings)) if wanted(v)]
         return emit({"ok": True, "epoch": h.epoch.name if h.epoch else None,
@@ -906,7 +908,8 @@ def cmd_ffi(args) -> int:
     for off in sorted(libs):
         entries.append({
             "pool_offset": off,
-            "library": libs[off].strip('"'),
+            # the label's text between its quotes; strip('"') also took an escaped one
+            "library": libs[off][1:-1] if libs[off][:1] == '"' else libs[off],
             "referenced_by": [
                 {"pc_offset": cr.pc_offset, "va": va_of(image, cr.pc_offset),
                  "name": bodies.get(cr.pc_offset, {}).get("name"),
@@ -983,10 +986,10 @@ def _xrefs_pool_matches(pool, kind, needle, exact=False):
         return {off: lab for off, lab in pool.items() if off == addr}, addr
 
     if kind == "string":
-        # A label is the string as printed (fill.printable), so a pattern matches as
-        # typed or as printed: escaping it the same way covers the raw spelling (#78).
-        from .fill import printable
-        spellings = {needle, printable(needle)}
+        # A label is the string as printed (fill.quoted), so a pattern matches as typed
+        # or as printed: escaping it the same way covers the raw spelling (#78, #83).
+        from .fill import printable, quoted
+        spellings = {needle, printable(needle), quoted(needle)[1:-1]}
         if exact:
             return (
                 {

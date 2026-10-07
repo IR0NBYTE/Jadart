@@ -38,7 +38,7 @@ except Exception as exc:                       # noqa: BLE001 - reported, not sw
 
 from .macho import open_container
 from .branches import code_target, printed_number
-from .fill import printable
+from .fill import quoted
 from .stream import ReadStream
 from . import versions
 
@@ -706,11 +706,11 @@ def build_pool_map(fr, arch=None) -> dict:
         s = fr.strings.get(val)
         if s is not None:
             # Escaped, for the same reason strings.txt is: a literal holding a newline
-            # would otherwise split one lifted line into several. And kept long, because a
-            # decompiler exists to show you the literal, truncating at forty characters
-            # hid the second half of an asset path that was the answer to a challenge.
-            e = printable(s)
-            m[off] = f'"{e}"' if len(e) <= 200 else f'"{e[:197]}..."'
+            # would otherwise split one lifted line into several, and one holding a quote
+            # would end early (#83). And kept long, because a decompiler exists to show
+            # you the literal, truncating at forty characters hid the second half of an
+            # asset path that was the answer to a challenge.
+            m[off] = quoted(s, 200)
         elif val in fname and fname[val]:
             m[off] = f"&{fname[val]}"
         else:
@@ -775,7 +775,7 @@ def _const_elems(fr, ref: int):
 
 
 def _fmt_elem(v):
-    return (hex(v) if abs(v) > 9 else str(v)) if isinstance(v, int) else f'"{printable(v)}"'
+    return (hex(v) if abs(v) > 9 else str(v)) if isinstance(v, int) else quoted(v)
 
 
 def _const_list(fr, ref: int, off: int):
