@@ -8532,9 +8532,11 @@ def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
 #: wheel, whose `capstone.__version__` reads 5.0.7; another build may print differently.
 #: Regenerated for #40, which moved only the label of a range with no name, from
 #: `sub_0x<pc_offset>` to `sub_0x<va>`: 514 and 512 lines of the samples, nothing else.
+#: Regenerated for #83, which escapes a quote inside a quoted literal: 6 and 2 lines of the
+#: samples, each a pool note holding a `"`, in text and in `-j`, nothing else.
 _ARM64_DISASM_SAMPLE_SHA = {
-    "clean": "130188ac8cf4bc8b26e5ed28f5ab8c5dce246543aa2d89c428607f18c7082956",
-    "obf": "2c53e444c07fab06d470f2b7dffc4d83ecc1dfdf36c0c38e71ee4b66fa3ca7dd",
+    "clean": "47efe1c2fb03d58cf1e44883c5883cdf538afa4ac5001d9b4bb9aab58f0f553f",
+    "obf": "f6d0ebbd84db3c5218df01ec956fb072a691cf1948910868b5f96344d7dbee3b",
 }
 
 

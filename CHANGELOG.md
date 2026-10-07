@@ -22,7 +22,8 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   200 characters is cut at the end of an escape; 6 cuts in the pools of both fixtures,
   the two CTF apps in ctfbench and arm32-2.19.6 left half of one. Over their exports at
   tiers 1 to 3 (1 and 2 for arm32), 669 lines change: 477 by the escape alone, and 192
-  are long literals whose cut moved. Nothing else does. Closes #83.
+  are long literals whose cut moved. Nothing else does. The arm64 disasm samples the
+  tests pin move by 6 and 2 lines, all such notes, and are regenerated. Closes #83.
 - **A function nested too deeply to structure prints its rows.** `structure` and the
   renderers recurse once for each level of nesting, so a range of 500 conditionals
   nested in each other, which only a crafted binary holds, ran out of Python's stack:
