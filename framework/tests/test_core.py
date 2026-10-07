@@ -8170,6 +8170,8 @@ def test_a_quote_in_a_literal_does_not_end_it():
         assert rc == 0 and '\\" is not supported by the platform' in out, (pattern, out)
         rc, out = run("strings", CLEAN, "-g", pattern)
         assert rc == 0 and '" is not supported by the platform' in out, (pattern, out)
+    rc, out = run("strings", CLEAN, "-g", 'android."')     # a quote that is not in it
+    assert rc == 0 and "0 hits" in out, out[-200:]
 
 
 def test_info_prints_the_header_fields_escaped(monkeypatch, capsys):
