@@ -65,9 +65,12 @@ A string literal in quotes is escaped the same way, and a quote inside it prints
 `"a\" ; isAdmin = true"` is one string, never code after a string. A literal whose escaped
 text runs past 200 characters ends in `..."`, cut short, in a `const[N]{...}` label too;
 `strings` prints it whole. `constants` quotes a list's string elements as well: `"a, b"`
-is one element, and `"0x10"` is a string, not the int `0x10`. It prints each thing once:
-a string over 200 characters whole where it first appears and cut where it comes back,
-and a slot whose list was listed already as `same as 0x...`, that list's offset.
+is one element, and `"0x10"` is a string, not the int `0x10`. It prints each thing once.
+A string whose escaped text runs past 200 characters is whole where it first appears and
+`same as 0x...[i]` where it comes back: the list, and the element, that hold it whole.
+A slot whose list was listed already is `same as 0x...`, that list's offset. `-j` says
+both with `same_as`: `{"same_as": offset}` in place of `elements`, and
+`{"same_as": offset, "index": i}` in place of the string.
 
 Two examples, so the distinction is concrete.
 

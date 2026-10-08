@@ -4357,9 +4357,10 @@ def test_a_crafted_pool_resolves_each_const_list_once():
     """A pool naming one Array from every slot cost slots times elements to resolve, in
     `constants` and in every command that labels the pool (#91).
 
-    A compiled pool holds an object once, but nothing in the stream says so: 3,000 slots
-    reaching one 3,000-element Array took 0.34s to label, and the time grew as the
-    product. Each Array is resolved once now, and the slots reaching it share it."""
+    No Array in the fixtures or the corpus is named from two slots, but nothing in the
+    stream stops it: 3,000 slots reaching one 3,000-element Array took 0.34s to label,
+    and the time grew as the product. Each Array is resolved once now, and the slots
+    reaching it share it."""
     from types import SimpleNamespace
     from jadart.disasm import build_pool_map, const_lists
 
@@ -4404,7 +4405,7 @@ def test_a_cut_literal_is_read_no_further_than_its_cut():
         return '"' + "".join(out) + '..."'
 
     rng = random.Random(91)
-    alphabet = 'ab"\\\n\x01‮\U0001f600 ,'
+    alphabet = 'ab"\\\n\x01\u202e\U0001f600 ,'
     for _ in range(3000):
         limit = rng.choice([0, 5, 10, 200])
         s = "".join(rng.choice(alphabet)
@@ -4424,8 +4425,9 @@ def test_a_crafted_pool_lists_each_list_and_long_string_once():
     length: 60 MB from 3,000 one-element lists of one 20,000 character string (#91).
 
     A slot reaching a list already listed says `same as` and the offset that listed it,
-    and a string over 200 characters is whole once and cut, as a label cuts it, where it
-    comes back. `-j` says the same with `same_as`, and constants.txt is the listing."""
+    and a string over 200 characters is whole once and `same as 0x10[1]`, where it is
+    whole, when it comes back. `-j` says the same with `same_as`, and constants.txt is
+    the listing."""
     import contextlib
     import io
     import json
@@ -4433,7 +4435,6 @@ def test_a_crafted_pool_lists_each_list_and_long_string_once():
     from types import SimpleNamespace
     from unittest import mock
     from jadart import cli, disasm
-    from jadart.fill import quoted
 
     long_ = "L" * 20000
     fr = SimpleNamespace(pool=[("ref", 1), ("ref", 1), ("ref", 2), ("ref", 3)],
@@ -4449,11 +4450,10 @@ def test_a_crafted_pool_lists_each_list_and_long_string_once():
             assert cli.main(["constants", CLEAN, *flags]) == 0
         return buf.getvalue()
 
-    cut = quoted(long_, 200)
     text = run()
     assert text == (f'0x10\t[2]\t0x7, "{long_}"\n'
                     "0x18\t[2]\tsame as 0x10\n"
-                    f'0x20\t[3]\t{cut}, "short", {cut}\n'
+                    '0x20\t[3]\tsame as 0x10[1], "short", same as 0x10[1]\n'
                     '0x28\t[1]\t"short"\n'), text[:400]
     again = {"same_as": 0x10, "index": 1}
     assert json.loads(run("-j"))["constants"] == [
@@ -4470,6 +4470,38 @@ def test_a_crafted_pool_lists_each_list_and_long_string_once():
             mock.patch.object(disasm, "const_lists", lambda *_: lists):
         export(CLEAN, out, tier=1)
         assert open(os.path.join(out, "constants.txt"), encoding="utf-8").read() == text
+
+
+def test_refs_on_one_rodata_string_share_one_decode():
+    """A RO data String cluster gives its offsets as deltas, and 0 is a valid one, so a
+    crafted cluster can put any number of refs on one long string. Each ref decoded its
+    own copy: 3,000 refs on one 20,000 character string made a 60 MB fill from 23 KB, and
+    the once-per-string caches downstream saw 3,000 strings (#91). One decode per
+    offset now, shared by the refs and across the clusters of one fill."""
+    import struct
+    from types import SimpleNamespace
+    from jadart import disasm, fillwalk
+
+    L = 5000
+    head = disasm._string_header_size(8, 8)
+    blob = bytearray(64 + head + L)
+    struct.pack_into("<q", blob, 4, 64 - 4)          # Snapshot::length(), image at 64
+    struct.pack_into("<I", blob, 64, 80 << 12)       # tags: a one-byte string's cid
+    struct.pack_into("<Q", blob, 64 + 8, L << 1)     # length, as a Smi
+    blob[64 + head:] = b"A" * L
+    table = SimpleNamespace(cid=lambda name: 81)     # the two-byte cid is another one
+
+    strings = {}
+    cl = SimpleNamespace(rodata_offsets=[0] * 300, start_ref=100)
+    fillwalk._rodata_strings(bytes(blob), cl, strings, table)
+    assert len(strings) == 300 and strings[100] == "A" * L
+    assert len({id(v) for v in strings.values()}) == 1, "each ref decoded its own copy"
+
+    decoded = {}
+    for start in (1000, 2000):                       # two clusters of one fill
+        cl = SimpleNamespace(rodata_offsets=[0] * 300, start_ref=start)
+        fillwalk._rodata_strings(bytes(blob), cl, strings, table, None, decoded)
+    assert strings[1000] is strings[2000], "a second cluster decoded the string again"
 
 
 def test_a_list_label_cuts_a_long_string_like_a_literal():

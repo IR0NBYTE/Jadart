@@ -698,10 +698,11 @@ def build_pool_map(fr, arch=None) -> dict:
     here by their true byte offset 0x10 + idx*8. Refs to a String or Function get a
     readable label; other object kinds are left unlabelled.
 
-    Each object is labelled once, however many slots name it. A compiled pool holds an
-    object once, but nothing in the stream says so, and a crafted pool naming one long
-    list or one long string from every slot cost slots times its length, in time and in
-    the labels, in every command that names pool entries (#91)."""
+    Each object is labelled once, however many slots name it. A compiled pool names some
+    objects from several slots (on clean, 180 of them, `oldWidget` from 89), and nothing
+    bounds how many: a crafted pool naming one long list or one long string from every
+    slot cost slots times its length, in time and in the labels, in every command that
+    names pool entries (#91)."""
     fname = {ref: fr.names.get(nr, "") for ref, nr, ow, kt in fr.functions}
     m, done, quotes = {}, {}, {}
     for idx, (kind, val) in enumerate(fr.pool):
@@ -798,7 +799,7 @@ def _const_elems(fr, ref: int):
 
 
 #: Past this many characters, quoted, a literal is cut to `..."` in a label, and in
-#: `constants` wherever it comes back after being listed whole once.
+#: `constants` it is printed whole once and named by where, wherever it comes back.
 _LITERAL_CUT = 200
 
 
@@ -867,25 +868,28 @@ def const_listing(lists: dict):
 
     And each thing is printed once. A slot reaching a list already listed says `same as`
     and the offset that listed it, and a string longer than _LITERAL_CUT is whole where
-    the listing first meets it and cut, as a label cuts it, where it comes back. A
-    crafted pool naming one list from every slot, or one long string from every element,
-    printed slots times elements times its length (#91).
+    the listing first meets it and `same as 0xOFF[i]`, the list and the element that
+    hold it whole, where it comes back. A crafted pool naming one list from every slot,
+    or one long string from every element, printed slots times elements times its
+    length (#91). A cut, as a label has, would not do here: two strings that differ
+    past the cut would read the same.
     """
     quotes = {}
 
-    def spell(v, cut: bool) -> str:
+    def spell(i, v, repeats) -> str:
         if isinstance(v, int):
             return hex(v)
-        key = (id(v), cut)
-        if key not in quotes:
-            quotes[key] = quoted(v, _LITERAL_CUT if cut else 0)
-        return quotes[key]
+        if i in repeats:
+            return "same as 0x%x[%d]" % repeats[i]
+        if id(v) not in quotes:
+            quotes[id(v)] = quoted(v)
+        return quotes[id(v)]
 
     for off, vals, same_as, repeats in _listed(lists):
         if same_as is not None:
             yield off, len(vals), f"same as 0x{same_as:x}"
         else:
-            yield off, len(vals), ", ".join(spell(v, i in repeats)
+            yield off, len(vals), ", ".join(spell(i, v, repeats)
                                             for i, v in enumerate(vals))
 
 

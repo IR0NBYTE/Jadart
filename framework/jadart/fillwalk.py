@@ -214,6 +214,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     libraries: list = []
     meta = {"field": {}, "patch": {}, "fdata": {}}
     instr_index = [0]      # running instructions-table index across Code clusters
+    rodata_text: dict = {}  # RO data offset -> its String, decoded once per fill (#91)
     boundary = epoch.num_predefined_cids or epoch.cid_table.num_predefined
     # The base table is the 3.2+ shape; an older epoch supplies only what it differs by.
     _refs = dict(_REFS, **epoch.fill_overrides) if epoch.fill_overrides else _REFS
@@ -228,7 +229,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
             # nothing is consumed here. The identifier pool still has to be recovered, but
             # it is read out of the image rather than the stream.
             if cl.name in ("StringCid", "OneByteStringCid", "TwoByteStringCid"):
-                _rodata_strings(st.data, cl, strings, epoch.cid_table, arch)
+                _rodata_strings(st.data, cl, strings, epoch.cid_table, arch, rodata_text)
         elif cl.name == "StringCid":
             seen_lengths = []
             for i in range(n):
@@ -345,7 +346,8 @@ class FillError(JadartError):
     pass
 
 
-def _rodata_strings(blob: bytes, cl, strings: dict, table, arch=None) -> None:
+def _rodata_strings(blob: bytes, cl, strings: dict, table, arch=None,
+                    decoded: dict = None) -> None:
     """Recover a ROData String cluster's text straight out of the RO data image.
 
     On uncompressed-pointer targets the identifier pool is not serialized into the stream at
@@ -362,7 +364,13 @@ def _rodata_strings(blob: bytes, cl, strings: dict, table, arch=None) -> None:
     past every string.
 
     Without this, name recovery yields nothing on iOS and the walk still completes, so the
-    empty result looks like an answer instead of a failure."""
+    empty result looks like an answer instead of a failure.
+
+    A string is decoded once per offset, and every ref at that offset gets the same one.
+    A delta of 0 is a valid encoding, so a crafted cluster can put any number of refs on
+    one long string, and decoding it again for each made the fill, and everything that
+    prints the strings, cost refs times its length (#91). `decoded` carries that across
+    the clusters of one fill."""
     import struct as _struct
     offsets = cl.rodata_offsets or []
     if not offsets:
@@ -377,23 +385,33 @@ def _rodata_strings(blob: bytes, cl, strings: dict, table, arch=None) -> None:
     len_fmt = "<Q" if slot == 8 else "<I"
     header_length = _struct.unpack_from("<q", blob, 4)[0] + 4      # Snapshot::length()
     image = (header_length + 63) & ~63
+    if decoded is None:
+        decoded = {}
     for i, off in enumerate(offsets):
         base = image + off
-        if base + head > len(blob):
-            continue
-        tags, = _struct.unpack_from("<I", blob, base)
-        length_smi, = _struct.unpack_from(len_fmt, blob, base + len_off)
-        length = length_smi >> 1
-        cid = (tags >> 12) & 0xFFFFF
-        two = (cid == table.cid("TwoByteStringCid"))
-        nbytes = length * 2 if two else length
-        # len_fmt is unsigned, so length cannot be negative; the bound is the only
-        # thing standing between a garbage tags word and a multi-gigabyte slice.
-        if base + head + nbytes > len(blob):
-            continue
-        raw = blob[base + head:base + head + nbytes]
-        strings[cl.start_ref + i] = (raw.decode("utf-16-le", "replace") if two
-                                     else raw.decode("latin-1"))
+        if base not in decoded:
+            decoded[base] = _rodata_string(blob, base, head, len_off, len_fmt, table)
+        if decoded[base] is not None:
+            strings[cl.start_ref + i] = decoded[base]
+
+
+def _rodata_string(blob: bytes, base: int, head: int, len_off: int, len_fmt: str, table):
+    """The String at `base` in the RO data image, or None when it runs past the file."""
+    import struct as _struct
+    if base + head > len(blob):
+        return None
+    tags, = _struct.unpack_from("<I", blob, base)
+    length_smi, = _struct.unpack_from(len_fmt, blob, base + len_off)
+    length = length_smi >> 1
+    cid = (tags >> 12) & 0xFFFFF
+    two = (cid == table.cid("TwoByteStringCid"))
+    nbytes = length * 2 if two else length
+    # len_fmt is unsigned, so length cannot be negative; the bound is the only
+    # thing standing between a garbage tags word and a multi-gigabyte slice.
+    if base + head + nbytes > len(blob):
+        return None
+    raw = blob[base + head:base + head + nbytes]
+    return raw.decode("utf-16-le", "replace") if two else raw.decode("latin-1")
 
 
 def _fill_refs(st, cl, spec, functions, fields, func_code_index=None,

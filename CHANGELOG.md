@@ -13,21 +13,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
-- **A crafted pool cannot make the const lists cost a product.** Nothing in the stream
-  says a pool holds an object once, and the const list paths took it for granted: a
-  pool naming one Array from every slot was resolved once per slot, in `constants` and
-  in the labels that every command naming pool entries builds, and `quoted()` escaped
-  all of a long string before cutting it to 200. On stand-in pools, 3,000 slots reaching
-  one 3,000 element list took 0.34s to label and printed 62 MB from `constants` (123 MB
-  with `-j`), and 3,000 lists of one 20,000 character string made 60 MB of labels and of
-  `constants`. Each Array and string is resolved and quoted once now, `quoted()` reads
-  no further than its cut, and `constants` prints each thing once: a slot reaching a
-  list already listed says `same as 0x...`, and a string over 200 characters is whole
-  where it first appears and cut where it comes back; `-j` says both with `same_as`.
-  The same pools label in under 0.01s and list in under 1 MB. `constants`, its `-j` and
-  exports at tiers 1 to 3 (1 and 2 for the corpus builds) are byte for byte the same on
-  both fixtures, the two CTF apps in ctfbench and the 3.12.2 and two arm32 corpus
-  builds: none names an object from two slots or holds a list string over 25
+- **A crafted pool cannot make the const lists cost a product.** Nothing bounds how
+  many pool slots name one object, or how many refs share one RO data string, and the
+  const list paths paid for each again: an Array was resolved once per slot naming it,
+  in `constants` and in the labels that every command naming pool entries builds,
+  `quoted()` escaped all of a long string before cutting it to 200, and the fill decoded
+  a RO data string once per ref on it. On stand-in pools, 3,000 slots reaching one 3,000
+  element list took 0.34s to label and printed 62 MB from `constants` (123 MB with
+  `-j`), and 3,000 lists of one 20,000 character string made 60 MB of labels and of
+  `constants`; 3,000 refs on one such string in RO data made a 60 MB fill. Each Array
+  and string is now resolved, decoded and quoted once, `quoted()` reads no further than
+  its cut, and `constants` prints each thing once: a slot reaching a list already listed
+  says `same as 0x...`, and a string over 200 characters is whole where it first appears
+  and `same as 0x...[i]` where it comes back; `-j` says both with `same_as`. The same
+  pools label in under 0.01s, list in under 1 MB, and fill in 0.3 MB. `constants`, its
+  `-j` and exports at tiers 1 to 3 (1 and 2 for the corpus builds) are byte for byte the
+  same on both fixtures, the two CTF apps in ctfbench and the 3.12.2 and two arm32
+  corpus builds: none names an Array from two slots or holds a list string over 25
   characters. Closes #91.
 - **A string in a const list label is cut at 200 like any literal.** `const[N]{...}`
   printed its string elements whole, where the same string in its own slot is cut, so
