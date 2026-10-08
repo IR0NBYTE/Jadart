@@ -62,7 +62,9 @@ written; it says the binary was crafted or tampered with, not that it was decode
 On a name ending in `~`, which a `--sigs` library supplied, it says that library was.
 A name ending in `\... (N chars)` ran past 200 characters as printed and was cut there;
 N is its whole length, and the cut spelling is the one commands take back. `symbols -j`
-keeps names as written, cut at 200 characters, and says the whole length under `cut`.
+keeps names as written, `name`, `owner` and `library` cut at 200 characters, and gives
+each whole length under `cut`; a name cut there is not one to look a function up by, so
+use its `va`.
 
 A string literal in quotes is escaped the same way, and a quote inside it prints as `\"`:
 `"a\" ; isAdmin = true"` is one string, never code after a string. A literal whose escaped

@@ -8381,13 +8381,14 @@ def test_a_long_name_is_cut_after_an_escape_and_says_how_long_it_was():
     `limit + 1` characters of a long name are read (#94)."""
     import random
     from unittest import mock
-    from jadart.fill import visible
+    from jadart.fill import uncut, visible
     assert visible("a" * 200, limit=200) == "a" * 200
     assert visible("a" * 201, limit=200) == "a" * 200 + "\\... (201 chars)"
     cut = visible("x" * 196 + chr(0x1f) + "z", limit=200)      # not half of `\\u001f`
     assert cut == "x" * 196 + "\\... (198 chars)", cut
     spelled = "a\\... (5 chars)"                      # a name that spells a cut
     assert _read_name(visible(spelled, limit=200)) == (spelled, None)
+    assert uncut(visible(spelled, limit=200)) == visible(spelled)
 
     rng = random.Random(94)
     alphabet = "ab.\\ (5)" + chr(1) + chr(0x202e) + chr(0xe0001)
@@ -8398,7 +8399,9 @@ def test_a_long_name_is_cut_after_an_escape_and_says_how_long_it_was():
         head, n = _read_name(shown)
         if n is None:
             assert head == s and shown == visible(s) and len(shown) <= limit, (s, limit)
+            assert uncut(shown) == shown, (s, limit)
         else:
+            assert uncut(shown) == visible(head), (s, limit, shown)
             # the longest start of the name that fits once escaped, and its whole length
             assert n == len(s) and s.startswith(head), (s, limit, shown)
             more = visible(s[:len(head) + 1])
@@ -8425,6 +8428,19 @@ def test_names_escape_a_string_once_however_many_refs_name_it():
     assert len(shown) == 1, f"{len(shown)} copies of one name"
     assert fr.names[100] == "\\u0001" + "A" * 194 + "\\... (20000 chars)"
 
+    class Compared(str):             # counts the whole comparisons a lookup makes
+        calls = 0
+
+        def __eq__(self, other):
+            Compared.calls += 1
+            return str.__eq__(self, other)
+        __hash__ = str.__hash__
+    first, second = Compared("B" * 10**5), Compared("B" * 10**5)
+    fr.strings.update({1: first, 2: second})
+    for _ in range(300):             # a second equal copy is looked up by itself
+        fr.names[1], fr.names[2]
+    assert Compared.calls == 0, f"{Compared.calls} whole comparisons for 600 lookups"
+
 
 def test_a_long_name_from_the_symbol_table_or_a_signature_prints_cut():
     """Names that do not come through `FillResult.names` are cut where they print as
@@ -8436,7 +8452,7 @@ def test_a_long_name_from_the_symbol_table_or_a_signature_prints_cut():
     from jadart.disasm import function_name_by_pc, named_ranges
     from jadart.fillwalk import FillResult
     from jadart.interop import CodeSymbol
-    from jadart.signatures import MARK, Match, merge
+    from jadart.signatures import MARK, Match, is_signable, merge
     L = 20000
     cr = SimpleNamespace(pc_offset=0x10, size=8)
     image = SimpleNamespace(symbol_names={0x10: "Owner." + "s" * L}, code_ranges={},
@@ -8449,6 +8465,8 @@ def test_a_long_name_from_the_symbol_table_or_a_signature_prints_cut():
     assert dispatch._slot_names(fr, image) == {0: "s" * 200 + f"\\... ({L} chars)"}
     merged, _ = merge({}, {0x20: Match("m" * L, "shape", 20)})
     assert merged == {0x20: "m" * 200 + f"\\... ({L} chars)" + MARK}
+    # and a library written from a binary leaves a function with such a name unsigned
+    assert is_signable("m" * 200) and not is_signable("m" * 201)
     sym = CodeSymbol(pc_offset=0, size=8, va=0x1000, file_offset=0x1000,
                      entry_offset=None, name="run", origin="snapshot", owner="O" * L,
                      library="package:a/b.dart", kind="RegularFunction", static=False)
@@ -8509,6 +8527,9 @@ def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
     def printed(base, n):            # how `base` grown by n characters prints
         return base + grow[base] * (200 - len(base)) + f"\\... ({len(base) + n} chars)"
 
+    def qualified(n):                # BenchAccount.benchWithdraw, both grown, as printed
+        return "BenchAccount" + "t" * 188 + f"\\... ({26 + 2 * n} chars)"
+
     sizes = {}
     for n in (20000, 40000):
         length[0] = n
@@ -8522,6 +8543,8 @@ def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
             "symbols ida": run("symbols", CLEAN, "--format", "ida"),
             "symbols ghidra": run("symbols", CLEAN, "--format", "ghidra"),
             "symbols r2": run("symbols", CLEAN, "--format", "r2"),
+            "symbols sigs": run("symbols", CLEAN, "-n", "0", "--sigs", lib),
+            "symbols -f": run("symbols", CLEAN, "-f", qualified(n)),
             "decompile": run("decompile", CLEAN, printed("BenchAccount", n),
                              "--sigs", lib),
             "disasm": run("disasm", CLEAN, printed("benchWithdraw", n)),
@@ -8530,14 +8553,16 @@ def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
         }
         assert printed("benchWithdraw", n) in texts["decompile"]
         assert printed("build", n) in texts["functions"]
+        assert qualified(n) in texts["symbols -f"]
+        sig = "sig" + "g" * 197 + f"\\... ({3 + n} chars)~"     # cut, and still marked
+        assert sig in texts["functions"] and sig in texts["symbols sigs"]
         out = tmp_path / f"out{n}"
         run("export", CLEAN, "-t", "1", "-q", "-o", out)
         for dp, _, fs in os.walk(out):
             for f in fs:
                 if f != "strings.txt":           # each string once, whole, as it was read
-                    p = os.path.join(dp, f)
-                    key = re.sub(r"\(\d+ chars\)", "(N chars)", os.path.relpath(p, out))
-                    texts[key] = open(p, encoding="utf-8").read()
+                    p = os.path.join(dp, f)      # named after the whole url
+                    texts[os.path.relpath(p, out)] = open(p, encoding="utf-8").read()
         sizes[n] = {k: len(v) for k, v in texts.items()}
     grew = {k: (v, sizes[40000].get(k)) for k, v in sizes[20000].items()
             if sizes[40000].get(k) != v}

@@ -261,12 +261,24 @@ def symbols_document(image, hdr, syms: list, label: str, version: str) -> dict:
 _UNSAFE = re.compile(r"[^A-Za-z0-9_]+")
 _PRINTABLE_ONLY = re.compile(r"[^\x20-\x7e]")
 
+
 def _shown(text: str) -> str:
     """A name from the binary as a comment, a Ghidra symbol or a message shows it: escaped
     and cut at NAME_CUT, as every other surface prints a name (#94). Dart names are short;
     the length is the author's choice, so without a cut one name can inflate a script
     without bound (a 20,000 character name produced a 26 KB comment line)."""
     return visible(text, limit=NAME_CUT)
+
+
+def _shown_name(sym: CodeSymbol) -> str:
+    """`sym`'s qualified name as _shown() prints it, with the MARK a `--sigs` name ends in
+    kept after the cut: it is the one sign on the line that the name was inferred, and
+    `functions` keeps it there too (#94)."""
+    from .signatures import MARK
+    q = sym.qualified or sym.name
+    if sym.origin == "signature" and q.endswith(MARK):
+        return _shown(q[:-len(MARK)]) + MARK
+    return _shown(q)
 
 
 def safe_name(sym: CodeSymbol, prefix: str) -> str:
@@ -288,7 +300,7 @@ def entry_label(sym: CodeSymbol, prefix: str, sep: str = "_") -> str:
 
 
 def _comment(sym: CodeSymbol) -> str:
-    parts = [f"Dart: {_shown(sym.qualified or sym.name)}"]
+    parts = [f"Dart: {_shown_name(sym)}"]
     if sym.library:
         parts.append(f"library: {_shown(sym.library)}")
     parts.append(f"name from: {sym.origin}")
@@ -510,7 +522,7 @@ def ghidra_name(sym: CodeSymbol) -> str:
     (`toString` names 18), so the Symbol Tree cannot tell them apart and a crafted name
     can be made identical to a real one. The exact name as written is in the plate
     comment either way."""
-    return f"{_shown(sym.qualified or sym.name)}_{sym.va:x}" if sym.name else \
+    return f"{_shown_name(sym)}_{sym.va:x}" if sym.name else \
         f"anon_{sym.va:x}"
 
 

@@ -536,10 +536,12 @@ def cmd_symbols(args) -> int:
 
     rows = syms
     if args.filter:
-        # as written, or as printed: a name is escaped where it is shown (#74)
+        # as written, or as printed: a name is escaped where it is shown (#74), and cut
+        # when it is long (#94)
         want = args.filter.lower()
         rows = [s for s in rows if want in s.qualified.lower()
-                or want in interop.visible(s.qualified).lower()]
+                or want in interop.visible(s.qualified).lower()
+                or want in interop._shown_name(s).lower()]
     if args.named:
         rows = [s for s in rows if s.name]
     shown = rows if args.limit <= 0 else rows[:args.limit]
@@ -561,7 +563,7 @@ def cmd_symbols(args) -> int:
     for s in shown:
         entry = ("?" if s.entry_offset is None else
                  f"+0x{s.entry_offset:x}" if s.entry_offset else "")
-        name = interop._shown(s.qualified) if s.name else dim("(anonymous)")
+        name = interop._shown_name(s) if s.name else dim("(anonymous)")
         print(f"0x{s.va:<10x} 0x{s.file_offset:<8x} {s.size:>7} {entry:>6}  {name}")
     if args.limit > 0 and len(rows) > args.limit:
         print(dim(f"... {len(rows) - args.limit} more (raise with -n, or -n 0 for all)"))

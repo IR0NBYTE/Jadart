@@ -29,7 +29,7 @@ import re
 
 from .disasm import ISOLATE_INSTRUCTIONS
 from .errors import InputError
-from .interop import binary_info, visible, _shown, _checks
+from .interop import binary_info, visible, _shown, _shown_name, _checks
 
 #: Function kinds MaxNumberOfParametersInRegisters returns 0 for (object.cc, 3.4.0 to
 #: 3.12.2): the VM calls them through the stack whatever their signature.
@@ -105,7 +105,7 @@ def select(syms: list, targets: list, all_matches: bool = False):
             if not hit:
                 inside = next((s for s in syms if s.va <= addr < s.va + s.size), None)
                 where = (f"; it is inside "
-                         f"{_shown(inside.qualified) or 'an anonymous range'} "
+                         f"{_shown_name(inside) or 'an anonymous range'} "
                          f"at 0x{inside.va:x} (+0x{addr - inside.va:x})" if inside else "")
                 problems.append(f"{t} is not the start or the entry of a code range{where}")
         else:
@@ -119,14 +119,14 @@ def select(syms: list, targets: list, all_matches: bool = False):
             def spelled(s):
                 names = (s.name, s.qualified)
                 return (names + tuple(visible(n) for n in names)
-                        + tuple(_shown(n) for n in names))
+                        + tuple(_shown(n) for n in names) + (_shown_name(s),))
 
             hit = [s for s in syms if s.name and (t in spelled(s) or
                    bare in {_PRIVATE_KEY.sub("", n) for n in spelled(s)})]
             if not hit:
                 problems.append(f"no function named {_shown(t)}")
             elif len(hit) > 1 and not all_matches:
-                lines = [f"  0x{s.va:x}  {_shown(s.qualified)}  "
+                lines = [f"  0x{s.va:x}  {_shown_name(s)}  "
                          f"{_shown(s.library)}" for s in hit[:20]]
                 more = [f"  ... {len(hit) - 20} more"] if len(hit) > 20 else []
                 problems.append("\n".join(
@@ -157,7 +157,7 @@ def plan(image, hdr, fr, chosen: list) -> list:
     for s in chosen:
         # The name came out of the binary, so it is escaped before it goes into a message:
         # a newline in it would otherwise add lines that read like jadart's own output.
-        who = _shown(s.qualified) or hex(s.va)
+        who = _shown_name(s) or hex(s.va)
         if s.entry_offset is None:
             if s.entry_error:
                 raise InputError(f"{who} cannot be hooked: {s.entry_error}")
@@ -175,7 +175,7 @@ def plan(image, hdr, fr, chosen: list) -> list:
                 f"the entry of {who} is at 0x{at:x}, which leaves no {GUARD_BYTES} bytes "
                 f"inside the {len(image.text)}-byte instructions image to check before "
                 f"hooking")
-        out.append({"name": _shown(s.qualified or f"anon_{s.va:x}"), "va": s.va,
+        out.append({"name": _shown_name(s) or f"anon_{s.va:x}", "va": s.va,
                      "entry_va": s.entry_va, "off": at, "size": s.size,
                      "bytes": image.text[at:at + GUARD_BYTES].hex(), "kind": s.kind,
                      "convention": convention(s, dart), "static": s.static,

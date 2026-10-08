@@ -147,6 +147,9 @@ _BLANKS = frozenset(
 #: longer ones, so this is no shorter. Printed whole, one long name cost its length at
 #: every slot, call and member that names it, and one string names any number (#94).
 NAME_CUT = 200
+#: The mark visible() ends a cut name with. Its backslash starts no escape, so the run of
+#: backslashes it ends is odd: escaped ones, in pairs, and then its own.
+_CUT = re.compile(r"(?<!\\)((?:\\\\)*)\\\.\.\. \(\d+ chars\)\Z")
 #: What visible() escapes that str.isprintable() lets through.
 _ODD = re.compile("[" + re.escape("".join(sorted(_BLANKS))) + "]")
 
@@ -186,9 +189,12 @@ def visible(text: str, backslash: bool = True, limit: int = 0) -> str:
     isprintable() and a regex search: isprintable() refuses exactly categories C* and Z*
     but the space."""
     if limit:
-        head = visible(text[:limit + 1], backslash)
+        start = text[:limit + 1]
+        head = visible(start, backslash)
         if len(head) <= limit:
             return head
+        if len(head) == len(start):          # longer than the limit, and no escapes
+            return head[:limit] + f"\\... ({len(text)} chars)"
         out, n = [], 0
         for ch in text:
             piece = visible(ch, backslash)
@@ -207,3 +213,10 @@ def visible(text: str, backslash: bool = True, limit: int = 0) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def uncut(text: str) -> str:
+    """`text`, as visible() prints a name, without the mark of a cut if it has one: what
+    is left of a long library url when a file is named after it (#94). A name that
+    spells the mark kept its backslash escaped, so it is left as it is."""
+    return _CUT.sub(r"\1", text, count=1)

@@ -170,7 +170,9 @@ class _Names(Mapping):
     """A read-only view of a strings dict, with each value escaped once, on first use.
 
     Kept by the string rather than the ref: refs on one RO data string share one object
-    (#91), and escaping it once per ref gave each of them a copy (#94)."""
+    (#91), and escaping it once per ref gave each of them a copy (#94). By its id(), not
+    its value, since a lookup by value compares a second equal copy whole every time;
+    the entry holds the string, so no other object can take that id while it is kept."""
 
     def __init__(self, strings: dict):
         self.strings = strings
@@ -178,11 +180,11 @@ class _Names(Mapping):
 
     def __getitem__(self, ref):
         s = self.strings[ref]
-        out = self._seen.get(s)
-        if out is None:
+        hit = self._seen.get(id(s))
+        if hit is None:
             from .fill import NAME_CUT, visible
-            out = self._seen[s] = visible(s, limit=NAME_CUT)
-        return out
+            hit = self._seen[id(s)] = (s, visible(s, limit=NAME_CUT))
+        return hit[1]
 
     def __iter__(self):
         return iter(self.strings)

@@ -237,9 +237,13 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     # Group by output path before writing. Two library objects can map to one path: an
     # internal patch library (name "dart.core") is the same logical library as its public
     # side (url "dart:core"), so they belong in one file rather than clobbering each other.
+    # A cut url is named after what is left of it: the mark ends in `\... (N chars)`,
+    # whose backslash _safe_relpath splits on, which made a directory where another url
+    # had made a file (#94).
+    from .fill import uncut
     by_path: dict = {}
     for url, ks in sorted(libs.items()):
-        by_path.setdefault(library_path(url), []).append((url, ks))
+        by_path.setdefault(library_path(uncut(url)), []).append((url, ks))
 
     stats = {"libraries": 0, "classes": 0, "methods": 0, "files": []}
     for i, (rel, entries) in enumerate(sorted(by_path.items())):

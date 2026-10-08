@@ -235,8 +235,11 @@ def is_signable(name: str) -> bool:
     # A name holding a line break cannot be written on its line of the library: save()
     # puts each name raw after a tab, so `\n` split the entry and load() refused the whole
     # file. Names come from the reference binary, so only a crafted one has such a name,
-    # and leaving that one function unsigned costs nothing (#49).
-    return not name.startswith(_GENERATED) and "\n" not in name and "\r" not in name
+    # and leaving that one function unsigned costs nothing (#49). Nor one past NAME_CUT:
+    # one string names any number of functions and the library writes it once for each,
+    # and no real name comes near it, 157 characters at most over the corpus (#94).
+    return (not name.startswith(_GENERATED) and "\n" not in name and "\r" not in name
+            and len(name) <= NAME_CUT)
 
 
 def base_name(n: str) -> str:
