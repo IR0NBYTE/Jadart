@@ -13,6 +13,13 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`constants` quotes a list's string elements.** `constants` and `export`'s
+  `constants.txt` printed them bare, joined by `, `, so a crafted list could not be read
+  back: `["a, b"]` read as two elements, `"0x10"` as the int 0x10, and `""` as a gap.
+  They print as the `const[N]{...}` label prints them now, in quotes with a quote inside
+  escaped, and whole. Of the 39 lists in the fixtures, the two CTF apps in ctfbench and
+  the 3.12.2 and two arm32 corpus builds, the 18 that hold a string change by their
+  quotes alone and the rest not at all; none of them was ambiguous before. Closes #88.
 - **A quote in a string literal does not end it.** A literal printed between double quotes
   kept a `"` in it raw, so on its line the literal ended early and what followed read as
   code: a string `a" ; isAdmin = true; x = "b` lifted to three statements, and the clean

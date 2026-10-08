@@ -64,6 +64,8 @@ On a name ending in `~`, which a `--sigs` library supplied, it says that library
 A string literal in quotes is escaped the same way, and a quote inside it prints as `\"`:
 `"a\" ; isAdmin = true"` is one string, never code after a string. A literal whose escaped
 text runs past 200 characters ends in `..."`, cut short; `strings` prints it whole.
+`constants` quotes a list's string elements too, and never cuts them: `"a, b"` is one
+element, and `"0x10"` is a string, not the int `0x10`.
 
 Two examples, so the distinction is concrete.
 
