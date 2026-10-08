@@ -52,7 +52,7 @@ import os
 import re
 import stat
 
-from .fill import visible
+from .fill import NAME_CUT, visible
 from .disasm import (MAX_INSNS, MissingDisassembler, UnsupportedArch, build_pool_map,
                      disassemble_range, function_name_by_pc, pool_byte_offset,
                      _add_imm_from_pp, _imm_from, _mem_base_disp)
@@ -369,7 +369,8 @@ def merge(pc_to_name: dict, matches: dict) -> tuple:
     for pc, m in matches.items():
         if pc in merged:
             continue
-        merged[pc] = visible(m.name) + MARK     # escaped as a name (#74); kept raw in m
+        # escaped and cut as a name (#74, #94); kept raw in m
+        merged[pc] = visible(m.name, limit=NAME_CUT) + MARK
         added += 1
     return merged, added
 

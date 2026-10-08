@@ -452,8 +452,9 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
         return [(sub_label(image, cr.pc_offset), cr)] if cr else []
 
     # Matched as printed: a name holding a control character is escaped everywhere it
-    # appears (#74), so the escaped spelling is the one that reads back.
-    from .fill import visible
+    # appears (#74), and a long one is cut (#94), so that spelling is the one that reads
+    # back.
+    from .fill import NAME_CUT, visible
 
     def collect(pred):
         for ref, nr, ow, kt in fr.functions:
@@ -464,7 +465,7 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
                     seen_pc.add(cr.pc_offset)
                     out.append((nm, cr))
         for pc, nm in (image.symbol_names or {}).items():
-            nm = visible(nm)
+            nm = visible(nm, limit=NAME_CUT)
             if pred(nm) and pc not in seen_pc and pc in by_pc:
                 seen_pc.add(pc)
                 out.append((nm, by_pc[pc]))
@@ -635,15 +636,15 @@ def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
     backfill is what recovers real names on dwarf_stack_traces_mode builds, where the
     snapshot itself no longer carries them.
 
-    Both come from the binary, so they are escaped as names (fill.visible, #74) unless
-    `raw` asks for them as written, which only interop does: it escapes each name where
-    it prints it and carries the original in base64."""
-    from .fill import visible
+    Both come from the binary, so they are escaped and cut as names (fill.visible, #74,
+    #94) unless `raw` asks for them as written, which only interop does: its JSON keeps
+    them as written, and it escapes and cuts each one where it prints it."""
+    from .fill import NAME_CUT, visible
     S = fr.strings if raw else fr.names
     fname = {}
     for ref, name_ref, owner_ref, kind_tag in fr.functions:
         fname[ref] = S.get(name_ref, "")
-    pc_to_name = {pc: (nm if raw else visible(nm))
+    pc_to_name = {pc: (nm if raw else visible(nm, limit=NAME_CUT))
                   for pc, nm in (image.symbol_names or {}).items()}
     for owner_ref, cr in image.code_ranges.items():
         nm = fname.get(owner_ref)

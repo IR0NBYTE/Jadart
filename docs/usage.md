@@ -348,7 +348,9 @@ real entry, and the plate comment says so. Every one of them has the miss handle
 Names are reduced to `[A-Za-z0-9_]` plus the address, so they are unique and cannot be
 read as anything else by a tool that takes a name on a command line. The Dart name as
 written travels as a base64 comment, and anything invisible in it (a bidi override, a zero
-width character, a newline) is escaped to `\uXXXX` rather than rendered.
+width character, a newline) is escaped to `\uXXXX` rather than rendered. A name longer
+than 200 characters is cut there and ends in `\... (N chars)`, N its whole length; `-j`
+keeps names as written, cut at 200 characters, and gives the whole length under `cut`.
 
 ### hook: a Frida script on the right address, reading the right registers
 

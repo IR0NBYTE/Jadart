@@ -159,15 +159,15 @@ def build_program(fr, hdr, raw: bool = False) -> Program:
     """Resolve a completed fill-walk result into the Program model (names, owners,
     fields, superclasses). Shared by recover_program and the decompile view.
 
-    Names and library urls are escaped as names (fill.visible, #74), since they come out
-    of the binary and are printed; `raw` keeps them as written, for interop, which
-    escapes them itself where it prints them."""
-    from .fill import visible
+    Names and library urls are escaped and cut as names (fill.visible, #74, #94), since
+    they come out of the binary and are printed; `raw` keeps them as written, for
+    interop, which escapes and cuts them itself where it prints them."""
+    from .fill import NAME_CUT, visible
     S = fr.strings if raw else fr.names
 
     def url(ref):
         u = fr.library_urls.get(fr.class_library.get(ref, -1), "")
-        return u if raw else visible(u)
+        return u if raw else visible(u, limit=NAME_CUT)
 
     classes = []
     by_ref = {}

@@ -561,7 +561,7 @@ def cmd_symbols(args) -> int:
     for s in shown:
         entry = ("?" if s.entry_offset is None else
                  f"+0x{s.entry_offset:x}" if s.entry_offset else "")
-        name = interop.visible(interop._capped(s.qualified)) if s.name else dim("(anonymous)")
+        name = interop._shown(s.qualified) if s.name else dim("(anonymous)")
         print(f"0x{s.va:<10x} 0x{s.file_offset:<8x} {s.size:>7} {entry:>6}  {name}")
     if args.limit > 0 and len(rows) > args.limit:
         print(dim(f"... {len(rows) - args.limit} more (raise with -n, or -n 0 for all)"))
