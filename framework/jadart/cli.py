@@ -663,8 +663,7 @@ def cmd_constants(args) -> int:
     spell at every use site. This is where the rest of it lives, keyed on the same offset,
     so the label in a body is followed rather than merely noticed.
     """
-    from .fill import printable
-    from .disasm import load_instructions, const_lists
+    from .disasm import load_instructions, const_lists, const_listing
     try:
         image, fr, _hdr = load_instructions(args.libapp)
         lists = const_lists(fr, getattr(image, "arch", None))
@@ -678,8 +677,7 @@ def cmd_constants(args) -> int:
         print("no const list in the object pool resolves to elements this can name")
         return 0
     for off, vals in sorted(lists.items()):
-        body = ", ".join(printable(v) if isinstance(v, str) else hex(v) for v in vals)
-        print(f"0x{off:x}\t[{len(vals)}]\t{body}")
+        print(f"0x{off:x}\t[{len(vals)}]\t{const_listing(vals)}")
     return 0
 
 

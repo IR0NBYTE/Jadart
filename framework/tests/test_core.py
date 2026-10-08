@@ -4279,6 +4279,80 @@ def test_a_long_const_list_is_named_rather_than_spelled_at_every_use():
         f"the long form is not actually shorter: {long_}")
 
 
+_LISTED = re.compile(r'"((?:[^"\\]|\\.)*)"|(-?0x[0-9a-f]+)')
+_ESCAPE = re.compile(r'\\(?:x([0-9a-f]{2})|u([0-9a-f]{4})|U([0-9a-f]{8})|(.))')
+_SIMPLE = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
+
+
+def _unescape(s):
+    """printable() and quoted() undone: the text the binary holds."""
+    def one(m):
+        code = m.group(1) or m.group(2) or m.group(3)
+        if code:
+            return chr(int(code, 16))
+        assert m.group(4) in _SIMPLE, f"no such escape: {m.group(0)!r}"
+        return _SIMPLE[m.group(4)]
+    return _ESCAPE.sub(one, s)
+
+
+def _read_listing(body):
+    """A `constants` line's elements with strings unescaped, or an AssertionError."""
+    out, pos = [], 0
+    while True:
+        m = _LISTED.match(body, pos)
+        assert m, f"no element starts at column {pos}: {body!r}"
+        s, n = m.groups()
+        out.append(_unescape(s) if s is not None else int(n, 16))
+        pos = m.end()
+        if pos == len(body):
+            return out
+        assert body.startswith(", ", pos), f"no separator at column {pos}: {body!r}"
+        pos += 2
+
+
+def test_a_const_list_listing_keeps_its_elements_apart():
+    """`constants` and constants.txt print each string element quoted, as the label does.
+
+    They printed strings bare, so `["a, b"]` read as two elements, `"0x10"` as the int
+    0x10, and an empty string as a gap. The count in front could show a mismatch, but no
+    reader, and no agent, could get the elements back."""
+    import contextlib
+    import io
+    import tempfile
+    from types import SimpleNamespace
+    from unittest import mock
+    from jadart import cli, disasm
+
+    crafted = ["a, b", "0x10", "", 'say "hi", x', 0x10, -3, "Unix",
+               'a\\", "b', "\\", "tab\tand\nline\u202e\ud800"]
+    loaded = (SimpleNamespace(arch=None), None, None)
+    with mock.patch.object(disasm, "load_instructions", lambda _p: loaded), \
+            mock.patch.object(disasm, "const_lists", lambda *_: {0x40: crafted}):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["constants", CLEAN])
+    assert rc == 0, buf.getvalue()
+    off, count, body = buf.getvalue().rstrip("\n").split("\t")
+    assert (off, count) == ("0x40", f"[{len(crafted)}]"), buf.getvalue()
+    assert _read_listing(body) == crafted, body
+
+    if not _capstone_available():
+        _skip("  SKIP the constants.txt half (no capstone)")
+    from jadart.export import export
+    real = disasm.const_lists
+    with tempfile.TemporaryDirectory() as out, \
+            mock.patch.object(disasm, "const_lists",
+                              lambda fr, arch=None: {**real(fr, arch), 0x1: crafted}):
+        export(CLEAN, out, tier=1)
+        lines = open(os.path.join(out, "constants.txt"), encoding="utf-8").read()
+    rows = [ln.split("\t") for ln in lines.splitlines()]
+    got = {off: _read_listing(body) for off, _n, body in rows}
+    assert got["0x1"] == crafted, got["0x1"]
+    assert got["0x5610"] == ["ANY", "IPv4", "IPv6", "Unix"], got["0x5610"]
+    for off, n, _body in rows:
+        assert n == f"[{len(got[off])}]", f"{off} says {n} but lists {len(got[off])}"
+
+
 def test_the_runner_block_is_the_last_thing_in_this_file():
     """The `if __name__ == "__main__"` block collects `globals()` when it RUNS, so every
     test defined below it is invisible to it.

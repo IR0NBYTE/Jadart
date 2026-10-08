@@ -778,6 +778,16 @@ def _fmt_elem(v):
     return (hex(v) if abs(v) > 9 else str(v)) if isinstance(v, int) else quoted(v)
 
 
+def const_listing(vals) -> str:
+    """A const list's elements as `constants` and constants.txt print them.
+
+    Strings are quoted, as the `const[N]{...}` label quotes them. Printed bare, an element
+    holding `, ` read as two elements, one spelling `0x10` read as that int, and an empty
+    one left a gap that looked like a missing element.
+    """
+    return ", ".join(quoted(v) if isinstance(v, str) else hex(v) for v in vals)
+
+
 def _const_list(fr, ref: int, off: int):
     vals = _const_elems(fr, ref)
     if vals is None:

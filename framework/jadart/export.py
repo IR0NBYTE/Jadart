@@ -279,14 +279,12 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     # `const[200] @0x60d8` into pool.txt found the same truncated label again, and the 200
     # values existed only behind the Python API. A table lookup is half an answer without
     # the table.
-    from .disasm import const_lists
+    from .disasm import const_lists, const_listing
     consts = const_lists(fr, getattr(image, "arch", None))
     if consts:
         with open(os.path.join(outdir, "constants.txt"), "w", **TEXT_OUT) as fh:
             for off, vals in sorted(consts.items()):
-                body = ", ".join(printable(v) if isinstance(v, str) else hex(v)
-                                 for v in vals)
-                fh.write(f"0x{off:x}\t[{len(vals)}]\t{body}\n")
+                fh.write(f"0x{off:x}\t[{len(vals)}]\t{const_listing(vals)}\n")
     if selectors:
         with open(os.path.join(outdir, "selectors.txt"), "w", **TEXT_OUT) as fh:
             for imm, name in sorted(selectors.items(), key=lambda kv: kv[1]):
