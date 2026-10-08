@@ -283,8 +283,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     consts = const_lists(fr, getattr(image, "arch", None))
     if consts:
         with open(os.path.join(outdir, "constants.txt"), "w", **TEXT_OUT) as fh:
-            for off, vals in sorted(consts.items()):
-                fh.write(f"0x{off:x}\t[{len(vals)}]\t{const_listing(vals)}\n")
+            for off, n, body in const_listing(consts):
+                fh.write(f"0x{off:x}\t[{n}]\t{body}\n")
     if selectors:
         with open(os.path.join(outdir, "selectors.txt"), "w", **TEXT_OUT) as fh:
             for imm, name in sorted(selectors.items(), key=lambda kv: kv[1]):

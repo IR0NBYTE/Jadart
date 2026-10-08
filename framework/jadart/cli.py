@@ -663,21 +663,19 @@ def cmd_constants(args) -> int:
     spell at every use site. This is where the rest of it lives, keyed on the same offset,
     so the label in a body is followed rather than merely noticed.
     """
-    from .disasm import load_instructions, const_lists, const_listing
+    from .disasm import load_instructions, const_lists, const_listing, const_entries
     try:
         image, fr, _hdr = load_instructions(args.libapp)
         lists = const_lists(fr, getattr(image, "arch", None))
     except JadartError as e:
         return _fail(e)
     if getattr(args, "json", False):
-        return emit({"ok": True, "count": len(lists),
-                     "constants": [{"offset": off, "length": len(v), "elements": v}
-                                   for off, v in sorted(lists.items())]})
+        return emit({"ok": True, "count": len(lists), "constants": const_entries(lists)})
     if not lists:
         print("no const list in the object pool resolves to elements this can name")
         return 0
-    for off, vals in sorted(lists.items()):
-        print(f"0x{off:x}\t[{len(vals)}]\t{const_listing(vals)}")
+    for off, n, body in const_listing(lists):
+        print(f"0x{off:x}\t[{n}]\t{body}")
     return 0
 
 

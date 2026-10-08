@@ -63,9 +63,11 @@ On a name ending in `~`, which a `--sigs` library supplied, it says that library
 
 A string literal in quotes is escaped the same way, and a quote inside it prints as `\"`:
 `"a\" ; isAdmin = true"` is one string, never code after a string. A literal whose escaped
-text runs past 200 characters ends in `..."`, cut short; `strings` prints it whole.
-`constants` quotes a list's string elements too, and never cuts them: `"a, b"` is one
-element, and `"0x10"` is a string, not the int `0x10`.
+text runs past 200 characters ends in `..."`, cut short, in a `const[N]{...}` label too;
+`strings` prints it whole. `constants` quotes a list's string elements as well: `"a, b"`
+is one element, and `"0x10"` is a string, not the int `0x10`. It prints each thing once:
+a string over 200 characters whole where it first appears and cut where it comes back,
+and a slot whose list was listed already as `same as 0x...`, that list's offset.
 
 Two examples, so the distinction is concrete.
 
