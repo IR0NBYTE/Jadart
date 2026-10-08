@@ -28,16 +28,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `hook` and an export print as much for a 20,000 character name as for a 40,000 one,
   but for `strings.txt`, which prints each string once and whole; an export names a
   file after what is left of a cut url, without the mark. `symbols -j` keeps names as
-  written: `name`,
-  `owner` and `library` are cut at 200 characters, `qualified` is the cut owner and
-  name joined, and a record with a field cut gives its whole length under `cut`. A cut
-  name there is not one `hook` or `disasm` can find; its `va` is. `cut` is a new key,
-  so the format version stays 1. `signatures` leaves a function whose name is longer
-  than 200 characters out of the library, as it does one holding a line break; it
-  writes the same library from both fixtures and the 3.12.2 build as before.
-  `FillResult.names` escapes a string once, not once per ref on it. The longest name
-  in the fixtures, the two CTF apps in ctfbench and the corpus is 165 characters, so
-  exports at tiers 1 to 3 (1 and 2 for arm32), `functions`, `classes`, `libraries`,
+  written: `name`, `owner` and `library` are cut at 200 characters, `qualified` is the
+  cut owner and name joined, and a record with a field cut gives its whole length
+  under `cut`. A cut name there is not one `hook` or `disasm` can find; its `va` is.
+  `cut` is a new key, so the format version stays 1. `signatures` leaves a function
+  whose name is longer than 200 characters out of the library, as it does one holding
+  a line break; it writes the same library from both fixtures and the 3.12.2 build as
+  before. `FillResult.names` escapes a string once, not once per ref on it. The longest
+  name in the fixtures, the two CTF apps in ctfbench and the corpus is 165 characters,
+  so exports at tiers 1 to 3 (1 and 2 for arm32), `functions`, `classes`, `libraries`,
   `selectors`, `decompile`, `hook` and the `-j` of `functions`, `classes`, `libraries`
   and `symbols` are byte for byte the same on both fixtures, those CTF apps and the
   2.19.6, 3.12.2 and two arm32 corpus builds. The `symbols` table and the IDA, Ghidra

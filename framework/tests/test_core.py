@@ -8410,10 +8410,14 @@ def test_a_long_name_is_cut_after_an_escape_and_says_how_long_it_was():
     from jadart import fill
     read = []
     real = fill.visible
-    with mock.patch.object(fill, "visible",
-                           lambda t, *a, **k: read.append(len(t)) or real(t, *a, **k)):
-        assert fill.visible("A" * 10**6, limit=200).endswith("\\... (1000000 chars)")
-    assert sum(read[1:]) <= 2 * 201, f"read {sum(read[1:])} characters to cut at 200"
+    for big, most in (("A" * 10**6, 201), (chr(1) * 10**6, 2 * 201)):
+        read.clear()                 # a name needing no escape is cut from its head
+        def counted(t, *a, **k):
+            read.append(len(t))
+            return real(t, *a, **k)
+        with mock.patch.object(fill, "visible", counted):
+            assert fill.visible(big, limit=200).endswith("\\... (1000000 chars)")
+        assert sum(read[1:]) <= most, f"read {sum(read[1:])} characters to cut at 200"
 
 
 def test_names_escape_a_string_once_however_many_refs_name_it():
@@ -8477,6 +8481,26 @@ def test_a_long_name_from_the_symbol_table_or_a_signature_prints_cut():
     short = dataclasses.replace(sym, owner="O").as_json()
     assert "cut" not in short and short["qualified"] == "O.run"
 
+    from jadart import hooks
+    from jadart.errors import InputError
+    from jadart.interop import _comment, ghidra_name
+    sig = dataclasses.replace(sym, name="m" * L + MARK, owner="", origin="signature",
+                              entry_offset=0)
+    marked = "m" * 200 + f"\\... ({L} chars)" + MARK       # cut, and still inferred
+    assert _comment(sig).splitlines()[0] == "Dart: " + marked
+    assert ghidra_name(sig) == f"{marked}_{sig.va:x}"
+    assert hooks.select([sig], [marked]) == ([sig], [])
+    twin = dataclasses.replace(sig, pc_offset=0x1000, va=0x2000)
+    _, (both,) = hooks.select([sig, twin], [marked])      # ambiguous: both listed
+    assert both.count(marked) == 2, both
+    _, (inside,) = hooks.select([sig], [hex(sig.va + 4)])
+    assert f"it is inside {marked} at" in inside, inside
+    image = SimpleNamespace(text=bytes(64))
+    hdr = SimpleNamespace(epoch=SimpleNamespace(dart="3.12.2"))
+    assert hooks.plan(image, hdr, fr, [sig])[0]["name"] == marked
+    with pytest.raises(InputError, match=re.escape(marked)):
+        hooks.plan(image, hdr, fr, [dataclasses.replace(sig, entry_offset=None)])
+
 
 def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
     """One string names every function that shares it, a class name comes back in each
@@ -8533,6 +8557,7 @@ def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
     sizes = {}
     for n in (20000, 40000):
         length[0] = n
+        sig = "sig" + "g" * 197 + f"\\... ({3 + n} chars)~"     # cut, and still marked
         texts = {
             "functions": run("functions", CLEAN, "-n", "0", "--sigs", lib),
             "classes": run("classes", CLEAN),
@@ -8545,6 +8570,7 @@ def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
             "symbols r2": run("symbols", CLEAN, "--format", "r2"),
             "symbols sigs": run("symbols", CLEAN, "-n", "0", "--sigs", lib),
             "symbols -f": run("symbols", CLEAN, "-f", qualified(n)),
+            "symbols -f sig": run("symbols", CLEAN, "-f", sig, "--sigs", lib),
             "decompile": run("decompile", CLEAN, printed("BenchAccount", n),
                              "--sigs", lib),
             "disasm": run("disasm", CLEAN, printed("benchWithdraw", n)),
@@ -8553,15 +8579,14 @@ def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
         }
         assert printed("benchWithdraw", n) in texts["decompile"]
         assert printed("build", n) in texts["functions"]
-        assert qualified(n) in texts["symbols -f"]
-        sig = "sig" + "g" * 197 + f"\\... ({3 + n} chars)~"     # cut, and still marked
+        assert qualified(n) in texts["symbols -f"] and sig in texts["symbols -f sig"]
         assert sig in texts["functions"] and sig in texts["symbols sigs"]
         out = tmp_path / f"out{n}"
         run("export", CLEAN, "-t", "1", "-q", "-o", out)
         for dp, _, fs in os.walk(out):
             for f in fs:
                 if f != "strings.txt":           # each string once, whole, as it was read
-                    p = os.path.join(dp, f)      # named after the whole url
+                    p = os.path.join(dp, f)      # a cut url names it without the mark
                     texts[os.path.relpath(p, out)] = open(p, encoding="utf-8").read()
         sizes[n] = {k: len(v) for k, v in texts.items()}
     grew = {k: (v, sizes[40000].get(k)) for k, v in sizes[20000].items()
