@@ -4280,6 +4280,19 @@ def test_a_long_const_list_is_named_rather_than_spelled_at_every_use():
 
 
 _LISTED = re.compile(r'"((?:[^"\\]|\\.)*)"|(-?0x[0-9a-f]+)')
+_ESCAPE = re.compile(r'\\(?:x([0-9a-f]{2})|u([0-9a-f]{4})|U([0-9a-f]{8})|(.))')
+_SIMPLE = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
+
+
+def _unescape(s):
+    """printable() and quoted() undone: the text the binary holds."""
+    def one(m):
+        code = m.group(1) or m.group(2) or m.group(3)
+        if code:
+            return chr(int(code, 16))
+        assert m.group(4) in _SIMPLE, f"no such escape: {m.group(0)!r}"
+        return _SIMPLE[m.group(4)]
+    return _ESCAPE.sub(one, s)
 
 
 def _read_listing(body):
@@ -4289,7 +4302,7 @@ def _read_listing(body):
         m = _LISTED.match(body, pos)
         assert m, f"no element starts at column {pos}: {body!r}"
         s, n = m.groups()
-        out.append(s.replace('\\"', '"') if s is not None else int(n, 16))
+        out.append(_unescape(s) if s is not None else int(n, 16))
         pos = m.end()
         if pos == len(body):
             return out
@@ -4310,7 +4323,8 @@ def test_a_const_list_listing_keeps_its_elements_apart():
     from unittest import mock
     from jadart import cli, disasm
 
-    crafted = ["a, b", "0x10", "", 'say "hi", x', 0x10, -3, "Unix"]
+    crafted = ["a, b", "0x10", "", 'say "hi", x', 0x10, -3, "Unix",
+               'a\\", "b', "\\", "tab\tand\nline\u202e\ud800"]
     loaded = (SimpleNamespace(arch=None), None, None)
     with mock.patch.object(disasm, "load_instructions", lambda _p: loaded), \
             mock.patch.object(disasm, "const_lists", lambda *_: {0x40: crafted}):
@@ -4319,7 +4333,7 @@ def test_a_const_list_listing_keeps_its_elements_apart():
             rc = cli.main(["constants", CLEAN])
     assert rc == 0, buf.getvalue()
     off, count, body = buf.getvalue().rstrip("\n").split("\t")
-    assert (off, count) == ("0x40", "[7]"), buf.getvalue()
+    assert (off, count) == ("0x40", f"[{len(crafted)}]"), buf.getvalue()
     assert _read_listing(body) == crafted, body
 
     if not _capstone_available():
