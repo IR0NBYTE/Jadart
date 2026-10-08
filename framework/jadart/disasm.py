@@ -696,28 +696,47 @@ def build_pool_map(fr, arch=None) -> dict:
     """ObjectPool byte-offset -> annotation string. The pool is loaded into PP (X27,
     untagged); a `ldr xN, [x27, #off]` reads pool entry (off - 0x10)//8. Entries keyed
     here by their true byte offset 0x10 + idx*8. Refs to a String or Function get a
-    readable label; other object kinds are left unlabelled."""
+    readable label; other object kinds are left unlabelled.
+
+    Each object is labelled once, however many slots name it. A compiled pool names some
+    objects from several slots (on clean, 180 of them, `oldWidget` from 89), and nothing
+    bounds how many: a crafted pool naming one long list or one long string from every
+    slot cost slots times its length, in time and in the labels, in every command that
+    names pool entries (#91)."""
     fname = {ref: fr.names.get(nr, "") for ref, nr, ow, kt in fr.functions}
-    m = {}
+    m, done, quotes = {}, {}, {}
     for idx, (kind, val) in enumerate(fr.pool):
         if kind != "ref":
             continue
-        off = pool_byte_offset(idx, arch)
-        s = fr.strings.get(val)
-        if s is not None:
-            # Escaped, for the same reason strings.txt is: a literal holding a newline
-            # would otherwise split one lifted line into several, and one holding a quote
-            # would end early (#83). And kept long, because a decompiler exists to show
-            # you the literal, truncating at forty characters hid the second half of an
-            # asset path that was the answer to a challenge.
-            m[off] = quoted(s, 200)
-        elif val in fname and fname[val]:
-            m[off] = f"&{fname[val]}"
-        else:
-            lit = _const_list(fr, val, off)
-            if lit is not None:
-                m[off] = lit
+        if val not in done:
+            done[val] = _pool_label(fr, val, fname, quotes)
+        if done[val] is not None:
+            off = pool_byte_offset(idx, arch)
+            m[off] = _at(done[val], off)
     return m
+
+
+def _pool_label(fr, val: int, fname: dict, quotes: dict):
+    """The label for pool object `val`: a string, a long list's (length, head) that
+    `_at` puts the slot's offset into, or None."""
+    s = fr.strings.get(val)
+    if s is not None:
+        # Escaped, for the same reason strings.txt is: a literal holding a newline
+        # would otherwise split one lifted line into several, and one holding a quote
+        # would end early (#83). And kept long, because a decompiler exists to show
+        # you the literal, truncating at forty characters hid the second half of an
+        # asset path that was the answer to a challenge.
+        return _fmt_elem(s, quotes)
+    if val in fname and fname[val]:
+        return f"&{fname[val]}"
+    return _list_label(fr, val, quotes)
+
+
+def _at(label, off: int) -> str:
+    if isinstance(label, str):
+        return label
+    n, head = label
+    return f"const[{n}] @0x{off:x}{{{head}, ...}}"
 
 
 #: How many elements to spell inline before the label becomes a reference. A short list is
@@ -734,14 +753,19 @@ def const_lists(fr, arch=None) -> dict:
     The decompiled body names a long table rather than spelling it, so this is where the
     bytes come back. Keyed the same way the body labels them, so `const[47] @0xb9b0` in a
     lifted line and `0xb9b0` here are the same slot.
+
+    Each Array is resolved once, and every slot reaching it gets that same list, so a
+    crafted pool naming one Array from every slot costs slots plus elements, not their
+    product (#91). `const_listing` relies on it to list such a slot as `same as`.
     """
-    out = {}
+    out, done = {}, {}
     for idx, (kind, val) in enumerate(fr.pool):
         if kind != "ref":
             continue
-        vals = _const_elems(fr, val)
-        if vals is not None:
-            out[pool_byte_offset(idx, arch)] = vals
+        if val not in done:
+            done[val] = _const_elems(fr, val)
+        if done[val] is not None:
+            out[pool_byte_offset(idx, arch)] = done[val]
     return out
 
 
@@ -774,28 +798,117 @@ def _const_elems(fr, ref: int):
     return out
 
 
-def _fmt_elem(v):
-    return (hex(v) if abs(v) > 9 else str(v)) if isinstance(v, int) else quoted(v)
+#: Past this many characters, quoted, a literal is cut to `..."` in a label, and in
+#: `constants` it is printed whole once and named by where, wherever it comes back.
+_LITERAL_CUT = 200
 
 
-def const_listing(vals) -> str:
-    """A const list's elements as `constants` and constants.txt print them.
+def _fmt_elem(v, quotes: dict):
+    """An element as a label spells it. A string is cut at _LITERAL_CUT like any literal
+    in a label (#92), once per string: `quotes` holds what each one came to."""
+    if isinstance(v, int):
+        return hex(v) if abs(v) > 9 else str(v)
+    if id(v) not in quotes:
+        quotes[id(v)] = quoted(v, _LITERAL_CUT)
+    return quotes[id(v)]
 
-    Strings are quoted, as the `const[N]{...}` label quotes them. Printed bare, an element
-    holding `, ` read as two elements, one spelling `0x10` read as that int, and an empty
-    one left a gap that looked like a missing element.
-    """
-    return ", ".join(quoted(v) if isinstance(v, str) else hex(v) for v in vals)
 
-
-def _const_list(fr, ref: int, off: int):
+def _list_label(fr, ref: int, quotes: dict):
     vals = _const_elems(fr, ref)
     if vals is None:
         return None
     if len(vals) <= _LIST_INLINE:
-        return "const[" + str(len(vals)) + "]{" + ", ".join(_fmt_elem(v) for v in vals) + "}"
-    head = ", ".join(_fmt_elem(v) for v in vals[:3])
-    return f"const[{len(vals)}] @0x{off:x}{{{head}, ...}}"
+        return ("const[" + str(len(vals)) + "]{"
+                + ", ".join(_fmt_elem(v, quotes) for v in vals) + "}")
+    return len(vals), ", ".join(_fmt_elem(v, quotes) for v in vals[:3])
+
+
+def _const_list(fr, ref: int, off: int):
+    label = _list_label(fr, ref, {})
+    return None if label is None else _at(label, off)
+
+
+def _listed(lists: dict):
+    """Each const list in offset order, with what the listing printed before it:
+    (offset, elements, same_as, repeats).
+
+    `same_as` is the offset that listed the same list, or None; `const_lists` hands
+    every slot reaching one Array the same list. `repeats` maps the index of a string
+    longer than _LITERAL_CUT, quoted, to the (offset, index) where it was listed whole.
+    """
+    first, whole, long_ = {}, {}, {}
+    for off, vals in sorted(lists.items()):
+        if id(vals) in first:
+            yield off, vals, first[id(vals)], {}
+            continue
+        first[id(vals)] = off
+        repeats = {}
+        for i, v in enumerate(vals):
+            if not isinstance(v, str):
+                continue
+            if id(v) not in long_:
+                long_[id(v)] = (len(v) > _LITERAL_CUT
+                                or len(quoted(v)) - 2 > _LITERAL_CUT)
+            if not long_[id(v)]:
+                continue
+            if id(v) in whole:
+                repeats[i] = whole[id(v)]
+            else:
+                whole[id(v)] = (off, i)
+        yield off, vals, None, repeats
+
+
+def const_listing(lists: dict):
+    """(offset, length, text) for each const list, as `constants` and constants.txt print
+    them, in offset order.
+
+    Strings are quoted, as the `const[N]{...}` label quotes them. Printed bare, an element
+    holding `, ` read as two elements, one spelling `0x10` read as that int, and an empty
+    one left a gap that looked like a missing element.
+
+    And each thing is printed once. A slot reaching a list already listed says `same as`
+    and the offset that listed it, and a string longer than _LITERAL_CUT is whole where
+    the listing first meets it and `same as 0xOFF[i]`, the list and the element that
+    hold it whole, where it comes back. A crafted pool naming one list from every slot,
+    or one long string from every element, printed slots times elements times its
+    length (#91). A cut, as a label has, would not do here: two strings that differ
+    past the cut would read the same.
+    """
+    quotes = {}
+
+    def spell(i, v, repeats) -> str:
+        if isinstance(v, int):
+            return hex(v)
+        if i in repeats:
+            return "same as 0x%x[%d]" % repeats[i]
+        if id(v) not in quotes:
+            quotes[id(v)] = quoted(v)
+        return quotes[id(v)]
+
+    for off, vals, same_as, repeats in _listed(lists):
+        if same_as is not None:
+            yield off, len(vals), f"same as 0x{same_as:x}"
+        else:
+            yield off, len(vals), ", ".join(spell(i, v, repeats)
+                                            for i, v in enumerate(vals))
+
+
+def const_entries(lists: dict) -> list:
+    """The `-j` form of `const_listing`: {"offset", "length", "elements"} per list. A
+    slot reaching a list already listed has {"same_as": offset} in place of "elements",
+    and a long string listed before is {"same_as": offset, "index": i} in its list."""
+    out = []
+    for off, vals, same_as, repeats in _listed(lists):
+        entry = {"offset": off, "length": len(vals)}
+        if same_as is not None:
+            entry["same_as"] = same_as
+        elif repeats:
+            entry["elements"] = [{"same_as": repeats[i][0], "index": repeats[i][1]}
+                                 if i in repeats else v for i, v in enumerate(vals)]
+        else:
+            entry["elements"] = vals
+        out.append(entry)
+    return out
 
 
 

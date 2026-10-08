@@ -110,8 +110,11 @@ def quoted(s: str, limit: int = 0) -> str:
 
     With a `limit`, a body longer than it is cut to `limit - 3` characters and `...`, at
     the end of an escape, never inside one, so a cut cannot leave a backslash that takes
-    the closing quote or half of a `\\xNN`."""
-    body = printable(s).replace('"', '\\"')
+    the closing quote or half of a `\\xNN`. Only the first `limit + 1` characters are
+    read: an escape is never shorter than its character, so past them the body is long
+    already. Escaping all of a long string before cutting it made each slot naming it
+    cost its whole length, and a crafted pool names one string from every slot (#91)."""
+    body = printable(s[:limit + 1] if limit else s).replace('"', '\\"')
     if not limit or len(body) <= limit:
         return f'"{body}"'
     out, n = [], 0

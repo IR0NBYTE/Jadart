@@ -140,7 +140,7 @@ def constants(path: str) -> dict:
     A decompiled body names a long table rather than spelling it out, because inlining a
     keystream at every use site buries the loop that reads it. This is where the elements
     come back, keyed the same way the body labels them: `const[47] @0xb9b0` in a lifted
-    line is `0xb9b0` here."""
+    line is `0xb9b0` here. Slots that reach the same Array share one list."""
     from .disasm import load_instructions, const_lists
     image, fr, _hdr = load_instructions(_resolve(path))
     return const_lists(fr, getattr(image, "arch", None))

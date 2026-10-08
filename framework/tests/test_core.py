@@ -4353,6 +4353,207 @@ def test_a_const_list_listing_keeps_its_elements_apart():
         assert n == f"[{len(got[off])}]", f"{off} says {n} but lists {len(got[off])}"
 
 
+def test_a_crafted_pool_resolves_each_const_list_once():
+    """A pool naming one Array from every slot cost slots times elements to resolve, in
+    `constants` and in every command that labels the pool (#91).
+
+    No Array in the fixtures or the corpus is named from two slots, but nothing in the
+    stream stops it: 3,000 slots reaching one 3,000-element Array took 0.34s to label,
+    and the time grew as the product. Each Array is resolved once now, and the slots
+    reaching it share it."""
+    from types import SimpleNamespace
+    from jadart.disasm import build_pool_map, const_lists
+
+    class Counted(dict):
+        reads = 0
+
+        def get(self, k, d=None):
+            Counted.reads += 1
+            return dict.get(self, k, d)
+
+    P = N = 300
+    fr = SimpleNamespace(pool=[("ref", 1)] * P, arrays={1: tuple(range(10, 10 + N))},
+                         smi_values=Counted({k: k for k in range(10, 10 + N)}),
+                         strings={}, functions=[], names={})
+    lists = const_lists(fr)
+    assert len(lists) == P and Counted.reads == N, Counted.reads
+    first = next(iter(lists.values()))
+    assert all(v is first for v in lists.values()), "slots reaching one Array share it"
+    Counted.reads = 0
+    assert len(build_pool_map(fr)) == P and Counted.reads == N, Counted.reads
+
+
+def test_a_cut_literal_is_read_no_further_than_its_cut():
+    """quoted(s, limit) escaped all of `s` before cutting it, so a pool naming one long
+    string from every slot cost slots times its length (#91). It reads `limit + 1`
+    characters now, and cuts exactly where it did."""
+    import random
+    from unittest import mock
+    from jadart import fill
+
+    def before(s, limit):
+        body = fill.printable(s).replace('"', '\\"')
+        if not limit or len(body) <= limit:
+            return f'"{body}"'
+        out, n = [], 0
+        for ch in s:
+            piece = fill.printable(ch).replace('"', '\\"')
+            if n + len(piece) > limit - 3:
+                break
+            out.append(piece)
+            n += len(piece)
+        return '"' + "".join(out) + '..."'
+
+    rng = random.Random(91)
+    alphabet = 'ab"\\\n\x01\u202e\U0001f600 ,'
+    for _ in range(3000):
+        limit = rng.choice([0, 5, 10, 200])
+        s = "".join(rng.choice(alphabet)
+                    for _ in range(rng.randint(0, 2 * (limit or 20) + 5)))
+        assert fill.quoted(s, limit) == before(s, limit), (s, limit)
+
+    read = []
+    real = fill.printable
+    with mock.patch.object(fill, "printable", lambda t: read.append(len(t)) or real(t)):
+        fill.quoted("A" * 10**6, 200)
+    assert sum(read) <= 2 * 201, f"read {sum(read)} characters to cut at 200"
+
+
+def test_a_crafted_pool_lists_each_list_and_long_string_once():
+    """`constants` printed every slot's list whole, so one Array named from every slot, or
+    one long string named from every element, printed slots times elements times its
+    length: 60 MB from 3,000 one-element lists of one 20,000 character string (#91).
+
+    A slot reaching a list already listed says `same as` and the offset that listed it,
+    and a string over 200 characters is whole once and `same as 0x10[1]`, where it is
+    whole, when it comes back. `-j` says the same with `same_as`, and constants.txt is
+    the listing."""
+    import contextlib
+    import io
+    import json
+    import tempfile
+    from types import SimpleNamespace
+    from unittest import mock
+    from jadart import cli, disasm
+
+    long_ = "L" * 20000
+    fr = SimpleNamespace(pool=[("ref", 1), ("ref", 1), ("ref", 2), ("ref", 3)],
+                         arrays={1: (10, 11), 2: (11, 12, 11), 3: (12,)},
+                         smi_values={10: 7}, strings={11: long_, 12: "short"},
+                         functions=[], names={})
+    loaded = (SimpleNamespace(arch=None), fr, None)
+
+    def run(*flags):
+        buf = io.StringIO()
+        with mock.patch.object(disasm, "load_instructions", lambda _p: loaded), \
+                contextlib.redirect_stdout(buf):
+            assert cli.main(["constants", CLEAN, *flags]) == 0
+        return buf.getvalue()
+
+    text = run()
+    assert text == (f'0x10\t[2]\t0x7, "{long_}"\n'
+                    "0x18\t[2]\tsame as 0x10\n"
+                    '0x20\t[3]\tsame as 0x10[1], "short", same as 0x10[1]\n'
+                    '0x28\t[1]\t"short"\n'), text[:400]
+    again = {"same_as": 0x10, "index": 1}
+    assert json.loads(run("-j"))["constants"] == [
+        {"offset": 0x10, "length": 2, "elements": [7, long_]},
+        {"offset": 0x18, "length": 2, "same_as": 0x10},
+        {"offset": 0x20, "length": 3, "elements": [again, "short", again]},
+        {"offset": 0x28, "length": 1, "elements": ["short"]}]
+
+    if not _capstone_available():
+        _skip("  SKIP the constants.txt half (no capstone)")
+    from jadart.export import export
+    lists = disasm.const_lists(fr)
+    with tempfile.TemporaryDirectory() as out, \
+            mock.patch.object(disasm, "const_lists", lambda *_: lists):
+        export(CLEAN, out, tier=1)
+        assert open(os.path.join(out, "constants.txt"), encoding="utf-8").read() == text
+
+
+def _rodata_fill(blob: bytes, *offset_lists):
+    """walk_fill over one RO data String cluster per offset list, and nothing else."""
+    from types import SimpleNamespace
+    from jadart.clusters import RODATA, Cluster
+    from jadart.fillwalk import walk_fill
+
+    clusters, ref = [], 100
+    for i, offsets in enumerate(offset_lists):
+        clusters.append(Cluster(index=i, cid=80, canonical=False, immutable=True,
+                                pattern=RODATA, count=len(offsets), start_ref=ref,
+                                stop_ref=ref + len(offsets), alloc_start=0, alloc_end=0,
+                                rodata_offsets=list(offsets), name="OneByteStringCid"))
+        ref += len(offsets)
+    epoch = SimpleNamespace(num_predefined_cids=1, fill_overrides=None,
+                            cid_table=SimpleNamespace(num_predefined=1,
+                                                      cid=lambda name: 81))
+    return walk_fill(SimpleNamespace(data=blob, pos=0), clusters, epoch).strings
+
+
+def _rodata_image(*strings):
+    """A file whose RO data image (at 64) holds each (offset, length, claimed) String:
+    its tags and its claimed length at `offset`, its characters after the header."""
+    import struct
+    from jadart.disasm import _string_header_size
+    head = _string_header_size(8, 8)
+    blob = bytearray(64 + max(off + head + n for off, n, _c in strings))
+    struct.pack_into("<q", blob, 4, 64 - 4)          # Snapshot::length(), image at 64
+    for off, n, claimed in strings:
+        blob[64 + off + head:64 + off + head + n] = b"A" * n
+    for off, n, claimed in strings:                  # headers last: they may overlap
+        struct.pack_into("<I", blob, 64 + off, 80 << 12)
+        struct.pack_into("<Q", blob, 64 + off + 8, claimed << 1)
+    return bytes(blob), head
+
+
+def test_refs_on_one_rodata_string_share_one_decode():
+    """A RO data String cluster gives its offsets as deltas, and 0 is a valid one, so a
+    crafted cluster can put any number of refs on one long string. Each ref decoded its
+    own copy: 3,000 refs on one 20,000 character string made a 60 MB fill from 23 KB, and
+    the once-per-string caches downstream saw 3,000 strings (#91). One decode per
+    offset now, shared by the refs and across the clusters of one fill."""
+    blob, _head = _rodata_image((0, 5000, 5000))
+    strings = _rodata_fill(blob, [0] * 300, [0] * 300)
+    assert len(strings) == 600 and strings[100] == "A" * 5000, len(strings)
+    assert len({id(v) for v in strings.values()}) == 1, (
+        f"{len({id(v) for v in strings.values()})} copies of one string")
+
+
+def test_rodata_strings_that_overlap_are_refused():
+    """Strings 16 bytes apart, each claiming to run to the end of the image, decoded the
+    same bytes once per string: a 33 KB file filled 34M characters and `constants` on
+    one list of them printed 127 MB (#91). Strings that do not overlap cannot come to
+    more characters than the file has bytes, so past that the fill refuses the file."""
+    import pytest
+    from jadart.fillwalk import FillError
+
+    n = 2048
+    blob, head = _rodata_image(*[(16 * k, n - 16 * k, n - 16 * k) for k in range(64)])
+    with pytest.raises(FillError, match="RO data strings overlap"):
+        _rodata_fill(blob, [16 * k for k in range(64)])
+    # The same image read as strings that do not overlap is fine.
+    apart = _rodata_fill(blob, [0])
+    assert apart[100] == blob[64 + head:64 + head + n].decode("latin-1"), len(apart[100])
+
+
+def test_a_list_label_cuts_a_long_string_like_a_literal():
+    """A string in a `const[N]{...}` label was printed whole, where the same string in its
+    own slot is cut at 200, so one long string cost its length at every slot and every
+    use site that named the list (#92)."""
+    from types import SimpleNamespace
+    from jadart.disasm import build_pool_map
+    from jadart.fill import quoted
+
+    long_ = "L" * 5000
+    fr = SimpleNamespace(pool=[("ref", 1), ("ref", 2), ("ref", 3)],
+                         arrays={2: (1, 10), 3: (1,) * 7}, strings={1: long_},
+                         smi_values={10: 3}, functions=[], names={})
+    cut = quoted(long_, 200)
+    assert build_pool_map(fr) == {0x10: cut, 0x18: f"const[2]{{{cut}, 3}}",
+                                  0x20: f"const[7] @0x20{{{cut}, {cut}, {cut}, ...}}"}
+
+
 def test_the_runner_block_is_the_last_thing_in_this_file():
     """The `if __name__ == "__main__"` block collects `globals()` when it RUNS, so every
     test defined below it is invisible to it.
