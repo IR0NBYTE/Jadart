@@ -214,7 +214,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     libraries: list = []
     meta = {"field": {}, "patch": {}, "fdata": {}}
     instr_index = [0]      # running instructions-table index across Code clusters
-    rodata_text: dict = {}  # RO data offset -> its String, decoded once per fill (#91)
+    rodata_text = _ROText()  # RO data offset -> its String, decoded once per fill (#91)
     boundary = epoch.num_predefined_cids or epoch.cid_table.num_predefined
     # The base table is the 3.2+ shape; an older epoch supplies only what it differs by.
     _refs = dict(_REFS, **epoch.fill_overrides) if epoch.fill_overrides else _REFS
@@ -346,8 +346,15 @@ class FillError(JadartError):
     pass
 
 
+class _ROText(dict):
+    """RO data offset -> its String, each decoded once per fill (#91), and how many
+    characters those decodes came to. Strings that do not overlap cannot hold more
+    characters than the file has bytes, so a count past that is a crafted image."""
+    chars = 0
+
+
 def _rodata_strings(blob: bytes, cl, strings: dict, table, arch=None,
-                    decoded: dict = None) -> None:
+                    decoded: _ROText = None) -> None:
     """Recover a ROData String cluster's text straight out of the RO data image.
 
     On uncompressed-pointer targets the identifier pool is not serialized into the stream at
@@ -369,8 +376,10 @@ def _rodata_strings(blob: bytes, cl, strings: dict, table, arch=None,
     A string is decoded once per offset, and every ref at that offset gets the same one.
     A delta of 0 is a valid encoding, so a crafted cluster can put any number of refs on
     one long string, and decoding it again for each made the fill, and everything that
-    prints the strings, cost refs times its length (#91). `decoded` carries that across
-    the clusters of one fill."""
+    prints the strings, cost refs times its length (#91). Strings can also overlap, each
+    one running to the end of the image from 16 bytes past the last: a 33 KB file filled
+    34M characters that way. That is refused, once the strings come to more characters
+    than the file has bytes. `decoded` carries both across the clusters of one fill."""
     import struct as _struct
     offsets = cl.rodata_offsets or []
     if not offsets:
@@ -386,11 +395,17 @@ def _rodata_strings(blob: bytes, cl, strings: dict, table, arch=None,
     header_length = _struct.unpack_from("<q", blob, 4)[0] + 4      # Snapshot::length()
     image = (header_length + 63) & ~63
     if decoded is None:
-        decoded = {}
+        decoded = _ROText()
     for i, off in enumerate(offsets):
         base = image + off
         if base not in decoded:
-            decoded[base] = _rodata_string(blob, base, head, len_off, len_fmt, table)
+            text = _rodata_string(blob, base, head, len_off, len_fmt, table)
+            decoded[base] = text
+            decoded.chars += len(text or "")
+            if decoded.chars > len(blob):
+                raise FillError(
+                    f"RO data strings overlap: cluster #{cl.index} brings them to "
+                    f"{decoded.chars} characters in a {len(blob)} byte file")
         if decoded[base] is not None:
             strings[cl.start_ref + i] = decoded[base]
 

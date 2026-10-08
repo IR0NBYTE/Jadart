@@ -4472,36 +4472,69 @@ def test_a_crafted_pool_lists_each_list_and_long_string_once():
         assert open(os.path.join(out, "constants.txt"), encoding="utf-8").read() == text
 
 
+def _rodata_fill(blob: bytes, *offset_lists):
+    """walk_fill over one RO data String cluster per offset list, and nothing else."""
+    from types import SimpleNamespace
+    from jadart.clusters import RODATA, Cluster
+    from jadart.fillwalk import walk_fill
+
+    clusters, ref = [], 100
+    for i, offsets in enumerate(offset_lists):
+        clusters.append(Cluster(index=i, cid=80, canonical=False, immutable=True,
+                                pattern=RODATA, count=len(offsets), start_ref=ref,
+                                stop_ref=ref + len(offsets), alloc_start=0, alloc_end=0,
+                                rodata_offsets=list(offsets), name="OneByteStringCid"))
+        ref += len(offsets)
+    epoch = SimpleNamespace(num_predefined_cids=1, fill_overrides=None,
+                            cid_table=SimpleNamespace(num_predefined=1,
+                                                      cid=lambda name: 81))
+    return walk_fill(SimpleNamespace(data=blob, pos=0), clusters, epoch).strings
+
+
+def _rodata_image(*strings):
+    """A file whose RO data image (at 64) holds each (offset, length, claimed) String:
+    its tags and its claimed length at `offset`, its characters after the header."""
+    import struct
+    from jadart.disasm import _string_header_size
+    head = _string_header_size(8, 8)
+    blob = bytearray(64 + max(off + head + n for off, n, _c in strings))
+    struct.pack_into("<q", blob, 4, 64 - 4)          # Snapshot::length(), image at 64
+    for off, n, claimed in strings:
+        blob[64 + off + head:64 + off + head + n] = b"A" * n
+    for off, n, claimed in strings:                  # headers last: they may overlap
+        struct.pack_into("<I", blob, 64 + off, 80 << 12)
+        struct.pack_into("<Q", blob, 64 + off + 8, claimed << 1)
+    return bytes(blob), head
+
+
 def test_refs_on_one_rodata_string_share_one_decode():
     """A RO data String cluster gives its offsets as deltas, and 0 is a valid one, so a
     crafted cluster can put any number of refs on one long string. Each ref decoded its
     own copy: 3,000 refs on one 20,000 character string made a 60 MB fill from 23 KB, and
     the once-per-string caches downstream saw 3,000 strings (#91). One decode per
     offset now, shared by the refs and across the clusters of one fill."""
-    import struct
-    from types import SimpleNamespace
-    from jadart import disasm, fillwalk
+    blob, _head = _rodata_image((0, 5000, 5000))
+    strings = _rodata_fill(blob, [0] * 300, [0] * 300)
+    assert len(strings) == 600 and strings[100] == "A" * 5000, len(strings)
+    assert len({id(v) for v in strings.values()}) == 1, (
+        f"{len({id(v) for v in strings.values()})} copies of one string")
 
-    L = 5000
-    head = disasm._string_header_size(8, 8)
-    blob = bytearray(64 + head + L)
-    struct.pack_into("<q", blob, 4, 64 - 4)          # Snapshot::length(), image at 64
-    struct.pack_into("<I", blob, 64, 80 << 12)       # tags: a one-byte string's cid
-    struct.pack_into("<Q", blob, 64 + 8, L << 1)     # length, as a Smi
-    blob[64 + head:] = b"A" * L
-    table = SimpleNamespace(cid=lambda name: 81)     # the two-byte cid is another one
 
-    strings = {}
-    cl = SimpleNamespace(rodata_offsets=[0] * 300, start_ref=100)
-    fillwalk._rodata_strings(bytes(blob), cl, strings, table)
-    assert len(strings) == 300 and strings[100] == "A" * L
-    assert len({id(v) for v in strings.values()}) == 1, "each ref decoded its own copy"
+def test_rodata_strings_that_overlap_are_refused():
+    """Strings 16 bytes apart, each claiming to run to the end of the image, decoded the
+    same bytes once per string: a 33 KB file filled 34M characters and `constants` on
+    one list of them printed 127 MB (#91). Strings that do not overlap cannot come to
+    more characters than the file has bytes, so past that the fill refuses the file."""
+    import pytest
+    from jadart.fillwalk import FillError
 
-    decoded = {}
-    for start in (1000, 2000):                       # two clusters of one fill
-        cl = SimpleNamespace(rodata_offsets=[0] * 300, start_ref=start)
-        fillwalk._rodata_strings(bytes(blob), cl, strings, table, None, decoded)
-    assert strings[1000] is strings[2000], "a second cluster decoded the string again"
+    n = 2048
+    blob, head = _rodata_image(*[(16 * k, n - 16 * k, n - 16 * k) for k in range(64)])
+    with pytest.raises(FillError, match="RO data strings overlap"):
+        _rodata_fill(blob, [16 * k for k in range(64)])
+    # The same image read as strings that do not overlap is fine.
+    apart = _rodata_fill(blob, [0])
+    assert apart[100] == blob[64 + head:64 + head + n].decode("latin-1"), len(apart[100])
 
 
 def test_a_list_label_cuts_a_long_string_like_a_literal():
