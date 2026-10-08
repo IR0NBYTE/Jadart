@@ -13,6 +13,35 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A long name is cut wherever it prints.** One string names every function that
+  shares it, a class name comes back in each of its members and a library url in each
+  of its classes, and nothing cut a name, so a long one cost the output its length at
+  every one of them: on the clean fixture, making `build` 20,000 characters long added
+  1.8M characters each to `functions` and `classes`, 2M to a tier 1 export and 3.6M to
+  `symbols -j`. Names from the snapshot, ELF symbol names, `--sigs` names and library
+  urls are cut where they print now, `jadart.program()` included: past 200 characters
+  as printed, a name ends in `\... (N chars)`, N its length as written, which no name
+  can spell, since a backslash in a name always prints as the start of an escape. That
+  spelling is the one `decompile`, `disasm`, `xrefs`, `hook` and `symbols -f` take
+  back, and a `--sigs` name keeps its `~` after the cut. `functions`, `classes`,
+  `libraries`, `selectors`, `symbols` in every format, `decompile`, `disasm`, `xrefs`,
+  `hook` and an export print as much for a 20,000 character name as for a 40,000 one,
+  but for `strings.txt`, which prints each string once and whole; an export names a
+  file after what is left of a cut url, without the mark. `symbols -j` keeps names as
+  written: `name`, `owner` and `library` are cut at 200 characters, `qualified` is the
+  cut owner and name joined, and a record with a field cut gives its whole length
+  under `cut`. A cut name there is not one `hook` or `disasm` can find; its `va` is.
+  `cut` is a new key, so the format version stays 1. `signatures` leaves a function
+  whose name is longer than 200 characters out of the library, as it does one holding
+  a line break; it writes the same library from both fixtures and the 3.12.2 build as
+  before. `FillResult.names` escapes a string once, not once per ref on it. The longest
+  name in the fixtures, the two CTF apps in ctfbench and the corpus is 165 characters,
+  so exports at tiers 1 to 3 (1 and 2 for arm32), `functions`, `classes`, `libraries`,
+  `selectors`, `decompile`, `hook` and the `-j` of `functions`, `classes`, `libraries`
+  and `symbols` are byte for byte the same on both fixtures, those CTF apps and the
+  2.19.6, 3.12.2 and two arm32 corpus builds. The `symbols` table and the IDA, Ghidra
+  and radare2 scripts cut a qualified name at 200 already; the cut gains its backslash
+  there, on 5 names of the clean fixture and 8 of the 2.19.6 build. Closes #94.
 - **A crafted pool cannot make the const lists cost a product.** Nothing bounds how
   many pool slots name one object, or how many refs share one RO data string, and the
   const list paths paid for each again: an Array was resolved once per slot naming it,

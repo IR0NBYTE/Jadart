@@ -8352,6 +8352,248 @@ def test_a_signature_library_name_is_escaped_once_where_it_prints(tmp_path):
                                      8: "bar\\\\x" + MARK}, merged
 
 
+def _read_name(text):
+    """A name as visible() prints it, read back left to right: its characters, and its
+    length as written when it was cut, else None."""
+    out, i = [], 0
+    while i < len(text):
+        if text[i] != "\\":
+            out.append(text[i])
+            i += 1
+        elif text[i + 1:i + 2] == "\\":
+            out.append("\\")
+            i += 2
+        elif text[i + 1:i + 2] in ("u", "U"):
+            n = 4 if text[i + 1] == "u" else 8
+            out.append(chr(int(text[i + 2:i + 2 + n], 16)))
+            i += 2 + n
+        else:
+            m = re.fullmatch(r"\\\.\.\. \((\d+) chars\)", text[i:])
+            assert m, f"a backslash that is neither an escape nor a cut: {text[i:]!r}"
+            return "".join(out), int(m.group(1))
+    return "".join(out), None
+
+
+def test_a_long_name_is_cut_after_an_escape_and_says_how_long_it_was():
+    """visible() with a limit: a name whose escaped text is longer is cut at the end of
+    an escape, and `\\... (N chars)` follows, N its length as written. Read left to right
+    it is the only backslash that starts no escape, so no name can spell a cut, and only
+    `limit + 1` characters of a long name are read (#94)."""
+    import random
+    from unittest import mock
+    from jadart.fill import uncut, visible
+    assert visible("a" * 200, limit=200) == "a" * 200
+    assert visible("a" * 201, limit=200) == "a" * 200 + "\\... (201 chars)"
+    cut = visible("x" * 196 + chr(0x1f) + "z", limit=200)      # not half of `\\u001f`
+    assert cut == "x" * 196 + "\\... (198 chars)", cut
+    spelled = "a\\... (5 chars)"                      # a name that spells a cut
+    assert _read_name(visible(spelled, limit=200)) == (spelled, None)
+    assert uncut(visible(spelled, limit=200)) == visible(spelled)
+
+    rng = random.Random(94)
+    alphabet = "ab.\\ (5)" + chr(1) + chr(0x202e) + chr(0xe0001)
+    for _ in range(3000):
+        limit = rng.choice([1, 5, 12, 200])
+        s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 2 * limit + 5)))
+        shown = visible(s, limit=limit)
+        head, n = _read_name(shown)
+        if n is None:
+            assert head == s and shown == visible(s) and len(shown) <= limit, (s, limit)
+            assert uncut(shown) == shown, (s, limit)
+        else:
+            assert uncut(shown) == visible(head), (s, limit, shown)
+            # the longest start of the name that fits once escaped, and its whole length
+            assert n == len(s) and s.startswith(head), (s, limit, shown)
+            more = visible(s[:len(head) + 1])
+            assert len(visible(head)) <= limit < len(more), (s, limit)
+
+    from jadart import fill
+    read = []
+    real = fill.visible
+    for big, most in (("A" * 10**6, 201), (chr(1) * 10**6, 2 * 201)):
+        read.clear()                 # a name needing no escape is cut from its head
+        def counted(t, *a, **k):
+            read.append(len(t))
+            return real(t, *a, **k)
+        with mock.patch.object(fill, "visible", counted):
+            assert fill.visible(big, limit=200).endswith("\\... (1000000 chars)")
+        assert sum(read[1:]) <= most, f"read {sum(read[1:])} characters to cut at 200"
+
+
+def test_names_escape_a_string_once_however_many_refs_name_it():
+    """`FillResult.names` kept an escaped copy per ref, and refs on one RO data string
+    share one object since #91: 3,000 of them on one 20,000 character name that needs
+    escaping made 3,000 copies, 60M characters. It keeps one per string now, cut (#94)."""
+    from jadart.fillwalk import FillResult
+    s = chr(1) + "A" * 19999
+    fr = FillResult(strings={100 + k: s for k in range(3000)}, functions=[], fields=[],
+                    classes=[], types={}, codes=[], pool=[], end_pos=0)
+    shown = {id(fr.names[100 + k]) for k in range(3000)}
+    assert len(shown) == 1, f"{len(shown)} copies of one name"
+    assert fr.names[100] == "\\u0001" + "A" * 194 + "\\... (20000 chars)"
+
+    class Compared(str):             # counts the whole comparisons a lookup makes
+        calls = 0
+
+        def __eq__(self, other):
+            Compared.calls += 1
+            return str.__eq__(self, other)
+        __hash__ = str.__hash__
+    first, second = Compared("B" * 10**5), Compared("B" * 10**5)
+    fr.strings.update({1: first, 2: second})
+    for _ in range(300):             # a second equal copy is looked up by itself
+        fr.names[1], fr.names[2]
+    assert Compared.calls == 0, f"{Compared.calls} whole comparisons for 600 lookups"
+
+
+def test_a_long_name_from_the_symbol_table_or_a_signature_prints_cut():
+    """Names that do not come through `FillResult.names` are cut where they print as
+    well: an ELF symbol name as a call target or a selector, a `--sigs` name, and the
+    names in `symbols -j`, which stay as written and say what was cut (#94)."""
+    import dataclasses
+    from types import SimpleNamespace
+    from jadart import dispatch
+    from jadart.disasm import function_name_by_pc, named_ranges
+    from jadart.fillwalk import FillResult
+    from jadart.interop import CodeSymbol
+    from jadart.signatures import MARK, Match, is_signable, merge
+    L = 20000
+    cr = SimpleNamespace(pc_offset=0x10, size=8)
+    image = SimpleNamespace(symbol_names={0x10: "Owner." + "s" * L}, code_ranges={},
+                            all_ranges=[cr], pcs=[0x10], first_code=1)
+    fr = FillResult(strings={}, functions=[], fields=[], classes=[], types={}, codes=[],
+                    pool=[], end_pos=0)
+    shown = "Owner." + "s" * 194 + f"\\... ({L + 6} chars)"
+    assert function_name_by_pc(image, fr) == {0x10: shown}
+    assert named_ranges(image, fr, shown) == [(shown, cr)]        # read back as printed
+    assert dispatch._slot_names(fr, image) == {0: "s" * 200 + f"\\... ({L} chars)"}
+    merged, _ = merge({}, {0x20: Match("m" * L, "shape", 20)})
+    assert merged == {0x20: "m" * 200 + f"\\... ({L} chars)" + MARK}
+    # and a library written from a binary leaves a function with such a name unsigned
+    assert is_signable("m" * 200) and not is_signable("m" * 201)
+    sym = CodeSymbol(pc_offset=0, size=8, va=0x1000, file_offset=0x1000,
+                     entry_offset=None, name="run", origin="snapshot", owner="O" * L,
+                     library="package:a/b.dart", kind="RegularFunction", static=False)
+    js = sym.as_json()
+    assert (js["name"], js["owner"], js["qualified"]) == ("run", "O" * 200,
+                                                          "O" * 200 + ".run"), js
+    assert js["cut"] == {"owner": L, "qualified": L + 4}, js["cut"]
+    short = dataclasses.replace(sym, owner="O").as_json()
+    assert "cut" not in short and short["qualified"] == "O.run"
+
+    from jadart import hooks
+    from jadart.errors import InputError
+    from jadart.interop import _comment, ghidra_name
+    sig = dataclasses.replace(sym, name="m" * L + MARK, owner="", origin="signature",
+                              entry_offset=0)
+    marked = "m" * 200 + f"\\... ({L} chars)" + MARK       # cut, and still inferred
+    assert _comment(sig).splitlines()[0] == "Dart: " + marked
+    assert ghidra_name(sig) == f"{marked}_{sig.va:x}"
+    assert hooks.select([sig], [marked]) == ([sig], [])
+    twin = dataclasses.replace(sig, pc_offset=0x1000, va=0x2000)
+    _, (both,) = hooks.select([sig, twin], [marked])      # ambiguous: both listed
+    assert both.count(marked) == 2, both
+    _, (inside,) = hooks.select([sig], [hex(sig.va + 4)])
+    assert f"it is inside {marked} at" in inside, inside
+    image = SimpleNamespace(text=bytes(64))
+    hdr = SimpleNamespace(epoch=SimpleNamespace(dart="3.12.2"))
+    assert hooks.plan(image, hdr, fr, [sig])[0]["name"] == marked
+    with pytest.raises(InputError, match=re.escape(marked)):
+        hooks.plan(image, hdr, fr, [dataclasses.replace(sig, entry_offset=None)])
+
+
+def test_a_long_name_prints_the_same_however_long_it_is(monkeypatch, tmp_path):
+    """One string names every function that shares it, a class name comes back in each
+    of its members and a library url in each of its classes, so a long one printed whole
+    made the output that count times its length: making `build` 20,000 characters long
+    added 1.8M characters to `functions` on the clean fixture. Names are cut where they
+    print now, so every command prints as much for a 20,000 character name as for a
+    40,000 one, and takes the cut spelling back (#94). Both keep every length the cut
+    marker states, `Owner.name` included, at five digits."""
+    _needs_capstone()
+    import io
+    import importlib
+    import contextlib
+    from jadart import cli, fillwalk, signatures
+    from jadart.disasm import function_name_by_pc
+    program_module = importlib.import_module("jadart.program")
+    real = fillwalk.walk_fill
+    grow = {"build": "d", "BenchAccount": "t", "benchWithdraw": "w"}
+    length = [0]
+
+    def crafted(*a, **k):
+        fr = real(*a, **k)
+        for ref, s in list(fr.strings.items()):
+            if s in grow:
+                fr.strings[ref] = s + grow[s] * length[0]
+        for ref, u in list(fr.library_urls.items()):
+            if u.startswith("package:flubench"):
+                fr.library_urls[ref] = u + "u" * length[0]
+        return fr
+
+    def matched(image, fr, _lib):    # a --sigs name for ranges the binary leaves unnamed
+        named, nm = function_name_by_pc(image, fr), "sig" + "g" * length[0]
+        return {cr.pc_offset: signatures.Match(nm, "shape", 20)
+                for cr in image.all_ranges[:400] if cr.pc_offset not in named}
+    monkeypatch.setattr(fillwalk, "walk_fill", crafted)
+    monkeypatch.setattr(program_module, "walk_fill", crafted)
+    monkeypatch.setattr(signatures, "match", matched)
+    lib = tmp_path / "empty.sig"                 # loads, and `matched` names the ranges
+    lib.write_text("# jadart-signatures-1\n")
+
+    def run(*argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main([str(a) for a in argv])
+        assert rc == 0, (argv[:2], rc, err.getvalue()[:300])
+        return out.getvalue() + err.getvalue()
+
+    def printed(base, n):            # how `base` grown by n characters prints
+        return base + grow[base] * (200 - len(base)) + f"\\... ({len(base) + n} chars)"
+
+    def qualified(n):                # BenchAccount.benchWithdraw, both grown, as printed
+        return "BenchAccount" + "t" * 188 + f"\\... ({26 + 2 * n} chars)"
+
+    sizes = {}
+    for n in (20000, 40000):
+        length[0] = n
+        sig = "sig" + "g" * 197 + f"\\... ({3 + n} chars)~"     # cut, and still marked
+        texts = {
+            "functions": run("functions", CLEAN, "-n", "0", "--sigs", lib),
+            "classes": run("classes", CLEAN),
+            "libraries": run("libraries", CLEAN),
+            "selectors": run("selectors", CLEAN),
+            "symbols": run("symbols", CLEAN, "-n", "0"),
+            "symbols -j": run("-j", "symbols", CLEAN, "-n", "0"),
+            "symbols ida": run("symbols", CLEAN, "--format", "ida"),
+            "symbols ghidra": run("symbols", CLEAN, "--format", "ghidra"),
+            "symbols r2": run("symbols", CLEAN, "--format", "r2"),
+            "symbols sigs": run("symbols", CLEAN, "-n", "0", "--sigs", lib),
+            "symbols -f": run("symbols", CLEAN, "-f", qualified(n)),
+            "symbols -f sig": run("symbols", CLEAN, "-f", sig, "--sigs", lib),
+            "decompile": run("decompile", CLEAN, printed("BenchAccount", n),
+                             "--sigs", lib),
+            "disasm": run("disasm", CLEAN, printed("benchWithdraw", n)),
+            "xrefs": run("xrefs", CLEAN, "function", printed("benchWithdraw", n)),
+            "hook": run("hook", CLEAN, printed("benchWithdraw", n)),
+        }
+        assert printed("benchWithdraw", n) in texts["decompile"]
+        assert printed("build", n) in texts["functions"]
+        assert qualified(n) in texts["symbols -f"] and sig in texts["symbols -f sig"]
+        assert sig in texts["functions"] and sig in texts["symbols sigs"]
+        out = tmp_path / f"out{n}"
+        run("export", CLEAN, "-t", "1", "-q", "-o", out)
+        for dp, _, fs in os.walk(out):
+            for f in fs:
+                if f != "strings.txt":           # each string once, whole, as it was read
+                    p = os.path.join(dp, f)      # a cut url names it without the mark
+                    texts[os.path.relpath(p, out)] = open(p, encoding="utf-8").read()
+        sizes[n] = {k: len(v) for k, v in texts.items()}
+    grew = {k: (v, sizes[40000].get(k)) for k, v in sizes[20000].items()
+            if sizes[40000].get(k) != v}
+    assert not grew and len(sizes[20000]) == len(sizes[40000]), grew
+
+
 def test_a_literal_escapes_what_a_name_does():
     """printable() escaped C0 controls, DEL, surrogates and NEL/LS/PS, and let C1 controls
     and format characters through: 150 C1 characters and a bidi embedding went out raw in

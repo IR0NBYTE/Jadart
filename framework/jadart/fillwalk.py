@@ -150,32 +150,41 @@ class FillResult:
 
     @property
     def names(self) -> "_Names":
-        """`strings` read as names: each through fill.visible() when it is looked up.
+        """`strings` read as names: each through fill.visible() when it is looked up, and
+        cut at fill.NAME_CUT.
 
         A function, class, field or library name comes out of the same string clusters as
         a literal, so a crafted snapshot can put a control character, a line break or a
         bidi override in one, and every surface that prints names printed it raw (#74).
-        `strings` stays as it was read, for the commands that print literals and escape
-        them with printable(). Rebuilt if `strings` is replaced, so a copy of this result
-        never reads another one's names."""
+        It can be any length as well, and one string names every function that shares
+        it, so a long one printed whole made the output that count times its length
+        (#94). `strings` stays as it was read, for the commands that print literals and
+        escape them with printable(). Rebuilt if `strings` is replaced, so a copy of this
+        result never reads another one's names."""
         if self._names is None or self._names.strings is not self.strings:
             self._names = _Names(self.strings)
         return self._names
 
 
 class _Names(Mapping):
-    """A read-only view of a strings dict, with each value escaped once, on first use."""
+    """A read-only view of a strings dict, with each value escaped once, on first use.
+
+    Kept by the string rather than the ref: refs on one RO data string share one object
+    (#91), and escaping it once per ref gave each of them a copy (#94). By its id(), not
+    its value, since a lookup by value compares a second equal copy whole every time;
+    the entry holds the string, so no other object can take that id while it is kept."""
 
     def __init__(self, strings: dict):
         self.strings = strings
         self._seen = {}
 
     def __getitem__(self, ref):
-        out = self._seen.get(ref)
-        if out is None:
-            from .fill import visible
-            out = self._seen[ref] = visible(self.strings[ref])
-        return out
+        s = self.strings[ref]
+        hit = self._seen.get(id(s))
+        if hit is None:
+            from .fill import NAME_CUT, visible
+            hit = self._seen[id(s)] = (s, visible(s, limit=NAME_CUT))
+        return hit[1]
 
     def __iter__(self):
         return iter(self.strings)

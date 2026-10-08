@@ -32,7 +32,7 @@ from dataclasses import dataclass
 
 from .disasm import ISOLATE_INSTRUCTIONS
 from .errors import InputError
-from .fill import visible            # hooks imports it from here too
+from .fill import NAME_CUT, visible  # hooks imports visible from here too
 
 #: Bumped whenever a field of the `symbols` JSON changes meaning or goes away.
 FORMAT_VERSION = 1
@@ -72,11 +72,33 @@ class CodeSymbol:
         return f"{self.owner}.{self.name}" if self.owner else self.name
 
     def as_json(self) -> dict:
-        return {"pc_offset": self.pc_offset, "va": self.va, "file_offset": self.file_offset,
-                "size": self.size, "entry_va": self.entry_va,
-                "entry_error": self.entry_error, "name": self.name,
-                "qualified": self.qualified, "origin": self.origin, "owner": self.owner,
-                "library": self.library, "kind": self.kind, "static": self.static}
+        """The names as written: `name`, `owner` and `library` each cut at NAME_CUT
+        characters, and `qualified` the cut owner and name joined. A class name comes
+        back in every function of the class and a library url in every function of the
+        library, so one long name printed whole made the document that count times its
+        length (#94). `cut`, present only then, gives the full length of each field it
+        cut; no name a compiler wrote comes near it."""
+        cut = {}
+
+        def part(field, text):
+            if len(text) <= NAME_CUT:
+                return text
+            cut[field] = len(text)
+            return text[:NAME_CUT]
+
+        name, owner = part("name", self.name), part("owner", self.owner)
+        out = {"pc_offset": self.pc_offset, "va": self.va,
+               "file_offset": self.file_offset, "size": self.size,
+               "entry_va": self.entry_va, "entry_error": self.entry_error, "name": name,
+               "qualified": f"{owner}.{name}" if name and owner else name,
+               "origin": self.origin, "owner": owner,
+               "library": part("library", self.library), "kind": self.kind,
+               "static": self.static}
+        if self.name and ("name" in cut or (self.owner and "owner" in cut)):
+            cut["qualified"] = len(self.name) + (len(self.owner) + 1 if self.owner else 0)
+        if cut:
+            out["cut"] = cut
+        return out
 
 
 def code_symbols(image, fr, hdr, sigs: str | None = None, notes: list | None = None) -> list:
@@ -239,15 +261,24 @@ def symbols_document(image, hdr, syms: list, label: str, version: str) -> dict:
 _UNSAFE = re.compile(r"[^A-Za-z0-9_]+")
 _PRINTABLE_ONLY = re.compile(r"[^\x20-\x7e]")
 
-#: Longest binary-derived name reproduced as written, in a comment or a Ghidra symbol.
-#: Dart names are short; the length is the author's choice, so without a cap one name can
-#: inflate a script without bound (a 20,000 character name produced a 26 KB comment line).
-NAME_CAP = 200
+
+def _shown(text: str) -> str:
+    """A name from the binary as a comment, a Ghidra symbol or a message shows it: escaped
+    and cut at NAME_CUT, as every other surface prints a name (#94). Dart names are short;
+    the length is the author's choice, so without a cut one name can inflate a script
+    without bound (a 20,000 character name produced a 26 KB comment line)."""
+    return visible(text, limit=NAME_CUT)
 
 
-def _capped(text: str) -> str:
-    """`text` as written, cut to NAME_CAP with the full length named."""
-    return text if len(text) <= NAME_CAP else f"{text[:NAME_CAP]}... ({len(text)} chars)"
+def _shown_name(sym: CodeSymbol) -> str:
+    """`sym`'s qualified name as _shown() prints it, with the MARK a `--sigs` name ends in
+    kept after the cut: it is the one sign on the line that the name was inferred, and
+    `functions` keeps it there too (#94)."""
+    from .signatures import MARK
+    q = sym.qualified or sym.name
+    if sym.origin == "signature" and q.endswith(MARK):
+        return _shown(q[:-len(MARK)]) + MARK
+    return _shown(q)
 
 
 def safe_name(sym: CodeSymbol, prefix: str) -> str:
@@ -269,9 +300,9 @@ def entry_label(sym: CodeSymbol, prefix: str, sep: str = "_") -> str:
 
 
 def _comment(sym: CodeSymbol) -> str:
-    parts = [f"Dart: {visible(_capped(sym.qualified or sym.name))}"]
+    parts = [f"Dart: {_shown_name(sym)}"]
     if sym.library:
-        parts.append(f"library: {visible(_capped(sym.library))}")
+        parts.append(f"library: {_shown(sym.library)}")
     parts.append(f"name from: {sym.origin}")
     if sym.kind:
         parts.append(f"kind: {sym.kind}")
@@ -491,7 +522,7 @@ def ghidra_name(sym: CodeSymbol) -> str:
     (`toString` names 18), so the Symbol Tree cannot tell them apart and a crafted name
     can be made identical to a real one. The exact name as written is in the plate
     comment either way."""
-    return f"{visible(_capped(sym.qualified or sym.name))}_{sym.va:x}" if sym.name else \
+    return f"{_shown_name(sym)}_{sym.va:x}" if sym.name else \
         f"anon_{sym.va:x}"
 
 

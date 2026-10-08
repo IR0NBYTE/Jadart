@@ -124,13 +124,14 @@ def _slot_names(fr, image) -> dict:
     symbol table still carries the real `Class.method`, whose trailing component is the
     selector. Falls back to the snapshot name, which is what clean builds carry."""
     out = {}
-    from .fill import visible
+    from .fill import NAME_CUT, visible
     syms = image.symbol_names or {}
     if syms:
         for slot, pc in enumerate(image.pcs):
             nm = syms.get(pc)
             if nm:
-                out[slot] = visible(nm.rsplit(".", 1)[-1])     # a name, as printed (#74)
+                # a name, as printed (#74, #94)
+                out[slot] = visible(nm.rsplit(".", 1)[-1], limit=NAME_CUT)
     fname = {ref: fr.names.get(nr, "") for ref, nr, _ow, _kt in fr.functions}
     for _code_ref, owner_ref, ci in fr.codes:
         slot = image.first_code + ci

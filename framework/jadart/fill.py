@@ -141,6 +141,15 @@ _BLANKS = frozenset(
     + "".join(chr(c) for c in range(0xFE00, 0xFE10))
     + "".join(chr(c) for c in range(0xFFF0, 0xFFF9))
 )
+#: Longest name printed whole, counted as printed. The longest across the fixtures, the
+#: CTF apps and the corpus is 165 characters, a mixin application class
+#: (`__ConstMap&_HashVMImmutableBase&MapMixin&...`), and an app that mixes more in makes
+#: longer ones, so this is no shorter. Printed whole, one long name cost its length at
+#: every slot, call and member that names it, and one string names any number (#94).
+NAME_CUT = 200
+#: The mark visible() ends a cut name with. Its backslash starts no escape, so the run of
+#: backslashes it ends is odd: escaped ones, in pairs, and then its own.
+_CUT = re.compile(r"(?<!\\)((?:\\\\)*)\\\.\.\. \(\d+ chars\)\Z")
 #: What visible() escapes that str.isprintable() lets through.
 _ODD = re.compile("[" + re.escape("".join(sorted(_BLANKS))) + "]")
 
@@ -155,7 +164,7 @@ def _hides(ch: str) -> bool:
             or ch in _BLANKS)
 
 
-def visible(text: str, backslash: bool = True) -> str:
+def visible(text: str, backslash: bool = True, limit: int = 0) -> str:
     """`text` with every character that renders as nothing, or changes how its neighbours
     render, written as a \\u escape: controls, bidi overrides, zero width and other
     format characters, line and paragraph separators, unassigned code points, and the
@@ -169,9 +178,31 @@ def visible(text: str, backslash: bool = True) -> str:
     for text that may already be the output of this function and must not be escaped
     twice.
 
+    With a `limit`, text longer than that once escaped is cut, at the end of an escape,
+    to at most `limit` characters, and `\\... (N chars)` follows, N its length as written.
+    Read left to right, every other backslash in the result starts `\\\\`, `\\u` or `\\U`
+    as long as `backslash` holds, so the marker reads as a cut and no name can spell one.
+    Only the first `limit + 1` characters are read, as in quoted(). A name is printed
+    with NAME_CUT wherever it is named (#94).
+
     A name that needs none of it, which is every name a compiler wrote, costs an
     isprintable() and a regex search: isprintable() refuses exactly categories C* and Z*
     but the space."""
+    if limit:
+        start = text[:limit + 1]
+        head = visible(start, backslash)
+        if len(head) <= limit:
+            return head
+        if len(head) == len(start):          # longer than the limit, and no escapes
+            return head[:limit] + f"\\... ({len(text)} chars)"
+        out, n = [], 0
+        for ch in text:
+            piece = visible(ch, backslash)
+            if n + len(piece) > limit:
+                break
+            out.append(piece)
+            n += len(piece)
+        return "".join(out) + f"\\... ({len(text)} chars)"
     if text.isprintable() and not _ODD.search(text) and not (backslash and "\\" in text):
         return text
     out = []
@@ -182,3 +213,10 @@ def visible(text: str, backslash: bool = True) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def uncut(text: str) -> str:
+    """`text`, as visible() prints a name, without the mark of a cut if it has one: what
+    is left of a long library url when a file is named after it (#94). A name that
+    spells the mark kept its backslash escaped, so it is left as it is."""
+    return _CUT.sub(r"\1", text, count=1)

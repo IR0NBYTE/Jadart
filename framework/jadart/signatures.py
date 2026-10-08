@@ -52,7 +52,7 @@ import os
 import re
 import stat
 
-from .fill import visible
+from .fill import NAME_CUT, visible
 from .disasm import (MAX_INSNS, MissingDisassembler, UnsupportedArch, build_pool_map,
                      disassemble_range, function_name_by_pc, pool_byte_offset,
                      _add_imm_from_pp, _imm_from, _mem_base_disp)
@@ -235,8 +235,11 @@ def is_signable(name: str) -> bool:
     # A name holding a line break cannot be written on its line of the library: save()
     # puts each name raw after a tab, so `\n` split the entry and load() refused the whole
     # file. Names come from the reference binary, so only a crafted one has such a name,
-    # and leaving that one function unsigned costs nothing (#49).
-    return not name.startswith(_GENERATED) and "\n" not in name and "\r" not in name
+    # and leaving that one function unsigned costs nothing (#49). Nor one past NAME_CUT:
+    # one string names any number of functions and the library writes it once for each,
+    # and no real name comes near it, 157 characters at most over the corpus (#94).
+    return (not name.startswith(_GENERATED) and "\n" not in name and "\r" not in name
+            and len(name) <= NAME_CUT)
 
 
 def base_name(n: str) -> str:
@@ -369,7 +372,8 @@ def merge(pc_to_name: dict, matches: dict) -> tuple:
     for pc, m in matches.items():
         if pc in merged:
             continue
-        merged[pc] = visible(m.name) + MARK     # escaped as a name (#74); kept raw in m
+        # escaped and cut as a name (#74, #94); kept raw in m
+        merged[pc] = visible(m.name, limit=NAME_CUT) + MARK
         added += 1
     return merged, added
 
