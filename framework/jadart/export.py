@@ -38,11 +38,13 @@ Matching it means output from the two tools can be diffed directly.
 """
 from __future__ import annotations
 
-from .errors import JadartError
+from .errors import InputError, JadartError
 from .fill import visible
 
+import contextlib
 import os
 import re
+import unicodedata
 
 #: Every text file jadart writes is UTF-8 with LF endings, on every platform.
 #: Without the explicit encoding Python uses the locale one, and a Windows console
@@ -88,15 +90,26 @@ def library_path(url: str) -> str:
 
 
 #: Windows treats these as devices whatever the extension, so a library called `con`
-#: would produce a file that cannot be created or opened.
+#: would produce a file that cannot be created or opened. COM0, LPT0 and the superscript
+#: digits are among them too.
 _WIN_RESERVED = frozenset(
-    ["con", "prn", "aux", "nul"] + [f"com{i}" for i in range(1, 10)]
-    + [f"lpt{i}" for i in range(1, 10)])
-#: Illegal in a Windows filename; the control range is illegal everywhere worth caring.
-_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+    ["con", "prn", "aux", "nul"]
+    + [f"{d}{i}" for d in ("com", "lpt") for i in "0123456789\u00b9\u00b2\u00b3"])
+#: Illegal in a Windows filename; the control range is illegal everywhere worth caring,
+#: and a lone surrogate is no character at all, so no filesystem can name a file with it.
+_BAD_CHARS = re.compile(r'[<>:"|?*\x00-\x1f\ud800-\udfff]')
 #: A component longer than this is refused by most filesystems, and the library url is
-#: attacker-controlled text out of the snapshot.
+#: attacker-controlled text out of the snapshot. In UTF-8 bytes, which is what ext4
+#: counts: 120 characters of a four-byte script came to 480, past its 255.
 _MAX_COMPONENT = 120
+#: The longest relative path a library is written to, in UTF-8 bytes. A url nests as
+#: deep as it likes, and with the output directory a long one passed the 1024 bytes
+#: macOS takes in one path (#96). Real ones come to 71 at most; see _safe_relpath for
+#: what gives way.
+_MAX_PATH = 400
+#: The most directories a library path goes down. Real ones go 3 deep at most, and each
+#: directory is one more thing to make on disk and to remember while paths are checked.
+_MAX_DEPTH = 16
 
 
 def _safe_relpath(rel: str) -> str:
@@ -109,21 +122,134 @@ def _safe_relpath(rel: str) -> str:
     a filename.
     """
     parts = []
-    for raw in re.split(r"[/\\]", rel):
+    raws = re.split(r"[/\\]", rel)
+    for i, raw in enumerate(raws):
         if raw in ("", ".", ".."):
             continue
         p = _BAD_CHARS.sub("_", raw)
         # a drive letter or a trailing dot/space, both of which Windows strips silently
         p = p.rstrip(". ")
-        if not p or p in ("", ".", ".."):
+        if len(p.encode("utf-8")) > _MAX_COMPONENT - 1:
+            # cut on a character, and the cut can leave a dot or a space at the end; one
+            # byte short of the bound, for the `_` below
+            p = p.encode("utf-8")[:_MAX_COMPONENT - 1].decode("utf-8", "ignore")
+            p = p.rstrip(". ")
+        if not p:
             continue
+        # After the cut, which can leave a bare `nul` where there was more
         stem = p.split(".", 1)[0].lower()
         if stem in _WIN_RESERVED:
             p = "_" + p
-        if len(p) > _MAX_COMPONENT:
-            p = p[:_MAX_COMPONENT]
         parts.append(p)
-    return os.path.join(*parts) if parts else "unnamed.dart"
+        last = i == len(raws) - 1
+    if not parts:
+        return "unnamed.dart"
+    if not last:
+        # The file's own name came to nothing, and the directory above it is not a file.
+        parts.append("unnamed.dart")
+    # Too deep or too long: the deepest directories give way and the file keeps its name,
+    # so the package it is in still leads the path. Counted as it goes, since a url can
+    # hold a great many components and joining them again for each one dropped is
+    # quadratic.
+    room = _MAX_PATH - len(parts[-1].encode("utf-8"))
+    keep = []
+    for p in parts[:-1][:_MAX_DEPTH]:
+        room -= len(p.encode("utf-8")) + 1
+        if room < 0:
+            break
+        keep.append(p)
+    return os.path.join(*keep, parts[-1])
+
+
+def _fold(rel: str) -> str:
+    """The form two paths are the same file under somewhere: macOS and Windows ignore
+    case, and macOS also ignores how an accented character is composed. Unicode's
+    canonical caseless match, which composed forms are not: `\u0391\u0342\u0345` and
+    `\u0391\u0342\u0399` are one file on APFS, and composed they fold apart."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", rel).casefold())
+
+
+def unique_paths(rels) -> dict:
+    """Each library path, mapped to the path it is written to.
+
+    Two libraries can need one file, and one can need for a file what another needs for a
+    directory. Obfuscation names libraries by short tokens, and `Ahd` and `ahd` are one
+    file on macOS and Windows: the second overwrote the first, and the obfuscated fixture
+    lost 99 of its 307 libraries without a word. `package:a/b` writes `a/b.dart`, and
+    `package:a/b.dart/c` then needs `a/b.dart` as a directory, which ended the export
+    with exit 3 (#96). So every path is held to be unique under _fold, the first in
+    sorted order keeps its own, a path some library needs as a directory keeps it for
+    that, and the file that gives way takes `~N` before `.dart`, never a name another
+    library has. Same output on every platform, since the rule ignores which one it is."""
+    rels = sorted(set(rels))
+    names = {_fold(r) for r in rels}
+    dirs = set()
+    for r in rels:
+        d = os.path.dirname(r)
+        while d and _fold(d) not in dirs:
+            dirs.add(_fold(d))
+            d = os.path.dirname(d)
+    taken, nxt, out = set(), {}, {}
+    for r in rels:
+        k = _fold(r)
+        new = r
+        if k in taken or k in dirs:
+            head, name = os.path.split(r)
+            stem, ext = (name[:-5], ".dart") if name.endswith(".dart") else (name, "")
+            # Each base counts on from where it got to: ten thousand spellings of one
+            # name in different cases would otherwise try every number again each time.
+            base = _fold(os.path.join(head, stem))
+            n = nxt.get(base, 2)
+            while True:
+                new = os.path.join(head, f"{stem}~{n}{ext}")
+                k = _fold(new)
+                n += 1
+                if k not in taken and k not in names and k not in dirs:
+                    break
+            nxt[base] = n
+        taken.add(k)
+        out[r] = new
+    return out
+
+
+def _check_outdir(outdir: str) -> None:
+    """Refuse an output directory that cannot be one, before anything is recovered.
+
+    It is user input, and a file in its place, or under it, raised the OSError from
+    os.makedirs only once the binary had been read, which the CLI calls a bug in jadart
+    (#96). Anything this cannot see, a directory it may not write say, is caught where
+    the files are written and is the same InputError."""
+    if os.path.lexists(outdir) and not os.path.isdir(outdir):
+        raise InputError(f"{outdir}: is not a directory, so jadart cannot export into it")
+    up = os.path.dirname(os.path.abspath(outdir))
+    while not os.path.lexists(up):
+        parent = os.path.dirname(up)
+        if parent == up:
+            # the root itself is missing: a drive or a share that is not there
+            raise InputError(f"{outdir}: cannot export there: {up} does not exist")
+        up = parent
+    if not os.path.isdir(up):
+        raise InputError(f"{outdir}: cannot export there: {up} is not a directory")
+
+
+@contextlib.contextmanager
+def _writing(outdir: str, path: str):
+    """open(path, "w") for a file of the export, with a failure to write it (permission,
+    a full disk) an InputError naming the output directory rather than a bug report."""
+    try:
+        with open(path, "w", **TEXT_OUT) as fh:
+            yield fh
+    except OSError as exc:
+        raise InputError(f"{outdir}: cannot write the export there: "
+                         f"{exc.strerror or exc}: {exc.filename or path}") from exc
+
+
+def _makedirs(outdir: str, path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise InputError(f"{outdir}: cannot write the export there: "
+                         f"{exc.strerror or exc}: {exc.filename or path}") from exc
 
 
 def export(path, outdir: str, tier: int = 3, app_only: bool = False,
@@ -146,6 +272,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     from .fields import recover_fields
     from .program import build_program
 
+    _check_outdir(outdir)
     image, fr, hdr = load_instructions(path)
     prog = build_program(fr, hdr)
     S = fr.names                         # names, as printed (#74)
@@ -223,16 +350,21 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     attributed = {id(k) for ks in libs.values() for k in ks}
     orphans = [k for k in named if id(k) not in attributed]
     anonymous = len(prog.classes) - len(named)
+    unattributed = None
     if orphans and not app_only:
         # A class with no library at all still gets written, in its own file. Silently
-        # dropping classes from a tree that looks complete is the worst option here.
+        # dropping classes from a tree that looks complete is the worst option here. A
+        # library whose url is `_unattributed` lost its classes to these (#96).
         libs = dict(libs)
-        libs["_unattributed"] = orphans
+        unattributed, n = "_unattributed", 2
+        while unattributed in libs:
+            unattributed, n = f"_unattributed~{n}", n + 1
+        libs[unattributed] = orphans
     if app_only:
         libs = {u: ks for u, ks in libs.items() if not is_framework(u)}
 
     src = os.path.join(outdir, "sources")
-    os.makedirs(src, exist_ok=True)
+    _makedirs(outdir, src)
 
     # Group by output path before writing. Two library objects can map to one path: an
     # internal patch library (name "dart.core") is the same logical library as its public
@@ -244,11 +376,14 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     by_path: dict = {}
     for url, ks in sorted(libs.items()):
         by_path.setdefault(library_path(uncut(url)), []).append((url, ks))
+    written = unique_paths(by_path)
 
-    stats = {"libraries": 0, "classes": 0, "methods": 0, "files": []}
-    for i, (rel, entries) in enumerate(sorted(by_path.items())):
+    stats = {"libraries": 0, "classes": 0, "methods": 0, "files": [],
+             "renamed": {r: w for r, w in written.items() if r != w}}
+    for i, (want, entries) in enumerate(sorted(by_path.items())):
+        rel = written[want]
         dest = os.path.join(src, rel)
-        os.makedirs(os.path.dirname(dest) or src, exist_ok=True)
+        _makedirs(outdir, os.path.dirname(dest) or src)
         body = [f"// jadart tier {tier}, epoch {prog.epoch_name}, dart {prog.dart}"]
         for url, ks in entries:
             body.append(f"// lib: {url}")
@@ -262,20 +397,20 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
                 stats["classes"] += 1
                 stats["methods"] += len(methods.get(k.ref, []))
             stats["libraries"] += 1
-        with open(dest, "w", **TEXT_OUT) as fh:
+        with _writing(outdir, dest) as fh:
             fh.write("\n".join(body))
         stats["files"].append(rel)
         if progress:
             progress(i + 1, len(by_path), rel)
 
     from .fill import printable
-    with open(os.path.join(outdir, "strings.txt"), "w", **TEXT_OUT) as fh:
+    with _writing(outdir, os.path.join(outdir, "strings.txt")) as fh:
         # Escaped, so one recovered string is one line. Literals contain newlines and NULs,
         # and writing them raw makes the dump binary as far as grep is concerned.
         # The literals as read, not the names view `S` is: printable() escapes them.
         for s in sorted(set(fr.strings.values())):
             fh.write(printable(s) + "\n")
-    with open(os.path.join(outdir, "pool.txt"), "w", **TEXT_OUT) as fh:
+    with _writing(outdir, os.path.join(outdir, "pool.txt")) as fh:
         for off, entry in sorted(pool_map.items()):
             fh.write(f"0x{off:x}\t{entry}\n")
     # The elements behind every `const[N] @0xOFF{...}` label pool.txt and the lifted
@@ -286,11 +421,11 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     from .disasm import const_lists, const_listing
     consts = const_lists(fr, getattr(image, "arch", None))
     if consts:
-        with open(os.path.join(outdir, "constants.txt"), "w", **TEXT_OUT) as fh:
+        with _writing(outdir, os.path.join(outdir, "constants.txt")) as fh:
             for off, n, body in const_listing(consts):
                 fh.write(f"0x{off:x}\t[{n}]\t{body}\n")
     if selectors:
-        with open(os.path.join(outdir, "selectors.txt"), "w", **TEXT_OUT) as fh:
+        with _writing(outdir, os.path.join(outdir, "selectors.txt")) as fh:
             for imm, name in sorted(selectors.items(), key=lambda kv: kv[1]):
                 fh.write(f"{name}\tselector_offset={imm + ORIGIN_ELEMENT_ARM64}\t"
                          f"call_site_imm={imm}\n")
@@ -317,7 +452,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     c = unpack(container, outdir) if container else None
     stats["container"] = c if c and c["members"] else None
 
-    with open(os.path.join(outdir, "summary.txt"), "w", **TEXT_OUT) as fh:
+    with _writing(outdir, os.path.join(outdir, "summary.txt")) as fh:
         fh.write(f"source      {label or path}\n")
         fh.write(f"epoch       {prog.epoch_name} (dart {prog.dart})\n")
         fh.write(f"target      {hdr.arch}\n")
@@ -326,9 +461,23 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
         fh.write(f"classes     {stats['classes']} written\n")
         fh.write(f"            {stats['classes_total']} in the snapshot: "
                  f"{stats['classes_named']} named, {stats['classes_anonymous']} anonymous\n")
-        if stats["orphans"]:
+        if stats["orphans"] and unattributed:
+            went = written[library_path(unattributed)].replace(os.sep, "/")
             fh.write(f"            {stats['orphans']} had no library and went to "
-                     f"sources/_unattributed.dart\n")
+                     f"sources/{went}\n")
+        elif stats["orphans"]:
+            # `-a` keeps the app's own libraries, so these are not written; saying they
+            # went to a file pointed at one that does not exist.
+            fh.write(f"            {stats['orphans']} had no library and are left out "
+                     f"with the framework (-a)\n")
+        if stats["renamed"]:
+            fh.write(f"renamed     {len(stats['renamed'])} library files, so that no "
+                     f"two are one file on a disk that ignores case and none is where "
+                     f"another needs a directory; the `// lib:` line in each names its "
+                     f"library\n")
+            for want, rel in sorted(stats["renamed"].items()):
+                want, rel = want.replace(os.sep, "/"), rel.replace(os.sep, "/")
+                fh.write(f"              {visible(want)} -> {visible(rel)}\n")
         fh.write(f"methods     {stats['methods']}\n")
         fh.write(f"strings     {stats['strings']}\n")
         fh.write(f"selectors   {stats['selectors']}\n")
