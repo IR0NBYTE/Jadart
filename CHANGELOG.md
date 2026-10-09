@@ -13,27 +13,32 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
-- **A container's tables cannot cost more than the file.** An ELF or Mach-O gives
-  the offset of each symbol's name, of each symbol table and of a segment's sections,
-  and their counts, and nothing stopped them from overlapping, so a crafted file made
-  every command pay a product before it ran: a symbol at each byte of one 20,000 byte
-  name kept 200M characters and 260 MB from a 500 KB ELF, and as much from a 340 KB
-  Mach-O; 5,000 ELF section names into one long string kept 87M characters from 340
-  KB; 2,000 section headers on one symbol table read it 2,000 times, 24s for 1.3 MB,
-  and 2,000 Mach-O symbol table commands on one table took 25s for 1 MB; 2,000 Mach-O
-  segment commands each claiming 2,000 sections they do not hold made 4M sections and
-  554 MB from 304 KB. Finding a Mach-O snapshot blob's end also looked its section up
-  again for each `_kDart` symbol, symbols times sections: 0.61s at 383 KB, four times
-  that for each doubling. A name is read once now however many symbols point at it,
-  and the names, the symbol tables and the Mach-O section headers each refuse the file
-  with a `ContainerError` (exit 2) once reading them comes to more bytes than the file
-  has, which only overlap can do; the blob's end needs no lookup, since it is inside its
-  section already. Each of those files is refused in under 0.03s and 44 MB. Over 4,537
-  real ELF and Mach-O files, the corpus, the fixtures, the CTF apps and the NDK and
-  Homebrew libraries among them, names came to at most 0.45 of the file and symbol
-  tables to 0.68; 99 hold names sharing a tail, which a budget of the string table's
-  size would have refused; and every one reads to the same symbols, sections and
-  `_kDart` blobs as before. Closes #95.
+- **A container's tables cannot cost more than the file.** An ELF or Mach-O gives the
+  offset of each symbol's name, of each symbol table and of a segment's sections, and
+  their counts, and nothing stopped them from overlapping, so a crafted file made every
+  command pay a product before it ran: a symbol at each byte of one 20,000 byte name
+  kept 200M characters and 260 MB from a 500 KB ELF, and as much from a 340 KB Mach-O;
+  5,000 ELF section names into one long string kept 87M characters from 340 KB; 2,000
+  section headers on one symbol table read it 2,000 times, 24s for 1.3 MB, and 2,000
+  Mach-O symbol table commands on one table took 25s for 1 MB; 2,000 Mach-O segment
+  commands each claiming 2,000 sections they do not hold made 4M sections and 554 MB
+  from 304 KB. Symbols that all name one string read it whole once each, and a file that
+  is half one name and half symbols on it took 29s to read as a 3.2 MB ELF and 76s as a
+  3.2 MB Mach-O, four times that for each doubling. Finding a Mach-O snapshot blob's end
+  also looked its section up again for each `_kDart` symbol, symbols times sections:
+  0.61s at 383 KB, four times that for each doubling. A symbol on a name offset read
+  already is skipped now, since the first symbol of a name is the one kept, and the
+  names, the symbol tables and the Mach-O section headers each refuse the file with a
+  `ContainerError` (exit 2) once reading them comes to more bytes than the file has,
+  which only overlap can do: a table that runs past the end of the file says so first.
+  The blob's end needs no lookup, since it is inside its section already. Each of those
+  files is refused, or read, in under 0.03s and 45 MB. Over 4,537 real ELF and Mach-O
+  files, the corpus, the fixtures, the CTF apps and the NDK and Homebrew libraries among
+  them, names came to at most 0.45 of the file and symbol tables to 0.68; 99 hold names
+  sharing a tail, which a budget of the string table's size would have refused; and
+  every one reads to the same symbols, sections and `_kDart` blobs as before.
+  Remembering the offsets read costs a large symbol table a little: libwireshark's 1M
+  symbols open in 0.54s and 438 MB, from 0.47s and 389 MB. Closes #95.
 - **A long name is cut wherever it prints.** One string names every function that
   shares it, a class name comes back in each of its members and a library url in each
   of its classes, and nothing cut a name, so a long one cost the output its length at

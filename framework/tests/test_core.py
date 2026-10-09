@@ -9115,7 +9115,7 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
     # section headers on one symbol table read it 2,000 times, and a 304 KB Mach-O made
     # 4M sections out of 2,000 load commands. Tables that do not overlap cannot cost
     # more than the file has bytes, so each kind is refused past that, as a
-    # ContainerError, and a name is read once however many symbols point at it.
+    # ContainerError, and a symbol on a name offset already read is skipped.
     import contextlib
     import io
     import json
@@ -9124,32 +9124,50 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
     from jadart.errors import ContainerError
     from jadart.macho import open_container
 
-    def elf(strtab, syms, tables=1, bits=64, shstr=b"\x00", table_names=None):
-        # the section names, the symbol names, then `tables` symbol tables that all
-        # read the one run of entries
+    def elf(strtab, syms, tables=1, bits=64, shstr=b"\x00", table_names=None,
+            stride=None, also=()):
+        # the section names, the symbol names, `tables` symbol tables that all read the
+        # one run of entries, `stride` bytes apart, and for each of `also` a string
+        # table and a symbol table of its own
         if bits == 64:
             eh, sh, shfmt, ent = 64, 64, "<IIQQQQIIQQ", 24
-            entries = b"".join(_s.pack("<IBBHQQ", n, 0, 0, 0, v, 4) for n, v in syms)
+            pack = lambda n, v: _s.pack("<IBBHQQ", n, 0, 0, 0, v, 4)    # noqa: E731
         else:
             eh, sh, shfmt, ent = 52, 40, "<IIIIIIIIII", 16
-            entries = b"".join(_s.pack("<IIIBBH", n, v, 4, 0, 0, 0) for n, v in syms)
-        count = 2 + tables
-        at = eh + count * sh
-        heads = [_s.pack(shfmt, 0, 3, 0, 0, at, len(shstr), 0, 0, 0, 0),
-                 _s.pack(shfmt, 0, 3, 0, 0, at + len(shstr), len(strtab), 0, 0, 0, 0)]
+            pack = lambda n, v: _s.pack("<IIIBBH", n, v, 4, 0, 0, 0)    # noqa: E731
+        gap = b"\x00" * ((stride or ent) - ent)
+        blobs, heads = [], []
+        at = eh + (2 + tables + 2 * len(also)) * sh
+
+        def put(blob):
+            nonlocal at
+            blobs.append(blob)
+            at += len(blob)
+            return at - len(blob)
+
+        heads.append((0, 3, put(shstr), len(shstr), 0, 0))
+        heads.append((0, 3, put(strtab), len(strtab), 0, 0))
+        run = gap.join(pack(n, v) for n, v in syms)
+        where = put(run)
         for i in range(tables):
-            heads.append(_s.pack(shfmt, (table_names or [0] * tables)[i], 2, 0, 0,
-                                 at + len(shstr) + len(strtab), len(entries), 1, 0, 0,
-                                 ent))
+            heads.append(((table_names or [0] * tables)[i], 2, where,
+                          len(syms) * (stride or ent), 1, stride or ent))
+        for st, sy in also:
+            heads.append((0, 3, put(st), len(st), 0, 0))
+            run = b"".join(pack(n, v) for n, v in sy)
+            heads.append((0, 11, put(run), len(run), len(heads) - 1, ent))
         h = bytearray(eh)
         h[0:7] = b"\x7fELF" + bytes([2 if bits == 64 else 1, 1, 1])
         if bits == 64:
             _s.pack_into("<Q", h, 0x28, eh)
-            _s.pack_into("<HHH", h, 0x3A, sh, count, 0)
+            _s.pack_into("<HHH", h, 0x3A, sh, len(heads), 0)
         else:
             _s.pack_into("<I", h, 0x20, eh)
-            _s.pack_into("<HHH", h, 0x2E, sh, count, 0)
-        return bytes(h) + b"".join(heads) + shstr + strtab + entries
+            _s.pack_into("<HHH", h, 0x2E, sh, len(heads), 0)
+        return (bytes(h) + b"".join(_s.pack(shfmt, nm, ty, 0, 0, off, size, link, 0, 0,
+                                            es)
+                                    for nm, ty, off, size, link, es in heads)
+                + b"".join(blobs))
 
     def macho(strtab, syms, tables=1, segments=()):
         # `segments` load commands of 72 bytes each claiming that many sections, which
@@ -9205,33 +9223,68 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
     syms = [(at, 0x1000 + i) for i, at in enumerate(starts)]
     refused(elf(short, syms, tables=200), tables)
     refused(macho(short, syms, tables=200), tables)
-    # a Mach-O table that runs off the end is read as far as it goes, as it always was
-    data = bytearray(macho(short, syms))
-    _s.pack_into("<I", data, 32 + 12, 0xFFFFFFFF)          # nsyms
-    assert len(open_container(bytes(data)).symbols) == 500
     # load commands that claim sections they do not hold
     refused(macho(b"\x00", [], tables=0, segments=[200] * 200), sections)
 
-    # Every symbol on the one offset is one name, read and charged once, so this is
-    # no overlap at all and reads as it always did.
-    for build in (elf, macho):
-        c = open_container(build(b"\x00" + long + b"\x00", [(1, 0x1000)] * 4000))
-        assert [len(n) for n in c.symbols if n.startswith("A")] == [4000], build
-        # the name and its NUL, and in the ELF the empty section name's NUL; and every
+    # The limit is the file's size: a file whose names come to exactly that is read.
+    few = elf(b"\x00" + long + b"\x00", one_name_each_byte[:10])
+    spent = open_container(few + bytes(10 ** 5))._budget.spent[names]
+    assert open_container(few + bytes(spent - len(few)))._budget.spent[names] == spent
+    refused(few + bytes(spent - 1 - len(few)), names)
+
+    # A table that runs past the end of the file says so, where it did not overlap
+    # anything; one whose last entry ends where the file does is read, as it always was.
+    data = bytearray(elf(short, syms))
+    _s.pack_into("<Q", data, 64 + 2 * 64 + 32, 10 ** 6)        # the table's sh_size
+    with pytest.raises(ContainerError, match="past the end of the file"):
+        open_container(bytes(data))
+    data = elf(short, syms, stride=32)          # the last 8 bytes of padding not there
+    c = open_container(data)
+    assert len(c.symbols) == 500 and c._budget.spent[tables] == 500 * 24  # bytes read
+    data = macho(b"", [], tables=0, segments=[1])[:32 + 72 + 52]
+    assert [s.name for s in open_container(data).sections] == [","]
+    with pytest.raises(ContainerError, match="past the end of the file"):
+        open_container(data[:-1])
+    # a Mach-O symbol table runs on past the file and is read as far as it goes
+    data = bytearray(macho(short, syms))
+    _s.pack_into("<I", data, 32 + 12, 0xFFFFFFFF)          # nsyms
+    assert len(open_container(bytes(data)).symbols) == 500
+
+    # Every symbol on one offset is one name, read and charged once, and costs nothing
+    # after: the lookups for every symbol on it cost its length each, so they are not
+    # made. In Mach-O its `_` alias too, and in either one a second copy of the name.
+    for build, under in ((elf, b""), (macho, b"_")):
+        twice = b"\x00" + under + long + b"\x00" + under + long + b"\x00"
+        second = 1 + len(under) + len(long) + 1
+        c = open_container(build(twice, [(1, 0x1000)] + [(second, 0x1000)] * 4000))
+        assert sorted(map(len, c.symbols)) == [4000, 4001][:1 + len(under)], build
+        # each name and its NUL, and in the ELF the empty section name's NUL; and every
         # byte of the entries
-        assert c._budget.spent == {names: 4001 + (build is elf),
-                                   tables: 4000 * (24 if build is elf else 16)}, build
+        assert c._budget.spent == {names: 2 * (len(under) + 4001) + (build is elf),
+                                   tables: 4001 * (24 if build is elf else 16)}, build
+    # and a name offset is a file offset: two tables can each have a name at 1
+    c = open_container(elf(b"\x00foo\x00", [(1, 0x10)],
+                           also=[(b"\x00bar\x00", [(1, 0x20)])]))
+    assert {n: s.value for n, s in c.symbols.items()} == {"foo": 0x10, "bar": 0x20}
 
     # A real build is nowhere near: the fixtures name a few hundred bytes. 4,537 ELF and
     # Mach-O files measured came to at most 0.45 of the file for names, 0.68 for tables.
     for lib in (CLEAN, OBF):
         with open(lib, "rb") as f:
             d = f.read()
-        spent = open_container(d)._budget.spent
-        assert 0 < spent[names] < len(d) // 1000 and 0 < spent[tables] < len(d) // 1000
+        c = open_container(d)
+        assert sorted(c.symbols) == ["_kDartIsolateSnapshotData",
+                                     "_kDartIsolateSnapshotInstructions",
+                                     "_kDartSnapshotBuildId", "_kDartVmSnapshotData",
+                                     "_kDartVmSnapshotInstructions"]
+        assert [s.name for s in c.sections] == [
+            "", ".note.gnu.build-id", ".dynstr", ".dynsym", ".hash", ".rodata",
+            ".eh_frame", ".text", ".dynamic", ".bss", ".shstrtab"]
+        assert c._budget.spent == {names: 222, tables: 144}
 
     # The extent of a Mach-O snapshot blob looked its section up again for every
-    # boundary symbol, which cost symbols times sections. Now one lookup however many.
+    # boundary symbol, which cost symbols times sections. Now two lookups however
+    # many, the blob's own and the one for its file offset.
     many = b"\x00_kDartIsolateSnapshotData\x00"
     syms = [(1, 0x100000)]
     for i in range(300):
@@ -9251,7 +9304,7 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
     find = m._section_of
     m._section_of = lambda va: looked.append(va) or find(va)
     assert m.symbol_bytes("_kDartIsolateSnapshotData") == m.data[64:65]
-    assert len(looked) <= 2, f"{len(looked)} section lookups for one blob"
+    assert len(looked) == 2, f"{len(looked)} section lookups for one blob"
 
     # and through the command line, a typed failure that says what overlapped
     path = tmp_path / "overlap.so"

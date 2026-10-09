@@ -81,7 +81,6 @@ class MachO64:
         # Nothing ties a segment's section count to its load command, or a symbol's name
         # offset to one name, so both are charged against the file's size (#95).
         budget = self._budget = ReadBudget(len(d))
-        names: dict = {}        # (start, end of its table) -> the name there, read once
         off = 32
         for _ in range(ncmds):
             cmd, cmdsize = struct.unpack_from("<II", d, off)
@@ -90,8 +89,14 @@ class MachO64:
             if cmd == LC_SEGMENT_64:
                 segname = d[off + 8:off + 24].split(b"\x00")[0].decode("utf-8", "replace")
                 nsects, = struct.unpack_from("<I", d, off + 64)
-                budget.charge("section headers", nsects * 80)
                 so = off + 72
+                # Each header is read up to its file offset, 52 of its 80 bytes. Said
+                # here rather than left to the budget, which would call it an overlap.
+                if nsects and so + (nsects - 1) * 80 + 52 > len(d):
+                    raise ContainerError(
+                        f"segment {segname!r} declares {nsects} sections, past the end "
+                        f"of the file (len {len(d)})")
+                budget.charge("section headers", nsects * 80)
                 for _i in range(nsects):
                     sect = d[so:so + 16].split(b"\x00")[0].decode("utf-8", "replace")
                     addr, size = struct.unpack_from("<QQ", d, so + 32)
@@ -103,26 +108,31 @@ class MachO64:
                 # The entries that fit in the file, which is where reading them stopped.
                 nsyms = min(nsyms, max(0, (len(d) - symoff) // 16))
                 budget.charge("symbol tables", nsyms * 16)
+                stop = min(len(d), stroff + strsize)
+                # The name offsets read so far in this table. Another symbol at one adds
+                # nothing, the first of a name being the one kept, so it is skipped:
+                # reading the name again, or only making its alias and looking both up,
+                # costs its length for every symbol on it.
+                named = set()
                 for i in range(nsyms):
                     base = symoff + i * 16
                     n_strx, n_type, _n_sect, _n_desc, n_value = struct.unpack_from(
                         "<IBBHQ", d, base)
-                    if not n_strx or (n_type & N_TYPE) != N_SECT:
+                    if not n_strx or (n_type & N_TYPE) != N_SECT or n_strx in named:
                         continue
+                    named.add(n_strx)
                     # Bounded by the declared string-table size. Unbounded, a table with
                     # no NUL scans the whole file, and find returning -1 sliced to len-1
                     # and produced a name made of whatever followed the real one. A scan
                     # that finds no NUL costs as much as one that does, so both are
                     # charged, and never less than nothing for a start past the table.
                     start = stroff + n_strx
-                    stop = min(len(d), stroff + strsize)
-                    nm = names.get((start, stop))
-                    if nm is None:
-                        end = d.find(b"\x00", start, stop)
-                        budget.charge("names in the string tables",
-                                      max(0, (stop if end < 0 else end + 1) - start))
-                        nm = names[start, stop] = (
-                            d[start:end].decode("utf-8", "replace") if end >= 0 else "")
+                    end = d.find(b"\x00", start, stop)
+                    budget.charge("names in the string tables",
+                                  max(0, (stop if end < 0 else end + 1) - start))
+                    if end < 0:
+                        continue
+                    nm = d[start:end].decode("utf-8", "replace")
                     if not nm:
                         continue
                     # Keep the name exactly as written: the snapshot blobs are spelled

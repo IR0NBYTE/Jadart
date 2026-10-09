@@ -106,17 +106,14 @@ class Elf:
         shstr_off = raw[e_shstrndx][3]
 
         budget = self._budget = ReadBudget(len(d))
-        names: dict[int, str] = {}      # file offset -> the name there, decoded once
 
         def cstr(base, idx):
             # Bounded on purpose. d.index scans the whole file when the string table is
             # not NUL-terminated (raising ValueError from the middle of a parse), and
             # d.find returning -1 would slice to len-1 and hand back a name made of
-            # whatever followed it. Each offset is read once however many symbols name
-            # it, and what the reads come to is charged to the budget (#95).
+            # whatever followed it. Every read is charged to the budget (#95), so the
+            # callers read each offset once.
             start = base + idx
-            if start in names:
-                return names[start]
             if start < 0 or start >= len(d):
                 raise ContainerError(
                     f"string table offset {start} is outside the file (len {len(d)})")
@@ -125,13 +122,16 @@ class Elf:
                 raise ContainerError(
                     f"unterminated string at offset {start} in the string table")
             budget.charge("names in the string tables", end + 1 - start)
-            names[start] = d[start:end].decode("utf-8", "replace")
-            return names[start]
+            return d[start:end].decode("utf-8", "replace")
 
         self.sections: list[Section] = []
         self._symtabs = []  # (offset, size, entsize, strtab_offset)
+        section_names: dict[int, str] = {}      # by file offset
         for (sh_name, sh_type, sh_addr, sh_offset, sh_size, sh_link, entsize) in raw:
-            name = cstr(shstr_off, sh_name)
+            at = shstr_off + sh_name
+            if at not in section_names:
+                section_names[at] = cstr(shstr_off, sh_name)
+            name = section_names[at]
             self.sections.append(Section(name, sh_type, sh_addr, sh_offset, sh_size))
             if sh_type in (2, 11):  # SYMTAB, DYNSYM
                 if sh_link >= len(raw):
@@ -146,12 +146,24 @@ class Elf:
                     raise ContainerError(
                         f"section {name!r} declares a {ent}-byte symbol entry, smaller "
                         f"than the {self._sym_size}-byte ELF{self.bits} symbol")
+                # Said here rather than left to the budget, which would call it an
+                # overlap.
+                n = sh_size // ent
+                if n and sh_offset + (n - 1) * ent + self._sym_size > len(d):
+                    raise ContainerError(
+                        f"section {name!r} holds {n} symbols from offset {sh_offset}, "
+                        f"past the end of the file (len {len(d)})")
                 self._symtabs.append((sh_offset, sh_size, ent, strtab_off))
 
         self.symbols: dict[str, Symbol] = {}
+        # The file offsets of the names read so far. Another symbol naming one adds
+        # nothing, since the first symbol of a name is the one kept, so it is skipped:
+        # reading the name again, or only looking it up, costs its length for every
+        # symbol on it.
+        named = set()
         for (soff, ssize, sent, str_off) in self._symtabs:
             n = ssize // sent
-            budget.charge("symbol tables", n * sent)
+            budget.charge("symbol tables", n * self._sym_size)
             for i in range(n):
                 base = soff + i * sent
                 if self.bits == 64:
@@ -160,8 +172,9 @@ class Elf:
                 else:
                     st_name, st_value, st_size, _info, _other, _shndx = struct.unpack_from(
                         self._sym_fmt, d, base)
-                if st_name == 0:
+                if st_name == 0 or str_off + st_name in named:
                     continue
+                named.add(str_off + st_name)
                 nm = cstr(str_off, st_name)
                 if nm and nm not in self.symbols:
                     self.symbols[nm] = Symbol(nm, st_value, st_size)
