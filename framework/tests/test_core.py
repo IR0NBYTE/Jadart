@@ -9874,6 +9874,174 @@ def test_cfgcheck_holds_a_leaving_arm_to_its_kind_and_target():
         (0, [8, "exit indirect"], [8, "exit return"])]
 
 
+def test_an_output_path_signatures_cannot_write_is_an_input_error(tmp_path, monkeypatch):
+    # `signatures -o` into a missing directory, onto a directory, under a file or into a
+    # directory it may not write raised the OSError from open(), and the CLI called that
+    # a bug in jadart with exit 3 (#97). A path is user input: exit 2, naming it.
+    import contextlib
+    import errno
+    import io
+    import json
+    import shutil
+    from jadart import cli
+    from jadart import signatures as sig
+
+    built = []
+
+    def build(refs, progress=None):
+        built.append(refs)
+        lib = sig.Library(sources=[("ref.so", "3.12.2", 1)])
+        lib.by_body[0x1234] = "foo"
+        return lib
+
+    monkeypatch.setattr(sig, "build", build)
+    ref = tmp_path / "ref.so"
+    shutil.copy(CLEAN, ref)
+
+    def run(out):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["signatures", str(ref), "-o", str(out), "-j"])
+        return rc, json.loads(buf.getvalue())
+
+    a_file = tmp_path / "a_file"
+    a_file.write_text("x")
+    a_dir = tmp_path / "a_dir"
+    a_dir.mkdir()
+    # Seen before the build, which reads every reference first and takes a while, and
+    # the reference itself is not a place to write the library to.
+    for out, why in ((tmp_path / "nodir" / "x.sig", "nodir: No such file or directory"),
+                     (a_file / "x.sig", "a_file is not a directory"),
+                     (a_dir, "is a directory"),
+                     (ref, "is one of the references")):
+        built.clear()
+        rc, doc = run(out)
+        assert rc == 2 and doc["type"] == "InputError", (out, rc, doc)
+        assert doc["error"].startswith(f"{out}: ") and why in doc["error"], doc
+        assert built == [], f"built before refusing {out}"
+    assert ref.read_bytes() == open(CLEAN, "rb").read()
+    # and nor is the binary inside a reference given as a directory
+    tree = tmp_path / "tree"
+    (tree / "lib" / "arm64-v8a").mkdir(parents=True)
+    inside = tree / "lib" / "arm64-v8a" / "libapp.so"
+    shutil.copy(CLEAN, inside)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["signatures", str(tree), "-o", str(inside), "-j"]) == 2
+    assert "is one of the references" in json.loads(buf.getvalue())["error"]
+    assert inside.read_bytes() == open(CLEAN, "rb").read()
+    built.clear()
+    rc, doc = run("")
+    assert rc == 2 and doc["error"].startswith("-o is empty") and built == [], doc
+
+    # Not seen until the file is opened, and the same typed failure then: a name too
+    # long for the filesystem, and, unless this runs as root, a directory read only.
+    long_name = tmp_path / ("n" * 300 + ".sig")
+    rc, doc = run(long_name)
+    assert rc == 2 and doc["error"].startswith(f"{long_name}: ") and built, doc
+    if os.geteuid() != 0:
+        ro = tmp_path / "ro"
+        ro.mkdir()
+        ro.chmod(0o555)
+        try:
+            rc, doc = run(ro / "x.sig")
+        finally:
+            ro.chmod(0o755)
+        assert rc == 2 and doc["type"] == "InputError", doc
+        assert doc["error"].startswith(f"{ro / 'x.sig'}: "), doc
+        assert "Permission denied" in doc["error"] and built, doc
+        assert not (ro / "x.sig").exists()
+
+    # A write that fails part way, a full disk say, leaves no library cut short behind,
+    # since one would load as a smaller library with nothing to say so.
+    real_open = open
+    hook = {}
+
+    class Full:
+        def __init__(self, f):
+            self.f, self.n = f, 0
+
+        def fileno(self):
+            return self.f.fileno()
+
+        def write(self, text):
+            self.n += 1
+            if self.n > 1:
+                if "before" in hook:
+                    hook["before"]()
+                raise hook.get("raise", OSError(errno.ENOSPC, "No space left on device"))
+            return self.f.write(text)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.f.close()
+
+    def full_open(path, mode="r", *a, **k):
+        f = real_open(path, mode, *a, **k)
+        return Full(f) if "w" in mode else f
+
+    monkeypatch.setattr(sig, "open", full_open, raising=False)
+    out = tmp_path / "full.sig"
+    rc, doc = run(out)
+    assert rc == 2 and "No space left on device" in doc["error"], doc
+    assert doc["error"].startswith(f"{out}: ") and not out.exists(), doc
+    # Behind a link the file is emptied, which load() refuses, and the link stays.
+    target = tmp_path / "target.sig"
+    target.write_text("old")
+    link = tmp_path / "link.sig"
+    link.symlink_to(target)
+    rc, doc = run(link)
+    assert rc == 2 and link.is_symlink() and target.read_bytes() == b"", doc
+    with pytest.raises(jadart.InputError):
+        sig.load(str(link))
+    a, b = tmp_path / "a.sig", tmp_path / "b.sig"
+    a.write_text("old")
+    os.link(a, b)
+    rc, doc = run(a)
+    assert rc == 2 and not a.exists() and b.read_bytes() == b"", doc
+    # A file put at the path while the library was being written is not ours to remove;
+    # ours, wherever it went, is emptied.
+    out = tmp_path / "swapped.sig"
+
+    def swap():
+        os.rename(out, tmp_path / "ours.sig")
+        out.write_text("theirs")
+
+    hook["before"] = swap
+    rc, doc = run(out)
+    assert rc == 2 and out.read_text() == "theirs", doc
+    assert (tmp_path / "ours.sig").read_bytes() == b""
+    # A pipe is no file of ours either, though the descriptor is the path's own.
+    if hasattr(os, "mkfifo"):
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        fd = os.open(fifo, os.O_RDWR)         # both ends, so opening it does not block
+        try:
+            sig._discard(fd, str(fifo))
+        finally:
+            os.close(fd)
+        assert fifo.exists()
+    # and Ctrl-C part way is undone the same way, and still a Ctrl-C
+    hook.clear()
+    hook["raise"] = KeyboardInterrupt()
+    out = tmp_path / "interrupted.sig"
+    with pytest.raises(KeyboardInterrupt):
+        sig.save(build([]), str(out))
+    assert not out.exists()
+    monkeypatch.undo()
+
+    # A path that can be written is, and reads back, a bare name in the current
+    # directory included.
+    monkeypatch.setattr(sig, "build", build)
+    monkeypatch.chdir(tmp_path)
+    for out in (tmp_path / "ok.sig", "bare.sig"):
+        rc, doc = run(out)
+        assert rc == 0 and doc["ok"], doc
+        assert sig.load(str(out)).by_body == {0x1234: "foo"}
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

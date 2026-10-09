@@ -613,6 +613,7 @@ def cmd_signatures(args) -> int:
     from . import signatures as sig
     quiet = getattr(args, "quiet", False) or getattr(args, "json", False)
     try:
+        sig.check_out(args.out, args.refs)
         lib = sig.build(args.refs,
                         progress=None if quiet else
                         (lambda p: print(comment(f"// reading {p}"), file=sys.stderr)))

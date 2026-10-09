@@ -93,6 +93,24 @@ def read_binary(target) -> Source:
     return open_source(target)
 
 
+def binary_path(path):
+    """The file open_source reads `path` from, without reading it: the path itself, or
+    for a directory the libapp.so or App under it that open_source picks, or None when a
+    directory holds neither. `signatures` needs it to know whether `-o` names a file it
+    is about to read (#97)."""
+    if os.path.isdir(path):
+        for abi in ABI_ORDER:
+            cand = os.path.join(path, "lib", abi, "libapp.so")
+            if os.path.exists(cand):
+                return cand
+        for name in ("libapp.so", "App"):
+            cand = os.path.join(path, name)
+            if os.path.exists(cand):
+                return cand
+        return None
+    return path
+
+
 def open_source(path) -> Source:
     """Accept what a user actually has and return the snapshot bytes.
 
@@ -103,15 +121,10 @@ def open_source(path) -> Source:
         return path
 
     if os.path.isdir(path):                        # an extracted lib/ tree or .framework
-        for abi in ABI_ORDER:
-            cand = os.path.join(path, "lib", abi, "libapp.so")
-            if os.path.exists(cand):
-                return _read_file(cand, origin=path)
-        for name in ("libapp.so", "App"):
-            cand = os.path.join(path, name)
-            if os.path.exists(cand):
-                return _read_file(cand, origin=path)
-        raise InputError(f"{path}: no libapp.so or App binary under this directory")
+        cand = binary_path(path)
+        if cand is None:
+            raise InputError(f"{path}: no libapp.so or App binary under this directory")
+        return _read_file(cand, origin=path)
 
     if not os.path.exists(path):
         # Before os.stat, which raised FileNotFoundError: the commonest failure of all

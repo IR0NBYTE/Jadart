@@ -286,7 +286,7 @@ tightened only by the next `_kDart*` boundary symbol in that same section.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q     # 328 tests
+python3 -m pytest tests -q     # 329 tests
 ```
 
 The arm64 FluBench Dart 3.12.2 fixtures are committed, so a fresh clone runs the suite
