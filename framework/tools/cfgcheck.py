@@ -46,11 +46,17 @@ _END = object()
 
 
 def _entry(stmts, cont, brk, cont_of_loop):
-    """The first thing this statement list transfers control to."""
+    """The first thing this statement list transfers control to: a block, or None for a
+    branch out of the function (`exit`) or past the instruction cut (`cut`), which
+    reach no block of this graph. Skipping those, as this did, read an arm that leaves
+    as one that falls through to whatever followed it (#86), as
+    expr.Lifter._entry_block does not."""
     for s in stmts:
         k = s[0]
         if k in ("asm", "loop", "goto"):
             return s[1]
+        if k in ("exit", "cut"):
+            return None
         if k == "break":
             return brk
         if k == "continue":
@@ -97,8 +103,14 @@ def check_function(blocks, stmts):
                     claimed = {_entry(then, after, brk, cont_of_loop),
                                _entry(els, after, brk, cont_of_loop)}
                     real = set(blk.succ)
-                    off_end = blk.insns[-1][0] == final and claimed == real | {None}
-                    if claimed != real and not off_end:
+                    # An arm that leaves the function claims None. It has to be there when
+                    # the block records a way out (a branch elsewhere, or a conditional
+                    # return or indirect jump) and may be there for the last block, past
+                    # which, where the cut runs on to as well, is no block at all.
+                    leaves = blk.exit_target >= 0 or blk.cexit
+                    off_end = blk.insns[-1][0] == final and None in claimed
+                    if claimed - {None} != real or (None in claimed) != (leaves
+                                                                         or off_end):
                         bad.append((s[1], sorted(x for x in claimed if x is not None),
                                     sorted(blk.succ)))
                     walk(then, after, brk, cont_of_loop)
@@ -110,6 +122,14 @@ def check_function(blocks, stmts):
                 if claimed - {None} != set(blk.succ):
                     bad.append((s[1], sorted(x for x in claimed if x is not None),
                                 sorted(blk.succ)))
+                if blk.exit_target >= 0 and not blk.succ:
+                    # A branch out of the function and nothing else: what follows it has
+                    # to say where it goes. With no successor to compare, a `goto` back
+                    # into the function there passed.
+                    nxt = seq[i + 1] if i + 1 < len(seq) else None
+                    if not (nxt and nxt[0] in ("exit", "cut")
+                            and nxt[1] == blk.exit_target):
+                        bad.append((s[1], ["no exit rendered"], []))
             elif k == "loop":
                 after = _entry(seq[i + 1:], cont, brk, cont_of_loop)
                 # falling off the end of a loop body is the back edge to its header

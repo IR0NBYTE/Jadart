@@ -51,6 +51,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   disk) is an `InputError` (exit 2) naming it, where those were exit 3 too; assets are
   #104. On the fixtures, four corpus builds and the CTF apps, every file main wrote has
   the same contents. Closes #96.
+- **A branch out of the function from inside a loop or an `if` reads as one.** cfgcheck
+  read a branch out of the function, or past the instruction cut, as nothing at all, so
+  an arm that leaves claimed whatever followed it and the check reported an edge the
+  rendering never claimed: random small functions turned up about 30 to 50 per 90,000,
+  every one of that shape. It reads them as leaving now, and holds an arm that leaves to
+  the block's own way out, so a rendering that drops an exit is caught where it passed
+  before, and a block that only branches out has to be followed by saying so, where a
+  jump back into the function there passed; every corpus build still reads 0. Tier 3 left
+  a loop through such a branch without writing the loop's names back, as a `break` does,
+  so they said nothing of what the registers held where control left; the innermost
+  loop's are written back now, as for a `break`. No corpus build or fixture has that
+  shape, and their tier 3 exports are unchanged. Closes #86.
 - **A stripped binary is read for two snapshots at most.** With no `_kDart*SnapshotData`
   symbols, the snapshots are found by scanning for their magic, and each hit was parsed
   out of a copy of the rest of the file and listed: an ELF of 201 byte snapshot headers
