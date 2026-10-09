@@ -10042,6 +10042,59 @@ def test_an_output_path_signatures_cannot_write_is_an_input_error(tmp_path, monk
         assert sig.load(str(out)).by_body == {0x1234: "foo"}
 
 
+def test_cfgcheck_knows_which_arm_of_an_if_is_taken():
+    # cfgcheck compared the set of places an `if`'s arms go with the block's, never which
+    # arm is which, so an `if` whose arms were the other way round, each running exactly
+    # when it should not, passed (#58's class, #110). Under the block's own condition the
+    # then-arm is the branch taken; under its negation, the one not taken.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import cfgcheck
+    from jadart.cfg import build_cfg, negate_cond, structure
+
+    def check(rows, stmts=None, cut=None):
+        blocks, entry = build_cfg(rows, traps=(), cut_end=cut)
+        return cfgcheck.check_function(blocks, stmts or structure(blocks, entry))[0]
+
+    # two blocks: taken (0x10) and not taken (0x8)
+    two = [(0, "cmp", "x0, #1", ""), (4, "b.eq", "#0x10", ""), (8, "mov", "x1, #1", ""),
+           (12, "ret", "", ""), (16, "mov", "x1, #2", ""), (20, "ret", "", "")]
+    blocks, entry = build_cfg(two, traps=())
+    cond = blocks[0].cond
+    good = structure(blocks, entry)
+    assert check(two) == [] and good[1][1] == negate_cond(cond)
+    for stmts in ([("asm", 0), ("if", cond, [("asm", 16)],
+                                [("asm", 8)])],
+                  [("asm", 0), ("if", negate_cond(cond), [("asm", 8)],
+                                [("asm", 16)])]):
+        assert check(two, stmts) == []
+    swapped = [("asm", 0), ("if", negate_cond(cond), [("asm", 16)],
+                            [("asm", 8)])]
+    assert check(two, swapped) == [(0, ["arms the wrong way round"], [16])]
+    # a condition that is neither the block's nor its negation says nothing of the arms
+    other = [("asm", 0), ("if", "x9 == 7", [("asm", 16)], [("asm", 8)])]
+    assert check(two, other) == [(0, ["arms the wrong way round"], [16])]
+
+    # a branch out of the function: under its own condition the exit is the then-arm
+    out = [(0, "cmp", "x0, #1", ""), (4, "b.eq", "#0x1000", ""), (8, "ret", "", "")]
+    blocks, entry = build_cfg(out, traps=())
+    cond = blocks[0].cond
+    assert check(out) == []
+    inverted = [("asm", 0), ("if", negate_cond(cond), [("exit", 0x1000)], []),
+                ("asm", 8)]
+    assert check(out, inverted) == [(0, ["arms the wrong way round"], ["exit 0x1000"])]
+
+    # at the cut: under the negation, the then-arm runs on past it
+    spin = [(0, "mov", "x0, #1", ""), (4, "cmp", "x0, #2", ""), (8, "b.gt", "#0x0", "")]
+    blocks, entry = build_cfg(spin, traps=(), cut_end=0x40)
+    cond = blocks[0].cond
+    assert check(spin, cut=0x40) == []
+    turned = [("loop", 0, [("asm", 0), ("if", cond, [("cut", 0xc)], [])])]
+    assert check(spin, turned, cut=0x40) == [(0, ["arms the wrong way round"], [0])]
+    # and with no cut, a loop whose not-taken arm runs off the end of the body has no way
+    # out written down, which is said as that rather than as a swap
+    assert check(spin) == [(0, ["runs off the end, and nothing says so"], [0])]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

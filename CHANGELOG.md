@@ -13,6 +13,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **cfgcheck knows which arm of an `if` is taken.** It compared the set of places an
+  `if`'s arms go with the set the block's CFG records, never which arm was which, so an
+  `if` rendered the other way round, each arm running exactly when it should not, passed:
+  #58's class of defect. Under the block's own condition the then-arm has to be the
+  branch taken, under its negation the one not taken, for every shape the structurer
+  emits (two successors, a branch out, a conditional return, a branch at the cut). Every
+  corpus build and the fixtures still read 0, and so do 150,000 random functions. Closes
+  #110.
 - **cfgcheck holds an arm that leaves to the way its block leaves.** It read every branch
   out of the function or past the instruction cut as one and the same, so a rendering
   that called a branch into the part past the cut a branch out of the function, which is

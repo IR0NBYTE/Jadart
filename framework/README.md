@@ -145,7 +145,7 @@ itself stays offline and dependency-free.
 | `gen_epoch.py` | derive a whole `Epoch` entry from a release's own source, with `grammars` left empty |
 | `build_corpus.py` | drive one app through several pinned SDKs, one build per distinct hash |
 | `quality.py` | count the symptoms that make Tier 3 read like a disassembly, over a whole image: bare machine registers, byte-offset fields, `(...)` call sites, gotos, raw arm64. `--baseline FILE` prints before/after for all of them at once, so a change that trades one for another is visible rather than hidden |
-| `cfgcheck.py` | read the structured statement tree back as a program and check, for every block, that the RENDERING claims exactly the successors the CFG has. Stronger than "no block placed twice and none dropped", which a broken structuring pass can satisfy while silently deleting a branch |
+| `cfgcheck.py` | read the structured statement tree back as a program and check, for every block, that the RENDERING claims exactly the successors the CFG has, leaves the way it leaves (an exit or a cut, to its address) and puts the branch taken in the right arm of its `if`. Stronger than "no block placed twice and none dropped", which a broken structuring pass can satisfy while silently deleting a branch |
 | `irfuzz.py` | differential execution against an emulated arm64, seven oracles over two lifters: `ir.py`'s value DAG, and `expr.py`, which is the one `export` prints from and whose PRINTED TEXT is evaluated against the CPU. `--cfg` generates whole control-flow graphs and RUNS the printed body as a program wherever the rendering is one (no goto, every block reachable) which is the only way to decide a value with two definitions: folding a name back into its use works for a name assigned once and gives up on every phi, so naming an if-join left the whole join unscored until this existed. `--mem` and `--cfgmem` add loads and stores and interpret the printed statements IN ORDER, which is how a value that goes stale when the memory it reads is written gets decided rather than assumed. `--fp` covers the scalar-double path, bit-exactly, because a Python float is an IEEE-754 binary64. Every oracle refuses a trial it cannot decide rather than guessing, so the deliberate reinterpretations (Smi tag, `>>` for both shifts, `<` for both signednesses) are excluded by construction instead of arriving as false defects |
 | `appsweep.py` | widen the evidence past flubench: probe F-Droid for real Flutter apps by range-reading each APK's zip central directory, range-fetch just `libapp.so` out of the hits, and run the gates over all of them. One request per probe and two per fetch, so 26-180 MB of APK costs 6-24 MB of transfer. flubench is fifteen epochs of ONE app we wrote, which is why a real app hit a cluster it could not produce |
 | `semdiff.py` | score the lift against the corpus app's own Dart source, across every epoch. `--hard` runs only the must-hold checks |
@@ -286,7 +286,7 @@ tightened only by the next `_kDart*` boundary symbol in that same section.
 ## Tests
 
 ```bash
-python3 -m pytest tests -q     # 329 tests
+python3 -m pytest tests -q     # 330 tests
 ```
 
 The arm64 FluBench Dart 3.12.2 fixtures are committed, so a fresh clone runs the suite
