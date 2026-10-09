@@ -13,6 +13,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A snapshot's features string is read only as long as a real one can be.** It names
+  the build's VM flags and target, in under 160 bytes in every AOT build measured, and it
+  was read to its NUL however far away that was, kept whole, and printed whole by `info
+  -j` and returned by `jadart.header()`: a 16.8 MB file of two headers whose features
+  were the real flags and then 8 MB of `0xff` gave 100.7 MB of JSON and a 208 MB peak,
+  every one of those bytes a six-character escape. A features string longer than 4096
+  bytes is refused now with an `InputError` (exit 2) that says so; one with no NUL at all
+  that runs past 4096 bytes raised `TruncatedSnapshot` before and is that `InputError`
+  too, and one that ends inside the bound with no NUL is still reported truncated. The 92
+  headers of 46 real libapp.so hold 118 to 156 bytes and read as before. Closes #101.
 - **A stripped binary is read for two snapshots at most.** With no `_kDart*SnapshotData`
   symbols, the snapshots are found by scanning for their magic, and each hit was parsed
   out of a copy of the rest of the file and listed: an ELF of 201 byte snapshot headers

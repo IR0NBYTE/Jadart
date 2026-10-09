@@ -65,6 +65,12 @@ class SnapshotHeader:
 #: header, and struct.unpack_from would raise struct.error from inside the parse.
 _MIN_HEADER = 52
 
+#: The longest features string read, in bytes. It names the build's VM flags and target:
+#: 310 AOT headers from 2.19.6 to 3.12.2 hold 118 to 159, and a JIT one up to 211. A
+#: string as long as the file was read whole and given to `info -j` whole, six times over
+#: as JSON escapes (#101).
+_MAX_FEATURES = 4096
+
 #: How many snapshots a library holds at most: the vm one and the isolate one, each
 #: starting with the magic (a deferred loading unit has only an isolate one). Each of 46
 #: real libapp.so (the corpus, the CTF apps, the fixtures) has the magic exactly twice,
@@ -98,6 +104,12 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
             f"{which}: header declares snapshot kind {kind}, which is not one of "
             f"{sorted(KIND)}")
     version_hash = blob[20:52].decode("ascii", "replace")
+    if (blob.find(b"\x00", 52, 52 + _MAX_FEATURES + 1) < 0
+            and len(blob) > 52 + _MAX_FEATURES):
+        raise InputError(
+            f"{which}: the features string is longer than {_MAX_FEATURES} bytes. A "
+            f"real one from an AOT build is under 160, so this is not a snapshot header "
+            f"jadart will read.")
 
     st = ReadStream(blob, 52)
     features = st.read_cstring()
