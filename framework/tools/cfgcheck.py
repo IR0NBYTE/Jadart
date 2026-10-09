@@ -6,7 +6,8 @@ a structuring pass can place every block exactly once and still claim an edge th
 not exist, which is the failure mode that matters. This reads the tree back as a program
 and asks, for every block, where the RENDERING says control goes next, fall-through to
 the next statement, into an arm, round a back edge, out through a break, along a goto,
-and compares that set against the block's real successors.
+and compares that set against the block's real successors and ways out, and, for an `if`,
+which arm is the branch taken (#110).
 
     python3 tools/cfgcheck.py [BINARY]        # 0 violations is the contract
     python3 tools/cfgcheck.py --synthetic     # the exit check on fixed arm32 words
@@ -77,6 +78,22 @@ def _leaving(blk) -> set:
     return out
 
 
+def _taken(blk) -> tuple:
+    """(where `blk`'s branch goes when taken, where control goes when it is not), as
+    _entry spells them. The structurer renders `if (blk.cond)` with the taken one in the
+    then-arm and `if (negate_cond(blk.cond))` with the other, in every shape it emits."""
+    from jadart.cfg import EXIT_INDIRECT, EXIT_RETURN
+    past = ("cut", blk.cut_next) if blk.cut_next >= 0 else None
+    if blk.cexit:
+        taken = ("exit", EXIT_RETURN if blk.exit == "return" else EXIT_INDIRECT)
+    elif blk.exit_target >= 0:
+        taken = ("cut" if blk.past_cut else "exit", blk.exit_target)
+    else:
+        taken = blk.succ[0] if blk.succ else None
+        return taken, past if past else (blk.succ[1] if len(blk.succ) > 1 else None)
+    return taken, blk.succ[0] if blk.succ else past
+
+
 def _spell(claims) -> list:
     """Blocks by address, then the ways out by address, as `exit 0x..`, `cut 0x..`,
     `exit return` or `exit indirect`, for a report."""
@@ -89,7 +106,7 @@ def _spell(claims) -> list:
 
 def check_function(blocks, stmts):
     """(edge violations, blocks the tree places) for one structured function."""
-    from jadart.cfg import _is_cond
+    from jadart.cfg import _is_cond, negate_cond
     bad, placed = [], []
     # Nothing follows the last decoded instruction, so an arm of its block that runs off
     # the end of the body is that block's fallthrough rather than an edge it lacks: the
@@ -131,6 +148,28 @@ def check_function(blocks, stmts):
                     off_end = blk.insns[-1][0] == final
                     if claimed - {None} != real or (None in claimed and not off_end):
                         bad.append((s[1], _spell(claimed - {None}), _spell(real)))
+                    else:
+                        # and the right arm for each: under its own condition the then-arm
+                        # is the branch taken, under the negation the one not taken. The
+                        # set alone passed an `if` whose arms were the other way round,
+                        # which runs each arm exactly when it should not (#58, #110).
+                        taken, other = _taken(blk)
+                        got = (_entry(then, after, brk, cont_of_loop),
+                               _entry(els, after, brk, cont_of_loop))
+                        if _cond == blk.cond:
+                            want = (taken, other)
+                        elif _cond == negate_cond(blk.cond):
+                            want = (other, taken)
+                        else:
+                            want = None
+                        if taken != other and got != want:
+                            # A block whose not-taken arm runs off the end of the body
+                            # has nowhere to render it, which is a gap in the rendering,
+                            # not a swap: say which.
+                            why = ("runs off the end, and nothing says so"
+                                   if other is None and want is not None
+                                   else "arms the wrong way round")
+                            bad.append((s[1], [why], _spell({taken} - {None})))
                     walk(then, after, brk, cont_of_loop)
                     walk(els, after, brk, cont_of_loop)
                     i += 2
