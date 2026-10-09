@@ -9169,23 +9169,26 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
                                     for nm, ty, off, size, link, es in heads)
                 + b"".join(blobs))
 
-    def macho(strtab, syms, tables=1, segments=()):
+    def macho(strtab, syms, tables=1, segments=(), also=()):
         # `segments` load commands of 72 bytes each claiming that many sections, which
-        # are read out of whatever follows, then `tables` LC_SYMTABs on one run of entries
+        # are read out of whatever follows, `tables` LC_SYMTABs on one run of entries,
+        # and for each of `also` an LC_SYMTAB with a string table of its own
         cmds = b""
         for nsects in segments:
             c = bytearray(72)
             _s.pack_into("<II", c, 0, 0x19, 72)
             _s.pack_into("<I", c, 64, nsects)
             cmds += bytes(c)
-        at = 32 + len(cmds) + 24 * tables
-        for _ in range(tables):
-            cmds += _s.pack("<IIIIII", 2, 24, at + len(strtab), len(syms), at,
-                            len(strtab))
-        nl = b"".join(_s.pack("<IBBHQ", n, 0x0E, 1, 0, v) for n, v in syms)
-        h = _s.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6, len(segments) + tables,
-                    len(cmds), 0, 0)
-        return h + cmds + strtab + nl + b"\x00" * (80 * max(segments, default=0))
+        at = 32 + len(cmds) + 24 * (tables + len(also))
+        rest = b""
+        for st, sy, times in [(strtab, syms, tables)] + [(st, sy, 1) for st, sy in also]:
+            where = at + len(rest)
+            cmds += _s.pack("<IIIIII", 2, 24, where + len(st), len(sy), where,
+                            len(st)) * times
+            rest += st + b"".join(_s.pack("<IBBHQ", n, 0x0E, 1, 0, v) for n, v in sy)
+        h = _s.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6,
+                    len(segments) + tables + len(also), len(cmds), 0, 0)
+        return h + cmds + rest + b"\x00" * (80 * max(segments, default=0))
 
     def refused(data, what):
         try:
@@ -9238,6 +9241,9 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
     _s.pack_into("<Q", data, 64 + 2 * 64 + 32, 10 ** 6)        # the table's sh_size
     with pytest.raises(ContainerError, match="past the end of the file"):
         open_container(bytes(data))
+    data = bytearray(elf(short, syms))          # no whole entry, so nothing read
+    _s.pack_into("<QQ", data, 64 + 2 * 64 + 24, 10 ** 9, 8)    # sh_offset, sh_size
+    assert open_container(bytes(data)).symbols == {}
     data = elf(short, syms, stride=32)          # the last 8 bytes of padding not there
     c = open_container(data)
     assert len(c.symbols) == 500 and c._budget.spent[tables] == 500 * 24  # bytes read
@@ -9245,6 +9251,13 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
     assert [s.name for s in open_container(data).sections] == [","]
     with pytest.raises(ContainerError, match="past the end of the file"):
         open_container(data[:-1])
+    # a Mach-O string table said to run on past the file, with no NUL in it: the scan
+    # stops at the end of the file, and so does what it is charged
+    at = 32 + 24
+    c = open_container(_s.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6, 1, 24, 0, 0)
+                       + _s.pack("<IIIIII", 2, 24, at, 1, at + 16, 10 ** 6)
+                       + _s.pack("<IBBHQ", 1, 0x0E, 1, 0, 0x1000) + b"\x00" + b"A" * 100)
+    assert c.symbols == {} and c._budget.spent[names] == 100
     # a Mach-O symbol table runs on past the file and is read as far as it goes
     data = bytearray(macho(short, syms))
     _s.pack_into("<I", data, 32 + 12, 0xFFFFFFFF)          # nsyms
@@ -9263,9 +9276,10 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
         assert c._budget.spent == {names: 2 * (len(under) + 4001) + (build is elf),
                                    tables: 4001 * (24 if build is elf else 16)}, build
     # and a name offset is a file offset: two tables can each have a name at 1
-    c = open_container(elf(b"\x00foo\x00", [(1, 0x10)],
-                           also=[(b"\x00bar\x00", [(1, 0x20)])]))
-    assert {n: s.value for n, s in c.symbols.items()} == {"foo": 0x10, "bar": 0x20}
+    for build in (elf, macho):
+        c = open_container(build(b"\x00foo\x00", [(1, 0x10)],
+                                 also=[(b"\x00bar\x00", [(1, 0x20)])]))
+        assert {n: s.value for n, s in c.symbols.items()} == {"foo": 0x10, "bar": 0x20}
 
     # A real build is nowhere near: the fixtures name a few hundred bytes. 4,537 ELF and
     # Mach-O files measured came to at most 0.45 of the file for names, 0.68 for tables.

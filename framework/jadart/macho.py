@@ -78,8 +78,9 @@ class MachO64:
             struct.unpack_from("<IiiIIIII", d, 0)
         self.sections: list[MachSection] = []
         self.symbols: dict[str, Symbol] = {}
-        # Nothing ties a segment's section count to its load command, or a symbol's name
-        # offset to one name, so both are charged against the file's size (#95).
+        # Nothing ties a segment's section count to its load command, a symbol table to
+        # one load command or a name offset to one name, so all three are charged
+        # against the file's size (#95).
         budget = self._budget = ReadBudget(len(d))
         off = 32
         for _ in range(ncmds):
@@ -94,8 +95,9 @@ class MachO64:
                 # here rather than left to the budget, which would call it an overlap.
                 if nsects and so + (nsects - 1) * 80 + 52 > len(d):
                     raise ContainerError(
-                        f"segment {segname!r} declares {nsects} sections, past the end "
-                        f"of the file (len {len(d)})")
+                        f"segment {segname!r} runs past the end of the file: its section "
+                        f"headers from offset {so} end at {so + nsects * 80} (len "
+                        f"{len(d)})")
                 budget.charge("section headers", nsects * 80)
                 for _i in range(nsects):
                     sect = d[so:so + 16].split(b"\x00")[0].decode("utf-8", "replace")

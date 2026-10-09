@@ -45,7 +45,7 @@ class ReadBudget:
     A table entry or a name is found by an offset the file gives, and nothing stops two
     of them from overlapping. A crafted string table can start a name at every byte of
     one long string, each a different suffix of it: a 500 KB ELF kept 200M characters
-    of names that way, and a 1.3 MB one with 2,000 section headers on one symbol table
+    of names that way, and a 1.4 MB one with 2,000 section headers on one symbol table
     took 24s to read it 2,000 times (#95). Tables that do not overlap cannot cost more
     than the file has bytes, so past that the file is refused. Linkers overlap names
     only where one is the tail of another: across 4,537 real ELF and Mach-O files the
@@ -151,8 +151,9 @@ class Elf:
                 n = sh_size // ent
                 if n and sh_offset + (n - 1) * ent + self._sym_size > len(d):
                     raise ContainerError(
-                        f"section {name!r} holds {n} symbols from offset {sh_offset}, "
-                        f"past the end of the file (len {len(d)})")
+                        f"section {name!r} runs past the end of the file: its symbols "
+                        f"from offset {sh_offset} end at {sh_offset + n * ent} (len "
+                        f"{len(d)})")
                 self._symtabs.append((sh_offset, sh_size, ent, strtab_off))
 
         self.symbols: dict[str, Symbol] = {}
