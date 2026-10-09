@@ -9449,6 +9449,73 @@ def test_the_magic_scan_refuses_more_snapshots_than_a_library_holds(
         doc["error"]), doc
 
 
+def test_a_features_string_is_read_only_as_long_as_a_real_one_can_be(tmp_path):
+    # The features string was read to its NUL however far away that was, kept whole and
+    # given to `info -j` whole: a 16.8 MB file of two headers whose features were the real
+    # flags and 8 MB of 0xff each printed 100 MB of JSON, every byte a six-character
+    # escape (#101). A real one from an AOT build is under 160 bytes; past 4096 it is
+    # refused.
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+    from jadart.elf import Elf
+    from jadart.stream import ReadStream
+
+    d = open(CLEAN, "rb").read()
+    vm = Elf(d).symbol_bytes("_kDartVmSnapshotData")
+    st = ReadStream(vm, 52)
+    feat = st.read_cstring().encode()
+    assert len(feat) < 200
+
+    def header(features):
+        h = bytearray(vm[:52]) + features + b"\x00" + bytes([0x80] * 5)
+        struct.pack_into("<q", h, 4, len(h))
+        return bytes(h)
+
+    real = parse_blob(vm, "vm")
+    # 4096 bytes of features is read, the real flags first so the target still resolves
+    longest = feat + b" " + b"x" * (4096 - len(feat) - 1)
+    got = parse_blob(header(longest), "vm")
+    assert got.features == longest.decode() and got.epoch == real.epoch
+    # one more is refused, whether it ends later or never does
+    for blob in (header(longest + b"x"), header(feat + b" " + b"\xff" * (1 << 20)),
+                 vm[:52] + b"\xff" * (1 << 20)):
+        with pytest.raises(jadart.InputError) as e:
+            parse_blob(blob, "vm")
+        assert str(e.value).startswith("vm: the features string is longer than 4096 ")
+    # A header that ends with no NUL is truncated, as before, unless it ran past the bound
+    # first: 4096 bytes and the end of the blob is the one, 4097 the other.
+    for n, said in ((100, "unterminated C-string"), (4096, "unterminated C-string"),
+                    (4097, "is longer than 4096 bytes")):
+        short = bytearray(vm[:52]) + b"x" * n
+        struct.pack_into("<q", short, 4, len(short))
+        with pytest.raises(jadart.JadartError) as e:
+            parse_blob(bytes(short), "vm")
+        assert said in str(e.value), (n, str(e.value))
+
+    # and through the command line, on a stripped ELF holding two such headers
+    def elf(body):
+        eh = bytearray(64)
+        eh[0:4] = b"\x7fELF"; eh[4] = 2; eh[5] = 1; eh[6] = 1
+        return bytes(eh) + body
+
+    path = tmp_path / "long.so"
+    for features, rc in ((feat, 0), (feat + b" " + b"\xff" * (1 << 20), 2)):
+        path.write_bytes(elf(header(features) * 2))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert cli.main(["info", str(path), "-j"]) == rc
+        doc = json.loads(buf.getvalue())
+        assert len(buf.getvalue()) < 10_000, len(buf.getvalue())
+        if rc:
+            assert doc["type"] == "InputError" and "4096 bytes" in doc["error"], doc
+        else:
+            assert doc["snapshots"]["blob0"]["features"] == feat.decode()
+    # The fixtures' own read as before.
+    assert parse_libapp(CLEAN)["vm"].features == feat.decode()
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

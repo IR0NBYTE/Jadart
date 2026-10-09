@@ -34,6 +34,8 @@ These are deliberate, tested properties rather than assumptions:
 - **A stripped binary is read for two snapshots at most.** Without snapshot symbols, the
   scan for the snapshot magic stops at a third hit, and the file exits `2` before any of
   them is parsed: a library holds two at most, the vm and the isolate one.
+- **A snapshot header's features string is bounded.** Past 4096 bytes the header exits
+  `2`; a real one from an AOT build is under 160.
 - **Unknown format versions are refused, not guessed at.** This is a security property, not
   only a correctness one: a mis-parsed snapshot produces a plausible-looking object graph,
   and someone auditing an app would act on it.
