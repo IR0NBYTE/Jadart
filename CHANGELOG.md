@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A stripped binary is read for two snapshots at most.** With no `_kDart*SnapshotData`
+  symbols, the snapshots are found by scanning for their magic, and each hit was parsed
+  out of a copy of the rest of the file and listed: an ELF of 201 byte snapshot headers
+  took 2.5s at 8 MB and 9.7s at 16 MB, four times that for each doubling, and `info`
+  printed 459,074 lines for the 8 MB one, while a 32 MB file of nothing but the magic
+  peaked at 429 MB listing its offsets before it was refused. A library holds two
+  snapshots at most, the vm and the isolate one, so the scan stops at a third and refuses
+  the file with an `InputError` (exit 2) that gives the offsets, before any is parsed;
+  `jadart.header()` and `jadart.parse_libapp()` raise it where they returned a `blobN`
+  for each. Each of those files is refused in 0.04s. A file with a third hit that did not
+  parse was refused before too, with that hit's parse error; it is the count that is
+  reported now. Each of 46 real libapp.so has the magic exactly twice, and with its
+  section headers removed still reads to the two headers its symbols name. Closes #99.
 - **A container's tables cannot cost more than the file.** An ELF or Mach-O gives the
   offset of each symbol's name, of each symbol table and of a segment's sections, and
   their counts, and nothing stopped them from overlapping, so a crafted file made every

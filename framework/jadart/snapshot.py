@@ -65,6 +65,13 @@ class SnapshotHeader:
 #: header, and struct.unpack_from would raise struct.error from inside the parse.
 _MIN_HEADER = 52
 
+#: How many snapshots a library holds at most: the vm one and the isolate one, each
+#: starting with the magic (a deferred loading unit has only an isolate one). Each of 46
+#: real libapp.so (the corpus, the CTF apps, the fixtures) has the magic exactly twice,
+#: and the scan for a stripped binary refuses a third rather than parsing every hit,
+#: which cost a copy of the rest of the file for each one (#99).
+_SNAPSHOTS = 2
+
 
 def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeader:
     if len(blob) < _MIN_HEADER:
@@ -213,8 +220,17 @@ def parse_libapp_with_anchor(path, *, strict: bool = True):
             continue
         out[which] = parse_blob(blob, which, strict=strict)
     if not out:
-        # stripped: fall back to magic scan
-        for i, off in enumerate(elf.find_snapshot_magic()):
+        # stripped: fall back to magic scan. One hit past what a library holds is enough
+        # to refuse, so the scan stops there instead of finding them all.
+        found = elf.find_snapshot_magic(limit=_SNAPSHOTS + 1)
+        if len(found) > _SNAPSHOTS:
+            raise InputError(
+                f"{src.label}: no _kDart*SnapshotData symbols, and the snapshot magic is "
+                f"at {len(found)} or more file offsets "
+                f"({', '.join(hex(o) for o in found)}). A Flutter library holds at most "
+                f"{_SNAPSHOTS} snapshots, the vm and the isolate one, so jadart will not "
+                f"guess which of these they are.")
+        for i, off in enumerate(found):
             out[f"blob{i}"] = parse_blob(data[off:], f"blob{i}", strict=strict)
     if not out:
         raise InputError(

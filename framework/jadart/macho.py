@@ -27,7 +27,7 @@ import struct
 from .errors import ContainerError, MissingSymbol
 from dataclasses import dataclass
 
-from .elf import DART_MAGIC, ReadBudget, Symbol
+from .elf import ReadBudget, Symbol, find_magic
 
 MH_MAGIC_64 = 0xFEEDFACF
 MH_CIGAM_64 = 0xCFFAEDFE          # big-endian 64 (not supported; arm64/x64 are LE)
@@ -197,16 +197,8 @@ class MachO64:
             out.append(Symbol(s.name, s.value, max(0, nxt - s.value)))
         return out
 
-    def find_snapshot_magic(self) -> list[int]:
-        needle = struct.pack("<I", DART_MAGIC)
-        out, start = [], 0
-        while True:
-            i = self.data.find(needle, start)
-            if i < 0:
-                break
-            out.append(i)
-            start = i + 4
-        return out
+    def find_snapshot_magic(self, limit: int | None = None) -> list[int]:
+        return find_magic(self.data, limit)
 
 
 def open_container(data: bytes):
