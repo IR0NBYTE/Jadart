@@ -39,6 +39,30 @@ SHT_NOBITS = 8
 DART_MAGIC = 0xDCDCF5F5
 
 
+class ReadBudget:
+    """What reading a container's tables has cost so far, in bytes of the file, by kind.
+
+    A table entry or a name is found by an offset the file gives, and nothing stops two
+    of them from overlapping. A crafted string table can start a name at every byte of
+    one long string, each a different suffix of it: a 500 KB ELF kept 200M characters
+    of names that way, and a 1.4 MB one with 2,000 section headers on one symbol table
+    took 24s to read it 2,000 times (#95). Tables that do not overlap cannot cost more
+    than the file has bytes, so past that the file is refused. Linkers overlap names
+    only where one is the tail of another: across 4,537 real ELF and Mach-O files the
+    names came to at most 0.45 of the file, the symbol tables to 0.68."""
+
+    def __init__(self, size: int):
+        self.size = size
+        self.spent: dict[str, int] = {}
+
+    def charge(self, what: str, n: int) -> None:
+        total = self.spent[what] = self.spent.get(what, 0) + n
+        if total > self.size:
+            raise ContainerError(
+                f"{what} overlap: reading them came to {total} bytes in a {self.size} "
+                f"byte file")
+
+
 class Elf:
     def __init__(self, data: bytes):
         if data[:4] != b"\x7fELF":
@@ -81,26 +105,33 @@ class Elf:
             raw.append((sh_name, sh_type, sh_addr, sh_offset, sh_size, sh_link, _entsize))
         shstr_off = raw[e_shstrndx][3]
 
-        def cstr(base, idx, limit=None):
+        budget = self._budget = ReadBudget(len(d))
+
+        def cstr(base, idx):
             # Bounded on purpose. d.index scans the whole file when the string table is
             # not NUL-terminated (raising ValueError from the middle of a parse), and
             # d.find returning -1 would slice to len-1 and hand back a name made of
-            # whatever followed it.
+            # whatever followed it. Every read is charged to the budget (#95), so the
+            # callers read each offset once.
             start = base + idx
             if start < 0 or start >= len(d):
                 raise ContainerError(
                     f"string table offset {start} is outside the file (len {len(d)})")
-            stop = len(d) if limit is None else min(len(d), base + limit)
-            end = d.find(b"\x00", start, stop)
+            end = d.find(b"\x00", start)
             if end < 0:
                 raise ContainerError(
                     f"unterminated string at offset {start} in the string table")
+            budget.charge("names in the string tables", end + 1 - start)
             return d[start:end].decode("utf-8", "replace")
 
         self.sections: list[Section] = []
         self._symtabs = []  # (offset, size, entsize, strtab_offset)
+        section_names: dict[int, str] = {}      # by file offset
         for (sh_name, sh_type, sh_addr, sh_offset, sh_size, sh_link, entsize) in raw:
-            name = cstr(shstr_off, sh_name)
+            at = shstr_off + sh_name
+            if at not in section_names:
+                section_names[at] = cstr(shstr_off, sh_name)
+            name = section_names[at]
             self.sections.append(Section(name, sh_type, sh_addr, sh_offset, sh_size))
             if sh_type in (2, 11):  # SYMTAB, DYNSYM
                 if sh_link >= len(raw):
@@ -115,11 +146,25 @@ class Elf:
                     raise ContainerError(
                         f"section {name!r} declares a {ent}-byte symbol entry, smaller "
                         f"than the {self._sym_size}-byte ELF{self.bits} symbol")
+                # Said here rather than left to the budget, which would call it an
+                # overlap.
+                n = sh_size // ent
+                if n and sh_offset + (n - 1) * ent + self._sym_size > len(d):
+                    raise ContainerError(
+                        f"section {name!r} runs past the end of the file: its symbols "
+                        f"from offset {sh_offset} end at {sh_offset + n * ent} (len "
+                        f"{len(d)})")
                 self._symtabs.append((sh_offset, sh_size, ent, strtab_off))
 
         self.symbols: dict[str, Symbol] = {}
+        # The file offsets of the names read so far. Another symbol naming one adds
+        # nothing, since the first symbol of a name is the one kept, so it is skipped:
+        # reading the name again, or only looking it up, costs its length for every
+        # symbol on it.
+        named = set()
         for (soff, ssize, sent, str_off) in self._symtabs:
             n = ssize // sent
+            budget.charge("symbol tables", n * self._sym_size)
             for i in range(n):
                 base = soff + i * sent
                 if self.bits == 64:
@@ -128,8 +173,9 @@ class Elf:
                 else:
                     st_name, st_value, st_size, _info, _other, _shndx = struct.unpack_from(
                         self._sym_fmt, d, base)
-                if st_name == 0:
+                if st_name == 0 or str_off + st_name in named:
                     continue
+                named.add(str_off + st_name)
                 nm = cstr(str_off, st_name)
                 if nm and nm not in self.symbols:
                     self.symbols[nm] = Symbol(nm, st_value, st_size)

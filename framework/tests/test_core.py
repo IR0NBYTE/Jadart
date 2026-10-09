@@ -9108,6 +9108,228 @@ def test_arm64_disasm_listing_unchanged_obf():
     assert _arm64_disasm_sample_sha("obf") == _ARM64_DISASM_SAMPLE_SHA["obf"]
 
 
+def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_path):
+    # A name, a symbol table and a segment's sections are each found by an offset or a
+    # count the file gives, and nothing stops them from overlapping (#95). One long name
+    # with a symbol at each of its bytes kept 200M characters from a 500 KB ELF, 2,000
+    # section headers on one symbol table read it 2,000 times, and a 304 KB Mach-O made
+    # 4M sections out of 2,000 load commands. Tables that do not overlap cannot cost
+    # more than the file has bytes, so each kind is refused past that, as a
+    # ContainerError, and a symbol on a name offset already read is skipped.
+    import contextlib
+    import io
+    import json
+    import struct as _s
+    from jadart import cli
+    from jadart.errors import ContainerError
+    from jadart.macho import open_container
+
+    def elf(strtab, syms, tables=1, bits=64, shstr=b"\x00", table_names=None,
+            stride=None, also=()):
+        # the section names, the symbol names, `tables` symbol tables that all read the
+        # one run of entries, `stride` bytes apart, and for each of `also` a string
+        # table and a symbol table of its own
+        if bits == 64:
+            eh, sh, shfmt, ent = 64, 64, "<IIQQQQIIQQ", 24
+            pack = lambda n, v: _s.pack("<IBBHQQ", n, 0, 0, 0, v, 4)    # noqa: E731
+        else:
+            eh, sh, shfmt, ent = 52, 40, "<IIIIIIIIII", 16
+            pack = lambda n, v: _s.pack("<IIIBBH", n, v, 4, 0, 0, 0)    # noqa: E731
+        gap = b"\x00" * ((stride or ent) - ent)
+        blobs, heads = [], []
+        at = eh + (2 + tables + 2 * len(also)) * sh
+
+        def put(blob):
+            nonlocal at
+            blobs.append(blob)
+            at += len(blob)
+            return at - len(blob)
+
+        heads.append((0, 3, put(shstr), len(shstr), 0, 0))
+        heads.append((0, 3, put(strtab), len(strtab), 0, 0))
+        run = gap.join(pack(n, v) for n, v in syms)
+        where = put(run)
+        for i in range(tables):
+            heads.append(((table_names or [0] * tables)[i], 2, where,
+                          len(syms) * (stride or ent), 1, stride or ent))
+        for st, sy in also:
+            heads.append((0, 3, put(st), len(st), 0, 0))
+            run = b"".join(pack(n, v) for n, v in sy)
+            heads.append((0, 11, put(run), len(run), len(heads) - 1, ent))
+        h = bytearray(eh)
+        h[0:7] = b"\x7fELF" + bytes([2 if bits == 64 else 1, 1, 1])
+        if bits == 64:
+            _s.pack_into("<Q", h, 0x28, eh)
+            _s.pack_into("<HHH", h, 0x3A, sh, len(heads), 0)
+        else:
+            _s.pack_into("<I", h, 0x20, eh)
+            _s.pack_into("<HHH", h, 0x2E, sh, len(heads), 0)
+        return (bytes(h) + b"".join(_s.pack(shfmt, nm, ty, 0, 0, off, size, link, 0, 0,
+                                            es)
+                                    for nm, ty, off, size, link, es in heads)
+                + b"".join(blobs))
+
+    def macho(strtab, syms, tables=1, segments=(), also=()):
+        # `segments` load commands of 72 bytes each claiming that many sections, which
+        # are read out of whatever follows, `tables` LC_SYMTABs on one run of entries,
+        # and for each of `also` an LC_SYMTAB with a string table of its own
+        cmds = b""
+        for nsects in segments:
+            c = bytearray(72)
+            _s.pack_into("<II", c, 0, 0x19, 72)
+            _s.pack_into("<I", c, 64, nsects)
+            cmds += bytes(c)
+        at = 32 + len(cmds) + 24 * (tables + len(also))
+        rest = b""
+        for st, sy, times in [(strtab, syms, tables)] + [(st, sy, 1) for st, sy in also]:
+            where = at + len(rest)
+            cmds += _s.pack("<IIIIII", 2, 24, where + len(st), len(sy), where,
+                            len(st)) * times
+            rest += st + b"".join(_s.pack("<IBBHQ", n, 0x0E, 1, 0, v) for n, v in sy)
+        h = _s.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6,
+                    len(segments) + tables + len(also), len(cmds), 0, 0)
+        return h + cmds + rest + b"\x00" * (80 * max(segments, default=0))
+
+    def refused(data, what):
+        try:
+            c = open_container(data)
+        except ContainerError as e:
+            assert str(e).startswith(f"{what} overlap: "), e
+            # refused at the file's size, by the one read that went past it
+            total, size = map(int, re.search(r"came to (\d+) bytes in a (\d+) byte file",
+                                             str(e)).groups())
+            assert size == len(data) < total <= size + 80 * 200, e
+            return
+        raise AssertionError(f"{len(data)} byte file read to {len(c.symbols)} symbols, "
+                             f"{sum(map(len, c.symbols))} characters of names, "
+                             f"{len(c.sections)} sections: {what} not refused")
+
+    long = b"A" * 4000
+    names, tables, sections = ("names in the string tables", "symbol tables",
+                               "section headers")
+    # a symbol at every byte of one name, in either ELF class and in Mach-O
+    one_name_each_byte = [(1 + i, 0x1000 + i) for i in range(len(long))]
+    refused(elf(b"\x00" + long + b"\x00", one_name_each_byte), names)
+    refused(elf(b"\x00" + long + b"\x00", one_name_each_byte, bits=32), names)
+    # ahead of them a Mach-O symbol whose name starts past its table, which reads
+    # nothing and must not be charged less than nothing to make room
+    refused(macho(b"\x00" + long + b"\x00", [(0xFFFF0000, 0x1000)] + one_name_each_byte),
+            names)
+    # with no NUL in the table no Mach-O name is kept, and each scan still costs
+    refused(macho(b"\x00" + long, one_name_each_byte), names)
+    # section names are read from offsets too
+    refused(elf(b"\x00", [], tables=2000, shstr=b"\x00" + long + b"\x00",
+                table_names=[1 + i for i in range(2000)]), names)
+    # many headers on one symbol table, in both containers
+    short = b"\x00" + b"".join(b"s%d\x00" % i for i in range(500))
+    starts = [1 + sum(len(b"s%d" % j) + 1 for j in range(i)) for i in range(500)]
+    syms = [(at, 0x1000 + i) for i, at in enumerate(starts)]
+    refused(elf(short, syms, tables=200), tables)
+    refused(macho(short, syms, tables=200), tables)
+    # load commands that claim sections they do not hold
+    refused(macho(b"\x00", [], tables=0, segments=[200] * 200), sections)
+
+    # The limit is the file's size: a file whose names come to exactly that is read.
+    few = elf(b"\x00" + long + b"\x00", one_name_each_byte[:10])
+    spent = open_container(few + bytes(10 ** 5))._budget.spent[names]
+    assert open_container(few + bytes(spent - len(few)))._budget.spent[names] == spent
+    refused(few + bytes(spent - 1 - len(few)), names)
+
+    # A table that runs past the end of the file says so, where it did not overlap
+    # anything; one whose last entry ends where the file does is read, as it always was.
+    data = bytearray(elf(short, syms))
+    _s.pack_into("<Q", data, 64 + 2 * 64 + 32, 10 ** 6)        # the table's sh_size
+    with pytest.raises(ContainerError, match="past the end of the file"):
+        open_container(bytes(data))
+    data = bytearray(elf(short, syms))          # no whole entry, so nothing read
+    _s.pack_into("<QQ", data, 64 + 2 * 64 + 24, 10 ** 9, 8)    # sh_offset, sh_size
+    assert open_container(bytes(data)).symbols == {}
+    data = elf(short, syms, stride=32)          # the last 8 bytes of padding not there
+    c = open_container(data)
+    assert len(c.symbols) == 500 and c._budget.spent[tables] == 500 * 24  # bytes read
+    data = macho(b"", [], tables=0, segments=[1])[:32 + 72 + 52]
+    assert [s.name for s in open_container(data).sections] == [","]
+    with pytest.raises(ContainerError, match="past the end of the file"):
+        open_container(data[:-1])
+    # a Mach-O string table said to run on past the file, with no NUL in it: the scan
+    # stops at the end of the file, and so does what it is charged
+    at = 32 + 24
+    c = open_container(_s.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6, 1, 24, 0, 0)
+                       + _s.pack("<IIIIII", 2, 24, at, 1, at + 16, 10 ** 6)
+                       + _s.pack("<IBBHQ", 1, 0x0E, 1, 0, 0x1000) + b"\x00" + b"A" * 100)
+    assert c.symbols == {} and c._budget.spent[names] == 100
+    # a Mach-O symbol table runs on past the file and is read as far as it goes
+    data = bytearray(macho(short, syms))
+    _s.pack_into("<I", data, 32 + 12, 0xFFFFFFFF)          # nsyms
+    assert len(open_container(bytes(data)).symbols) == 500
+
+    # Every symbol on one offset is one name, read and charged once, and costs nothing
+    # after: the lookups for every symbol on it cost its length each, so they are not
+    # made. In Mach-O its `_` alias too, and in either one a second copy of the name.
+    for build, under in ((elf, b""), (macho, b"_")):
+        twice = b"\x00" + under + long + b"\x00" + under + long + b"\x00"
+        second = 1 + len(under) + len(long) + 1
+        c = open_container(build(twice, [(1, 0x1000)] + [(second, 0x1000)] * 4000))
+        assert sorted(map(len, c.symbols)) == [4000, 4001][:1 + len(under)], build
+        # each name and its NUL, and in the ELF the empty section name's NUL; and every
+        # byte of the entries
+        assert c._budget.spent == {names: 2 * (len(under) + 4001) + (build is elf),
+                                   tables: 4001 * (24 if build is elf else 16)}, build
+    # and a name offset is a file offset: two tables can each have a name at 1
+    for build in (elf, macho):
+        c = open_container(build(b"\x00foo\x00", [(1, 0x10)],
+                                 also=[(b"\x00bar\x00", [(1, 0x20)])]))
+        assert {n: s.value for n, s in c.symbols.items()} == {"foo": 0x10, "bar": 0x20}
+
+    # A real build is nowhere near: the fixtures name a few hundred bytes. 4,537 ELF and
+    # Mach-O files measured came to at most 0.45 of the file for names, 0.68 for tables.
+    for lib in (CLEAN, OBF):
+        with open(lib, "rb") as f:
+            d = f.read()
+        c = open_container(d)
+        assert sorted(c.symbols) == ["_kDartIsolateSnapshotData",
+                                     "_kDartIsolateSnapshotInstructions",
+                                     "_kDartSnapshotBuildId", "_kDartVmSnapshotData",
+                                     "_kDartVmSnapshotInstructions"]
+        assert [s.name for s in c.sections] == [
+            "", ".note.gnu.build-id", ".dynstr", ".dynsym", ".hash", ".rodata",
+            ".eh_frame", ".text", ".dynamic", ".bss", ".shstrtab"]
+        assert c._budget.spent == {names: 222, tables: 144}
+
+    # The extent of a Mach-O snapshot blob looked its section up again for every
+    # boundary symbol, which cost symbols times sections. Now two lookups however
+    # many, the blob's own and the one for its file offset.
+    many = b"\x00_kDartIsolateSnapshotData\x00"
+    syms = [(1, 0x100000)]
+    for i in range(300):
+        syms.append((len(many), 0x100001 + 299 - i))   # each one nearer, so each counts
+        many += b"_kDartX%d\x00" % i
+    seg = bytearray(152)                 # one segment, one section at 0x100000
+    _s.pack_into("<II", seg, 0, 0x19, 152)
+    _s.pack_into("<I", seg, 64, 1)
+    seg[72:74] = b"s\x00"
+    _s.pack_into("<QQI", seg, 72 + 32, 0x100000, 0x100000, 64)
+    at = 32 + 152 + 24
+    m = open_container(
+        _s.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6, 2, 152 + 24, 0, 0) + bytes(seg)
+        + _s.pack("<IIIIII", 2, 24, at + len(many), len(syms), at, len(many)) + many
+        + b"".join(_s.pack("<IBBHQ", n, 0x0E, 1, 0, v) for n, v in syms))
+    looked = []
+    find = m._section_of
+    m._section_of = lambda va: looked.append(va) or find(va)
+    assert m.symbol_bytes("_kDartIsolateSnapshotData") == m.data[64:65]
+    assert len(looked) == 2, f"{len(looked)} section lookups for one blob"
+
+    # and through the command line, a typed failure that says what overlapped
+    path = tmp_path / "overlap.so"
+    path.write_bytes(elf(b"\x00" + long + b"\x00", one_name_each_byte))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["info", str(path), "-j"]) == 2
+    doc = json.loads(buf.getvalue())
+    assert doc["type"] == "ContainerError" and doc["error"].startswith(names), doc
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
