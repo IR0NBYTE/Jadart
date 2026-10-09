@@ -10313,6 +10313,55 @@ def test_a_branch_reads_the_operands_its_flags_were_set_from():
         assert body[0] == "subs x1, x1, #8", body
 
 
+def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
+    # A raw line assigns its destination in the printed body, so a value the lifter
+    # still held that was spelled with that register read as the new value after it:
+    # `add x5, x1, #1; subs x1, x1, #8; str x5` printed `x1 + 1` for the old x1 (#118).
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, *r, "") for i, r in enumerate(rows)])]
+    for raw in (("subs", "x1, x1, #8"), ("adcs", "x1, x1, x3"), ("mrs", "x1, nzcv"),
+                ("fmov", "x1, d0"), ("ldr", "x1, [x1, #-8]!")):
+        body = lift([("add", "x5, x1, #1"), raw, ("str", "x5, [x2, #7]"), ("ret", "")])
+        assert body == ["var t0 = x1 + 1;", " ".join(raw), "x2.field_0x8 = t0;",
+                        "return x0;"], raw
+    # A frame slot holding one is named the same way.
+    assert lift([("add", "x5, x1, #1"), ("stur", "x5, [x29, #-8]"),
+                 ("adcs", "x1, x1, x3"), ("ldur", "x6, [x29, #-8]"),
+                 ("str", "x6, [x2, #7]"), ("ret", "")]) == [
+        "var t0 = x1 + 1;", "adcs x1, x1, x3", "x2.field_0x8 = t0;", "return x0;"]
+    # In a block with no call or store in it too.
+    assert lift([("add", "x5, x1, #1"), ("adcs", "x1, x1, x3"), ("mov", "x0, x5"),
+                 ("ret", "")]) == ["var t0 = x1 + 1;", "adcs x1, x1, x3", "return t0;"]
+    # A store that moves its base by a register moves it in the printed body as well.
+    assert lift([("add", "x5, x1, #1"), ("str", "x0, [x1], x2"), ("str", "x5, [x4, #7]"),
+                 ("str", "x1, [x4, #0xf]"), ("ret", "")]) == [
+        "var t0 = x1 + 1;", "str x0, [x1], x2", "x4.field_0x8 = t0;",
+        "x4.field_0x10 = x1;", "return x0;"]
+    # An `ldp` writes both of its registers, and the second one was kept as it was. The
+    # old value of a register the line writes is not named, it is not read again.
+    assert lift([("add", "x2, x3, #1"), ("ldp", "x1, x2, [x1], #0x10"),
+                 ("str", "x2, [x4, #7]"), ("ret", "")])[1] == "x4.field_0x8 = x2;"
+    assert lift([("add", "x5, x2, #1"), ("ldp", "x1, x2, [x1], #0x10"),
+                 ("str", "x5, [x4, #7]"), ("ret", "")])[0] == "var t0 = x2 + 1;"
+    assert lift([("add", "x2, x1, #1"), ("add", "x5, x1, #2"),
+                 ("ldp", "x1, x2, [x1], #0x10"), ("str", "x5, [x4, #7]"),
+                 ("str", "x2, [x4, #0xf]"), ("ret", "")])[0] == "var t0 = x1 + 2;"
+    # A role register stays a role where the line only moves it, and is forgotten,
+    # as before, where it is what the line loads.
+    assert lift([("str", "x0, [x15], x1"), ("add", "x5, x15, #8"),
+                 ("str", "x5, [x4, #7]"), ("ret", "")])[1] == "x4.field_0x8 = SP + 8;"
+    assert lift([("ldr", "x15, [x15, #8]!"), ("add", "x5, x15, #8"),
+                 ("str", "x5, [x4, #7]"), ("ret", "")])[1] == "x4.field_0x8 = x15 + 8;"
+    # Nothing reads x5 after the line, so nothing is named, and a name only a raw line
+    # would read is left out: the raw line reads the machine register.
+    assert lift([("add", "x5, x1, #1"), ("subs", "x1, x1, #8"), ("ret", "")]) == [
+        "subs x1, x1, #8", "return x0;"]
+    assert lift([("add", "x5, x1, #1"), ("adcs", "x1, x1, x3"), ("adcs", "x5, x5, x3"),
+                 ("str", "x5, [x4, #7]"), ("ret", "")])[0] == "adcs x1, x1, x3"
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

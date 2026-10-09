@@ -13,6 +13,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A raw line no longer changes what an earlier value reads as.** An instruction tier 3
+  prints as it is assigns the registers it writes, so a value the lifter still held that
+  was spelled with one of them read as the new value after it: `add x5, x1, #1; subs x1,
+  x1, #8; str x5` printed `x1 + 1` for the old x1, and a hash index in the clean
+  fixture's `_compact_hash.dart` was computed from the `w4` an `ldar` had just replaced.
+  Each such value still read later is named first (`var t0 = x1 + 1;`), as tier 3
+  already did before a pointer moves, and every register a raw line writes is forgotten:
+  an `ldp` kept its second register's old value, and a store that moves its base by a
+  register kept the base's. A name only another raw line would read is left out. Tier 3
+  exports change in 20 functions on the clean fixture (1,216 lines in 12 files, most of
+  it later temps renumbered), 25 on 3.4.4, 20 on 3.10.9, 9 on 2.19.6 and 1 on obf.
+  Closes #118.
 - **A branch reads the operands its flags were set from.** `subs x1, x1, #8` sets the
   flags from the x1 it is overwriting, and tier 3 rendered the branch after it with the
   x1 that was left: a copy loop in the clean fixture (0x2d32c8) printed `if (x1 == 8)`

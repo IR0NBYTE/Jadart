@@ -1129,6 +1129,8 @@ class Lifter:
         #: use by _inline_single_use; a temp that exists to STOP an expression growing
         #: must not be inlined back into the expression it was cut out of.
         self.results: set = set()
+        #: Names _verbatim gave, which _drop_unread leaves out where nothing reads them.
+        self.raw_names: set = set()
         #: entry block, and the memoised dominator tree / per-join kill sets `_join_kill`
         #: needs. Built on first use, because most functions never reach a goto join.
         self.entry = entry if entry is not None else (min(blocks) if blocks else 0)
@@ -1225,9 +1227,27 @@ class Lifter:
         The same thing the unmodelled-instruction fallthrough does, reached earlier when a
         modelled instruction turns out to carry an operand we cannot render.
         """
+        return self._verbatim(st, mn, op, op, dst)
+
+    def _verbatim(self, st: State, mn: str, op: str, shown: str, dst: str = "") -> list:
+        """The instruction printed as it is, and every register it writes forgotten.
+
+        The printed body reads the line as having run, so from there on a register it
+        writes means what the machine put in it. A value the lifter still holds that is
+        spelled with one of them would read as the new value: `add x5, x1, #1; subs x1,
+        x1, #8; str x5` printed `x1 + 1` for the old x1 (#118). Each such value still read
+        later is named first, `var t0 = x1 + 1;`, as _pin does before a base moves."""
+        defs = set(_def_use(mn, op)[0]) - _SPECIAL
         if dst:
-            st.set(dst, V(dst, P_ATOM))
-        return [f"{mn} {op}".rstrip()]
+            defs.add(dst)
+        out = []
+        live = self._live_after & ~_reg_mask(defs)
+        for r in sorted(defs):
+            out += self._pin(st, r, live)
+        self.raw_names.update(_DECL_RE.match(ln).group(2) for ln in out)
+        for r in sorted(defs):
+            st.set(r, V(r, P_ATOM))
+        return out + [f"{mn} {shown}".rstrip()]
 
     def _src(self, ops: list, i: int, st: State) -> V:
         """Source operand `i` with any shift or extend that follows it applied.
@@ -1378,7 +1398,7 @@ class Lifter:
         st.set(base, V(base, P_ATOM))
         return out
 
-    def _pin(self, st: State, name: str) -> list:
+    def _pin(self, st: State, name: str, live=None) -> list:
         """Give a name to every tracked value that mentions `name`, before `name` changes.
 
         The register map holds expressions, not results, and they are substituted into
@@ -1388,7 +1408,9 @@ class Lifter:
         has advanced, printing that text at the store describes the WRONG element.
 
         Writing the value out at the point the base changes is not a heuristic. The load
-        already happened, so the value already exists; this only says so out loud."""
+        already happened, so the value already exists; this only says so out loud.
+
+        `live`, a register mask, leaves out a register nothing reads again."""
         pat = _USE_RE.get(name)
         if pat is None:
             pat = _USE_RE[name] = re.compile(rf"\b{re.escape(name)}\b")
@@ -1401,6 +1423,8 @@ class Lifter:
             # check locally; one unsorted set in `_merge` was enough to break it.
             for key, v in sorted(holder.items()):
                 if key == name or name not in v.text or not pat.search(v.text):
+                    continue
+                if live is not None and holder is st.reg and not live & _reg_mask((key,)):
                     continue
                 tmp = f"t{st.tmpc[0]}"
                 st.tmpc[0] += 1
@@ -1770,7 +1794,7 @@ class Lifter:
             src = canon(ops[0])
             addr = _addr(ops)
             if addr is None or addr[1] is _BAD_POST:
-                return [f"{mn} {op}"]
+                return self._verbatim(st, mn, op, op)
             (base, disp, index, scale, wb), post = addr
             val = g(src)
             delta = disp if wb else post     # how far the base register moves, if at all
@@ -1882,8 +1906,7 @@ class Lifter:
             # fmov between an integer and an FP register REINTERPRETS the bits, it does
             # not convert. Modelling it as a move would silently invent a numeric
             # equality, so keep the raw instruction.
-            st.set(dst, V(dst, P_ATOM))
-            return [f"{mn} {op}"]
+            return self._verbatim(st, mn, op, op, dst)
         if mn in ("scvtf", "ucvtf") and len(ops) >= 2 and "." not in ops[1]:
             st.set(canon(ops[0]), V(f"{_wrap(g(canon(ops[1])), P_POST)}.toDouble()", P_POST))
             return []
@@ -1899,13 +1922,13 @@ class Lifter:
             dst = canon(ops[0])
             addr = _addr(ops)
             if addr is None or addr[1] is _BAD_POST:
-                st.set(dst, V(dst, P_ATOM))
-                return [f"{mn} {op}"]
+                return self._verbatim(st, mn, op, op, dst)
             (base, disp, index, scale, wb), post = addr
             delta = disp if wb else post
             if delta and base in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]):
-                st.set(dst, V(dst, P_ATOM))   # writeback into a loaded register: arm64
-                return [f"{mn} {op}"]         # calls it unpredictable, so neither do we
+                # writeback into a loaded register: arm64 calls it unpredictable, so
+                # neither do we
+                return self._verbatim(st, mn, op, op, dst)
             if post:
                 disp = 0                     # post-index: the access is at the OLD base
             if note.startswith("  ; = ") or note.startswith("; = "):
@@ -2158,10 +2181,8 @@ class Lifter:
         # not modelled: emit the raw arm64 (never wrong, no information lost). Of what
         # reaches here only `adr` names a code address, and `show` writes it as a virtual
         # address; the loads, stores and arithmetic kept raw above name none.
-        if dst:
-            st.set(dst, V(dst, P_ATOM))
         shown = self.show(addr, op) if self.show is not None else op
-        return [f"{mn} {shown}".rstrip()]
+        return self._verbatim(st, mn, op, shown, dst)
 
     def _elem_access(self, base_reg, index_reg, scale, st: State, disp: int = 0) -> V:
         """`base[index]` for a computed address, with the displacement folded in where it
@@ -2339,8 +2360,8 @@ class Lifter:
         # memory it reads changes, and doing that for a register nothing reads again would
         # put a dead `var tN = this.field_0x8;` in front of every compound assignment,
         # benchWithdraw's `balance -= amount` grows two of them, one for each register that
-        # mentions the field.
-        if any(t[1] in _CALLS or t[1] in _STORES for t in insns):
+        # mentions the field. And an instruction printed raw can be anywhere (_verbatim).
+        if insns:
             after, m = [0] * len(insns), self._liveout.get(addr, 0)
             for k in range(len(insns) - 1, -1, -1):
                 after[k] = m
@@ -3144,6 +3165,28 @@ def _inline_single_use(lines: list, names: set) -> list:
     return out
 
 
+def _drop_unread(lines: list, names: set) -> list:
+    """Leave out the declaration of each of `names` that nothing else in `lines` reads.
+
+    _verbatim names a value where liveness says a register holding it is read again,
+    and a raw line reads the machine register, not the name. A value whose only reader
+    is another raw line, or `d0` at a `ret` that returns x0, gets a name nothing prints
+    (#118). Reading a field or a register has no side effect to keep."""
+    if not names:
+        return lines
+    counts: dict = {}
+    for ln in lines:
+        for m in _TMP_RE.finditer(ln):
+            counts[m.group(0)] = counts.get(m.group(0), 0) + 1
+    out = []
+    for ln in lines:
+        m = _DECL_RE.match(ln)
+        if m and m.group(2) in names and counts[m.group(2)] == 1:
+            continue
+        out.append(ln)
+    return out
+
+
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
                   indent="  ", depth=1, selectors=None, arch=None, fields=None,
                   show=None, cut_end=None) -> list:
@@ -3255,4 +3298,4 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     lifter.show = show
     lifter.labels = label_targets(stmts)
     lines, _falls = lifter.walk(stmts, State(), indent, depth)
-    return _inline_single_use(lines, lifter.results)
+    return _inline_single_use(_drop_unread(lines, lifter.raw_names), lifter.results)
