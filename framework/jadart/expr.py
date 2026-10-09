@@ -101,6 +101,35 @@ def _is_fp(reg: str) -> bool:
     return bool(_FREG_RE.match(reg))
 
 
+#: Any spelling of an arm64 FP/SIMD register: d3, v3.16b, v3.d[0], q3, h3, b3 (s3 is
+#: already d3 by canon). All of them are one register, v3.
+_FP_VIEW_RE = re.compile(r"^[dvqhb](3[01]|[12]\d|\d)(?:\.\w+(?:\[\d+\])?|\[\d+\])?$")
+
+
+#: What `eor` of a register with itself, or `movi #0`, zeroes the whole double in.
+_ZEROED = re.compile(r"(v(3[01]|[12]\d|\d)\.(16b|8b|2d))|d(3[01]|[12]\d|\d)")
+
+
+_FP_N_CACHE: dict = {}
+
+
+def _fp_n(reg: str):
+    """The number of the FP/SIMD register `reg` spells, or None. arm64 only: on arm32 q1
+    is d2:d3, and tier 3 lifts arm64 alone (LIFTABLE_ARCHS)."""
+    hit = _FP_N_CACHE.get(reg, _FP_N_CACHE)
+    if hit is not _FP_N_CACHE:
+        return hit
+    m = _FP_VIEW_RE.match(reg)
+    out = m.group(1) if m else None
+    if len(reg) <= 12:
+        _FP_N_CACHE[reg] = out
+    return out
+
+
+#: A vector spelling of an FP/SIMD register in an operand, for liveness (#114).
+_VREG_RE = re.compile(r"\b[vqhb](3[01]|[12]\d|\d)\b")
+
+
 def _vd(tok: str):
     """`d3` / `v3.2d` -> 'd3'; anything else -> None.
 
@@ -339,6 +368,10 @@ def _regs(tokens) -> frozenset:
             r = canon(m)
             if r != "xzr":
                 out.add(r)
+        # v0.16b, q0, h0 and b0 are d0 too: `mov v0.16b, v1.16b` in a loop writes d0, and
+        # liveness that did not say so let a 0.0 from before the loop stand after it.
+        for n in _VREG_RE.findall(t):
+            out.add("d" + n)
     fs = frozenset(out)
     return _REGSET_INTERN.setdefault(fs, fs)
 
@@ -583,7 +616,7 @@ MAX_INLINE_CHARS = 200
 
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
-                 "src")
+                 "src", "views")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
@@ -614,6 +647,9 @@ class State:
         # broke out of it. `Lifter._arrive` reads it to tell a goto straight from its
         # block from one that follows a `break`.
         self.src = None
+        # FP/SIMD register number -> the spellings other than dN it is held under (q0,
+        # v0.16b), so a write under one need not search the whole map for the others.
+        self.views: dict = {}
 
     def copy(self) -> "State":
         s = State()
@@ -623,6 +659,7 @@ class State:
         s.result = self.result
         s.poolbase = dict(self.poolbase)
         s.pair = dict(self.pair)
+        s.views = {n: set(v) for n, v in self.views.items()}
         s.tmpc = self.tmpc
         s.src = self.src
         return s
@@ -655,6 +692,35 @@ class State:
         self.elem.pop(reg, None)
         self.poolbase.pop(reg, None)
         self._unpair(reg)
+        self._other_views(reg)
+
+    def _other_views(self, reg: str):
+        """Forget what the other spellings of `reg`'s FP/SIMD register hold.
+
+        d0, v0.16b and q0 are one register, and a value is tracked under the spelling it
+        was written with. A write under one left the others describing what was there
+        before: `eor v0.16b, v0.16b, v0.16b` (the VM's 0.0), `ldr q0`, `ins v0.d[0], x3`
+        and `movi v0.2d, #0` all left d0 holding the double loaded before them, and the
+        store after printed that (#114)."""
+        n = _fp_n(reg)
+        if n is None:
+            return
+        d = "d" + n
+        if reg != d and d in self.reg:
+            self.reg[d] = V(d, P_ATOM)
+            self.elem.pop(d, None)
+            self.poolbase.pop(d, None)
+        others = self.views.get(n)
+        if others:
+            for k in [k for k in others if k != reg]:
+                # Gone rather than reset: an unknown register reads as its own name either
+                # way, and a key left behind would be searched at every later write.
+                self.reg.pop(k, None)
+                self.elem.pop(k, None)
+                self.poolbase.pop(k, None)
+                others.discard(k)
+        if reg != d:
+            self.views.setdefault(n, set()).add(reg)
 
     def set(self, reg: str, v: V):
         reg = canon(reg)
@@ -671,6 +737,7 @@ class State:
         self.elem.pop(reg, None)
         self.poolbase.pop(reg, None)
         self._unpair(reg)
+        self._other_views(reg)
         if reg in (_T.ret_int, _T.ret_fp):
             self.result = reg
 
@@ -679,6 +746,10 @@ class State:
 #: as opposed to a machine register or a source-level name. It is spelled only in the
 #: printed body, so dropping it loses the only statement that says what the value is.
 _MINTED_RE = re.compile(r"t\d+")
+#: A double literal. The instruction that made it (`fmov #`, the `eor` zeroing idiom)
+#: prints nothing, so a join one arm of which holds it is no more visible than one
+#: holding a computed value, and has to be named (#114).
+_FLIT_RE = re.compile(r"-?\d+\.\d+")
 
 
 def _use_re(name: str):
@@ -1513,7 +1584,10 @@ class Lifter:
         """
         touched = (set(st.reg) | set(st.elem) | set(st.poolbase) | set(st.pair)
                    | set(st.pair.values()) | set(self.alias))
-        for r in sorted(touched & _CALL_CLOBBERS):
+        # A V register is clobbered under every spelling: `ldr q0; bl f; str q0` printed
+        # the load as what was stored (#114).
+        for r in sorted(r for r in touched if r in _CALL_CLOBBERS
+                        or (_fp_n(r) is not None and f"d{_fp_n(r)}" in _CALL_CLOBBERS)):
             st.forget(r)
 
     def _pin_call(self, st: State) -> list:
@@ -2252,6 +2326,21 @@ class Lifter:
             if all(v):
                 st.set(v[0], V(f"{_wrap(g(v[1]), P_POST)}.{mn[1:]}({g(v[2]).text})", P_POST))
                 return []
+        # The two ways the VM zeroes a double register (#114): LoadDImmediate(0.0) emits
+        # `eor vN.16b, vN.16b, vN.16b`, and `movi` with #0 does the same.
+        zero = None
+        if mn == "eor" and len(ops) == 3 and len({o.strip() for o in ops}) == 1:
+            zero = ops[0].strip()
+        elif mn == "movi" and len(ops) == 2 and _imm(ops[1]) == 0:
+            zero = ops[0].strip()
+        if zero and _ZEROED.fullmatch(zero):
+            # Not a vote on which register the function returns: the VM zeroes a double
+            # for a comparison as often as for a result, and counting it printed `return
+            # 0.0;` in functions returning the object in x0 (lerp, clamp; see #115).
+            result = st.result
+            st.set("d" + _fp_n(zero), V("0.0", P_ATOM))
+            st.result = result
+            return []
         if mn == "mov" and len(ops) == 2 and ops[0].strip().endswith(".16b"):
             d, sv = ops[0].strip(), ops[1].strip()
             if sv.endswith(".16b") and d[:1] == "v" and sv[:1] == "v":
@@ -3022,9 +3111,17 @@ class Lifter:
             # The exception is a name this lifter MINTED. A `t3` exists only in the printed
             # body, so declining the phi drops it to a bare `x3` and the binding that said
             # what x3 holds becomes the one thing the reader cannot see.
+            #
+            # So is a double literal against something other than the register's bare
+            # name. An arm that overwrote it and then lost the value at a join inside
+            # leaves that same bare name, which is also how the value on entry reads, and
+            # the phi would carry the entry value down an arm that never kept it (#114).
+            lit = ((_FLIT_RE.fullmatch(va.text) and vb.text != r)
+                   or (_FLIT_RE.fullmatch(vb.text) and va.text != r))
             if (va.prec >= P_POST and vb.prec >= P_POST
                     and not _MINTED_RE.fullmatch(va.text)
-                    and not _MINTED_RE.fullmatch(vb.text)):
+                    and not _MINTED_RE.fullmatch(vb.text)
+                    and not lit):
                 continue
             # The value on entry to the `if`. `a` and `b` are copies of `st` taken before
             # either arm walked, so anything they both still agree with is what `st` had;

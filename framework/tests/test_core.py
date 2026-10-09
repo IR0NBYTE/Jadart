@@ -10957,7 +10957,7 @@ def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
             ("swp", "x0, x1, [x2]", {"x1"}, {"x0", "x2"}),
             ("cas", "x0, x1, [x2]", {"x0"}, {"x0", "x1", "x2"}),
             ("ldaxp", "x0, x1, [x2]", {"x0", "x1"}, {"x2"}),
-            ("st1", "{v0.16b}, [x1], x2", {"x1"}, {"x1", "x2"}),
+            ("st1", "{v0.16b}, [x1], x2", {"x1"}, {"d0", "x1", "x2"}),
             ("br", "x16", set(), {"x16"})):
         assert _def_use(mn, op) == (defs, uses), (mn, _def_use(mn, op))
     # Nothing reads x5 after the line, so nothing is named, and a name nothing prints
@@ -11165,6 +11165,99 @@ def test_a_bitfield_reads_as_wide_as_its_field():
             for _ in range(200):
                 x = rng.getrandbits(64)
                 assert dart(t, x) == arm(mn, x, lsb, width), (mn, lsb, width, t, hex(x))
+
+def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
+    # d0, v0.16b and q0 are one register, and tier 3 tracked a double under the spelling
+    # it was written with: `eor v0.16b, v0.16b, v0.16b` (how the VM loads 0.0), `movi`,
+    # `ldr q0` and `ins v0.d[0]` all left d0 describing the double loaded before them,
+    # so the store after printed that (#114).
+    from jadart.expr import lift_function
+
+    def lift(mid):
+        rows = [(0, "ldur", "d0, [x20, #7]", ""), mid, (8, "stur", "d0, [x21, #7]", ""),
+                (12, "ret", "", "")]
+        return [ln.strip() for ln in lift_function(rows)]
+
+    # An `if` that leaves 0.0 in d1 on one arm names it at the join, unless the other
+    # arm's d1 is the bare register: a join inside that arm lost the value, which reads
+    # just like the d1 from before the `if`, and the name would carry that one down an
+    # arm that loaded a field.
+    rows = [("cbz", "x0, #0x10"), ("movi", "d1, #0"), ("b", "#0x24"), ("nop", ""),
+            ("cbz", "x2, #0x1c"), ("ldur", "d1, [x3, #7]"), ("b", "#0x20"),
+            ("ldur", "d1, [x3, #0xf]"), ("nop", ""), ("stur", "d1, [x4, #7]"),
+            ("ret", "")]
+    assert [ln.strip() for ln in lift_function(
+        [(i * 4, *r, "") for i, r in enumerate(rows)])] == [
+        "x4.field_0x8 = d1;", "return x0;"]
+
+    # the two ways the VM zeroes a double are 0.0
+    for mid in ((4, "eor", "v0.16b, v0.16b, v0.16b", ""), (4, "movi", "v0.2d, #0", ""),
+                (4, "movi", "d0, #0", "")):
+        assert lift(mid) == ["DISPATCH.field_0x7 = 0.0;", "return 0.0;"], mid
+    # anything else that writes the register leaves the double unknown, not stale
+    for mid, raw in (((4, "ldr", "q0, [x22, #0x10]", ""), []),
+                     ((4, "ins", "v0.d[0], x3", ""), ["ins v0.d[0], x3"]),
+                     ((4, "eor", "v0.16b, v0.16b, v1.16b", ""), []),
+                     ((4, "movi", "v0.2d, #0xff", ""), ["movi v0.2d, #0xff"])):
+        assert lift(mid) == raw + ["DISPATCH.field_0x7 = d0;", "return d0;"], mid
+    # and another register's write leaves it alone
+    assert lift((4, "eor", "v1.16b, v1.16b, v1.16b", "")) == [
+        "DISPATCH.field_0x7 = x20.field_0x8;", "return x20.field_0x8;"]
+    # A q-register copy keeps reading as one, and a write to d0 in between ends it.
+    copy = [(0, "ldr", "q0, [x1, #0x10]", ""), (4, "str", "q0, [x2, #0x10]", ""),
+            (8, "ret", "", "")]
+    stale = copy[:1] + [(4, "fmov", "d0, #1.0", ""), (8, "str", "q0, [x2, #0x10]", ""),
+                        (12, "ret", "", "")]
+    kept = [ln.strip() for ln in lift_function(copy)]
+    ended = [ln.strip() for ln in lift_function(stale)]
+    assert kept[0] == "x2.field_0x11 = x1.field_0x11;", kept
+    assert ended[0] == "x2.field_0x11 = q0;", ended
+    # and so does a call, which clobbers the register whatever it is called
+    called = copy[:1] + [(4, "bl", "#0x100", ""), (8, "str", "q0, [x2, #0x10]", ""),
+                         (12, "ret", "", "")]
+    assert "x2.field_0x11 = q0;" in [ln.strip() for ln in lift_function(called)]
+    # and so does a loop that writes d0, whose state after it forgets d0
+    looped = copy[:1] + [(4, "fmov", "d0, #1.0", ""), (8, "subs", "x3, x3, #1", ""),
+                         (12, "b.ne", "#0x4", ""), (16, "str", "q0, [x2, #0x10]", ""),
+                         (20, "ret", "", "")]
+    assert "x2.field_0x11 = q0;" in [ln.strip() for ln in lift_function(looped)]
+
+    # Zeroing a double for a comparison is no vote on what the function returns: x0 here.
+    assert [ln.strip() for ln in lift_function(
+        [(0, "mov", "x0, x2", ""), (4, "eor", "v0.16b, v0.16b, v0.16b", ""),
+         (8, "fcmp", "d1, d0", ""), (12, "ret", "", "")])] == ["return x2;"]
+    # A loop that writes v0 writes d0, so the 0.0 from before it does not stand after it.
+    after = [ln.strip() for ln in lift_function(
+        [(0, "eor", "v0.16b, v0.16b, v0.16b", ""), (4, "mov", "v0.16b, v1.16b", ""),
+         (8, "subs", "x3, x3, #1", ""), (12, "b.ne", "#0x4", ""),
+         (16, "stur", "d0, [x2, #7]", ""), (20, "ret", "", "")])]
+    assert "x2.field_0x8 = d0;" in after, after
+    # A join one arm of which is the 0.0 the eor made is named, as a computed one is, so a
+    # spill of it read back after a call still says what it holds.
+    joined = [ln.strip() for ln in lift_function(
+        [(0, "cbz", "x0, #0xc", ""), (4, "ldur", "d0, [x1, #7]", ""),
+         (8, "b", "#0x10", ""),
+         (12, "eor", "v0.16b, v0.16b, v0.16b", ""), (16, "stur", "d0, [x29, #-8]", ""),
+         (20, "bl", "#0x100", ""), (24, "ldur", "d1, [x29, #-8]", ""),
+         (28, "stur", "d1, [x2, #7]", ""), (32, "ret", "", "")])]
+    assert "t0 = 0.0;" in joined and "x2.field_0x8 = t0;" in joined, joined
+
+    # The clean fixture's lerp clamps to [0.0, 1.0]: `eor v4.16b` zeroes d4, which held a
+    # product a moment before, and main compared that product.
+    _needs_capstone()
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
+    from jadart.expr import make_arity_resolver
+    image, fr, _hdr = load_instructions(CLEAN)
+    p2n = function_name_by_pc(image, fr)
+    pm, ar = build_pool_map(fr), make_arity_resolver(image)
+    cr = next(c for c in image.all_ranges
+              if c.pc_offset <= 0x11a9c8 < c.pc_offset + (c.size or 0))
+    body = "\n".join(lift_function(_ann(image, disassemble_range(image, cr), p2n, pm),
+                                   pm, arity=ar))
+    assert "if (0.0 > (" in body, body
+    assert "(d0 * x3.field_0x8) > (" not in body
+
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
