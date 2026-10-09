@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A branch reads the operands its flags were set from.** `subs x1, x1, #8` sets the
+  flags from the x1 it is overwriting, and tier 3 rendered the branch after it with the
+  x1 that was left: a copy loop in the clean fixture (0x2d32c8) printed `if (x1 == 8)`
+  after the raw `subs`, where the machine leaves when the new x1 is 0. A branch's
+  condition is rendered from the operands as the flag-setting instruction read them,
+  which the lifter already kept for `csel`, and where something reads the flags an old
+  value spelled with the register being overwritten is named first (`var t0 = x1;`),
+  for a `csel` too. A `cbz` or `tbz` reads its register as it is. Of the conditions
+  this changes, 118 of 213 on the clean fixture and 114 of 207 on 3.4.4 were wrong
+  after a `subs` or `adds`; the rest follow an `ands`, which reads the same either way.
+  Tier 3 exports change by 1,923 lines in 7 files on the clean fixture, 1,803 in 7 on
+  3.4.4 and 1,870 in 7 on 3.10.9, much of it later temps renumbered, and by 8 and 12
+  lines on obf and 2.19.6. Closes #116.
 - **cfgcheck knows which arm of an `if` is taken.** It compared the set of places an
   `if`'s arms go with the set the block's CFG records, never which arm was which, so an
   `if` rendered the other way round, each arm running exactly when it should not, passed:

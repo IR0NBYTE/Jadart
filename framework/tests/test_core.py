@@ -10257,6 +10257,62 @@ def test_assets_are_written_one_to_a_file_and_failures_name_the_right_side(tmp_p
     assert not (tmp_path / "out3" / "assets").exists()
 
 
+def test_a_branch_reads_the_operands_its_flags_were_set_from():
+    # `subs x1, x1, #8` sets the flags from the x1 it overwrites, and the branch after it
+    # printed its condition with the x1 that was left: the clean fixture's copy loop read
+    # `if (x1 == 8) break;` after the raw `subs`, where the machine leaves when the new x1
+    # is 0 (#116). The condition is rendered from the operands as the flags saw them, and
+    # an old value spelled with the register being overwritten is named first.
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(rows)]
+
+    assert lift([(0, "subs", "x1, x1, #8", ""), (4, "b.ne", "#0xc", ""),
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")]) == [
+        "var t0 = x1;", "subs x1, x1, #8", "if (t0 == 8) {", "x2.field_0x8 = 0;", "}",
+        "return x0;"]
+    assert lift([(0, "ands", "x3, x3, #0xfffffff9", ""), (4, "b.eq", "#0xc", ""),
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[2] == (
+        "if ((t0 & 0xfffffff9) != 0) {")
+    # an operand that is a field read keeps its text, and needs no name
+    assert lift([(0, "ldur", "x1, [x2, #0xf]", ""), (4, "subs", "x1, x1, #8", ""),
+                 (8, "b.ne", "#0x10", ""), (12, "str", "xzr, [x2, #7]", ""),
+                 (16, "ret", "", "")])[1] == "if (x2.field_0x10 == 8) {"
+    # and in the copy loop the loop's own name for x1 is the old value
+    body = lift([(0, "ldr", "x0, [x3], #8", ""), (4, "str", "x0, [x4], #8", ""),
+                 (8, "subs", "x1, x1, #8", ""), (12, "b.ne", "#0x0", ""),
+                 (16, "ret", "", "")])
+    assert body[body.index("subs x1, x1, #8") + 1] == "if (t0 == 8) {", body
+    # A compare sets the flags without writing, and reads as it always did.
+    assert lift([(0, "cmp", "x1, #8", ""), (4, "b.ne", "#0xc", ""),
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[0] == (
+        "if (x1 == 8) {")
+    # A select reads the flags as the branch does.
+    assert lift([(0, "subs", "x1, x1, #8", ""), (4, "csel", "x0, x3, x4, ne", ""),
+                 (8, "ret", "", "")]) == [
+        "var t0 = x1;", "subs x1, x1, #8", "return t0 != 8 ? x3 : x4;"]
+    # cbz and tbz test their register as it is when they run, not the flags left by
+    # the instruction before, and with nothing reading the flags nothing is named.
+    assert lift([(0, "subs", "x1, x1, #8", ""), (4, "cbz", "x1, #0xc", ""),
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[:2] == [
+        "subs x1, x1, #8", "if (x1 != 0) {"]
+    assert lift([(0, "subs", "x1, x1, #2", ""), (4, "tbnz", "x1, #1, #0xc", ""),
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[1] == (
+        "if ((x1 >> 1) & 1 == 0) {")
+    assert lift([(0, "ldur", "x0, [x2, #7]", ""), (4, "cmp", "x0, #5", ""),
+                 (8, "stur", "xzr, [x2, #7]", ""), (12, "cbz", "x0, #0x14", ""),
+                 (16, "stur", "x0, [x2, #0xf]", ""), (20, "ret", "", "")])[2] == (
+        "if (t0 != 0) {")
+    assert lift([(0, "subs", "x1, x1, #8", ""), (4, "str", "x1, [x2, #7]", ""),
+                 (8, "ret", "", "")])[0] == "subs x1, x1, #8"
+    # ...nor where the flags are replaced, or an operand overwritten, before the select.
+    for row in (("sbcs", "x5, x6, x7"), ("mov", "x1, #3")):
+        body = lift([(0, "subs", "x1, x1, #8", ""), (4, *row, ""),
+                     (8, "csel", "x0, x3, x4, ne", ""), (12, "ret", "", "")])
+        assert body[0] == "subs x1, x1, #8", body
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
