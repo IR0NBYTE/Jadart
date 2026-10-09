@@ -27,7 +27,7 @@ import struct
 from .errors import ContainerError, MissingSymbol
 from dataclasses import dataclass
 
-from .elf import Symbol, DART_MAGIC
+from .elf import DART_MAGIC, ReadBudget, Symbol
 
 MH_MAGIC_64 = 0xFEEDFACF
 MH_CIGAM_64 = 0xCFFAEDFE          # big-endian 64 (not supported; arm64/x64 are LE)
@@ -78,6 +78,10 @@ class MachO64:
             struct.unpack_from("<IiiIIIII", d, 0)
         self.sections: list[MachSection] = []
         self.symbols: dict[str, Symbol] = {}
+        # Nothing ties a segment's section count to its load command, or a symbol's name
+        # offset to one name, so both are charged against the file's size (#95).
+        budget = self._budget = ReadBudget(len(d))
+        names: dict = {}        # (start, end of its table) -> the name there, read once
         off = 32
         for _ in range(ncmds):
             cmd, cmdsize = struct.unpack_from("<II", d, off)
@@ -86,6 +90,7 @@ class MachO64:
             if cmd == LC_SEGMENT_64:
                 segname = d[off + 8:off + 24].split(b"\x00")[0].decode("utf-8", "replace")
                 nsects, = struct.unpack_from("<I", d, off + 64)
+                budget.charge("section headers", nsects * 80)
                 so = off + 72
                 for _i in range(nsects):
                     sect = d[so:so + 16].split(b"\x00")[0].decode("utf-8", "replace")
@@ -95,22 +100,29 @@ class MachO64:
                     so += 80
             elif cmd == LC_SYMTAB:
                 symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", d, off + 8)
+                # The entries that fit in the file, which is where reading them stopped.
+                nsyms = min(nsyms, max(0, (len(d) - symoff) // 16))
+                budget.charge("symbol tables", nsyms * 16)
                 for i in range(nsyms):
                     base = symoff + i * 16
-                    if base + 16 > len(d):
-                        break
                     n_strx, n_type, _n_sect, _n_desc, n_value = struct.unpack_from(
                         "<IBBHQ", d, base)
                     if not n_strx or (n_type & N_TYPE) != N_SECT:
                         continue
                     # Bounded by the declared string-table size. Unbounded, a table with
                     # no NUL scans the whole file, and find returning -1 sliced to len-1
-                    # and produced a name made of whatever followed the real one.
+                    # and produced a name made of whatever followed the real one. A scan
+                    # that finds no NUL costs as much as one that does, so both are
+                    # charged, and never less than nothing for a start past the table.
                     start = stroff + n_strx
-                    end = d.find(b"\x00", start, min(len(d), stroff + strsize))
-                    if end < 0:
-                        continue
-                    nm = d[start:end].decode("utf-8", "replace")
+                    stop = min(len(d), stroff + strsize)
+                    nm = names.get((start, stop))
+                    if nm is None:
+                        end = d.find(b"\x00", start, stop)
+                        budget.charge("names in the string tables",
+                                      max(0, (stop if end < 0 else end + 1) - start))
+                        nm = names[start, stop] = (
+                            d[start:end].decode("utf-8", "replace") if end >= 0 else "")
                     if not nm:
                         continue
                     # Keep the name exactly as written: the snapshot blobs are spelled
@@ -151,11 +163,13 @@ class MachO64:
         end = sec.addr + sec.size
         # Tighten to the next snapshot boundary symbol in the same section, but NOT to the
         # next symbol generally: that would cut the instructions image at its first
-        # function. Only the _kDart* blobs delimit each other.
+        # function. Only the _kDart* blobs delimit each other. Between sym and the end of
+        # its section is inside the section already; looking the section up again for each
+        # boundary symbol scanned every section per symbol, which a crafted file made cost
+        # their product (#95).
         for other in self.symbols.values():
             if (other.value > sym.value and other.value < end
-                    and other.name.lstrip("_").startswith("kDart")
-                    and self._section_of(other.value) is sec):
+                    and other.name.lstrip("_").startswith("kDart")):
                 end = other.value
         off = self.va_to_offset(sym.value)
         return self.data[off:off + (end - sym.value)]

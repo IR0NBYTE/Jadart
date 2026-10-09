@@ -27,6 +27,10 @@ These are deliberate, tested properties rather than assumptions:
 - **`export` strips `.` and `..` from every library URL** before it becomes a path, and
   extracted members are taken by basename, so a crafted library name cannot escape the
   output directory.
+- **A container's tables cannot cost more than the file.** ELF and Mach-O names, symbol
+  tables and sections are found by offsets and counts the file gives. Each name is read
+  once, and a file whose tables come to more bytes than it holds, which only overlapping
+  ones can, exits `2`.
 - **Unknown format versions are refused, not guessed at.** This is a security property, not
   only a correctness one: a mis-parsed snapshot produces a plausible-looking object graph,
   and someone auditing an app would act on it.
