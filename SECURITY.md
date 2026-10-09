@@ -31,6 +31,9 @@ These are deliberate, tested properties rather than assumptions:
   tables and sections are found by offsets and counts the file gives. A symbol on a name
   offset read already is skipped, and a file whose tables come to more bytes than it
   holds, which only overlapping ones can, exits `2`.
+- **A stripped binary is read for two snapshots at most.** Without snapshot symbols, the
+  scan for the snapshot magic stops at a third hit, and the file exits `2` before any of
+  them is parsed: a library holds two at most, the vm and the isolate one.
 - **Unknown format versions are refused, not guessed at.** This is a security property, not
   only a correctness one: a mis-parsed snapshot produces a plausible-looking object graph,
   and someone auditing an app would act on it.

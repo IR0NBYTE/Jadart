@@ -39,6 +39,22 @@ SHT_NOBITS = 8
 DART_MAGIC = 0xDCDCF5F5
 
 
+def find_magic(data: bytes, limit: int | None = None) -> list[int]:
+    """File offsets where the Dart snapshot magic sits, at most `limit` of them.
+
+    Pass a limit for anything read from a file: a file of nothing but the magic has one
+    every four bytes, and listing them all took a 32 MB one to 429 MB (#99)."""
+    needle = struct.pack("<I", DART_MAGIC)
+    out, start = [], 0
+    while limit is None or len(out) < limit:
+        i = data.find(needle, start)
+        if i < 0:
+            break
+        out.append(i)
+        start = i + 4
+    return out
+
+
 class ReadBudget:
     """What reading a container's tables has cost so far, in bytes of the file, by kind.
 
@@ -243,17 +259,9 @@ class Elf:
         out.sort(key=lambda s: s.value)
         return out
 
-    def find_snapshot_magic(self) -> list[int]:
+    def find_snapshot_magic(self, limit: int | None = None) -> list[int]:
         """Fallback for stripped binaries: file offsets where the Dart magic sits."""
-        needle = struct.pack("<I", DART_MAGIC)
-        out, start = [], 0
-        while True:
-            i = self.data.find(needle, start)
-            if i < 0:
-                break
-            out.append(i)
-            start = i + 4
-        return out
+        return find_magic(self.data, limit)
 
 
 # The reader handled only 64-bit when it was written, and the name is used across the

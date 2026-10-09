@@ -9330,6 +9330,125 @@ def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_
     assert doc["type"] == "ContainerError" and doc["error"].startswith(names), doc
 
 
+def test_the_magic_scan_refuses_more_snapshots_than_a_library_holds(
+        tmp_path, monkeypatch):
+    # A binary with no _kDart*SnapshotData symbols is read by scanning for the snapshot
+    # magic, and each hit was parsed out of a copy of the rest of the file: a file of
+    # small headers cost hits times its size, 9.7s for 16 MB and four times that for
+    # each doubling, and `info` listed every one (#99). A library holds two snapshots at
+    # most, the vm and the isolate one.
+    import contextlib
+    import dataclasses
+    import io
+    import json
+    from jadart import cli
+    from jadart import snapshot
+    from jadart.elf import Elf, find_magic
+    from jadart.macho import MachO64, open_container
+    from jadart.stream import ReadStream
+
+    d = open(CLEAN, "rb").read()
+    real = parse_libapp(CLEAN)
+
+    # The fixture with its section headers gone has no symbols to find the snapshots by,
+    # and the scan finds the same two headers they name.
+    bare = bytearray(d)
+    struct.pack_into("<HHH", bare, 0x3A, 0, 0, 0)
+    path = tmp_path / "stripped.so"
+    path.write_bytes(bare)
+    got = parse_libapp(str(path))
+    assert list(got) == ["blob0", "blob1"]
+    assert dataclasses.replace(got["blob0"], which="vm") == real["vm"]
+    assert dataclasses.replace(got["blob1"], which="isolate") == real["isolate"]
+
+    # The fixture's vm header up to its counts, the five counts zero, and a length that
+    # is its own size, so a copy of it is a whole snapshot header on its own.
+    vm = Elf(d).symbol_bytes("_kDartVmSnapshotData")
+    st = ReadStream(vm, 52)
+    st.read_cstring()
+    hdr = bytearray(vm[:st.pos]) + bytes([0x80] * 5)
+    struct.pack_into("<q", hdr, 4, len(hdr))
+    hdr = bytes(hdr)
+
+    def elf(body):
+        eh = bytearray(64)
+        eh[0:4] = b"\x7fELF"; eh[4] = 2; eh[5] = 1; eh[6] = 1
+        return bytes(eh) + body             # no section headers, so no symbols
+
+    def macho(body):
+        mh = struct.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6, 0, 0, 0, 0)
+        return mh + body                    # no load commands, so no symbols
+
+    calls, asked = [], []
+    real_parse = snapshot.parse_blob
+
+    def counted(blob, which, **kw):
+        calls.append(which)
+        return real_parse(blob, which, **kw)
+
+    monkeypatch.setattr(snapshot, "parse_blob", counted)
+    # The scan has to be asked for three, not made to find them all and cut to three:
+    # that refused the same files and still took a file of nothing but the magic to
+    # 396 MB.
+    for cls in (Elf, MachO64):
+        def scan(self, limit=None, real=cls.find_snapshot_magic):
+            asked.append(limit)
+            return real(self, limit)
+        monkeypatch.setattr(cls, "find_snapshot_magic", scan)
+
+    magic = struct.pack("<I", 0xDCDCF5F5)
+    for build, at in ((elf, 64), (macho, 32)):
+        # Two are what a library holds, and read as before.
+        path.write_bytes(build(hdr * 2))
+        calls.clear(); asked.clear()
+        got = parse_libapp(str(path))
+        assert list(got) == ["blob0", "blob1"] and calls == ["blob0", "blob1"]
+        assert asked == [3]
+        for h in got.values():
+            assert (h.length, h.version_hash, h.features, h.num_objects) == (
+                len(hdr), real["vm"].version_hash, real["vm"].features, 0)
+        # and a release nothing has vetted is refused unless asked to be lenient
+        unknown = hdr[:20] + b"0" * 32 + hdr[52:]
+        path.write_bytes(build(unknown * 2))
+        with pytest.raises(UnknownEpoch):
+            parse_libapp(str(path))
+        assert [h.epoch for h in parse_libapp(str(path), strict=False).values()] == [
+            None, None]
+
+        # A third is refused before any is parsed, and the scan stops at it.
+        # Nothing but the magic, one every four bytes, is refused at the third as well.
+        for body, step in ((hdr * 3, len(hdr)), (hdr * 2000, len(hdr)),
+                           (magic * 1000, 4)):
+            path.write_bytes(build(body))
+            calls.clear(); asked.clear()
+            with pytest.raises(jadart.InputError) as e:
+                parse_libapp(str(path))
+            offs = ", ".join(hex(at + i * step) for i in range(3))
+            assert f"magic is at 3 or more file offsets ({offs}). " in str(e.value)
+            assert calls == [], f"{len(calls)} headers parsed before refusing"
+            assert asked == [3]
+            assert open_container(path.read_bytes()).find_snapshot_magic(3) == [
+                at + i * step for i in range(3)]
+
+    # The scan itself holds only what it is asked for.
+    assert find_magic(magic * 1000, 3) == [0, 4, 8]
+    assert find_magic(magic * 1000) == list(range(0, 4000, 4))
+    assert find_magic(b"\x00" + magic * 2, 3) == [1, 5]
+    assert find_magic(b"", 3) == []
+    for build in (elf, macho):
+        assert open_container(build(magic * 1000)).find_snapshot_magic(limit=3) == [
+            len(build(b"")) + i for i in (0, 4, 8)]
+
+    # and through the command line, a typed failure that says why
+    path.write_bytes(elf(hdr * 3))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["info", str(path), "-j"]) == 2
+    doc = json.loads(buf.getvalue())
+    assert doc["type"] == "InputError" and "A Flutter library holds at most 2 " in (
+        doc["error"]), doc
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
