@@ -9516,6 +9516,205 @@ def test_a_features_string_is_read_only_as_long_as_a_real_one_can_be(tmp_path):
     assert parse_libapp(CLEAN)["vm"].features == feat.decode()
 
 
+def test_export_gives_every_library_a_file_of_its_own(tmp_path, monkeypatch):
+    # A library url is text out of the snapshot, and export wrote each one where its url
+    # said. Two could be one file: obfuscation names libraries `Ahd` and `ahd`, one file
+    # on macOS and Windows, and the obfuscated fixture lost 99 of its 307 libraries to
+    # that without a word. One could need for a file what another needs as a directory,
+    # which ended the export with exit 3, and so did a url nested past what the OS takes
+    # in one path. An output directory it cannot write was exit 3 as well (#96).
+    import contextlib
+    import errno
+    import importlib
+    import io
+    import json
+    import unicodedata
+    from jadart import cli
+    # the modules, not the API functions the package exports under the same names
+    ex = importlib.import_module("jadart.export")
+    program = importlib.import_module("jadart.program")
+
+    up = ex.unique_paths
+    j = os.path.join
+    # a file where another library needs a directory gives way, whatever the order
+    for rels in ([j("zz", "foo.dart"), j("zz", "foo.dart", "bar.dart")],
+                 [j("zz", "foo.dart", "bar.dart"), j("zz", "foo.dart")]):
+        bar = j("zz", "foo.dart", "bar.dart")
+        assert up(rels) == {j("zz", "foo.dart"): j("zz", "foo~2.dart"), bar: bar}
+    # and one where a library deeper down needs a directory, not only the next one down
+    assert up([j("zz", "foo.dart"), j("zz", "foo.dart", "x", "y.dart")])[
+        j("zz", "foo.dart")] == j("zz", "foo~2.dart")
+    # so does one that differs from a directory only in case
+    got = up([j("zz", "Foo.dart"), j("zz", "foo.dart", "x.dart")])
+    assert got[j("zz", "Foo.dart")] == j("zz", "Foo~2.dart")
+    got = up([j("zz", "foo.dart"), j("zz", "FOO.dart", "x.dart")])
+    assert got[j("zz", "foo.dart")] == j("zz", "foo~2.dart")
+    # case and composition: the first in sorted order keeps its name, and a new name is
+    # never one a library has already
+    assert up(["Ahd.dart", "ahd.dart"]) == {"Ahd.dart": "Ahd.dart",
+                                            "ahd.dart": "ahd~2.dart"}
+    assert up(["a.dart", "A.dart", "a~2.dart"]) == {
+        "A.dart": "A.dart", "a.dart": "a~3.dart", "a~2.dart": "a~2.dart"}
+    nfc, nfd = "caf\u00e9.dart", "cafe\u0301.dart"
+    assert unicodedata.normalize("NFC", nfd) == nfc
+    assert sorted(up([nfc, nfd]).values()) == sorted([nfd, "caf\u00e9~2.dart"])
+    assert up(["x"]) == {"x": "x"} and up(["x", "X"])["x"] == "x~2"
+    # Composed, these two fold apart; APFS holds them one file, as the canonical caseless
+    # match does.
+    greek = ["\u0391\u0342\u0345.dart", "\u0391\u0342\u0399.dart"]
+    # and two orders of one pair of marks are one name too, which only the inner NFD sees
+    marks = ["\u0391\u0345\u0342.dart", "\u0391\u0342\u0345.dart"]
+    assert up(marks)[marks[0]] == "\u0391\u0345\u0342~2.dart"
+    assert up(greek) == {greek[0]: greek[0], greek[1]: "\u0391\u0342\u0399~2.dart"}
+    # nor a directory another library needs
+    got = up([j("zz", "Foo.dart"), j("zz", "foo.dart"), j("zz", "foo~2.dart", "x.dart")])
+    assert got[j("zz", "foo.dart")] == j("zz", "foo~3.dart")
+    # Every case spelling of one name: each gets a file, and the numbering counts on
+    # rather than trying every number again for each, which was quadratic.
+    import itertools
+    cases = [(c, c.upper()) for c in "abcdefghijkl"]
+    spell = ["".join(c) + ".dart" for c in itertools.product(*cases)]
+    folds = []
+    real_fold = ex._fold
+    monkeypatch.setattr(ex, "_fold", lambda r: folds.append(r) or real_fold(r))
+    got = up(spell)
+    monkeypatch.undo()
+    assert len({real_fold(p) for p in got.values()}) == len(spell) == 4096
+    assert len(folds) < 8 * len(spell), f"{len(folds)} folds for {len(spell)} paths"
+
+    # One component is cut to 120 bytes of UTF-8 on a character, a path to 400 bytes by
+    # its deepest directories, and a lone surrogate, which no filesystem names a file
+    # with, is replaced like any other character a filename cannot hold.
+    # (100 characters, under the cap, but 400 bytes)
+    wide = ex.library_path("package:zz/" + "\U0001d538" * 100)
+    head, name = wide.split(os.sep)
+    assert head == "zz" and 115 < len(name.encode()) < 120
+    # a cut that ends on a dot loses it, as Windows would
+    assert ex.library_path("package:zz/" + "a" * 119 + ".b" * 20) == j("zz", "a" * 119)
+    dirs = [f"d{i:02d}" + "x" * 27 for i in range(40)]
+    deep = ex.library_path("package:" + "/".join(dirs) + "/x.dart")
+    parts = deep.split(os.sep)
+    assert 400 - 31 < len(deep.encode()) <= 400 and parts[-1] == "x.dart"
+    assert parts[:-1] == dirs[:len(parts) - 1]
+    assert ex.library_path("package:zz/a\ud800b") == j("zz", "a_b.dart")
+    # A Windows device name is still caught where the cut leaves one bare, as a file or
+    # as a directory; a file's own name that comes to nothing is `unnamed.dart`, not the
+    # directory above it; and a path goes no more than 16 directories down.
+    assert ex.library_path("package:zz/nul" + " " * 117 + "x" * 10) == j("zz", "_nul")
+    assert ex.library_path("package:aux" + " " * 120 + "x/y") == j("_aux", "y.dart")
+    for dev in ("com0", "lpt0", "com\u00b9", "lpt\u00b3"):
+        assert ex.library_path("package:zz/" + dev) == j("zz", "_" + dev + ".dart")
+    assert ex.library_path("package:zz/" + "." * 130 + "x") == j("zz", "unnamed.dart")
+    assert ex.library_path("package:" + "d/" * 40 + "x").count(os.sep) == 16
+
+    # An output directory on a drive or a share that is not there, where dirname of its
+    # root is the root itself, forever
+    with monkeypatch.context() as m:
+        m.setattr(ex.os.path, "lexists", lambda p: False)
+        with pytest.raises(jadart.InputError) as e:
+            ex._check_outdir(str(tmp_path / "gone" / "out"))
+        assert "does not exist" in str(e.value)
+
+    _needs_capstone()                     # from here on the fixture is read and lifted
+    # The same through `export`, with library urls of the clean fixture renamed to these.
+    crafted = {"_unattributed": "named so",
+               "package:zz/foo": "foo", "package:zz/foo.dart/bar": "bar",
+               "package:zz/Case": "Case", "package:zz/case": "case",
+               "package:" + "d/" * 600 + "deep": "deep",
+               "package:zz/" + "\U0001d538" * 100: "wide"}
+    real_libraries = program.Program.libraries
+
+    def libraries(self):
+        libs = real_libraries(self)
+        mine = sorted(u for u in libs if u.startswith("package:") and "flutter" not in u)
+        assert len(mine) > len(crafted)
+        for old, new in zip(mine, crafted):
+            libs[new] = libs.pop(old)
+        # and one more left out, so its classes have no library
+        del libs[mine[len(crafted)]]
+        return libs
+
+    monkeypatch.setattr(program.Program, "libraries", libraries)
+
+    def run(out, *more):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["export", CLEAN, "-t", "1", "-q", "-o", str(out), "-j", *more])
+        return rc, json.loads(buf.getvalue())
+
+    out = tmp_path / "out"
+    rc, doc = run(out)
+    assert rc == 0, doc
+    files = doc["files"]
+    on_disk = [os.path.relpath(j(d, f), out / "sources")
+               for d, _, fs in os.walk(out / "sources") for f in fs]
+    assert sorted(on_disk) == sorted(files) and len(files) == doc["libraries"]
+    assert len({ex._fold(f) for f in files}) == len(files)
+    assert doc["renamed"] == {j("zz", "foo.dart"): j("zz", "foo~2.dart"),
+                              j("zz", "case.dart"): j("zz", "case~2.dart")}
+    for want, rel in doc["renamed"].items():
+        head = (out / "sources" / rel).read_text().split("\n")[1]
+        assert head == "// lib: package:zz/" + want[3:-5], head
+    summary = (out / "summary.txt").read_text()
+    assert "renamed     2 library files" in summary
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["export", CLEAN, "-t", "1", "-q", "-o", str(tmp_path / "t")])
+    assert rc == 0
+    assert "2 renamed so that each has a file of its own" in buf.getvalue()
+    # A library named `_unattributed` keeps its classes, and the classes with no library
+    # go beside it, where the summary says.
+    assert "went to sources/_unattributed_2.dart" in summary
+    named_so = (out / "sources" / "_unattributed.dart").read_text().split("\n")[1]
+    assert named_so == "// lib: _unattributed"
+    assert (out / "sources" / "_unattributed_2.dart").read_text().split("\n")[1] == (
+        "// lib: _unattributed~2")
+    # `-a` writes the app's own libraries only, and says so rather than naming a file
+    rc, doc = run(tmp_path / "app", "-a")
+    summary = (tmp_path / "app" / "summary.txt").read_text()
+    assert rc == 0, doc
+    assert "had no library and are left out with the framework (-a)" in summary
+    assert not (tmp_path / "app" / "sources" / "_unattributed_2.dart").exists()
+    assert f"{j('zz', 'case.dart')} -> {j('zz', 'case~2.dart')}" in summary
+
+    # An output directory that cannot be one is refused before the binary is read, and
+    # one that cannot be written is the same InputError when it is found.
+    from jadart import disasm
+    loaded = []
+    real_load = disasm.load_instructions
+    monkeypatch.setattr(disasm, "load_instructions",
+                        lambda *a, **k: loaded.append(a) or real_load(*a, **k))
+    a_file = tmp_path / "a_file"
+    a_file.write_text("x")
+    for bad, why in ((a_file, "is not a directory"),
+                     (a_file / "x" / "y", "a_file is not")):
+        loaded.clear()
+        rc, doc = run(bad)
+        assert rc == 2 and doc["type"] == "InputError" and why in doc["error"], doc
+        assert doc["error"].startswith(f"{bad}: ") and loaded == [], doc
+    if os.geteuid() != 0:
+        ro = tmp_path / "ro"
+        ro.mkdir()
+        ro.chmod(0o555)
+        try:
+            rc, doc = run(ro / "out")
+        finally:
+            ro.chmod(0o755)
+        assert rc == 2 and "Permission denied" in doc["error"], doc
+    # a write that fails part way, a full disk say
+    real_open = open
+
+    def full(path, mode="r", *a, **k):
+        if "w" in mode and str(path).endswith("pool.txt"):
+            raise OSError(errno.ENOSPC, "No space left on device", str(path))
+        return real_open(path, mode, *a, **k)
+
+    monkeypatch.setattr(ex, "open", full, raising=False)
+    rc, doc = run(tmp_path / "full")
+    assert rc == 2 and "No space left on device" in doc["error"], doc
+    assert doc["error"].startswith(f"{tmp_path / 'full'}: "), doc
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

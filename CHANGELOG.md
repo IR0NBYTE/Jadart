@@ -23,6 +23,34 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   that runs past 4096 bytes raised `TruncatedSnapshot` before and is that `InputError`
   too, and one that ends inside the bound with no NUL is still reported truncated. The 92
   headers of 46 real libapp.so hold 118 to 156 bytes and read as before. Closes #101.
+- **`export` no longer writes one library over another.** A library goes where its url
+  says, and nothing checked that two did not land in one place. Obfuscation names
+  libraries by short tokens, and `Ahd` and `ahd` are one file on macOS and Windows: the
+  second overwrote the first, so on a Mac the obfuscated fixture's export listed 307
+  libraries and held 208, HiveHex lost 128 and an obfuscated flagcheck build 129, without
+  a word. A library whose file another needed as a directory (`package:zz/foo` and
+  `package:zz/foo.dart/bar`) ended the export with exit 3, and so could a long url under
+  a long output directory, past the 1024 bytes macOS takes in one path. Each library's
+  path is now held unique under Unicode's canonical caseless match, which is how APFS
+  compares names: the first in sorted order keeps its name, a path another library needs
+  as a directory stays one, and the file that gives way takes `~2` (or the next free
+  number) before `.dart`, on every platform alike. `summary.txt` lists each move, the
+  terminal says how many, and `-j` gives them as `renamed`; the `files` list names the
+  new paths. On a disk that ignores case this recovers the libraries main lost; on Linux,
+  where main wrote both of each pair, those 356 files across the three builds keep their
+  contents under the new names. A path component is held to 120 bytes of UTF-8 rather
+  than 120 characters, which ext4 refused past 255 bytes, a Windows device name is caught
+  after that cut as well as before and now takes in COM0, LPT0 and the superscript
+  digits, a path goes at most 16 directories and 400 bytes down (real ones go 3 and 71),
+  a lone surrogate is replaced like any character a filename cannot hold, and a file name
+  that cuts to nothing is `unnamed.dart`. A library whose url is `_unattributed` lost its
+  classes to the ones with no library; those go beside it now, and the summary names the
+  file they went to, or says `-a` left them out, where it named a file `-a` never wrote.
+  An output directory that is a file, or under one, is refused before the binary is read,
+  and any failure to write the sources or the listings beside them (permission, a full
+  disk) is an `InputError` (exit 2) naming it, where those were exit 3 too; assets are
+  #104. On the fixtures, four corpus builds and the CTF apps, every file main wrote has
+  the same contents. Closes #96.
 - **A stripped binary is read for two snapshots at most.** With no `_kDart*SnapshotData`
   symbols, the snapshots are found by scanning for their magic, and each hit was parsed
   out of a copy of the rest of the file and listed: an ELF of 201 byte snapshot headers

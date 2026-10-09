@@ -212,6 +212,10 @@ def cmd_export(args) -> int:
     print(comment(f"// wrote {stats['libraries']} libraries, {stats['classes']} classes, "
                   f"{stats['methods']} methods to {args.out}/"))
     print(f"  {args.out}/sources/     decompiled tree, one file per library")
+    if stats["renamed"]:
+        pad = " " * (len(str(args.out)) + 16)       # under the descriptions above
+        print(f"{pad}{len(stats['renamed'])} renamed so that each has a file of its own; "
+              f"summary.txt lists them")
     c = stats.get("container")
     if c and c["assets"]:
         extra = f", {c['packages']} packages named" if c["packages"] else ""
