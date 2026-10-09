@@ -33,6 +33,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   the body is the last block's only. Its reports name the ways out, as `exit 0x...`, `cut
   0x...`, `exit return` or `exit indirect`. Every corpus build, arm64 and arm32, and
   120,000 random functions still read 0. Closes #107.
+- **`export` writes no asset over another, and blames a failure on the side it came
+  from.** An APK's or IPA's assets went where their names said, as libraries did before
+  #96: on the Brod & Co. apk with two members added, `Logo.txt` and `logo.txt` left one
+  file on macOS, named `Logo.txt` and holding `logo.txt`'s bytes, while `assets.txt`
+  listed both; a file another member needed as a directory refused the whole archive with
+  exit 2 once the sources were written; a name the archive held twice kept only the last;
+  and jadart's own `NOTICES`, `dependencies.txt` and `AssetManifest.decoded.json` were
+  written over assets of those names, on macOS even when the archive's source was only
+  `notices.z`. Assets take the library rule now, names held twice and names that clean up
+  the same included, and jadart's files come from the members named exactly `NOTICES.Z`
+  and `AssetManifest.bin` (the first, where the archive holds the name twice: main read
+  the last), are taken before the assets, and are left out where an asset needs one of
+  their names as a directory. `assets.txt` lists what each asset was written as and the
+  moves, and `summary.txt` counts them. The library rule also renames: a Windows device
+  name (`con.txt` becomes `_con.txt`), a control character or one of `<>:"|?*` (`_`), a
+  trailing dot or space (dropped), a name past 119 bytes (cut) and a path past 16
+  directories, on every platform, where the raw name went to disk before. Every member is
+  checked against the size limits before any is written, where one past them refused the
+  archive with part of it on disk. A failure writing the output, `<out>/assets` a file or
+  a directory it may not write, was reported as `<apk>: cannot read this archive`, a
+  `ContainerError` about an archive that is fine; it is an `InputError` naming the output
+  directory now, and a failure reading the archive is still its `ContainerError`. The
+  four Flutter apks on hand export byte for byte as before. Closes #104.
 - **A snapshot's features string is read only as long as a real one can be.** It names
   the build's VM flags and target, in under 160 bytes in every AOT build measured, and it
   was read to its NUL however far away that was, kept whole, and printed whole by `info

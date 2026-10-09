@@ -36,9 +36,10 @@ binary is the ONLY index of what the app declares as an asset.
 """
 from __future__ import annotations
 
-from .errors import ContainerError, JadartError
+from .errors import ContainerError, InputError, JadartError
 from .fill import visible
 
+import contextlib
 import gzip
 import json
 import os
@@ -304,11 +305,6 @@ def abi_of(member: str):
     return parts[1] if len(parts) >= 3 and parts[0] == "lib" else None
 
 
-def _safe(outdir: str, rel: str) -> str:
-    parts = [p for p in rel.split("/") if p not in ("", ".", "..")]
-    return os.path.join(outdir, *parts) if parts else ""
-
-
 def unpack(container: str, outdir: str) -> dict:
     """Write outdir/assets/ and inventory the rest of `container`. Returns a stats dict.
 
@@ -320,7 +316,7 @@ def unpack(container: str, outdir: str) -> dict:
     error: `export` is expected to work on all of them.
     """
     stats = {"assets": 0, "assets_bytes": 0, "notable": [], "abis": [], "packages": 0,
-             "declared_assets": 0, "members": 0, "bytes": 0, "groups": {}}
+             "declared_assets": 0, "members": 0, "bytes": 0, "groups": {}, "renamed": []}
     if not os.path.isfile(container) or not zipfile.is_zipfile(container):
         return stats
 
@@ -328,9 +324,9 @@ def unpack(container: str, outdir: str) -> dict:
     # Everything zipfile raises on a malformed or hostile archive is turned into a
     # ContainerError here: BadZipFile for a broken central directory or a failed CRC,
     # zlib.error mid-stream, NotImplementedError for a compression method it does not
-    # have, RuntimeError for an encrypted member, and OSError (FileExistsError,
-    # NotADirectoryError) when one member's name is a prefix of another's directory.
-    # None of those are catchable by a caller following the documented API.
+    # have, RuntimeError for an encrypted member, and OSError reading it. None of those
+    # are catchable by a caller following the documented API. What goes wrong writing
+    # the output is the output's, not the archive's: an InputError naming it (#104).
     try:
         return _unpack_members(container, outdir, stats, total, inventory, groups)
     except ContainerError:
@@ -341,7 +337,12 @@ def unpack(container: str, outdir: str) -> dict:
 
 
 def _unpack_members(container, outdir, stats, total, inventory, groups):
+    from .export import _fold, _safe_relpath, needed_dirs, unique_each
+    adir = os.path.join(outdir, "assets")
     with zipfile.ZipFile(container) as z:
+        # Every member is counted and checked before any is written, so one past the
+        # limits refuses the archive with nothing of it on disk.
+        wanted, written = [], []
         for info in z.infolist():
             if info.filename.endswith("/"):
                 continue
@@ -367,30 +368,99 @@ def _unpack_members(container, outdir, stats, total, inventory, groups):
                 raise ContainerError(
                     f"{container}: total extracted size passed "
                     f"{MAX_TOTAL / 1e9:.1f} GB; refusing to continue.")
-            dest = _safe(os.path.join(outdir, "assets"), rel)
-            if not dest:
-                continue
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            with z.open(info) as src, open(dest, "wb") as out:
-                shutil.copyfileobj(src, out)
+            wanted.append((info, rel, _safe_relpath(rel, fallback="unnamed")))
+
+        # One asset written over another lost it without a word, and one whose file
+        # another needed as a directory refused the whole archive after the sources were
+        # written (#104). Asset paths take the library rule (export.unique_each), a name
+        # the archive holds twice is two files, and the files jadart writes beside them
+        # are taken first: from the members named exactly NOTICES.Z and
+        # AssetManifest.bin, which is what Flutter writes. A name that only differs in
+        # case is an asset like any other, where asking the filesystem whether NOTICES.Z
+        # exists said yes to notices.z on macOS and no on Linux. And where an asset needs
+        # one of jadart's names as a directory, jadart does without that file.
+        safe = [s for _info, _rel, s in wanted]
+        dirs = needed_dirs(safe)
+        first = {}
+        for i, (_info, rel, _s) in enumerate(wanted):
+            first.setdefault(rel, i)
+        notices, manifest = first.get("NOTICES.Z"), first.get("AssetManifest.bin")
+        if notices is not None and {_fold("NOTICES"), _fold("dependencies.txt")} & dirs:
+            notices = None
+        decoded = manifest is not None and _fold("AssetManifest.decoded.json") not in dirs
+        reserved = (["NOTICES", "dependencies.txt"] if notices is not None else []) + (
+            ["AssetManifest.decoded.json"] if decoded else [])
+        written = unique_each(safe, reserved)
+
+        for (info, rel, _s), path in zip(wanted, written):
+            dest = os.path.join(adir, path)
+            _makedirs(outdir, os.path.dirname(dest))
+            head = _copy_out(container, outdir, z, info, dest)
+            shown = path.replace(os.sep, "/")
+            if shown != rel:
+                stats["renamed"].append([rel, shown])
             stats["assets"] += 1
             stats["assets_bytes"] += info.file_size
-            with open(dest, "rb") as fh:
-                head = fh.read(64)
             kind, notable = sniff(rel, head)
-            inventory.append((rel, info.file_size, kind, notable))
+            inventory.append((shown, info.file_size, kind, notable))
             if notable:
-                stats["notable"].append(rel)
+                stats["notable"].append(shown)
+
+    def at(i):
+        return None if i is None else os.path.join(adir, written[i])
 
     stats["groups"] = groups
     if stats["assets"]:
-        adir = os.path.join(outdir, "assets")
-        stats["packages"] = _expand_notices(adir)
-        stats["declared_assets"] = _expand_manifest(adir)
-        _write_inventory(outdir, inventory)
+        stats["packages"] = _expand_notices(outdir, adir, at(notices))
+        stats["declared_assets"] = _expand_manifest(
+            outdir, adir, at(manifest), at(first.get("AssetManifest.json")), decoded)
+        _write_inventory(outdir, inventory, stats["renamed"])
     if stats["members"]:
         _write_container_map(outdir, container, stats)
     return stats
+
+
+def _out_error(outdir: str, exc: OSError, path: str) -> InputError:
+    return InputError(f"{outdir}: cannot write the export there: {exc.strerror or exc}: "
+                      f"{exc.filename or path}")
+
+
+@contextlib.contextmanager
+def _writing(outdir: str, path: str, mode: str = "w"):
+    """open(path, mode) for a file of the export, with a failure to write it an
+    InputError naming the output directory, as export.py's own files are (#96)."""
+    try:
+        with open(path, mode, **({} if "b" in mode else TEXT_OUT)) as fh:
+            yield fh
+    except OSError as exc:
+        raise _out_error(outdir, exc, path) from exc
+
+
+def _makedirs(outdir: str, path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise _out_error(outdir, exc, path) from exc
+
+
+def _copy_out(container: str, outdir: str, z, info, dest: str) -> bytes:
+    """Write one member to `dest` and return its first 64 bytes, for sniff(). A failure
+    reading it is the archive's and one writing it the output's, so the two are told
+    apart here, where it is still known which was which."""
+    head = b""
+    with z.open(info) as src, _writing(outdir, dest, "wb") as out:
+        while True:
+            try:
+                chunk = src.read(1 << 20)
+            except OSError as exc:
+                raise ContainerError(f"{container}: cannot read this archive: {exc}") \
+                    from exc
+            if not chunk:
+                break
+            if len(head) < 64:
+                head += chunk[:64 - len(head)]
+            out.write(chunk)
+    return head
 
 
 def _write_container_map(outdir: str, container: str, stats: dict):
@@ -429,11 +499,11 @@ def _write_container_map(outdir: str, container: str, stats: dict):
         abis = ", ".join(visible(a) for a in stats["abis"])    # directory names (#78)
         out.append(f"\nABIs present: {abis}. They carry the same Dart "
                    f"compiled for\ndifferent targets; jadart read the arm64 one.\n")
-    with open(os.path.join(outdir, "container.txt"), "w", **TEXT_OUT) as fh:
+    with _writing(outdir, os.path.join(outdir, "container.txt")) as fh:
         fh.writelines(out)
 
 
-def _expand_notices(adir: str) -> int:
+def _expand_notices(outdir: str, adir: str, src) -> int:
     """NOTICES.Z is gzip. Unpack it and list the packages beside it.
 
     Read through GzipFile in chunks rather than gzip.decompress, because the compressed
@@ -442,8 +512,7 @@ def _expand_notices(adir: str) -> int:
     anything could look at it. Measured on a crafted APK: 1.68 GB resident and 838 MB
     written before the cap existed.
     """
-    src = os.path.join(adir, "NOTICES.Z")
-    if not os.path.exists(src):
+    if src is None:                 # no NOTICES.Z, or an asset needs its names (#104)
         return 0
     try:
         buf = bytearray()
@@ -462,10 +531,10 @@ def _expand_notices(adir: str) -> int:
         raise
     except (OSError, EOFError, zlib.error, ValueError):
         return 0
-    with open(os.path.join(adir, "NOTICES"), "w", **TEXT_OUT) as fh:
+    with _writing(outdir, os.path.join(adir, "NOTICES")) as fh:
         fh.write(text)
     names = notice_packages(text)
-    with open(os.path.join(adir, "dependencies.txt"), "w", **TEXT_OUT) as fh:
+    with _writing(outdir, os.path.join(adir, "dependencies.txt")) as fh:
         fh.write(f"# {len(names)} packages named in NOTICES: everything this build links.\n")
         fh.write("# Decompressed from NOTICES.Z, which ships gzipped and unreadable.\n\n")
         for n in names:
@@ -473,12 +542,14 @@ def _expand_notices(adir: str) -> int:
     return len(names)
 
 
-def _expand_manifest(adir: str) -> int:
-    """Decode AssetManifest.bin. Current Flutter ships no readable manifest at all."""
-    src = os.path.join(adir, "AssetManifest.bin")
-    if not os.path.exists(src):
-        plain = os.path.join(adir, "AssetManifest.json")
-        if os.path.exists(plain):
+def _expand_manifest(outdir: str, adir: str, src, plain, decoded: bool) -> int:
+    """Decode AssetManifest.bin. Current Flutter ships no readable manifest at all.
+
+    `src` and `plain` are where the members named AssetManifest.bin and
+    AssetManifest.json were written, or None, and `decoded` is False where an asset needs
+    the decoded file's name as a directory (#104)."""
+    if src is None:
+        if plain is not None:
             try:
                 with open(plain) as fh:
                     return len(json.load(fh))
@@ -488,23 +559,24 @@ def _expand_manifest(adir: str) -> int:
     try:
         with open(src, "rb") as fh:
             data = decode_asset_manifest(fh.read())
-    except ContainerError:
+    except (ContainerError, OSError):
         return 0
-    out = os.path.join(adir, "AssetManifest.decoded.json")
-    with open(out, "w", **TEXT_OUT) as fh:
-        json.dump(data, fh, indent=2, sort_keys=True, default=str)
-        fh.write("\n")
+    if decoded:
+        out = os.path.join(adir, "AssetManifest.decoded.json")
+        with _writing(outdir, out) as fh:
+            json.dump(data, fh, indent=2, sort_keys=True, default=str)
+            fh.write("\n")
     return len(data) if isinstance(data, dict) else 0
 
 
-def _write_inventory(outdir: str, inventory: list):
+def _write_inventory(outdir: str, inventory: list, renamed: list):
     """One line per asset: what it is, how big, and whether it is worth opening."""
     inventory.sort(key=lambda r: (not r[3], r[0]))
     # A member's path is the container's to choose, so it is listed escaped (#78).
     inventory = [(visible(rel), size, kind, notable)
                  for rel, size, kind, notable in inventory]
     width = min(max((len(r[0]) for r in inventory), default=10), 68)
-    with open(os.path.join(outdir, "assets.txt"), "w", **TEXT_OUT) as fh:
+    with _writing(outdir, os.path.join(outdir, "assets.txt")) as fh:
         fh.write(f"{len(inventory)} files in the Flutter asset bundle. "
                  f"`*` marks ones worth opening first:\n")
         fh.write("a certificate, a key, a database, a model, or a name suggesting "
@@ -512,3 +584,10 @@ def _write_inventory(outdir: str, inventory: list):
         for rel, size, kind, notable in inventory:
             mark = "*" if notable else " "
             fh.write(f"{mark} {rel:<{width}} {size:>10,}  {kind}\n")
+        if renamed:
+            fh.write(f"\n{len(renamed)} written under another name, so that each has a "
+                     f"file of its own: no two are one file on a disk that ignores case, "
+                     f"none is where another needs a directory or jadart writes a file, "
+                     f"and a name a filesystem cannot hold is cut or replaced:\n")
+            for rel, path in sorted(renamed):
+                fh.write(f"  {visible(rel)} -> {visible(path)}\n")

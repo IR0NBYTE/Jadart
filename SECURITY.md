@@ -30,7 +30,8 @@ These are deliberate, tested properties rather than assumptions:
 - **`export` writes no library over another.** No two libraries' files are one file on
   a disk that ignores case, none is where another needs a directory, and a path is held
   to 16 directories and about 400 bytes, 120 a component, so a crafted library name
-  cannot overwrite another library or stop the export.
+  cannot overwrite another library or stop the export. Assets from an APK or IPA take the
+  same rule.
 - **A container's tables cannot cost more than the file.** ELF and Mach-O names, symbol
   tables and sections are found by offsets and counts the file gives. A symbol on a name
   offset read already is skipped, and a file whose tables come to more bytes than it

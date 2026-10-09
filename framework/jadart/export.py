@@ -112,8 +112,10 @@ _MAX_PATH = 400
 _MAX_DEPTH = 16
 
 
-def _safe_relpath(rel: str) -> str:
+def _safe_relpath(rel: str, fallback: str = "unnamed.dart") -> str:
     """A library url turned into a relative path that cannot leave the output directory.
+    An asset's name too (#104), with a `fallback` of its own for a name that comes to
+    nothing.
 
     Splitting on "/" alone was POSIX-only thinking: on Windows a backslash is also a
     separator, so `package:foo\\..\\..\\evil` kept its `..` as part of a single
@@ -143,10 +145,10 @@ def _safe_relpath(rel: str) -> str:
         parts.append(p)
         last = i == len(raws) - 1
     if not parts:
-        return "unnamed.dart"
+        return fallback
     if not last:
         # The file's own name came to nothing, and the directory above it is not a file.
-        parts.append("unnamed.dart")
+        parts.append(fallback)
     # Too deep or too long: the deepest directories give way and the file keeps its name,
     # so the package it is in still leads the path. Counted as it goes, since a url can
     # hold a great many components and joining them again for each one dropped is
@@ -169,8 +171,9 @@ def _fold(rel: str) -> str:
     return unicodedata.normalize("NFD", unicodedata.normalize("NFD", rel).casefold())
 
 
-def unique_paths(rels) -> dict:
-    """Each library path, mapped to the path it is written to.
+def unique_paths(rels, reserved=()) -> dict:
+    """Each path, mapped to the path it is written to. `reserved` are paths jadart writes
+    itself beside them, which a path that lands on one gives way to (#104).
 
     Two libraries can need one file, and one can need for a file what another needs for a
     directory. Obfuscation names libraries by short tokens, and `Ahd` and `ahd` are one
@@ -179,25 +182,44 @@ def unique_paths(rels) -> dict:
     `package:a/b.dart/c` then needs `a/b.dart` as a directory, which ended the export
     with exit 3 (#96). So every path is held to be unique under _fold, the first in
     sorted order keeps its own, a path some library needs as a directory keeps it for
-    that, and the file that gives way takes `~N` before `.dart`, never a name another
-    library has. Same output on every platform, since the rule ignores which one it is."""
+    that, and the file that gives way takes `~N` before `.dart` (or its last extension),
+    never a name another has. Same output on every platform, since the rule ignores which
+    one it is. Assets take the same rule: an APK's `Logo.txt` and `logo.txt` were one file
+    too."""
     rels = sorted(set(rels))
-    names = {_fold(r) for r in rels}
+    return dict(zip(rels, unique_each(rels, reserved)))
+
+
+def needed_dirs(rels) -> set:
+    """Every directory the paths need, folded (see _fold)."""
     dirs = set()
     for r in rels:
         d = os.path.dirname(r)
         while d and _fold(d) not in dirs:
             dirs.add(_fold(d))
             d = os.path.dirname(d)
-    taken, nxt, out = set(), {}, {}
-    for r in rels:
+    return dirs
+
+
+def unique_each(rels, reserved=()) -> list:
+    """unique_paths for a list that can hold one path more than once, as an archive's
+    members can: the result is in the list's order, and each copy after the first, in
+    the list's order, is a file of its own."""
+    names = {_fold(r) for r in rels} | {_fold(r) for r in reserved}
+    dirs = needed_dirs(set(rels))
+    taken, nxt = {_fold(r) for r in reserved}, {}
+    out = [None] * len(rels)
+    for i in sorted(range(len(rels)), key=lambda i: rels[i]):    # stable: the first keeps
+        r = rels[i]
         k = _fold(r)
         new = r
         if k in taken or k in dirs:
             head, name = os.path.split(r)
-            stem, ext = (name[:-5], ".dart") if name.endswith(".dart") else (name, "")
+            stem, ext = ((name[:-5], ".dart") if name.endswith(".dart")
+                         else os.path.splitext(name))
             # Each base counts on from where it got to: ten thousand spellings of one
-            # name in different cases would otherwise try every number again each time.
+            # name in different cases, or ten thousand copies of it, would otherwise try
+            # every number again each time.
             base = _fold(os.path.join(head, stem))
             n = nxt.get(base, 2)
             while True:
@@ -208,7 +230,7 @@ def unique_paths(rels) -> dict:
                     break
             nxt[base] = n
         taken.add(k)
-        out[r] = new
+        out[i] = new
     return out
 
 
@@ -496,6 +518,9 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
             if c["assets"]:
                 fh.write(f"  assets      {c['assets']} files "
                          f"({c['assets_bytes'] / 1e6:.1f} MB) -> assets/\n")
+                if c["renamed"]:
+                    fh.write(f"              {len(c['renamed'])} written under another "
+                             f"name; assets.txt lists them\n")
                 if c["declared_assets"]:
                     fh.write(f"              {c['declared_assets']} declared in "
                              f"AssetManifest\n")
