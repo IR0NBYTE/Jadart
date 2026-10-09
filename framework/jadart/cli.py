@@ -221,6 +221,10 @@ def cmd_export(args) -> int:
         extra = f", {c['packages']} packages named" if c["packages"] else ""
         print(f"  {args.out}/assets/      {c['assets']} files, "
               f"{c['assets_bytes'] / 1e6:.1f} MB{extra}")
+        if c["renamed"]:
+            pad = " " * (len(str(args.out)) + 16)       # under the descriptions above
+            print(f"{pad}{len(c['renamed'])} written under another name; assets.txt "
+                  f"lists them")
         if c["notable"]:
             print(f"  {args.out}/assets.txt   what each asset is; "
                   + bold(f"{len(c['notable'])} worth opening first"))

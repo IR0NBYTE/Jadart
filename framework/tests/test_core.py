@@ -8748,10 +8748,13 @@ def test_a_container_listing_escapes_the_names_it_was_given(tmp_path):
     for name, text in listed.items():
         assert not [c for c in text if unicodedata.category(c)[0] == "C"
                     and c not in "\n\t"], name
-    assert "evil\\u001b[31m.txt" in listed["assets.txt"], listed["assets.txt"]
+    # An asset is written under a name a filesystem can hold, as a library is (#104),
+    # and assets.txt says what it was called.
+    assets = listed["assets.txt"]
+    assert "evil\\u001b[31m.txt -> evil_[31m.txt" in assets, assets
     assert "x86\\u202e_64" in listed["container.txt"], listed["container.txt"]
     assert "pkg\\u001b[31m\\u202e" in listed["dependencies.txt"]
-    assert "a\\u202egnp.key\\u001b[31m" in listed["summary.txt"], listed["summary.txt"]
+    assert "a\\u202egnp.key_[31m" in listed["summary.txt"], listed["summary.txt"]
 
 
 def test_a_range_with_no_name_is_labelled_by_its_address_and_read_back():
@@ -10093,6 +10096,165 @@ def test_cfgcheck_knows_which_arm_of_an_if_is_taken():
     # and with no cut, a loop whose not-taken arm runs off the end of the body has no way
     # out written down, which is said as that rather than as a swap
     assert check(spin) == [(0, ["runs off the end, and nothing says so"], [0])]
+
+
+def test_assets_are_written_one_to_a_file_and_failures_name_the_right_side(tmp_path):
+    # An archive's assets went where their names said: two that differ only in case were
+    # one file on macOS and Windows, so one was lost and the other's name labelled its
+    # contents, and a file where another needed a directory refused the whole archive
+    # after the sources were written. A failure writing the output blamed the archive
+    # (#104). Assets take the library rule now (#96), and each side owns its failures.
+    import gzip
+    import warnings
+    import zipfile
+    from jadart import container
+
+    fa = "assets/flutter_assets/"
+    members = [("Logo.txt", b"upper"), ("logo.txt", b"lower"),
+               ("zz", b"file"), ("zz/inner", b"inner"),
+               ("NOTICES.Z", gzip.compress(b"pkg\n\nMIT\n")),
+               ("dependencies.txt", b"mine"), ("n" * 300 + ".txt", b"long"),
+               ("con.txt", b"device"), ("dup.txt", b"first"), ("dup.txt", b"second"),
+               ("Icon.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 8), ("icon.png", b"{}")]
+    apk = tmp_path / "app.apk"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")              # the duplicate name, on purpose
+        with zipfile.ZipFile(apk, "w") as z:
+            for name, data in members:
+                z.writestr(fa + name, data)
+            z.writestr("lib/arm64-v8a/libapp.so", b"\x7fELF")
+
+    out = tmp_path / "out"
+    stats = container.unpack(str(apk), str(out))
+    moved = {("logo.txt", "logo~2.txt"), ("zz", "zz~2"),
+             ("dependencies.txt", "dependencies~2.txt"), ("con.txt", "_con.txt"),
+             ("dup.txt", "dup~2.txt"), ("n" * 300 + ".txt", "n" * 119),
+             ("icon.png", "icon~2.png")}
+    assert {tuple(p) for p in stats["renamed"]} == moved, stats["renamed"]
+    assert stats["assets"] == len(members)
+    # every member is on disk under the name it was given, with its own bytes
+    got = {"Logo.txt": b"upper", "logo~2.txt": b"lower", "zz~2": b"file",
+           "zz/inner": b"inner", "dependencies~2.txt": b"mine", "n" * 119: b"long",
+           "_con.txt": b"device", "dup.txt": b"first", "dup~2.txt": b"second"}
+    for path, data in got.items():
+        assert (out / "assets" / path).read_bytes() == data, path
+    # and jadart's own files beside them keep their names
+    assert (out / "assets" / "dependencies.txt").read_text().startswith("# ")
+    inv = (out / "assets.txt").read_text()
+    assert "7 written under another name" in inv and "  logo.txt -> logo~2.txt" in inv
+    assert "logo~2.txt" in inv.split("\n\n")[1]
+    # what each is, read from its own bytes, under the name it was written to
+    rows = [ln[2:].split() for ln in inv.split("\n\n")[1].splitlines()]
+    kinds = {r[0]: " ".join(r[2:]) for r in rows}
+    assert (kinds["Icon.png"], kinds["icon~2.png"]) == ("png", "json"), kinds
+
+    # The output's failures are the output's: InputError naming the directory.
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "assets").write_text("x")
+    with pytest.raises(jadart.InputError) as e:
+        container.unpack(str(apk), str(blocked))
+    assert str(e.value).startswith(f"{blocked}: cannot write the export there")
+    if os.geteuid() != 0:
+        ro = tmp_path / "ro"
+        (ro / "assets").mkdir(parents=True)
+        (ro / "assets").chmod(0o555)
+        try:
+            with pytest.raises(jadart.InputError) as e:
+                container.unpack(str(apk), str(ro))
+        finally:
+            (ro / "assets").chmod(0o755)
+        assert "Permission denied" in str(e.value)
+    # and the archive's are the archive's: a member whose bytes fail their CRC
+    with zipfile.ZipFile(apk) as z:
+        info = next(i for i in z.infolist() if i.filename == fa + "Logo.txt")
+    raw = bytearray(apk.read_bytes())
+    raw[info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)] ^= 0xFF
+    bad = tmp_path / "bad.apk"
+    bad.write_bytes(bytes(raw))
+    with pytest.raises(jadart.ContainerError) as e:
+        container.unpack(str(bad), str(tmp_path / "out2"))
+    assert "Bad CRC-32" in str(e.value) and str(e.value).startswith(f"{bad}: ")
+    # and a read of it that fails part way, though the copy is writing at the time
+    import errno
+    real_read = zipfile.ZipExtFile.read
+
+    def failing(self, n=-1):
+        raise OSError(errno.EIO, "Input/output error")
+
+    zipfile.ZipExtFile.read = failing
+    try:
+        with pytest.raises(jadart.ContainerError) as e:
+            container.unpack(str(apk), str(tmp_path / "out4"))
+    finally:
+        zipfile.ZipExtFile.read = real_read
+    assert "Input/output error" in str(e.value)
+
+    # Many copies of one name: each its own file, the numbering counting on rather than
+    # trying every number again for each copy, which took 41s for 32,000 of them.
+    import importlib
+    ex = importlib.import_module("jadart.export")
+
+    def archive(path, names):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with zipfile.ZipFile(path, "w") as z:
+                for name, data in names:
+                    z.writestr(fa + name, data)
+        return str(path)
+
+    folds = []
+    real_fold = ex._fold
+    ex._fold = lambda r: folds.append(r) or real_fold(r)
+    try:
+        stats = container.unpack(archive(tmp_path / "dups.apk",
+                                         [("a.txt", b"%d" % i) for i in range(2000)]),
+                                 str(tmp_path / "dups"))
+    finally:
+        ex._fold = real_fold
+    assert len(folds) < 8 * 2000, f"{len(folds)} folds for 2000 copies"
+    assert sorted(os.listdir(tmp_path / "dups" / "assets")) == sorted(
+        ["a.txt"] + [f"a~{n}.txt" for n in range(2, 2001)])
+    assert (tmp_path / "dups" / "assets" / "a~2000.txt").read_bytes() == b"1999"
+
+    # jadart's own files come from the members named exactly as Flutter names them, so a
+    # case variant is an asset like any other, on every platform; and where an asset
+    # needs one of jadart's names as a directory, jadart does without that file.
+    notices = gzip.compress(b"pkg\n\nMIT\n")
+    manifest = b"\x0d\x02\x07\x01a\x00\x07\x01b\x00"     # {"a": null, "b": null}
+    for name, extra, keeps in (
+            ("cased", [("notices.z", notices), ("NOTICES", b"mine-notices"),
+                       ("dependencies.txt", b"mine-deps")],
+             {"NOTICES": b"mine-notices", "dependencies.txt": b"mine-deps"}),
+            ("dir", [("NOTICES.Z", notices), ("NOTICES/readme", b"a dir")],
+             {"NOTICES/readme": b"a dir"}),
+            # the NOTICES.Z that is read is the one written under that name, the first
+            ("twice", [("NOTICES.Z", notices), ("NOTICES.Z", gzip.compress(b"other\n"))],
+             {"NOTICES": b"pkg\n\nMIT\n"}),
+            ("binary", [("AssetManifest.bin", manifest),
+                        ("AssetManifest.bin/readme", b"a dir"),
+                        ("AssetManifest.decoded.json/x", b"a dir")],
+             {"AssetManifest~2.bin": manifest, "AssetManifest.bin/readme": b"a dir",
+              "AssetManifest.decoded.json/x": b"a dir"})):
+        out = tmp_path / name
+        got = container.unpack(archive(tmp_path / f"{name}.apk", extra), str(out))
+        for path, data in keeps.items():
+            assert (out / "assets" / path).read_bytes() == data, (name, path)
+        if name == "binary":
+            # read from where it was written, and counted though its decoded copy is not
+            assert got["declared_assets"] == 2, got
+
+    # Every member is checked before any is written.
+    with zipfile.ZipFile(apk) as z:
+        sizes = [i.file_size for i in z.infolist()]
+    old = container.MAX_MEMBER
+    container.MAX_MEMBER = max(sizes) - 1
+    try:
+        with pytest.raises(jadart.ContainerError):
+            container.unpack(str(apk), str(tmp_path / "out3"))
+    finally:
+        container.MAX_MEMBER = old
+    assert not (tmp_path / "out3" / "assets").exists()
 
 
 if __name__ == "__main__":

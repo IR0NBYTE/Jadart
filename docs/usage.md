@@ -30,7 +30,8 @@ Each library goes where its url says, as Blutter lays it out, unless that file i
 another library's on a disk that ignores case, or a directory another library needs. Then
 it takes `~2` (or the next free number) before `.dart`, the same on every platform, and
 `summary.txt` lists each one it moved. Obfuscated builds need this: their library tokens
-come in pairs like `Ahd` and `ahd`.
+come in pairs like `Ahd` and `ahd`. Assets take the same rule, and `assets.txt` lists the
+ones it moved.
 
 There is no `resources/` or `native/`. Unpacking `res/`, `META-INF/` and three copies of a
 10 MB Flutter engine would add nothing to bytes you already have, and `unzip` and apktool do
