@@ -8213,8 +8213,11 @@ def test_a_function_cut_short_says_where_it_goes_on():
         assert cfgcheck.check_function(blocks, stmts)[0] == [], arch
         assert cfgcheck.exit_violations(image, cr, blocks) == [], arch
         old, entry = build_cfg(ann, exits=exits(image, dis))
+        # the old rendering ran nowhere past the cut, and called the branch into the part
+        # left out a branch out of the function, which is #70's mistake (#107)
         assert cfgcheck.check_function(blocks, structure(old, entry))[0] == [
-            (0, ["no cut rendered"], [])], arch
+            (0, ["no cut rendered"], []),
+            (0, ["exit 0x14"], ["cut 0x8", "cut 0x14"])], arch
         # A target past the end of the range is another function's, as it was.
         far = build_cfg(ann, exits=exits(image, dis), cut_end=0x10)[0]
         assert not far[0].past_cut and far[0].cut_next == 8, far
@@ -9761,7 +9764,7 @@ def test_a_branch_out_from_inside_a_loop_or_an_if_is_read_as_leaving():
         return out
 
     bad = cfgcheck.check_function(blocks, drop_exits(copy.deepcopy(stmts)))[0]
-    assert bad == [(24, [28], [28])], bad
+    assert bad == [(24, [28], [28, "exit 0x1000"])], bad
     # and a branch out with nothing after it is held to saying so: rendered as a jump
     # back into the function it passed, with no successor to compare against
     out = build_cfg([(0, "mov", "x0, #1", ""), (4, "b", "#0x1000", "")], traps=())[0]
@@ -9810,6 +9813,65 @@ def test_a_branch_out_from_inside_a_loop_or_an_if_is_read_as_leaving():
         assert any(b.cexit for b in blocks.values())
         stmts = structure(blocks, min(blocks))
         assert cfgcheck.check_function(blocks, stmts)[0] == [], words
+
+
+def test_cfgcheck_holds_a_leaving_arm_to_its_kind_and_target():
+    # cfgcheck read every arm that leaves as None, whichever way it left and to where, so
+    # a branch into the part past the cut rendered as one out of the function (#70's
+    # mistake), an exit pointed somewhere else, or an exit arm emptied with the
+    # fallthrough nested in the other arm all passed (#107). Each correct rendering
+    # below passes, and each wrong one is reported.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import cfgcheck
+    from jadart.cfg import EXIT_INDIRECT, EXIT_RETURN, build_cfg, structure
+
+    def check(rows, stmts=None, cut=None):
+        blocks, entry = build_cfg(rows, traps=(), cut_end=cut)
+        return cfgcheck.check_function(blocks, stmts or structure(blocks, entry))[0]
+
+    out = [(0, "mov", "x0, #1", ""), (4, "b", "#0x1000", "")]
+    assert check(out) == [] and check(out, [("asm", 0), ("exit", 0x1000)]) == []
+    assert check(out, [("asm", 0), ("cut", 0x1000)]) == [(0, ["no exit rendered"], [])]
+
+    past = [(0, "mov", "x0, #1", ""), (4, "b", "#0x20", "")]
+    assert check(past, cut=0x40) == []
+    assert check(past, [("asm", 0), ("exit", 0x20)], cut=0x40) == [
+        (0, ["no exit rendered"], [])]
+
+    cond = [(0, "cmp", "x0, #1", ""), (4, "b.eq", "#0x1000", ""), (8, "ret", "", "")]
+    good = [("asm", 0), ("if", "x0 == 1", [("exit", 0x1000)], []), ("asm", 8)]
+    assert check(cond) == [] and check(cond, good) == []
+    elsewhere = [("asm", 0), ("if", "x0 == 1", [("exit", 0x2000)], []), ("asm", 8)]
+    assert check(cond, elsewhere) == [(0, [8, "exit 0x2000"], [8, "exit 0x1000"])]
+    as_cut = [("asm", 0), ("if", "x0 == 1", [("cut", 0x1000)], []), ("asm", 8)]
+    assert check(cond, as_cut) == [(0, [8, "cut 0x1000"], [8, "exit 0x1000"])]
+    # the exit arm emptied and the fallthrough nested in the other one, at the end
+    nested = [("asm", 0), ("if", "x0 == 1", [], [("asm", 8)])]
+    assert check(cond, nested) == [(0, [8], [8, "exit 0x1000"])]
+
+    # A conditional return is a return, and an indirect jump an indirect jump.
+    _needs_capstone()
+    import struct
+    from jadart.disasm import InstrImage, CodeRange, disassemble_range
+    words = cfgcheck._A32_RANGES[2]                      # popne {fp, pc}
+    image = InstrImage(text=b"".join(struct.pack("<I", w) for w in words), pcs=[0],
+                       first_code=0, code_ranges={}, all_ranges=[], symbol_names={})
+    image.arch = type("Arch", (), {"name": "arm", "compressed": False,
+                                   "word_size": 4})()
+    image.anchor_va = None
+    cr = CodeRange(pc_offset=0, size=4 * len(words), owner_ref=-1)
+    blocks = cfgcheck._tier2_cfg(image, disassemble_range(image, cr), {}, {}, True)
+    stmts = structure(blocks, min(blocks))
+    assert cfgcheck.check_function(blocks, stmts)[0] == []
+
+    def swap(seq):
+        return [("if", s[1], [("exit", EXIT_INDIRECT, "x") if t[:2] == ("exit",
+                                                                       EXIT_RETURN)
+                              else t for t in s[2]], s[3]) if s[0] == "if" else s
+                for s in seq]
+
+    assert cfgcheck.check_function(blocks, swap(stmts))[0] == [
+        (0, [8, "exit indirect"], [8, "exit return"])]
 
 
 if __name__ == "__main__":
