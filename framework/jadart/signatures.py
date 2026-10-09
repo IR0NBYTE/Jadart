@@ -400,19 +400,97 @@ def names_with_signatures(image, fr, sigs_path: str | None) -> tuple:
 FORMAT = "jadart-signatures-1"
 
 
+def check_out(path: str, refs=()) -> None:
+    """Refuse a path save() cannot write to, or must not, before anything is built.
+
+    Building reads every reference first, which takes a while on real apps, and a wrong
+    `-o` used to come out only after that, as an OSError the CLI reported as a bug in
+    jadart (#97). This catches what can be seen up front, a directory read only to
+    someone else excepted; save() turns anything else into the same InputError."""
+    from .errors import InputError
+    if not path:
+        raise InputError("-o is empty: it names the file to write the library to")
+    if os.path.isdir(path):
+        raise InputError(f"{path}: is a directory, not a file to write the library to")
+    parent = os.path.dirname(path) or "."
+    try:
+        st = os.stat(parent)
+    except OSError as exc:
+        raise InputError(f"{path}: cannot write the library there: {parent}: "
+                         f"{exc.strerror or exc}") from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise InputError(f"{path}: cannot write the library there: {parent} is not a "
+                         f"directory")
+    # `signatures ref.so -o ref.so` wrote the library over the reference it was read from,
+    # and so did an `-o` naming the libapp.so inside a reference given as a directory.
+    from .source import binary_path
+    if os.path.exists(path):
+        for ref in refs:
+            try:
+                same = os.path.samefile(path, binary_path(ref) or ref)
+            except OSError:
+                continue
+            if same:
+                raise InputError(f"{path}: is one of the references, and writing the "
+                                 f"library there would overwrite it")
+
+
 def save(lib: Library, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# {FORMAT}\n")
-        for src, dart, n in lib.sources:
-            # The source is a path, shown and never matched on, so a line break in it is
-            # spelled out rather than allowed to end the line, and so is a byte that is
-            # not UTF-8, which raised UnicodeEncodeError, a bug report, from the path.
-            src = src.encode("utf-8", "backslashreplace").decode("utf-8")
-            src = src.replace("\r", "\\r").replace("\n", "\\n")
-            f.write(f"# from\t{dart}\t{n}\t{src}\n")
-        for tag, table in (("c", lib.by_ctx), ("p", lib.by_pooled), ("b", lib.by_body)):
-            for h, nm in sorted(table.items()):
-                f.write(f"{tag}\t{h:016x}\t{nm}\n")
+    """Write `lib` to `path`. An output path is user input, so a failure to write it is
+    an InputError naming the path, not a builtin exception (#97)."""
+    from .errors import InputError
+    try:
+        f = open(path, "w", encoding="utf-8")
+    except OSError as exc:
+        raise InputError(f"{path}: cannot write the library there: "
+                         f"{exc.strerror or exc}") from exc
+    # A descriptor of its own, so what was written can still be found once `f` is closed,
+    # whatever the path names by then.
+    fd = os.dup(f.fileno())
+    try:
+        with f:
+            f.write(f"# {FORMAT}\n")
+            for src, dart, n in lib.sources:
+                # The source is a path, shown and never matched on, so a line break in it
+                # is spelled out rather than allowed to end the line, and so is a byte
+                # that is not UTF-8, which raised UnicodeEncodeError, a bug report, from
+                # the path.
+                src = src.encode("utf-8", "backslashreplace").decode("utf-8")
+                src = src.replace("\r", "\\r").replace("\n", "\\n")
+                f.write(f"# from\t{dart}\t{n}\t{src}\n")
+            for tag, table in (("c", lib.by_ctx), ("p", lib.by_pooled),
+                               ("b", lib.by_body)):
+                for h, nm in sorted(table.items()):
+                    f.write(f"{tag}\t{h:016x}\t{nm}\n")
+    except BaseException as exc:
+        _discard(fd, path)
+        if isinstance(exc, OSError):
+            raise InputError(f"{path}: writing the library failed: "
+                             f"{exc.strerror or exc}") from exc
+        raise
+    finally:
+        os.close(fd)
+
+
+def _discard(fd: int, path: str) -> None:
+    """Undo a library save() could not finish: on a full disk, say, or at Ctrl-C.
+
+    A library cut short loads as a smaller one with nothing to say so, which names fewer
+    functions without a word. So the file is emptied through its own descriptor, which
+    reaches it behind a symlink or a hard link too, and load() refuses an empty file.
+    Then it is removed, but only while the path still names that same plain file: a
+    pipe, a device or a link is not ours to remove, and nor is a file put there since."""
+    try:
+        os.ftruncate(fd, 0)
+    except OSError:
+        pass
+    try:
+        here, ours = os.lstat(path), os.fstat(fd)
+        if stat.S_ISREG(here.st_mode) and (here.st_dev, here.st_ino) == (ours.st_dev,
+                                                                          ours.st_ino):
+            os.unlink(path)
+    except OSError:
+        pass
 
 
 #: A body line as save() writes it: a table tag, the shape hash as 16 hex digits, a name.

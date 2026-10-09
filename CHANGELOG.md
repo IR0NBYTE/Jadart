@@ -75,6 +75,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   so they said nothing of what the registers held where control left; the innermost
   loop's are written back now, as for a `break`. No corpus build or fixture has that
   shape, and their tier 3 exports are unchanged. Closes #86.
+- **`signatures -o` into a path it cannot write exits 2.** A missing directory, a
+  directory, a path under a file, a directory it may not write or a name too long raised
+  the `OSError` from opening the file, and the CLI reported it as a bug in Jadart, with
+  exit 3. Each is an `InputError` (exit 2) naming the path now, and the first three are
+  refused before the references are read, so they no longer cost a build first; so is an
+  empty `-o`, and so is a reference given as `-o`, or the libapp.so inside a reference
+  given as a directory, which the library used to be written over. A write that fails
+  part way, on a full disk say, or at Ctrl-C, leaves no library cut short behind, since
+  one loads as a smaller library with nothing to say so: the file is emptied through its
+  own descriptor, which reaches it behind a symlink or a hard link too, and removed while
+  the path still names it. A broken pipe on `-o /dev/stdout` is that same exit 2, where
+  it was 0. Closes #97.
 - **A stripped binary is read for two snapshots at most.** With no `_kDart*SnapshotData`
   symbols, the snapshots are found by scanning for their magic, and each hit was parsed
   out of a copy of the rest of the file and listed: an ELF of 201 byte snapshot headers
