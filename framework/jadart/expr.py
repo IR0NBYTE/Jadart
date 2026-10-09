@@ -869,6 +869,22 @@ _CSEL = {"csel": 2, "csinc": 2, "csinv": 2, "csneg": 2,
          "cinc": 1, "cinv": 1, "cneg": 1, "cset": 0, "csetm": 0}
 
 
+def _flags_read(insns) -> frozenset:
+    """The addresses of the flag-setting instructions in one block whose flags are read
+    before anything replaces them: by a conditional select, or by the branch that ends
+    the block. Only those need the old value of a register they overwrite named (#116);
+    the rest would print a declaration nothing reads."""
+    out, live = set(), None
+    for a, mn, op, _note in insns:
+        if live and (mn in _CSEL or cond_of(mn)):
+            out.add(live[0])
+        if mn in _FLAG_SRC:
+            live = (a, _regs(_split_ops(op)))
+        elif mn in _FLAG_KILL or (live and _def_use(mn, op)[0] & live[1]):
+            live = None
+    return frozenset(out)
+
+
 #: What a call destroys. `constants_arm64.h:557-561`: kDartVolatileCpuRegs is
 #: kDartAvailableCpuRegs minus kAbiPreservedCpuRegs, spelled out as R0 through R14
 #: (kDartFirstVolatileCpuReg = R0, kDartLastVolatileCpuReg = R14, count 15). Every V
@@ -1104,6 +1120,8 @@ class Lifter:
         # (mnemonic, operands, {reg: rendered value}, register set) for the comparison
         # whose result is sitting in the condition flags right now, or None.
         self._flags = None
+        # The addresses of the flag-setting instructions whose flags something reads.
+        self._flag_reads = frozenset()
         # Registers live after the instruction currently being lifted, as a mask.
         self._live_after = 0
         self._livein, self._liveout = _liveness(blocks)
@@ -1258,19 +1276,37 @@ class Lifter:
         st.set(reg, V(reg, P_ATOM))
         return [f"{expr};"]
 
-    def _note_flags(self, st: State, mn: str, op: str, ops):
+    def _note_flags(self, st: State, mn: str, op: str, ops, read=True) -> list:
         """Track which comparison the condition flags currently hold, and its operands
         AS THEY READ AT THAT POINT. A `csel` three instructions later has to be rendered
         against the values the `cmp` saw, not against whatever those registers hold by
         then, so the rendering is captured with the comparison rather than recovered at
-        the use."""
+        the use. The branch that ends the block is rendered from it too (#116).
+
+        `subs x1, x1, #8` sets the flags from the x1 it is about to overwrite. Where the
+        value captured for x1 is spelled with x1 itself, that spelling means the new
+        value once the instruction has run, so the old one is named first, where
+        something reads the flags (`read`, see _flags_read); the line that names it is
+        returned."""
+        out = []
         if mn in _FLAG_SRC:
             regs = _regs(ops)
-            self._flags = (mn, op, {r: self._leaf(r, st) for r in regs}, regs)
+            vals = {r: self._leaf(r, st) for r in regs}
+            dst = canon(ops[0]) if mn not in _CMP else None
+            if read and dst in vals:
+                pat = re.compile(rf"\b{re.escape(dst)}\b")
+                for r, v in sorted(vals.items()):
+                    if pat.search(v.text):
+                        name = f"t{st.tmpc[0]}"
+                        st.tmpc[0] += 1
+                        out.append(f"var {name} = {v.text};")
+                        vals[r] = V(name, P_ATOM)
+            self._flags = (mn, op, vals, regs)
         elif mn in _FLAG_KILL:
             self._flags = None
         elif self._flags is not None and _def_use(mn, op)[0] & self._flags[3]:
             self._flags = None      # an operand of the live comparison was overwritten
+        return out
 
     def _flag_cond(self, cc: str):
         """The live comparison spelled for condition code `cc`, or None.
@@ -1602,7 +1638,13 @@ class Lifter:
         if mn in ("nop", "brk", "hlt") or (not ops and mn not in ("ret",)):
             return []                           # brk/hlt: unreachable trap after a noreturn
 
-        self._note_flags(st, mn, op, ops)
+        flagged = self._note_flags(st, mn, op, ops, addr in self._flag_reads)
+        if flagged:
+            return flagged + self._step_rest(st, addr, mn, op, note, ops, g)
+        return self._step_rest(st, addr, mn, op, note, ops, g)
+
+    def _step_rest(self, st: State, addr, mn, op, note, ops, g) -> list:
+        """_step past the flags: what the instruction does to `st`, and its lines."""
 
         # A machine narrower than a Dart `int` splits one value across two registers.
         if _T.pairs:
@@ -2288,6 +2330,7 @@ class Lifter:
         self._last_mem = None
         self._pend_pair = None
         lines, insns = [], blk.insns
+        self._flag_reads = _flags_read(insns)
         # Which registers each instruction's result is still needed by. Walked backwards
         # from what is live on the way out of the block, so it covers a value read in a
         # later block as well as one read two instructions on.
@@ -2314,6 +2357,8 @@ class Lifter:
                 # at the point the value was produced, and only later instructions read it.
                 lines.extend(st.spill)
                 st.spill.clear()
+        if insns and insns[-1][1] in _CONDB:
+            self._flags = None              # cbz and tbz test a register, not the flags
         falls = blk.term not in ("ret", "br", "bx")
         # Kept for `_reenter`: a block emitted after something that did not fall through
         # needs the state of its own predecessor, not of whatever the tree put above it.
@@ -2353,8 +2398,20 @@ class Lifter:
             st.result = _T.ret_int
 
     def _cond(self, cond: str, st: State) -> str:
-        """Render cfg's register-level condition with lifted expressions substituted."""
-        return _REG_RE.sub(lambda m: _in_cond(self._leaf(canon(m.group(1)), st)), cond)
+        """Render cfg's register-level condition with lifted expressions substituted.
+
+        From the operands the live comparison captured where it has them: the flags
+        were set from those values, and a register the flag-setting instruction
+        overwrote no longer holds them: `subs x1, x1, #8; b.ne` printed `x1 == 8` after
+        the `subs`, where it reads as the new x1 (#116). A `cbz` or `tbz` reads its
+        register as it is, and _lift_block drops the comparison before one."""
+        vals = self._flags[2] if self._flags is not None else {}
+
+        def sub(m):
+            r = canon(m.group(1))
+            v = vals.get(r)
+            return _in_cond(v if v is not None else self._leaf(r, st))
+        return _REG_RE.sub(sub, cond)
 
     def _entry_block(self, stmts, cont):
         """The block a statement list first transfers control to, or `cont` if it has none
