@@ -9715,6 +9715,103 @@ def test_export_gives_every_library_a_file_of_its_own(tmp_path, monkeypatch):
     assert doc["error"].startswith(f"{tmp_path / 'full'}: "), doc
 
 
+def test_a_branch_out_from_inside_a_loop_or_an_if_is_read_as_leaving():
+    # Two readings of a branch out of the function (or past the instruction cut) from
+    # inside a structured region (#86). cfgcheck skipped it, so an arm that leaves read
+    # as falling through to whatever followed, and reported an edge the rendering never
+    # claimed. Tier 3 left without writing the loop's names back, as a break does, so a
+    # name read one trip behind its register.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import copy
+    import cfgcheck
+    from jadart.cfg import build_cfg, structure
+    from jadart.expr import lift_function
+
+    # A block at the cut whose arms both leave, inside an `if` with code after it: main
+    # read it as going on to block 4. Found by building random functions.
+    rows = [(0, "b.gt", "#0x1c", ""), (4, "b", "#0x1000", ""),
+            (8, "b.eq", "#0x1000", ""), (12, "mov", "x0, #4", ""),
+            (16, "cmp", "x0, #1", ""), (20, "b", "#0x1000", ""),
+            (24, "cbz", "x0, #0x1000", ""), (28, "b", "#0x18", ""),
+            (32, "b.eq", "#0x18", ""), (36, "mov", "x2, #1", ""),
+            (40, "b.gt", "#0x30", "")]
+    blocks, entry = build_cfg(rows, traps=(), cut_end=60)
+    stmts = structure(blocks, entry)
+    assert cfgcheck.check_function(blocks, stmts)[0] == []
+    # A loop whose back edge is at the cut runs on past it, which is past the last block
+    # decoded and so no block; it has no exit of its own to say so.
+    spin = [(0, "mov", "x0, #1", ""), (4, "cmp", "x0, #2", ""), (8, "b.gt", "#0x0", "")]
+    b2, e2 = build_cfg(spin, traps=(), cut_end=0x40)
+    assert b2[0].cut_next == 0xc and b2[0].exit_target < 0
+    assert cfgcheck.check_function(b2, structure(b2, e2))[0] == []
+    # and an exit the rendering drops is a violation now, where it read as the
+    # fallthrough before
+    exits = [b for b in blocks.values() if b.exit_target >= 0 and b.succ]
+    assert exits
+
+    def drop_exits(seq):
+        out = []
+        for s in seq:
+            if s[0] == "if":
+                s = ("if", s[1], [] if s[2] and s[2][0][0] == "exit" else
+                     drop_exits(s[2]), drop_exits(s[3]))
+            elif s[0] == "loop":
+                s = ("loop", s[1], drop_exits(s[2]))
+            out.append(s)
+        return out
+
+    bad = cfgcheck.check_function(blocks, drop_exits(copy.deepcopy(stmts)))[0]
+    assert bad == [(24, [28], [28])], bad
+    # and a branch out with nothing after it is held to saying so: rendered as a jump
+    # back into the function it passed, with no successor to compare against
+    out = build_cfg([(0, "mov", "x0, #1", ""), (4, "b", "#0x1000", "")], traps=())[0]
+    assert cfgcheck.check_function(out, [("asm", 0), ("exit", 0x1000)])[0] == []
+    for wrong in ([("asm", 0), ("goto", 0)], [("asm", 0)],
+                  [("asm", 0), ("exit", 0x2000)], [("asm", 0), ("goto", 0x1000)]):
+        assert cfgcheck.check_function(out, wrong)[0] == [(0, ["no exit rendered"], [])]
+
+    # Tier 3: a counted loop that leaves the function, or runs past the cut, writes its
+    # name back first, as its break does.
+    loop = [(0, "mov", "x0, #0", ""), (4, "add", "x0, x0, #1", ""),
+            (8, "cmp", "x0, #0xa", "")]
+    for last, cut, leave in ((("b.eq", "#0x1000"), None, "goto sub_0x1000;"),
+                             (("b.eq", "#0x20"), 0x40,
+                              "goto 0x20;  // TRUNCATED: past the instruction cut")):
+        body = [ln.strip() for ln in lift_function(
+            loop + [(12, *last, ""), (16, "b", "#0x4", "")], cut_end=cut)]
+        assert body[body.index(leave) - 1] == "t0 += 1;", body
+    # From an inner loop, the inner loop's names, as a break from it writes back. Not the
+    # outer loop's too: written after the inner ones they read names the inner loop has
+    # just reassigned, which printed values the CPU contradicts (#86, review).
+    nested = [(0, "mov", "x0, #0", ""), (4, "mov", "x1, #0", ""),
+              (8, "add", "x1, x1, #1", ""), (12, "add", "x0, x0, #2", ""),
+              (16, "cmp", "x1, #5", ""), (20, "b.eq", "#0x1000", ""),
+              (24, "cmp", "x1, #3", ""), (28, "b.ne", "#0x8", ""),
+              (32, "add", "x0, x0, #1", ""), (36, "b", "#0x4", "")]
+    body = [ln.strip() for ln in lift_function(nested)]
+    at = body.index("goto sub_0x1000;")
+    brk = body.index("break;")
+    assert body[at - 2:at] == body[brk - 2:brk] == ["t1 += 2;", "t2 += 1;"], body
+    assert body[at - 3] == "if ((t2 + 1) == 5) {", body
+
+    # A conditional return or indirect jump on arm32 leaves too, and its arm claims None
+    # where the block records a cexit: bxeq lr, popne {fp, pc}, ldrne pc, [sl, #0x1c].
+    _needs_capstone()
+    import struct
+    from jadart.disasm import InstrImage, CodeRange, disassemble_range
+    for words in cfgcheck._A32_RANGES[1:3] + cfgcheck._A32_RANGES[6:7]:
+        image = InstrImage(text=b"".join(struct.pack("<I", w) for w in words), pcs=[0],
+                           first_code=0, code_ranges={}, all_ranges=[], symbol_names={})
+        image.arch = type("Arch", (), {"name": "arm", "compressed": False,
+                                       "word_size": 4})()
+        image.anchor_va = None
+        cr = CodeRange(pc_offset=0, size=4 * len(words), owner_ref=-1)
+        blocks = cfgcheck._tier2_cfg(image, disassemble_range(image, cr), {}, {}, True)
+        assert any(b.cexit for b in blocks.values())
+        stmts = structure(blocks, min(blocks))
+        assert cfgcheck.check_function(blocks, stmts)[0] == [], words
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

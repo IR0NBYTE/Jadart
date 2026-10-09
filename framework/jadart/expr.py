@@ -2607,16 +2607,23 @@ class Lifter:
                     out.extend(self._carry_out(st, pad, True))
                 out.append(pad + f"goto L_0x{s[1]:x};")
                 falls = alive = False
-            elif kind == "exit":
-                # A branch out of this function. It is not a local label, and it does not
-                # fall through: leaving it unsaid ended the body with no explanation, or
-                # let the carried state run on into a block control never reaches from
-                # here. 997 sites on the clean fixture did exactly that.
-                out.append(pad + (f"goto {self._sub(s[1])};" if s[1] >= 0
-                                  else "goto <unresolved>;"))
-                falls = alive = False
-            elif kind == "cut":
-                out.append(pad + cut_goto(s[1], self.show))      # inside this function
+            elif kind in ("exit", "cut"):
+                # Out of the loop as surely as a break, so its names are written back
+                # first, as a break's are, or they say nothing of what the registers
+                # hold where control leaves (#86). The innermost loop's only, as for a
+                # goto: writing back the loops around it too reads names the inner one
+                # has just reassigned.
+                out.extend(self._carry_out(st, pad, True))
+                if kind == "exit":
+                    # A branch out of this function. It is not a local label, and it does
+                    # not fall through: leaving it unsaid ended the body with no
+                    # explanation, or let the carried state run on into a block control
+                    # never reaches from here. 997 sites on the clean fixture did exactly
+                    # that.
+                    out.append(pad + (f"goto {self._sub(s[1])};" if s[1] >= 0
+                                      else "goto <unresolved>;"))
+                else:
+                    out.append(pad + cut_goto(s[1], self.show))  # inside this function
                 falls = alive = False
         return out, falls
 
