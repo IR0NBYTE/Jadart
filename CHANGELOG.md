@@ -13,6 +13,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **cfgcheck holds an arm that leaves to the way its block leaves.** It read every branch
+  out of the function or past the instruction cut as one and the same, so a rendering
+  that called a branch into the part past the cut a branch out of the function, which is
+  #70's mistake, passed; so did a conditional exit pointed at another address, a
+  conditional return rendered as an indirect jump, and an exit arm emptied with the
+  fallthrough nested in the other arm at the end of the function. Each block's ways out
+  are read off its own record now (its branch elsewhere, its conditional return or
+  indirect jump, where it runs on past the cut), and its arms have to reach exactly
+  those, of that kind and to that address, besides its successors; running off the end of
+  the body is the last block's only. Its reports name the ways out, as `exit 0x...`, `cut
+  0x...`, `exit return` or `exit indirect`. Every corpus build, arm64 and arm32, and
+  120,000 random functions still read 0. Closes #107.
 - **A snapshot's features string is read only as long as a real one can be.** It names
   the build's VM flags and target, in under 160 bytes in every AOT build measured, and it
   was read to its NUL however far away that was, kept whole, and printed whole by `info

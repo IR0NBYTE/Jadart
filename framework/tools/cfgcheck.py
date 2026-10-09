@@ -39,24 +39,20 @@ sys.path.insert(0, FRAMEWORK)
 
 DEFAULT_LIB = os.path.join(ROOT, "flubench/artifacts/clean/lib/arm64-v8a/libapp.so")
 
-#: Where control goes when a statement list runs off its end without a block: the caller's
-#: continuation. `None` means "the function returns / nothing follows", which claims no
-#: edge at all.
-_END = object()
-
 
 def _entry(stmts, cont, brk, cont_of_loop):
-    """The first thing this statement list transfers control to: a block, or None for a
-    branch out of the function (`exit`) or past the instruction cut (`cut`), which
-    reach no block of this graph. Skipping those, as this did, read an arm that leaves
-    as one that falls through to whatever followed it (#86), as
-    expr.Lifter._entry_block does not."""
+    """The first thing this statement list transfers control to: a block; `(kind,
+    target)` for a branch out of the function (`exit`) or past the instruction cut
+    (`cut`), which reach no block of this graph; or None, past the end of the body.
+    Skipping those, as this did, read an arm that leaves as one that falls through to
+    whatever followed it (#86), and reading them all as None let one stand in for
+    another, or for an arm that leaves to somewhere else (#107)."""
     for s in stmts:
         k = s[0]
         if k in ("asm", "loop", "goto"):
             return s[1]
         if k in ("exit", "cut"):
-            return None
+            return (k, s[1])
         if k == "break":
             return brk
         if k == "continue":
@@ -64,6 +60,31 @@ def _entry(stmts, cont, brk, cont_of_loop):
         if k == "if":                    # only ever preceded by its own `asm`
             return _entry(s[2], cont, brk, cont_of_loop) if s[2] else cont
     return cont
+
+
+def _leaving(blk) -> set:
+    """How `blk` leaves the graph, as _entry spells it: its branch elsewhere (into the
+    part past the cut, or out of the function), its conditional return or indirect jump,
+    and where it runs on past the cut."""
+    from jadart.cfg import EXIT_INDIRECT, EXIT_RETURN
+    out = set()
+    if blk.cexit:
+        out.add(("exit", EXIT_RETURN if blk.exit == "return" else EXIT_INDIRECT))
+    elif blk.exit_target >= 0:
+        out.add(("cut" if blk.past_cut else "exit", blk.exit_target))
+    if blk.cut_next >= 0:
+        out.add(("cut", blk.cut_next))
+    return out
+
+
+def _spell(claims) -> list:
+    """Blocks by address, then the ways out by address, as `exit 0x..`, `cut 0x..`,
+    `exit return` or `exit indirect`, for a report."""
+    from jadart.cfg import EXIT_INDIRECT, EXIT_RETURN
+    named = {EXIT_RETURN: "return", EXIT_INDIRECT: "indirect"}
+    blocks = sorted(c for c in claims if isinstance(c, int))
+    ways = sorted((c for c in claims if isinstance(c, tuple)), key=lambda c: (c[1], c[0]))
+    return blocks + [f"{k} {named.get(t, f'{t:#x}')}" for k, t in ways]
 
 
 def check_function(blocks, stmts):
@@ -102,17 +123,14 @@ def check_function(blocks, stmts):
                     after = _entry(seq[i + 2:], cont, brk, cont_of_loop)
                     claimed = {_entry(then, after, brk, cont_of_loop),
                                _entry(els, after, brk, cont_of_loop)}
-                    real = set(blk.succ)
-                    # An arm that leaves the function claims None. It has to be there when
-                    # the block records a way out (a branch elsewhere, or a conditional
-                    # return or indirect jump) and may be there for the last block, past
-                    # which, where the cut runs on to as well, is no block at all.
-                    leaves = blk.exit_target >= 0 or blk.cexit
-                    off_end = blk.insns[-1][0] == final and None in claimed
-                    if claimed - {None} != real or (None in claimed) != (leaves
-                                                                         or off_end):
-                        bad.append((s[1], sorted(x for x in claimed if x is not None),
-                                    sorted(blk.succ)))
+                    # The arms have to reach the block's successors, and leave exactly
+                    # as it does: each way out it records, of that kind and to that
+                    # address. Running off the end of the body (None) is only the last
+                    # block's, past which there is nothing.
+                    real = set(blk.succ) | _leaving(blk)
+                    off_end = blk.insns[-1][0] == final
+                    if claimed - {None} != real or (None in claimed and not off_end):
+                        bad.append((s[1], _spell(claimed - {None}), _spell(real)))
                     walk(then, after, brk, cont_of_loop)
                     walk(els, after, brk, cont_of_loop)
                     i += 2
@@ -120,15 +138,14 @@ def check_function(blocks, stmts):
                 nxt = _entry(seq[i + 1:], cont, brk, cont_of_loop)
                 claimed = set() if not blk.succ else {nxt}
                 if claimed - {None} != set(blk.succ):
-                    bad.append((s[1], sorted(x for x in claimed if x is not None),
-                                sorted(blk.succ)))
-                if blk.exit_target >= 0 and not blk.succ:
-                    # A branch out of the function and nothing else: what follows it has
-                    # to say where it goes. With no successor to compare, a `goto` back
-                    # into the function there passed.
+                    bad.append((s[1], _spell(claimed - {None}), sorted(blk.succ)))
+                if not blk.succ and _leaving(blk):
+                    # A branch out and nothing else: what follows it has to say where it
+                    # goes, and how. With no successor to compare, a `goto` back into the
+                    # function there passed, and so did a `cut` for an `exit`.
                     nxt = seq[i + 1] if i + 1 < len(seq) else None
                     if not (nxt and nxt[0] in ("exit", "cut")
-                            and nxt[1] == blk.exit_target):
+                            and (nxt[0], nxt[1]) in _leaving(blk)):
                         bad.append((s[1], ["no exit rendered"], []))
             elif k == "loop":
                 after = _entry(seq[i + 1:], cont, brk, cont_of_loop)
