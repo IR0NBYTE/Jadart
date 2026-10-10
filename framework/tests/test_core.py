@@ -4883,7 +4883,7 @@ def test_a_field_pinned_across_a_call_is_pinned_by_its_recovered_name_too():
     only knew the byte offset."""
     from jadart.expr import lift_function
 
-    rows = [("ldur", "x16, [x1, #7]"), ("bl", "#0x40"), ("add", "x0, x16, #1"), ("ret", "")]
+    rows = [("ldur", "x19, [x1, #7]"), ("bl", "#0x40"), ("add", "x0, x19, #1"), ("ret", "")]
     ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
 
     def body(fields):
@@ -6619,11 +6619,12 @@ def test_a_call_clobbers_every_volatile_register():
     from jadart.expr import _def_use, _CALL_CLOBBERS
     for mn, op in (("bl", "#0x1234"), ("blr", "x16")):
         defs, _uses = _def_use(mn, op)
-        for r in ("x0", "x5", "x14", "d0", "d30"):
+        for r in ("x0", "x5", "x14", "x16", "x17", "d0", "d30"):
             assert r in defs, f"{mn} does not clobber {r}"
         for r in ("x15", "x19", "x22", "x26", "x27", "x28", "d31"):
             assert r not in defs, f"{mn} wrongly clobbers preserved/reserved {r}"
-    assert len(_CALL_CLOBBERS) == 15 + 31
+    # and TMP/TMP2, x16 and x17, which a stub or a veneer may use (#137)
+    assert len(_CALL_CLOBBERS) == 15 + 2 + 31
 
 
 def test_static_bit_is_calibrated_not_hardcoded():
@@ -11869,6 +11870,55 @@ def test_a_negative_literal_and_a_32_bit_shift_read_as_dart_reads_them():
                 low = x & mask32
                 want = low >> n if mn == "lsr" else signed(low, 32) >> n
                 assert dart(t, x) & mask32 == want & mask32, (mn, n, t, hex(x))
+
+
+def test_a_frame_slot_past_the_displacement_is_its_own_slot():
+    # A slot too far from FP for the 9-bit displacement is reached through x17: `mov
+    # x17, #-0x158; str d0, [x29, x17]`. Read as `[x29]`, every such slot was x29+0, so
+    # a load took whatever was stored at another offset last (#137).
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])])]
+    assert lift([("mov", "x17, #-0x158"), ("str", "x1, [x29, x17]"),
+                 ("mov", "x17, #-0x160"), ("str", "x2, [x29, x17]"),
+                 ("mov", "x17, #-0x158"), ("ldr", "x0, [x29, x17]")]) == ["return x1;"]
+    # The same slot as a displacement reaches it, under either spelling of the offset.
+    assert lift([("mov", "x17, #-0x10"), ("str", "x1, [x29, x17]"),
+                 ("ldur", "x0, [x29, #-0x10]")]) == ["return x1;"]
+    assert lift([("mov", "x17, #0xfffffffffffffff0"), ("str", "x1, [x29, x17]"),
+                 ("ldur", "x0, [x29, #-0x10]")]) == ["return x1;"]
+    assert lift([("mov", "x17, #-0x158"), ("str", "x1, [x15, x17]"),
+                 ("ldur", "x0, [x15, #-0x158]")]) == ["return x1;"]
+    # A call may change x17, as a stub or a veneer uses it, so the offset is the `mov`'s
+    # only right after it; and x17 itself is not what it was before the call.
+    assert lift([("stur", "x2, [x29, #-0x160]"), ("mov", "x17, #-0x158"),
+                 ("bl", "#0x100"), ("str", "x1, [x29, x17]"), ("mov", "x17, #-0x160"),
+                 ("ldr", "x0, [x29, x17]")])[1:] == ["str x1, [x29, x17]", "return x0;"]
+    assert lift([("mov", "x17, #5"), ("bl", "#0x100"), ("mov", "x0, x17")])[1:] == [
+        "return x17;"]
+    # An offset changed since its `mov` is not the `mov`'s: this x17 is -0x158 again.
+    assert lift([("mov", "x17, #-0x158"), ("str", "x1, [x29, x17]"),
+                 ("mov", "x17, #-0x160"), ("add", "x17, x17, #8"),
+                 ("str", "x2, [x29, x17]"), ("mov", "x17, #-0x158"),
+                 ("ldr", "x0, [x29, x17]")])[-1] == "return x0;"
+    # An offset the lifter cannot read is printed, and a store through it may have
+    # written any slot.
+    assert lift([("stur", "x2, [x29, #-8]"), ("str", "x1, [x29, x3]"),
+                 ("ldur", "x0, [x29, #-8]")]) == ["str x1, [x29, x3]", "return x0;"]
+    assert lift([("stur", "x2, [x29, #-8]"), ("ldr", "x0, [x29, x3]")]) == [
+        "ldr x0, [x29, x3]", "return x0;"]
+    # A loop that stores through one rewrites every slot, the -8 it reloads too, off SP
+    # as off FP.
+    for base in ("x29", "x15"):
+        assert "x1.field_0x8 = x0;" in lift([
+            ("stur", "x2, [x29, #-8]"), ("ldur", "x0, [x29, #-8]"),
+            ("stur", "x0, [x1, #7]"), ("str", f"x3, [{base}, x4]"), ("cbnz", "x5, #4")])
+    # Only an offset set in the same block counts: x17 here is -0x158 or -0x160.
+    assert lift([("mov", "x17, #-0x158"), ("cbz", "x5, #0xc"), ("mov", "x17, #-0x160"),
+                 ("str", "x1, [x29, x17]"), ("mov", "x17, #-0x158"),
+                 ("ldr", "x0, [x29, x17]")]) == ["str x1, [x29, x17]", "return x0;"]
 
 
 if __name__ == "__main__":

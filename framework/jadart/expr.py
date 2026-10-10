@@ -1001,7 +1001,13 @@ def _flags_read(insns) -> frozenset:
 #: post-call read of x5 as a read of the value the CALLER passed in. That made registers
 #: look live on entry when they are not, and entry_arity turned them into arguments the
 #: function never had.
-_CALL_CLOBBERS = frozenset({f"x{i}" for i in range(15)} | {f"d{i}" for i in range(31)})
+#:
+#: x16 and x17 too. They are not in that list because Dart never allocates them, they are
+#: TMP and TMP2, and a stub or a veneer between the call and its target may use them: a
+#: value set in x17 before a call printed as still there after it (#137).
+_A64_CLOBBERS = frozenset({f"x{i}" for i in range(15)} | {"x16", "x17"}
+                          | {f"d{i}" for i in range(31)})
+_CALL_CLOBBERS = _A64_CLOBBERS
 
 
 _NO_REGS = frozenset()
@@ -1504,9 +1510,16 @@ def _frame_access(mn: str, op: str):
     fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
     ops = _split_ops(op)
     got = _addr(ops)
-    if got is None or got[1] is _BAD_POST or got[0][0] != fp:
+    if got is None or got[1] is _BAD_POST:
         return None
-    (_base, disp, _index, _scale, wb), post = got
+    (base, disp, index, _scale, wb), post = got
+    if index is not None and _T.roles.get(base) in ("SP", "FP"):
+        # An offset in a register _fold_frame_offsets could not read: a load from it
+        # fills no slot, and a store may have written any of them, off SP as off FP,
+        # which these analyses take as they take the frame moving.
+        return ([], 1, ops) if mn in _STORES else None
+    if base != fp:
+        return None
     delta = disp if wb else post
     if mn in _LOADS and delta and fp in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]):
         return None                                   # left raw by _step, see there
@@ -1515,6 +1528,33 @@ def _frame_access(mn: str, op: str):
     pair = mn in ("stp", "ldp", "ldpsw") and len(ops) >= 3
     width = 4 if pair and ops[1].strip()[:1] == "w" else 8
     return [f"{fp}{disp:+d}"] + ([f"{fp}{disp + width:+d}"] if pair else []), delta, ops
+
+
+_FRAME_INDEX_RE = re.compile(r"\[(\w+), (x\d+)\]")
+
+
+def _fold_frame_offsets(blocks) -> None:
+    """Write a frame offset held in a register into the access, in place.
+
+    A frame slot past the 9-bit displacement is reached as `mov x17, #-0x158; str d0,
+    [x29, x17]`, 622 accesses on the clean fixture, every one with the `mov` just before.
+    Read as `[x29]`, every such slot was one slot, x29+0, and a load got whatever was
+    stored at another offset last (#137). Folded to `[x29, #-0x158]` where the `mov` is
+    the instruction before it in the same block, so the walk and every analysis over the
+    slots read the same address. No further: x16 and x17 are scratch registers a callee
+    or a stub may change, and a call need not say so. The `mov` stays."""
+    frame = {r for r, v in _T.roles.items() if v in ("SP", "FP")}
+    for blk in blocks.values():
+        prev = None
+        for k, (a, mn, op, note) in enumerate(blk.insns):
+            m = _FRAME_INDEX_RE.search(op) if mn in _LOADS or mn in _STORES else None
+            if m and prev and canon(m.group(1)) in frame and m.group(2) == prev[0]:
+                op = f"{op[:m.start()]}[{m.group(1)}, #{prev[1]:#x}]{op[m.end():]}"
+                blk.insns[k] = (a, mn, op, note)
+            ops = _split_ops(op) if mn == "mov" else ()
+            val = _imm(ops[1]) if len(ops) == 2 and ops[0].strip()[:1] == "x" else None
+            prev = None if val is None else (
+                canon(ops[0]), val - (1 << 64 if val >= 1 << 63 else 0))
 
 
 #: The stub kinds that never return; see Lifter._loop_rewrites.
@@ -2696,6 +2736,9 @@ class Lifter:
                 second = canon(ops[1])
                 width = 4 if ops[1].strip().startswith("w") else 8
                 pair = (second, disp + width, g(second))
+            if _T.roles.get(base) in ("SP", "FP") and index is not None:
+                st.slot.clear()              # an offset _fold_frame_offsets left
+                return self._verbatim(st, mn, op, op)
             if _T.roles.get(base) in ("SP", "FP"):           # spill to a stack slot
                 self._frame_moved(st, base, delta)
                 # Saving the untouched link register is a callee-saved spill, not an
@@ -2852,6 +2895,8 @@ class Lifter:
             second = None
             if mn in ("ldp", "ldpsw") and len(ops) >= 3:
                 second = (canon(ops[1]), disp + (4 if ops[1].strip()[:1] == "w" else 8))
+            if _T.roles.get(base) in ("SP", "FP") and index is not None:
+                return self._verbatim(st, mn, op, op, dst)       # as for a store
             if _T.roles.get(base) in ("SP", "FP"):           # reload a stack slot
                 # A 64-bit incoming argument or spill occupies two adjacent slots, and the
                 # same adjacency rule applies as for a field: the previous access was one
@@ -3303,8 +3348,8 @@ class Lifter:
                     got = _addr(ops)
                     if got is None or got[1] is _BAD_POST:
                         continue
-                    (base, disp, _i, _s, _wb), post = got
-                    if _T.roles.get(base) not in ("SP", "FP"):
+                    (base, disp, index, _s, _wb), post = got
+                    if _T.roles.get(base) not in ("SP", "FP") or index is not None:
                         continue
                     disp = 0 if post else disp
                     self._loads.add(f"{base}{disp:+d}")
@@ -4659,8 +4704,7 @@ def use_target(tgt: Target):
     ROLE, _SPECIAL, _UNTAGGED = tgt.roles, set(tgt.special), tgt.untagged
     ARG_REGS = tgt.arg_regs
     _RET_USES = frozenset({tgt.ret_int, tgt.ret_fp})
-    _CALL_CLOBBERS = (frozenset({f"x{i}" for i in range(15)}
-                                | {f"d{i}" for i in range(31)}) if tgt is ARM64 else
+    _CALL_CLOBBERS = (_A64_CLOBBERS if tgt is ARM64 else
                       # arm32: R0-R3 and R12 are AAPCS volatile, and Dart adds R9. The FPU
                       # side is D0-D7 (constants_arm.h kAbiVolatileFpuRegs).
                       frozenset({f"r{i}" for i in (0, 1, 2, 3, 9, 12)}
@@ -4693,6 +4737,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     blocks, entry = build_cfg(stripped, traps=(), cut_end=cut_end)
     if not blocks:
         return []
+    _fold_frame_offsets(blocks)
     stmts = structure(blocks, entry)
     dispatch = detect_dispatch(stripped)
 
