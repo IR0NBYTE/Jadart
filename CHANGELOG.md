@@ -22,8 +22,10 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   printed body still assigns a register only where the machine's own instruction does.
   On the clean fixture's `export -t 3` that is 369 raw lines in 207 functions, 114 of
   them a `subs`, 75 a `br`, 49 an `ands`, 46 a `csel` and 31 an `ldar`; 348 in 191 on
-  3.4.4. A flag-setting instruction also no longer names the old value of a destination
-  it does not read, as `subs x1, x0, x2` named x1 (#116). Closes #120.
+  3.4.4. A name such a comment reads keeps its declaration, so a call's result it
+  mentions is no longer folded into the next line (`var t3 = lerpDouble(...)`). A
+  flag-setting instruction also no longer names the old value of a destination it does
+  not read, as `subs x1, x0, x2` named x1 (#116). Closes #120.
 - **A name is read only on paths that set it.** Tier 3 read a name on paths that never
   set it, in three ways. A goto join kept every register no block between wrote, and
   naming a value writes none, so a call's result or a phi named on one path into the
@@ -37,9 +39,10 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   over every printed function finds a name read on a path that never set it in 108
   functions of the clean fixture's `export -t 3` before and 8 after, 114 and 3 on
   2.19.6, 93 and 3 on 3.4.4, 100 and 7 on 3.10.9, and in no function more often than
-  before. With the change below, tier 3 exports change in 144 functions on the clean
-  fixture (2,622 lines in 50 files), 145 on 3.4.4, 140 on 3.10.9, 162 on 2.19.6 and 2
-  on obf, and the clean export grows from 141,867 to 142,083 lines. Closes #121.
+  before. With the changes above and below, tier 3 exports change in 323 functions on
+  the clean fixture (2,499 lines in 65 files), 300 on 3.4.4, 298 on 3.10.9, 287 on
+  2.19.6 and 82 on obf, and the clean export grows from 141,867 to 142,084 lines.
+  Closes #121.
 - **A raw line no longer changes what an earlier value reads as.** An instruction tier 3
   prints as it is assigns the registers it writes, so a value the lifter still held that
   was spelled with one of them read as the new value after it: `add x5, x1, #1; subs x1,

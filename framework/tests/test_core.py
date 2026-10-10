@@ -10361,6 +10361,9 @@ def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
                  ("str", "x5, [x4, #7]"), ("ret", "")])[1] == "x4.field_0x8 = SP + 8;"
     assert lift([("ldr", "x15, [x15, #8]!"), ("add", "x5, x15, #8"),
                  ("str", "x5, [x4, #7]"), ("ret", "")])[1] == "x4.field_0x8 = x15 + 8;"
+    # A store-release reads the register it names and writes none: x0 keeps its value.
+    assert lift([("add", "x0, x1, #1"), ("add", "x17, x2, #27"), ("stlr", "x0, [x17]"),
+                 ("str", "x0, [x3, #7]"), ("ret", "")])[1] == "x3.field_0x8 = x1 + 1;"
     # A comparison made from a value spelled with the register reads it no more.
     assert lift([("add", "x2, x1, #1"), ("cmp", "x2, #5"), ("umulh", "x1, x1, x3"),
                  ("csel", "x0, x4, x5, eq"), ("ret", "")])[1] == "csel x0, x4, x5, eq"
@@ -10413,6 +10416,18 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
             [(i * 4, *r, "") for i, r in enumerate(rows)])]
     body = lift(_FROM_POINTS)
     assert body[-2] == "x1.field_0x8 = x8;", body
+    # A loop that opens an arm declares its names inside the arm, not at the `if` above
+    # it, so a goto past the arm does not find them set: here the label after the loop
+    # read `t1`, set only in the loop.
+    body = lift([("add", "x17, x14, #7"), ("swp", "x11, x7, [x17]"),
+                 ("cbnz", "x3, #0x18"), ("stlr", "x7, [x17]"), ("b.eq", "#0x1c"),
+                 ("tbz", "x9, #63, #0xc"), ("b", "#0x1c"), ("stur", "x7, [x2, #71]"),
+                 ("ret", "")])
+    assert body[-2] == "x2.field_0x48 = x7;", body
+    body = lift([("add", "x8, x4, #49"), ("cbz", "x11, #0x18"), ("add", "x17, x14, #31"),
+                 ("cbnz", "x0, #0x1c"), ("sub", "x10, x8, x1"), ("tbz", "x9, #63, #0x8"),
+                 ("add", "x17, x14, #31"), ("swp", "x8, x4, [x17]"), ("ret", "")])
+    assert body[-2] == "swp x8, x4, [x17]", body
     # What a block that dominates the join names is set on every path, so it is kept:
     # a call's result, a phi bound above an `if` and a loop's name, each made before the
     # branches start.
@@ -10462,6 +10477,12 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
         _ann(image, disassemble_range(image, cr), p2n, pm), pm, arity=ar)]
     assert "var t1 = x0;" not in body and "var t1;" in body, body
     assert body.index("L_0xae0b0:") < body.index("t1 = x0;"), body
+    # ...and a phi an entered arm sets is set on every path into the `if`'s join, though
+    # not on every path through its head: `ui.dart`'s goto into the arm keeps reading it.
+    cr = next(c for c in image.all_ranges if c.pc_offset == 0x18d4e4)
+    body = [ln.strip() for ln in lift_function(
+        _ann(image, disassemble_range(image, cr), p2n, pm), pm, arity=ar)]
+    assert "var t5 = pool_0x2650.field_0x7(t4, t3);" in body, body
 
 def test_a_raw_line_says_what_the_registers_it_reads_hold():
     # A raw line reads the machine registers it names, and a register tier 3 held as an
@@ -10492,7 +10513,18 @@ def test_a_raw_line_says_what_the_registers_it_reads_hold():
                  ("ret", "")])[0] == "ldar x0, [x22]   // x22 holds x1"
     assert lift([("ldr", "x16, [x26, #0x258]"), ("br", "x16")]) == [
         "br x16   // x16 holds THR.field_0x258"]
-    # A register that holds itself, or the receiver it was on entry, says nothing.
+    # A call's result only the note mentions is still a call in the code, not folded
+    # into the note.
+    assert lift([("bl", "#0x100"), ("add", "x17, x0, #27"), ("mov", "x0, #0"),
+                 ("ldar", "w1, [x17]"), ("str", "x1, [x2, #7]"), ("ret", "")])[:2] == [
+        "var t0 = sub_0x100(...);", "ldar w1, [x17]   // x17 holds t0 + 27"]
+    # A register that holds itself, or the receiver it was on entry, says nothing, nor
+    # one a loop's name for it collapsed back to.
+    body = lift([("add", "x17, x14, #7"), ("swp", "x11, x7, [x17]"),
+                 ("cbnz", "x3, #0x18"), ("stlr", "x7, [x17]"), ("b.eq", "#0x1c"),
+                 ("tbz", "x9, #63, #0xc"), ("b", "#0x1c"), ("stur", "x7, [x2, #71]"),
+                 ("ret", "")])
+    assert "stlr x7, [x17]   // x17 holds t0" in body, body
     assert lift([("adcs", "x1, x1, x3"), ("adcs", "x1, x1, x3"), ("str", "x1, [x2, #7]"),
                  ("ret", "")])[:2] == ["adcs x1, x1, x3", "adcs x1, x1, x3"]
     assert lift([("ldar", "w0, [x1]"), ("ret", "")], receiver={"x1": "this"})[0] == (

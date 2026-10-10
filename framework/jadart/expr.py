@@ -1166,6 +1166,7 @@ class Lifter:
         #: for the goto join in `walk`.
         self._anchor: dict = {}
         self._last_block = None
+        self._loop_before = None
         #: Whether a frame address ever reaches a general register; see _frame_escaped.
         self._escaped = None
         #: (header, {reg: name}, copied) for each loop being walked, innermost last. An
@@ -1276,8 +1277,8 @@ class Lifter:
         only where the machine's own instruction does."""
         def_regs, use_regs = _def_use(mn, op)
         defs = set(def_regs) - _SPECIAL
-        if dst:
-            defs.add(dst)
+        if dst in def_regs:               # a role register it loads, as before; not
+            defs.add(dst)                 # the source of `stlr x0, [x17]`
         out = []
         live = self._live_after & ~_reg_mask(defs)
         for r in sorted(defs):
@@ -2731,8 +2732,12 @@ class Lifter:
                     named, decls = self._phi(st, a, b, tlines, elines,
                                              self._livein.get(joins[i], 0), pad, indent)
                     out.extend(decls)
-                    # declared above the `if`, at the end of the block that decides it
-                    self._anchor.update(dict.fromkeys(range(first, st.tmpc[0]), head))
+                    # Declared above the `if`, at the end of the block that decides it,
+                    # and set on every path through it. Where a goto enters an arm, that
+                    # arm sets it too, and it is set on every path into the join instead.
+                    entered = any(_LABEL_LINE_RE.match(ln) for ln in tlines + elines)
+                    at = joins[i] if entered and joins[i] is not None else head
+                    self._anchor.update(dict.fromkeys(range(first, st.tmpc[0]), at))
                 out.extend(self._render_if(cond_txt, tlines, elines, pad, indent))
                 if tfalls and efalls:
                     _merge(st, a, b)
@@ -2752,6 +2757,10 @@ class Lifter:
                     falls = False
                 alive = tfalls or efalls
             elif kind == "loop":
+                # Its names are declared right after the statement before it, and only a
+                # block falls straight into them; anything else anchors them nowhere.
+                prev = stmts[i - 1] if i and alive else None
+                self._loop_before = prev[1] if prev and prev[0] == "asm" else None
                 label(s[1])
                 out.extend(self._render_loop(s[1], s[2], st, indent, depth))
                 alive = True
@@ -2820,7 +2829,7 @@ class Lifter:
         # iterating a set made that depend on the per-process hash seed.
         init = {r: st.get(r) for r in sorted(carried)}
         names = {}
-        before = self._last_block if self._last_block is not None else self.entry
+        before = self._loop_before
         for r in sorted(carried):
             self._anchor[st.tmpc[0]] = before       # declared above the loop
             names[r] = f"t{st.tmpc[0]}"
@@ -2865,7 +2874,8 @@ class Lifter:
             # exactly the occurrences this function created and nothing else.
             sub = {names[r]: init[r].text for r in drop}
             pat = re.compile(r"\b(" + "|".join(map(re.escape, sub)) + r")\b")
-            blines = [pat.sub(lambda m: sub[m.group(1)], ln) for ln in blines]
+            blines = [_no_self_holds(pat.sub(lambda m: sub[m.group(1)], ln))
+                      for ln in blines]
             tail = [pat.sub(lambda m: sub[m.group(1)], ln) for ln in tail]
             for r in drop:
                 names.pop(r)
@@ -3236,14 +3246,28 @@ def _inline_single_use(lines: list, names: set) -> list:
             # had nothing defining it. Latent rather than live, 0 of the corpus's 4,642
             # folds collide, but the numbering reaches t10 in 1,600 functions, so it is
             # a coincidence away.
+            # A use in the line's comment (`// x0 holds t4`, _verbatim) is no use to fold
+            # into: the call would leave the code for the comment.
             use = _TMP_RE.findall(nxt)
-            if len(use) == 1 and use[0] == m.group(2):
+            if (len(use) == 1 and use[0] == m.group(2)
+                    and m.group(2) in _TMP_RE.findall(nxt.split("   // ", 1)[0])):
                 out.append(re.sub(rf"\b{m.group(2)}\b", m.group(3).replace("\\", "\\\\"),
                                   nxt))
                 skip = i + 1
                 continue
         out.append(ln)
     return out
+
+
+def _no_self_holds(ln: str) -> str:
+    """`ln` without the `x7 holds x7` a raw line's note says once a loop name it held
+    is put back to the register it stood for (_render_loop)."""
+    if " holds " not in ln or "   // " not in ln:
+        return ln
+    code, note = ln.split("   // ", 1)
+    keep = [p for p in re.split(r", (?=\w+ holds )", note)
+            if not re.fullmatch(r"(\w+) holds \1", p)]
+    return f"{code}   // {', '.join(keep)}" if keep else code
 
 
 def _forget_temps(st: State, gone) -> None:
