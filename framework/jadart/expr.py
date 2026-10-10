@@ -1199,15 +1199,18 @@ def _or_all(values) -> int:
     return m
 
 
-def _live_in_header(blocks, nodes, header, preds):
+def _live_in_header(blocks, nodes, header, preds, reads=None):
     """Registers live on entry to `header` considering only edges inside `nodes`
-    (iterative backward dataflow). These are the loop's read-before-write registers."""
+    (iterative backward dataflow). These are the loop's read-before-write registers.
+    `reads` adds what each call prints as its arguments (Lifter._call_reads): a value a
+    loop passes to a call on the next trip is carried as much as one it adds to (#142)."""
     use, dfn = {}, {}
     for b in nodes:
         u = d = 0
-        for (_a, mn, o, _n) in blocks[b].insns:
+        more = reads.get(b, {}) if reads else {}
+        for i, (_a, mn, o, _n) in enumerate(blocks[b].insns):
             de, us = _def_use_masks(mn, o)
-            u |= us & ~d
+            u |= (us | more.get(i, 0)) & ~d
             d |= de
         use[b], dfn[b] = u, d
     succ = {b: [s for s in blocks[b].succ if s in nodes] for b in nodes}
@@ -4007,7 +4010,8 @@ class Lifter:
         nodes = self._loop_nodes(header)
         carried = self.carried.get(header)
         if carried is None:
-            carried = (_live_in_header(self.blocks, nodes, header, self._preds)
+            carried = (_live_in_header(self.blocks, nodes, header, self._preds,
+                                       self._printed_liveness()[0])
                        & self._written(nodes)) - _SPECIAL
             self.carried[header] = carried
         # A loop-carried register is a phi, and a phi reaching exactly one join has a name
