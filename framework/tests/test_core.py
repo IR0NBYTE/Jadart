@@ -12097,6 +12097,20 @@ def test_a_stub_that_returns_a_value_is_a_call_to_the_return_rule():
         "return x1.field_0x10 + x1.field_0x10;"]
 
 
+def test_a_loop_carries_a_register_it_reads_only_as_a_call_argument():
+    # A loop decides what it carries from the registers its body reads before writing,
+    # and a call read none: x2, passed to the call and then set from its result, printed
+    # as the value from before the loop on every trip (#142).
+    from jadart.expr import lift_function
+    rows = [("mov", "x2, #0"), ("mov", "x1, x6"), ("bl", "#0x200"), ("mov", "x2, x0"),
+            ("cbnz", "x0, #0x4"), ("ret", "")]
+    body = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)], arity=lambda pc: 2)]
+    assert body[:4] == ["var t0 = 0;", "var t1 = x6;", "while (true) {",
+                        "var t2 = sub_0x200(t1, t0);"], body
+    assert "t0 = t2;" in body, body
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

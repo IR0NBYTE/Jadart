@@ -13,6 +13,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop carries a register it reads only as a call argument.** A loop decides what it
+  carries from the registers its body reads before writing, and a call read none, so a
+  value passed to a call and set again later in the loop printed as its value from before
+  the loop on every trip: `writeMap` wrote its first separator, `"`, before every key,
+  where every later trip writes `,"`. The carried set now counts a call's printed
+  arguments, as the function's liveness does since #122. A call whose argument register
+  was never set before the loop printed `(...)`, and now names it, a bare register as
+  often as not. Tier 3 exports change in 12 functions on the clean fixture, 7 on 3.4.4 and
+  14 on 3.10.9; 2.19.6, which passes no arguments in registers, does not change. Closes
+  #142.
 - **A stub that returns a value is a call to the return rule.** The walk suppresses
   `InitLate*`, `Await`, `InitAsync` and `CloneContext` as it does the stubs that give
   every register back, and the rule that decides whether a `ret` hands back x0 or d0 took
@@ -48,8 +58,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   recomputes from one it lost there, ends with the register spelled as it was before the
   `if`, and the phi took the value from before the `if`. Such an arm now assigns the
   register itself. Tier 3 exports change in 161 functions on the clean fixture, 117 on
-  2.19.6, 243 on 3.4.4 and 257 on 3.10.9, most of them one of those three. A loop does not
-  yet carry a register it reads only as a call argument (#142). Closes #122.
+  2.19.6, 243 on 3.4.4 and 257 on 3.10.9, most of them one of those three. Closes #122.
 - **A register list load writes every register in it.** `ld1 {v0.16b, v1.16b}` writes
   d0 and d1, and tier 3 took only the first register of a list as written and the rest
   as read: a store of d1 after the load printed the field d1 held before, and the raw
