@@ -47,7 +47,8 @@ jobs:
       # -rs prints why each test skipped. Seventy tests used to skip by printing and
       # returning, which pytest counts as a PASS and whose print it captures, so the
       # suite reported 192 green while 131 had run. They raise unittest.SkipTest now,
-      # and the count below fails the build if skipping ever spreads quietly.
+      # and the count below fails the build if skipping ever spreads quietly. 27: the
+      # CPU halves of the goto write-back tests (#106) need unicorn, which CI lacks.
       - name: tests
         working-directory: framework
         run: |
@@ -56,8 +57,8 @@ jobs:
           skipped=$(sed -n 's/.*[^0-9]\([0-9]\+\) skipped.*/\1/p' /tmp/pytest.out | tail -1)
           skipped=${skipped:-0}
           echo "skipped: $skipped"
-          if [ "$skipped" -gt 25 ]; then
-            echo "::error::$skipped tests skipped; expected at most 25 on a CI checkout"
+          if [ "$skipped" -gt 27 ]; then
+            echo "::error::$skipped tests skipped; expected at most 27 on a CI checkout"
             exit 1
           fi
 

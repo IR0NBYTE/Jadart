@@ -9818,6 +9818,224 @@ def test_a_branch_out_from_inside_a_loop_or_an_if_is_read_as_leaving():
         assert cfgcheck.check_function(blocks, stmts)[0] == [], words
 
 
+#: For test_a_goto_target_reads_what_the_jump_left: name -> (the code as (word, mnemonic,
+#: operands), the arguments to run it on a CPU with or None, the lines that end the way
+#: out, a line the target has to print, and one it must not). The text is what capstone
+#: prints for the words.
+_GOTO_SHAPES = {
+    # One loop, two ways out. The goto's target reads the register the write-back just
+    # copied into t0, so the target has to read t0, not `t0 + 1` over again. x8 and the
+    # slot it is spilled to hold `t0 + 5` and nothing past the goto reads either.
+    "renamed": ([(0xd2800003, "mov", "x3, #0"), (0x91001468, "add", "x8, x3, #5"),
+                 (0xf81f03a8, "stur", "x8, [x29, #-0x10]"),
+                 (0x91000463, "add", "x3, x3, #1"), (0xeb01007f, "cmp", "x3, x1"),
+                 (0x540000a0, "b.eq", "#0x28"), (0xf100247f, "cmp", "x3, #9"),
+                 (0x54ffff41, "b.ne", "#4"), (0xd2800000, "mov", "x0, #0"),
+                 (0xd65f03c0, "ret", ""), (0x91019060, "add", "x0, x3, #0x64"),
+                 (0xd65f03c0, "ret", "")],
+                {"x1": 3}, ["t0 += 1;", "goto L_0x28;"], "return t0 + 100;",
+                "return t0 + 1 + 100;"),
+    # The same goto to a block another path reaches too: that block is entered from
+    # nothing (`_reenter`), so nothing is written out for it, x1 included.
+    "joined": ([(0xd2800003, "mov", "x3, #0"), (0xb4000122, "cbz", "x2, #0x28"),
+                (0xaa0303e1, "mov", "x1, x3"), (0x91000463, "add", "x3, x3, #1"),
+                (0xeb04007f, "cmp", "x3, x4"), (0x540000a0, "b.eq", "#0x28"),
+                (0xf100247f, "cmp", "x3, #9"), (0x54ffff61, "b.ne", "#8"),
+                (0xd2800000, "mov", "x0, #0"), (0xd65f03c0, "ret", ""),
+                (0xaa0103e0, "mov", "x0, x1"), (0xd65f03c0, "ret", "")],
+               None, ["t0 += 1;", "goto L_0x28;"], "return x1;", "var t1 = t0;"),
+    # x1 holds t0 from before the write-back and is the argument of the call there,
+    # which liveness does not count as a read. Not run: the printed call has no value.
+    "call_arg": ([(0xd2800003, "mov", "x3, #0"), (0xaa0303e1, "mov", "x1, x3"),
+                  (0x91000463, "add", "x3, x3, #1"), (0xeb02007f, "cmp", "x3, x2"),
+                  (0x540000a0, "b.eq", "#0x24"), (0xf100247f, "cmp", "x3, #9"),
+                  (0x54ffff61, "b.ne", "#4"), (0xd2800000, "mov", "x0, #0"),
+                  (0xd65f03c0, "ret", ""), (0x94000037, "bl", "#0x100"),
+                  (0xd65f03c0, "ret", "")],
+                 None, ["var t1 = t0;", "t0 += 1;", "goto L_0x24;"],
+                 "return sub_0x100(t1);", "return sub_0x100(t0);"),
+    # The target reads x4 and x6, which hold t0 from BEFORE the write-back, and reloads
+    # `t0 + 2` from a frame slot: each value is written out once, while it still means
+    # that, and the target reads the copies. x5 holds `t0 + 3` and nothing reads it, so
+    # it is not written out.
+    "pinned": ([(0xd2800003, "mov", "x3, #0"), (0xaa0303e4, "mov", "x4, x3"),
+                (0xaa0303e6, "mov", "x6, x3"), (0x91000c65, "add", "x5, x3, #3"),
+                (0x91000868, "add", "x8, x3, #2"), (0xf81f83a8, "stur", "x8, [x29, #-8]"),
+                (0x91000463, "add", "x3, x3, #1"), (0xeb01007f, "cmp", "x3, x1"),
+                (0x540000a0, "b.eq", "#0x34"), (0xf100247f, "cmp", "x3, #9"),
+                (0x54fffee1, "b.ne", "#4"), (0xd2800000, "mov", "x0, #0"),
+                (0xd65f03c0, "ret", ""), (0xf85f83a9, "ldur", "x9, [x29, #-8]"),
+                (0x8b060080, "add", "x0, x4, x6"), (0x8b090000, "add", "x0, x0, x9"),
+                (0xd65f03c0, "ret", "")],
+               {"x1": 3},
+               ["var t1 = t0;", "var t2 = t0 + 2;", "t0 += 1;", "goto L_0x34;"],
+               "return t1 + t1 + t2;", "return t0 + t0 + (t0 + 2);"),
+    # The inner loop's `break` writes t2 back, then the outer loop's goto leaves: the
+    # shape parsePartialString has, where no write-back sits next to the goto at all.
+    "via_break": ([(0xd2800003, "mov", "x3, #0"), (0x14000005, "b", "#0x18"),
+                   (0xd28000e0, "mov", "x0, #7"), (0xd65f03c0, "ret", ""),
+                   (0x910190a0, "add", "x0, x5, #0x64"), (0xd65f03c0, "ret", ""),
+                   (0xb4ffff82, "cbz", "x2, #8"), (0xd2800005, "mov", "x5, #0"),
+                   (0x910004a5, "add", "x5, x5, #1"), (0xeb0100bf, "cmp", "x5, x1"),
+                   (0x54ffff40, "b.eq", "#0x10"), (0xf1000cbf, "cmp", "x5, #3"),
+                   (0x54ffff81, "b.ne", "#0x20"), (0x91000463, "add", "x3, x3, #1"),
+                   (0xf100107f, "cmp", "x3, #4"), (0x54fffee1, "b.ne", "#0x18"),
+                   (0x17fffff2, "b", "#8")],
+                  {"x1": 2, "x2": 1}, ["t2 += 1;", "break;"], "return t2 + 100;",
+                  "return t2 + 1 + 100;"),
+    # The same, but the break leaves before the increment and writes nothing back, so
+    # x6, the copy of t2 the state past the loop has lost, still reads as t2.
+    "via_break_kept": ([(0xd2800003, "mov", "x3, #0"), (0x14000005, "b", "#0x18"),
+                        (0xd28000e0, "mov", "x0, #7"), (0xd65f03c0, "ret", ""),
+                        (0x910190c0, "add", "x0, x6, #0x64"), (0xd65f03c0, "ret", ""),
+                        (0xb4ffff82, "cbz", "x2, #8"), (0xd2800005, "mov", "x5, #0"),
+                        (0xaa0503e6, "mov", "x6, x5"), (0xeb0100bf, "cmp", "x5, x1"),
+                        (0x54ffff40, "b.eq", "#0x10"), (0x910004a5, "add", "x5, x5, #1"),
+                        (0xf1000cbf, "cmp", "x5, #3"), (0x54ffff61, "b.ne", "#0x20"),
+                        (0x91000463, "add", "x3, x3, #1"), (0xf100107f, "cmp", "x3, #4"),
+                        (0x54fffec1, "b.ne", "#0x18"), (0x17fffff1, "b", "#8")],
+                       {"x1": 2, "x2": 1}, ["} else {", "break;"], "return t2 + 100;",
+                       "return x6 + 100;"),
+}
+
+
+def test_a_goto_target_reads_what_the_jump_left():
+    # A block only a goto reaches is lifted from the state its one predecessor left, and
+    # that state was recorded BEFORE the printed program writes loop names back on the
+    # way there (#106). The write-back changes what a name means, and the target went on
+    # reading the old meaning: 2.19.6's parsePartialKeyword returned `t4 + 1` right after
+    # `t4 += 1;`, one more than the CPU, and 3.4.4's parsePartialString passed `t0` where
+    # the machine passes the t0 from before `t0 = x0;`. Each shape is one way in.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import struct
+    from jadart import expr
+
+    lifted, walks = {}, []
+    init = expr.Lifter.__init__
+    try:
+        def counted(self, *a, **k):
+            walks.append(1)
+            init(self, *a, **k)
+        expr.Lifter.__init__ = counted
+        for name, (rows, _args, before, want, old) in _GOTO_SHAPES.items():
+            walks.clear()
+            lines = expr.lift_function([(4 * i, mn, op, "")
+                                        for i, (_w, mn, op) in enumerate(rows)],
+                                       arity=lambda pc: 1)
+            body = [ln.strip() for ln in lines]
+            at = body.index(before[-1])
+            assert body[at - len(before) + 1:at + 1] == before, (name, body)
+            assert want in body and old not in body, (name, body)
+            lifted[name] = (lines, len(walks))
+    finally:
+        expr.Lifter.__init__ = init
+    # A second walk is what keeps a value written out for nothing out of the output;
+    # one nothing past the jump can read is not written out to begin with.
+    assert [lifted[k][1] for k in ("renamed", "joined", "pinned")] == [1, 1, 2], lifted
+
+    # And on a CPU: the value the printed program returns is the one the machine does.
+    if not _unicorn_available() or not _capstone_available():
+        _skip("  SKIP test_a_goto_target_reads_what_the_jump_left, CPU half")
+    import irfuzz
+    from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+    from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, arm64_const as a64
+    md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+    for name, (rows, args, _b, _w, _o) in _GOTO_SHAPES.items():
+        code = b"".join(struct.pack("<I", w) for w, _m, _o in rows)
+        assert [(i.mnemonic, i.op_str) for i in md.disasm(code, 0)] == [
+            (m, o) for _w, m, o in rows], name
+        if args is None:
+            continue
+        base, end = 0x10000, 0x10000 + len(code)
+        mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+        mu.mem_map(base, 0x1000)
+        mu.mem_map(0x20000, 0x1000)                   # a frame for the slot x29 names
+        mu.mem_write(base, code)
+        for reg, v in args.items():
+            mu.reg_write(getattr(a64, f"UC_ARM64_REG_X{reg[1:]}"), v)
+        mu.reg_write(a64.UC_ARM64_REG_X29, 0x20800)
+        mu.reg_write(a64.UC_ARM64_REG_X30, end)
+        mu.emu_start(base, end, count=1000)
+        env = dict(args, xzr=0)
+        ret = irfuzz._run_printed([ln.strip() for ln in lifted[name][0]], env)
+        got = irfuzz._ev(irfuzz._mem_expr(ret), env)
+        assert got == mu.reg_read(a64.UC_ARM64_REG_X0), (name, ret, got)
+
+
+def test_a_function_writes_out_a_bounded_number_of_values_before_its_gotos():
+    # A loop that spills S slots and leaves by G gotos asked `_arrive` for S x G
+    # write-outs, every slot before every goto: 4,000 slots and 250 gotos took 6 s and a
+    # gigabyte of declarations. Past _MAX_PINS a value is forgotten instead (#106).
+    import jadart.expr as E
+    rows, labels, fix = [], {}, []
+
+    def emit(mn, op=""):
+        rows.append([len(rows) * 4, mn, op, ""])
+    emit("mov", "x3, #0")
+    labels["loop"] = len(rows) * 4
+    for k in range(400):
+        emit("add", f"x8, x3, #{k + 1}")
+        emit("str", f"x8, [x29, #{16 + 8 * k}]")
+    emit("add", "x3, x3, #1")
+    for g in range(60):
+        emit("cmp", f"x3, x{1 + g % 2}")
+        fix.append((len(rows), f"out{g}"))
+        emit("b.eq", "")
+    emit("cmp", "x3, #100")
+    fix.append((len(rows), "loop"))
+    emit("b.ne", "")
+    emit("ret")
+    for g in range(60):
+        labels[f"out{g}"] = len(rows) * 4
+        for k in range(400 if g == 0 else 1):
+            emit("ldr", f"x10, [x29, #{16 + 8 * k}]")
+            emit("add", "x0, x0, x10")
+        emit("ret")
+    for i, label in fix:
+        rows[i][2] = f"#{labels[label]:#x}"
+    most = []
+    real, cap = E.Lifter._arrive, E._MAX_PINS
+
+    def spy(self, *a, **k):
+        out = real(self, *a, **k)
+        most.append(len(self.pins))
+        return out
+    E.Lifter._arrive = spy
+    try:
+        E.lift_function([tuple(r) for r in rows])
+        assert most and max(most) == cap, max(most)
+        E._MAX_PINS, most[:] = 10, []
+        E.lift_function([tuple(r) for r in rows])
+        assert max(most) == 10, max(most)
+    finally:
+        E.Lifter._arrive, E._MAX_PINS = real, cap
+
+def test_the_nested_loop_oracle_catches_a_goto_target_read_stale():
+    """Teeth for `irfuzz --cfgmem --nested`, which generates the shape #106 was found in.
+
+    `_gen_function` builds one loop at most, so a goto out of two never came up and the
+    oracle reported nothing on a lifter that had the defect. Without `_arrive` a goto's
+    target is lifted from the state before the write-back again, and the nested graphs
+    have to catch it; `--cfg` runs them too, and has to stay clean."""
+    if not _unicorn_available() or not _capstone_available():
+        _skip("  SKIP test_the_nested_loop_oracle_catches_a_goto_target_read_stale")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import irfuzz
+    from jadart import expr
+
+    assert irfuzz.run_cfg(200, 25, 1, False, nested=True) == 0
+    for seed in (1, 3):
+        got = irfuzz.run_cfgmem(300, 50, seed, False, seed_outs=True, nested=True)
+        assert got == 0, f"the nested graphs disagreed with the CPU at seed {seed}"
+    arrive = expr.Lifter._arrive
+    try:
+        expr.Lifter._arrive = lambda self, addr, st, moved, pad="": []
+        assert irfuzz.run_cfgmem(300, 50, 3, False, seed_outs=True, nested=True) != 0, (
+            "the nested graphs passed with a goto's target read from before its copy")
+    finally:
+        expr.Lifter._arrive = arrive
+
+
 def test_cfgcheck_holds_a_leaving_arm_to_its_kind_and_target():
     # cfgcheck read every arm that leaves as None, whichever way it left and to where, so
     # a branch into the part past the cut rendered as one out of the function (#70's

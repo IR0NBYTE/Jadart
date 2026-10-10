@@ -582,7 +582,8 @@ MAX_INLINE_CHARS = 200
 
 
 class State:
-    __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair")
+    __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
+                 "src")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
@@ -609,6 +610,10 @@ class State:
         # whole 64 bits; this map only records which other register is its top half, so a
         # store of both halves can be read back as one assignment rather than two.
         self.pair: dict = {}
+        # The block this state last came out of, or right after a loop the blocks that
+        # broke out of it. `Lifter._arrive` reads it to tell a goto straight from its
+        # block from one that follows a `break`.
+        self.src = None
 
     def copy(self) -> "State":
         s = State()
@@ -619,6 +624,7 @@ class State:
         s.poolbase = dict(self.poolbase)
         s.pair = dict(self.pair)
         s.tmpc = self.tmpc
+        s.src = self.src
         return s
 
     def _unpair(self, reg: str):
@@ -684,6 +690,12 @@ def _use_re(name: str):
     if pat is None:
         pat = _USE_RE[name] = re.compile(rf"\b{re.escape(name)}\b")
     return pat
+
+
+def _mentions(names):
+    """A test for whether a text mentions any of `names`, word-bounded."""
+    pats = [_use_re(n) for n in sorted(names)]
+    return lambda text: any(p.search(text) for p in pats)
 
 
 def _is_lr_spill(reg: str, st: State) -> bool:
@@ -1177,6 +1189,17 @@ class Lifter:
         #: the printed body has assigned that name, so a reader takes it as that value.
         #: block -> the state the walk left it in, for _reenter.
         self._exit: dict = {}
+        #: block -> the state the goto to it left, after its write-back; see _arrive.
+        self._came: dict = {}
+        #: For `_arrive`: block -> the names written back by the `break` it left a loop
+        #: by, and loop header -> the blocks that broke out of it.
+        self._broke: dict = {}
+        self._breakers: dict = {}
+        #: The values `_arrive` wrote out before a write-back, name -> (target, "reg" or
+        #: "slot", key), and which of them to write out, None for all; see _lift_function.
+        self.pins: dict = {}
+        self.keep = None
+        self._loads = None
 
     def _clobber_call(self, st: State):
         """Forget every value a call destroys.
@@ -2308,7 +2331,7 @@ class Lifter:
         return f"{lhs.text} = {rhs.text};{_smi_note(lhs, rhs)}"
 
     # block + tree walk
-    def _carry_out(self, st: State, pad: str, leaving: bool) -> list:
+    def _carry_out(self, st: State, pad: str, leaving: bool, target=None) -> list:
         """Write the enclosing loop's carried names back before an edge that skips the tail.
 
         `_render_loop` binds each loop-carried register to a name, and assigns the name at
@@ -2331,7 +2354,8 @@ class Lifter:
 
         `leaving` is False for a `continue`, which re-enters the body rather than leaving
         the loop, and True otherwise. Both need the copy, a continue skips the tail just
-        as a break does, and the flag only says which frame's names to use.
+        as a break does, and the flag only says which frame's names to use. `target` is
+        the block a goto goes to, which `_arrive` hands the state it is entered with.
         """
         if not self._carrying:
             return []
@@ -2341,12 +2365,131 @@ class Lifter:
         # first. See _parallel_copy.
         here = [(r, st.get(r)) for r in sorted(names)]
         here = [(r, v) for r, v in here if v.text != names[r]]
-        out = self._parallel_copy(st, [(names[r], v) for r, v in here], pad)
+        pins = ([] if target is None else
+                self._arrive(target, st, {names[r]: r for r, _v in here}, pad))
+        out = pins + self._parallel_copy(st, [(names[r], v) for r, v in here], pad)
         for r, _v in here:
             copied.add(r)
             if leaving:
                 st.reg[r] = V(names[r], P_ATOM)
         return out
+
+    def _arrive(self, addr, st: State, moved: dict, pad: str = "") -> list:
+        """Record the state a goto hands `addr`; return what to write out first (#106).
+
+        `_reenter` gave a block only a jump reaches the exit state of its one predecessor,
+        and that state was recorded BEFORE the printed program writes names back on the
+        way there: in the goto's own write-back, and in a `break`'s when the goto comes
+        right after a loop. A write-back changes what a NAME means, and the target went on
+        reading the old meaning. 3.4.4's parsePartialString printed `t0` for a register
+        that holds the `t0` from before `t0 = x0;`, and 2.19.6's parsePartialKeyword
+        returned `t4 + 1` after `t4 += 1;`, one more than the CPU does.
+
+        Straight from its block, the walk's own state at the goto is that exit state.
+        Right after a loop it is the state past the loop, which holds for every way out of
+        it and so knows less, so there the exit state is kept and only what mentions a
+        name the breaks on this path wrote back is taken from the walk. Then, for the
+        names this goto writes back (`moved`, name -> register), a value spelled exactly
+        as one of those registers IS that name once the copy has run, and anything else
+        that mentions one is written out first, once per value, while it still means what
+        it says. Most of those nothing reads; `_lift_function` keeps the ones read."""
+        preds = self._preds.get(addr, ())
+        if len(preds) != 1:
+            return []                       # _reenter starts from nothing here anyway
+        left = self._exit.get(preds[0])
+        if isinstance(st.src, frozenset) and preds[0] in st.src and left is not None:
+            got = left.copy()
+            stale = _mentions(self._broke.get(preds[0], ()))
+            for r, v in sorted(got.reg.items()):
+                if stale(v.text):
+                    got.reg[r] = st.get(r)
+                    got.elem.pop(r, None)
+                    got.poolbase.pop(r, None)
+            for k, v in sorted(got.slot.items()):
+                if stale(v.text):
+                    del got.slot[k]
+            for k, (b, i, *_r) in list(got.elem.items()):
+                if stale(b.text) or stale(i.text):
+                    del got.elem[k]
+        else:
+            got = st.copy()
+        moves = _mentions(moved)
+        now = {}
+        for n in sorted(moved, reverse=True):
+            now[got.get(moved[n]).text] = n
+        out, pinned = [], {}
+        live = self._livein.get(addr, 0)
+        for side, held in (("reg", got.reg), ("slot", got.slot)):
+            for k, v in sorted(held.items()):
+                if not moves(v.text):
+                    continue
+                n = now.get(v.text) or pinned.get(v.text)
+                if n is None:
+                    # The first walk writes out what can be read at all: a register live
+                    # at the target or one a call can take, which liveness does not count
+                    # (`bl` uses nothing), and a slot the function loads somewhere. Which
+                    # of those is read decides what the second walk writes out.
+                    if self.keep is not None:
+                        want = (addr, side, k) in self.keep
+                    elif side == "reg":
+                        want = (k in ARG_REGS or k == _T.ret_int
+                                or live & _reg_mask((k,)))
+                    else:
+                        want = k in self._slot_loads()
+                    if want and self.keep is None and len(self.pins) >= _MAX_PINS:
+                        want = False            # a crafted function: forget, a decline
+                    if not want:
+                        if side == "reg":
+                            got.forget(k)
+                        else:
+                            del held[k]
+                        continue
+                    n = pinned[v.text] = f"t{st.tmpc[0]}"
+                    st.tmpc[0] += 1
+                    out.append(f"{pad}var {n} = {v.text};")
+                    self.pins[n] = (addr, side, k)
+                    # Set on the goto's path, and that is every path into its one-way
+                    # target; see the join in `walk`.
+                    self._anchor[int(n[1:])] = addr
+                held[k] = V(n, P_ATOM)
+                if side == "reg":
+                    got.elem.pop(k, None)
+                    got.poolbase.pop(k, None)
+        for k, (b, i, *_r) in list(got.elem.items()):
+            if moves(b.text) or moves(i.text):
+                del got.elem[k]
+        self._came[addr] = got
+        return out
+
+    def _slot_loads(self) -> set:
+        """The frame slots this function loads anywhere, keyed as `State.slot` is."""
+        if self._loads is None:
+            self._loads = set()
+            for blk in self.blocks.values():
+                for (_a, mn, op, _n) in blk.insns:
+                    if mn not in _LOADS:
+                        continue
+                    ops = _split_ops(op)
+                    got = _addr(ops)
+                    if got is None or got[1] is _BAD_POST:
+                        continue
+                    (base, disp, _i, _s, _wb), post = got
+                    if _T.roles.get(base) not in ("SP", "FP"):
+                        continue
+                    disp = 0 if post else disp
+                    self._loads.add(f"{base}{disp:+d}")
+                    if mn in ("ldp", "ldpsw") and len(ops) >= 3:
+                        w = 4 if ops[1].strip()[:1] == "w" else 8
+                        self._loads.add(f"{base}{disp + w:+d}")
+        return self._loads
+
+    def _note_break(self, st: State):
+        """Record the names this `break` writes back, against the block it leaves."""
+        header, names, _c = self._carrying[-1]
+        if isinstance(st.src, int):
+            self._broke[st.src] = frozenset(n for r, n in names.items()
+                                            if st.get(r).text != n)
+            self._breakers.setdefault(header, set()).add(st.src)
 
     def _leaves_loop(self, addr) -> bool:
         """True when a goto to `addr` jumps out of the loop currently being walked."""
@@ -2469,6 +2612,7 @@ class Lifter:
         # Kept for `_reenter`: a block emitted after something that did not fall through
         # needs the state of its own predecessor, not of whatever the tree put above it.
         self._exit[addr] = st.copy()
+        st.src = addr
         return lines, falls
 
     def _reenter(self, addr, st: State):
@@ -2483,11 +2627,15 @@ class Lifter:
         of the 8,194 functions in the 3.12.2 clean build contain a block reachable from
         nothing, so this is not a corner.
 
-        Where the block has exactly one predecessor its exit state IS the edge and is used.
-        Anything else drops to symbolic, which is what "no path led here" honestly reads as.
+        Where the block has exactly one predecessor its exit state IS the edge and is
+        used, or, where a goto takes that edge, the state the goto left, since the printed
+        program can write names back on the way (`_arrive`). Anything else drops to
+        symbolic, which is what "no path led here" honestly reads as.
         """
         preds = self._preds.get(addr, ())
-        carry = self._exit.get(preds[0]) if len(preds) == 1 else None
+        carry = None
+        if len(preds) == 1:
+            carry = self._came.get(addr) or self._exit.get(preds[0])
         st.elem.clear()
         st.poolbase.clear()
         st.pair.clear()
@@ -2788,14 +2936,17 @@ class Lifter:
                 self._loop_before = prev[1] if prev and prev[0] == "asm" else None
                 label(s[1])
                 out.extend(self._render_loop(s[1], s[2], st, indent, depth))
+                st.src = frozenset(self._breakers.get(s[1], ()))
                 alive = True
             elif kind in ("break", "continue"):
+                if kind == "break" and self._carrying:
+                    self._note_break(st)
                 out.extend(self._carry_out(st, pad, kind == "break"))
                 out.append(pad + kind + ";")
                 falls = alive = False
             elif kind == "goto":
                 if self._leaves_loop(s[1]):
-                    out.extend(self._carry_out(st, pad, True))
+                    out.extend(self._carry_out(st, pad, True, s[1]))
                 out.append(pad + f"goto L_0x{s[1]:x};")
                 falls = alive = False
             elif kind in ("exit", "cut"):
@@ -3310,6 +3461,12 @@ def _forget_temps(st: State, gone) -> None:
 
 
 _TMP_NUM_RE = re.compile(r"\bt(\d+)\b")
+
+#: How many values one function's first walk writes out before a goto (_arrive). A real
+#: function needs a handful; a crafted one with thousands of slots and hundreds of gotos
+#: asked for millions, a gigabyte of declarations. Past the bound a value is forgotten,
+#: which the target reads as its bare register.
+_MAX_PINS = 2048
 _RAW_LINE_RE = re.compile(r"\s*([a-z][a-z0-9.]*)(?:\s+(.*?))?(?:\s+//.*)?$")
 _ASSIGN_LINE_RE = re.compile(r"\s*([a-z]\d+) ([-+*&|^]?=) ")
 _NOT_RAW = frozenset({"return", "throw", "rethrow", "break", "continue", "goto", "var"})
@@ -3463,9 +3620,29 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         return []
     stmts = structure(blocks, entry)
     dispatch = detect_dispatch(stripped)
-    lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
-                    dispatch=dispatch, selectors=selectors, entry=entry, fields=fields)
-    lifter.show = show
-    lifter.labels = label_targets(stmts)
-    lines, _falls = lifter.walk(stmts, State(), indent, depth)
+
+    def walk(keep):
+        lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
+                        dispatch=dispatch, selectors=selectors, entry=entry,
+                        fields=fields)
+        lifter.show = show
+        lifter.labels = label_targets(stmts)
+        lifter.keep = keep
+        lines, _falls = lifter.walk(stmts, State(), indent, depth)
+        return lifter, lines
+
+    lifter, lines = walk(None)
+    if lifter.pins:
+        # Which of the values `_arrive` wrote out the body goes on to read is only known
+        # once the body is printed. One nothing read still took a temporary's number, so
+        # the walk runs again writing out only those that were read, and every other name
+        # is numbered as it would have been without them.
+        counts: dict = {}
+        for ln in lines:
+            for m in _TMP_RE.finditer(ln):
+                counts[m.group(0)] = counts.get(m.group(0), 0) + 1
+        read = frozenset(at for n, at in lifter.pins.items() if counts.get(n, 0) > 1)
+        if len(read) < len(lifter.pins):
+            lifter = lines = None           # not held while the second walk runs
+            lifter, lines = walk(read)
     return _inline_single_use(_drop_unread(lines, lifter.raw_names), lifter.results)
