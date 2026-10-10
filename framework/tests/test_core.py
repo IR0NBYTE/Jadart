@@ -10530,6 +10530,61 @@ def test_a_raw_line_says_what_the_registers_it_reads_hold():
     assert lift([("ldar", "w0, [x1]"), ("ret", "")], receiver={"x1": "this"})[0] == (
         "ldar w0, [x1]")
 
+def test_a_bitfield_reads_as_wide_as_its_field():
+    # `sbfx` carries the top bit of its field up, and tier 3 printed it as `(x >> lsb) &
+    # mask`, which clears it; `sbfiz` and `ubfiz` printed `x << lsb` and kept every bit
+    # above the field; and `ubfx` put its source in unbracketed, so `x1 & x2` read as
+    # `x1 & (x2 >> 4)` (#124). Each form is checked against the arm64 definition on
+    # random inputs, in Dart's 64-bit arithmetic.
+    import random
+    from jadart.expr import lift_function
+
+    def text(mn, lsb, width, rows=()):
+        body = lift_function([(i * 4, r[0], r[1], "") for i, r in enumerate(
+            list(rows) + [(mn, f"x5, x3, #{lsb}, #{width}"), ("stur", "x5, [x2, #7]"),
+                          ("ret", "")])])
+        return body[0].strip().split(" = ", 1)[1].rstrip(";")
+    assert text("sbfx", 4, 8) == "(x3 >> 4).toSigned(8)"
+    assert text("sbfiz", 3, 8) == "x3.toSigned(8) << 3"
+    assert text("ubfiz", 3, 8) == "(x3 & 0xff) << 3"
+    assert text("sbfx", 4, 60) == "x3 >> 4" and text("ubfx", 4, 60) == "x3 >>> 4"
+    assert text("ubfx", 4, 8, [("and", "x3, x1, x2")]) == "((x1 & x2) >> 4) & 0xff"
+    # A negative literal is no atom to Dart's `.`: `-128.toSigned(8)` is
+    # `-(128.toSigned(8))`, 1024 where the machine has -1024 for `<< 3`.
+    assert text("sbfiz", 3, 8, [("mov", "x3, #-0x80")]) == "(-128).toSigned(8) << 3"
+    # The Smi tag and untag keep the reading they had: the value, and `>> 1`. The class
+    # id read out of a tags word keeps its brackets.
+    assert text("sbfiz", 1, 31) == "x3" and text("sbfx", 1, 31) == "x3 >> 1"
+    assert text("ubfx", 12, 20) == "(x3 >> 12) & 0xfffff"
+
+    mask = (1 << 64) - 1
+
+    def signed(v, n):
+        v &= (1 << n) - 1
+        return v - (1 << n) if v >> (n - 1) & 1 else v
+
+    def arm(mn, x, lsb, width):
+        field = (1 << width) - 1
+        return {"ubfx": (x >> lsb) & field, "sbfx": signed(x >> lsb, width),
+                "ubfiz": (x & field) << lsb, "sbfiz": signed(x, width) << lsb}[mn] & mask
+
+    def dart(t, x):
+        t = t.replace("x3 >>> ", "_u(x3) >> ")
+        t = re.sub(r"(\([^()]*\)|\w+)\.toSigned\((\d+)\)", r"_s(\1, \2)", t)
+        t = re.sub(r"\bx3\b", "_x", t)
+        env = {"_s": signed, "_u": lambda v: v & mask, "_x": signed(x, 64)}
+        return eval(t, env) & mask
+    rng = random.Random(124)
+    for mn in ("ubfx", "sbfx", "ubfiz", "sbfiz"):
+        for lsb, width in ((4, 8), (4, 60), (3, 61), (12, 20), (7, 1), (5, 32), (1, 8),
+                           (1, 63)):
+            if mn == "sbfiz" and (lsb, width) == (1, 63):
+                continue                                    # the Smi tag
+            t = text(mn, lsb, width)
+            for _ in range(200):
+                x = rng.getrandbits(64)
+                assert dart(t, x) == arm(mn, x, lsb, width), (mn, lsb, width, t, hex(x))
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
