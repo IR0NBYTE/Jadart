@@ -11921,6 +11921,30 @@ def test_a_frame_slot_past_the_displacement_is_its_own_slot():
                  ("ldr", "x0, [x29, x17]")]) == ["str x1, [x29, x17]", "return x0;"]
 
 
+def test_a_register_list_load_writes_every_register_in_it():
+    # `ld1 {v0.16b, v1.16b}` writes d0 and d1, and only the first register of a list
+    # was seen as written: a store of d1 after it printed the field d1 held before, and
+    # the raw line said it read d1 (#134).
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])])]
+    assert lift([("ldur", "d1, [x4, #0xf]"), ("ld1", "{v0.16b, v1.16b}, [x1]"),
+                 ("stur", "d1, [x5, #7]")])[:2] == [
+        "ld1 {v0.16b, v1.16b}, [x1]", "x5.field_0x8 = d1;"]
+    assert lift([("ldur", "q3, [x4, #0xf]"),
+                 ("ld4", "{v0.2d, v1.2d, v2.2d, v3.2d}, [x2], #64"),
+                 ("stur", "d3, [x5, #7]")])[1] == "x5.field_0x8 = d3;"
+    # A lane of each keeps the rest of the register, so the line reads it too.
+    assert lift([("ldur", "d5, [x4, #0xf]"), ("ld2", "{v4.s, v5.s}[1], [x3]"),
+                 ("stur", "d5, [x5, #7]")])[:2] == [
+        "ld2 {v4.s, v5.s}[1], [x3]   // d5 holds x4.field_0x10", "x5.field_0x8 = d5;"]
+    # A store of a list writes none of them.
+    assert lift([("ldur", "d1, [x4, #0xf]"), ("st1", "{v0.16b, v1.16b}, [x1]"),
+                 ("stur", "d1, [x5, #7]")])[1] == "x5.field_0x8 = x4.field_0x10;"
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
