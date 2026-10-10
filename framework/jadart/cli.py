@@ -282,7 +282,7 @@ def cmd_lift(args) -> int:
     from .branches import row_kinds
     from .disasm import rebaser, cut_end
     from .signatures import names_with_signatures
-    from .expr import lift_function, make_arity_resolver
+    from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
     from .fields import recover_fields
     try:
@@ -307,6 +307,7 @@ def cmd_lift(args) -> int:
     from .program import static_function_refs, receiver_for
     static_refs = static_function_refs(fr)
     arity = make_arity_resolver(image)
+    returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
     out = []
@@ -320,7 +321,8 @@ def cmd_lift(args) -> int:
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             show=rebaser(image), cut_end=cut_end(cr, dis))
+                             show=rebaser(image), cut_end=cut_end(cr, dis),
+                             returns=returns)
         if getattr(args, "json", False):
             out.append({"name": nm, "pc_offset": cr.pc_offset,
                         "va": va_of(image, cr.pc_offset), "size": cr.size,
@@ -861,7 +863,7 @@ def cmd_ffi(args) -> int:
     from .branches import row_kinds
     from .disasm import rebaser, sub_label
     from .signatures import names_with_signatures
-    from .expr import lift_function, make_arity_resolver
+    from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
     from .fields import recover_fields
     from .program import static_function_refs, receiver_for
@@ -885,6 +887,7 @@ def cmd_ffi(args) -> int:
         pc_to_name, _note = names_with_signatures(image, fr, getattr(args, "sigs", None))
         static_refs = static_function_refs(fr)
         arity = make_arity_resolver(image)
+        returns = make_return_resolver(image)
         selectors = recover_selectors(image, fr, hdr)
         layout = recover_fields(fr, getattr(image, "arch", None))
         lit = _literal_re()
@@ -899,7 +902,7 @@ def cmd_ffi(args) -> int:
                                      arity=arity, selectors=selectors,
                                      arch=getattr(image, "arch", None),
                                      fields=layout.for_function(cr.owner_ref),
-                                     show=rebaser(image))
+                                     show=rebaser(image), returns=returns)
             except JadartError:
                 # Tier 3 declines on a target it has no register model for (UnsupportedArch
                 # is a JadartError). The pool and xref halves still hold, so the library is
