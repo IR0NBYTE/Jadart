@@ -318,8 +318,8 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
     quarter of its functions (#45).
 
     `traps` are the mnemonics that end a block with no successor (#57). Tier 3 passes
-    none, and keeps the edge past a trap it has always had, until it can name a frame
-    slot across a call; see `_lift_function`.
+    none, and keeps the edge past a trap it has always had, until the walk no longer
+    leans on it (#64); see `_lift_function`.
 
     `cut_end` is where the range ends when the instruction cut stopped `dis` short of it
     (disasm.cut_end), else None. A target from the end of `dis` up to it is inside this

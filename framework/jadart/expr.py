@@ -29,12 +29,13 @@ x22=NULL (true=+0x20, false=+0x30), x21=DISPATCH_TABLE.
 from __future__ import annotations
 
 import contextlib
+import heapq
 import re
 from dataclasses import dataclass, field
 from sys import intern
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, _idoms, cut_goto, flat)
+                  cond_of, _idoms, cut_goto, flat, TRAPS)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -1465,6 +1466,74 @@ def _return_facts(blocks, entry):
             live = step_bwd(live, r)
     proven = only_ret or any(not st[0] and st[1] for st in at_ret.values())
     return at_ret, proven, read
+def _frame_access(mn: str, op: str):
+    """(slot keys, how far FP moves, operands) for a load or store `_step` keeps in the
+    slot map, else None. The keys are the ones `_step` files the access under, so an
+    analysis over them agrees with what the walk reads back."""
+    if mn not in _STORES and mn not in _LOADS:
+        return None
+    fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
+    ops = _split_ops(op)
+    got = _addr(ops)
+    if got is None or got[1] is _BAD_POST or got[0][0] != fp:
+        return None
+    (_base, disp, _index, _scale, wb), post = got
+    delta = disp if wb else post
+    if mn in _LOADS and delta and fp in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]):
+        return None                                   # left raw by _step, see there
+    if post:
+        disp = 0
+    pair = mn in ("stp", "ldp", "ldpsw") and len(ops) >= 3
+    width = 4 if pair and ops[1].strip()[:1] == "w" else 8
+    return [f"{fp}{disp:+d}"] + ([f"{fp}{disp + width:+d}"] if pair else []), delta, ops
+
+
+#: The stub kinds that never return; see Lifter._loop_rewrites.
+_NORETURN = frozenset({"throw", "rethrow", "throw_err"})
+
+
+def _ends_path(mn: str, note: str) -> bool:
+    """True for an instruction no path runs past: a trap, or a call to a stub that throws.
+
+    Tier 3 builds its graph with neither ending a block (#64), so the instructions after
+    one, and the block they fall into, look reachable from it."""
+    if mn in TRAPS:
+        return True
+    if mn == "bl" and "-> " in note and "_iso_stub_" in note:
+        return _classify_stub(note.split("-> ", 1)[1].strip())[0] in _NORETURN
+    return False
+
+
+def _frame_accesses(insns, stop=False):
+    """(index, slot keys, how far FP moves, operands, write-backs) for each load and store
+    of one block that `_step` keeps in the slot map, in order. `write-backs` is None for a
+    load, and for a store says per key whether the register stored was reloaded from that
+    slot in this block with nothing written to either since: the value already there.
+    `stop` ends the block at the first instruction no path runs past (_ends_path)."""
+    fresh = {}                             # {register: the slot it was reloaded from}
+    for i, (_a, mn, op, note) in enumerate(insns):
+        if stop and _ends_path(mn, note):
+            return
+        got = _frame_access(mn, op)
+        if got is None:
+            for r in _def_use(mn, op)[0]:
+                fresh.pop(r, None)
+            continue
+        keys, delta, ops = got
+        if mn in _LOADS:
+            for k, dst in zip(keys, ops):
+                fresh[canon(dst)] = k
+            backs = None
+        else:
+            backs = []
+            for k, src in zip(keys, ops):
+                r = canon(src)
+                backs.append(not delta and fresh.get(r) == k)
+                for other in [o for o, at in fresh.items() if at == k and o != r]:
+                    del fresh[other]
+        if delta:
+            fresh.clear()
+        yield i, keys, delta, ops, backs
 
 
 # ── the lifter ──────────────────────────────────────────────────────────────
@@ -1535,6 +1604,17 @@ class Lifter:
         self._loop_before = None
         #: Whether a frame address ever reaches a general register; see _frame_escaped.
         self._escaped = None
+        #: (address, slot) of the frame stores that name their value; see _slot_crossings.
+        self._crossings = None
+        #: The names those stores gave; see _lift_function.
+        self.slot_names: set = set()
+        #: ({slot: bit}, {block: (live, crossing) masks}) from _slot_crossings, and the
+        #: block order its worklist runs in; see _backward.
+        self._slot_live = ({}, {})
+        self._rank = None
+        #: Blocks no path runs to the end of (_ends_path), the dominators of the graph
+        #: where they end, and each block's frame stores; see _loop_rewrites.
+        self._ended = self._ridom = self._spills = None
         #: (header, {reg: name}, copied) for each loop being walked, innermost last. An
         #: exit inside the body has to write the carried names back itself; see _carry_out.
         self._carrying: list = []
@@ -1606,11 +1686,11 @@ class Lifter:
         Call this AFTER the receiver and arguments have been rendered, so the call site
         itself still spells them the way the reader expects.
 
-        Registers only. A stack slot holding a memory read has the same problem and no
-        liveness to consult, and dropping those at every call was measured: the outgoing
-        area is what `_stack_args` reconstructs a stack-convention call's arguments from,
-        so emptying it cost `benchDecodeFlag` the literal semdiff pins it on. That limit
-        is recorded in FINDINGS.md rather than traded for a hard check.
+        Registers only. A frame slot holding a memory read has the same problem, and is
+        named where it is stored rather than here; see `_slot_crossings` (#64). Dropping
+        every slot at a call was tried first: the outgoing area is what `_stack_args`
+        reconstructs a stack-convention call's arguments from, so emptying it cost
+        `benchDecodeFlag` the literal semdiff pins it on.
         """
         out = []
         for key, v in sorted(st.reg.items()):
@@ -1622,6 +1702,333 @@ class Lifter:
             st.tmpc[0] += 1
             out.append(f"var {tmp} = {v.text};")
             st.reg[key] = V(tmp, P_ATOM)
+        return out
+
+    def _call_reads(self, insns) -> dict:
+        """{index: the registers the call there prints, as a mask} for one block.
+
+        `_def_use` says a direct call reads no register, which is what the machine needs
+        and not what the printed body does: `_call_args` spells the callee's register
+        arguments when its arity is known, and a throw prints x0. A value reloaded from a
+        slot only to be passed to a call is read by the reader, and `_slot_crossings` has
+        to count it (#64): `handleMessage` reloads a spilled field to pass it on, and the
+        argument printed as a fresh read of the field after the calls in between. The
+        same tests `_step` makes, so a register counted here is one a call can print. An
+        indirect call needs nothing here: liveness already sees it read its target, and a
+        dispatch call's receiver is read by the class id load in front of it."""
+        out = {}
+        for i, (_a, mn, op, note) in enumerate(insns):
+            if mn != "bl":
+                continue
+            name = note.split("-> ", 1)[1].strip() if "-> " in note else None
+            ops = _split_ops(op)
+            target = _imm(ops[0]) if ops and ops[0].startswith("#") else None
+            if name and "_iso_stub_" in name:
+                if _classify_stub(name)[0] == "throw":
+                    out[i] = _reg_mask((_T.ret_int,))
+            elif not (name and "stub" in name) and self.arity is not None and (
+                    target is not None):
+                k = self.arity(target)
+                if k:
+                    out[i] = _reg_mask(ARG_REGS[:k])
+        return out
+
+    def _slot_crossings(self) -> frozenset:
+        """(address, slot) for each frame store whose slot is read back after a call.
+
+        The frame-slot half of `_pin_call`. A slot keeps the TEXT of what was stored in
+        it, and when that text reads memory a reload on the far side of a call prints a
+        field the callee may have rewritten. `_CompactLinkedHashBase.forEach` saves
+        `_data`'s length in a slot, calls the user's callback, and throws if the length
+        changed; with the slot spelled as the field the guard reads `this.field_0xc !=
+        this.field_0xc` (#64).
+
+        Slots have no register liveness, so this is the same backward dataflow done over
+        slot keys: a slot is LIVE where a load of it is reachable with no store to it in
+        between, and CROSSING where such a load is reachable through a call. A store into
+        a crossing slot is where the value gets its name. At the store, and not at the
+        call, for two reasons measured on the clean build. Naming at the call put a
+        declaration in front of every call a spilled value outlives (14,294 of them) where
+        one per store does. And a store before a loop or an `if` is outside it, so the
+        name is bound once on a path every use is on; naming at a call inside one arm
+        made the arms disagree at the join, and inside a loop body it would re-read the
+        field on each trip, which the machine does not do.
+
+        Only the calls `_pin_call` runs for count: a runtime stub keeps or does not touch
+        the heap a spilled read came from. Keys and frame moves are worked out exactly as
+        `_step` does, so a slot this misses is one the walk would not have kept either.
+        """
+        if self._crossings is not None:
+            return self._crossings
+        bit: dict = {}
+        events = {}
+        reads = live_out = None
+        for b, blk in self.blocks.items():
+            ev, after = [], None
+            frame = {t[0]: t[1:] for t in _frame_accesses(blk.insns)}
+            for i, (a, mn, op, note) in enumerate(blk.insns):
+                if mn in _CALLS:
+                    name = note.split("-> ", 1)[1].strip() if "-> " in note else None
+                    if not (mn == "bl" and name and "_iso_stub_" in name):
+                        ev.append(("call", a, 0))
+                    continue
+                got = frame.get(i)
+                if got is None:
+                    continue
+                keys, delta, ops, backs = got
+                for k in keys:
+                    bit.setdefault(k, 1 << len(bit))
+                if backs is not None:
+                    # `_step` drops the slots the move made stale, THEN stores. A store
+                    # that writes back what was reloaded from the slot is no store here:
+                    # the value the next reload sees is still the one stored before, and
+                    # that is the store the name belongs to. `ldur x24, [k]; bl; stur x24,
+                    # [k]` round a loop otherwise hid the store in front of it, and the
+                    # field it spilled was read again inside the loop.
+                    if delta:
+                        ev.append(("kill", a, 0))
+                    for k, back in zip(keys, backs):
+                        if not back:
+                            ev.append(("store", a, bit[k], k))
+                    continue
+                # A reload counts only where the register it fills is read, the rule
+                # `_pin_call` applies to a register: a name for a spill nothing reads
+                # would be a declaration for nothing. Read as the printed body reads,
+                # with a call's printed arguments counted (`_call_reads`).
+                if after is None:
+                    if live_out is None:
+                        reads = {n: self._call_reads(x.insns)
+                                 for n, x in self.blocks.items()}
+                        live_out = self._printed_live_out(reads)
+                    more = reads[b]
+                    after, m = [0] * len(blk.insns), live_out.get(b, 0)
+                    for k in range(len(blk.insns) - 1, -1, -1):
+                        after[k] = m
+                        de, us = _def_use_masks(blk.insns[k][1], blk.insns[k][2])
+                        m = us | more.get(k, 0) | (m & ~de)
+                for k, dst in zip(keys, ops):
+                    if after[i] & _reg_mask((canon(dst),)):
+                        ev.append(("load", a, bit[k]))
+                if delta:
+                    ev.append(("kill", a, 0))
+            if ev:
+                events[b] = ev
+
+        def back(b, live, cross, hits=None):
+            for e in reversed(events.get(b, ())):
+                kind, m = e[0], e[2]
+                if kind == "load":
+                    live |= m
+                elif kind == "call":
+                    cross |= live
+                elif kind == "store":
+                    if hits is not None and cross & m:
+                        hits.add((e[1], e[3]))
+                    live &= ~m
+                    cross &= ~m
+                else:
+                    live = cross = 0
+            return live, cross
+
+        def out_of(b):
+            lo = co = 0
+            for s in self.blocks[b].succ:
+                sl, sc = live_in.get(s, (0, 0))
+                lo |= sl
+                co |= sc
+            return lo, co
+
+        found: set = set()
+        live_in: dict = {}
+        if bit:
+            self._backward(lambda b: back(b, *out_of(b)), live_in, (0, 0))
+            for b in events:
+                back(b, *out_of(b), found)
+        self._crossings = frozenset(found)
+        self._slot_live = (bit, live_in)
+        return self._crossings
+
+    def _backward(self, step, live_in: dict, empty) -> None:
+        """Run a backward dataflow to its fixed point: `step(b)` is block b's answer from
+        what `live_in` says of its successors, and `live_in` is filled in place.
+
+        A worklist in postorder, not the repeated sweeps of `_liveness`. A fact crosses
+        one block per sweep along a chain of backward branches, so sweeping costs blocks
+        times chain length: on a crafted 3,903-instruction chain the register half of
+        `_slot_crossings` took 0.19 s that way, as long as the whole lift takes on main,
+        and takes 0.002 s this way. Successors first, and a block again only when a
+        successor's answer changed."""
+        if self._rank is None:
+            self._rank = self._postorder()
+        rank = self._rank
+        work = [(rank[b], b) for b in self.blocks]
+        heapq.heapify(work)
+        queued = set(self.blocks)
+        while work:
+            _r, b = heapq.heappop(work)
+            queued.discard(b)
+            got = step(b)
+            if got != live_in.get(b, empty):
+                live_in[b] = got
+                for p in self._preds.get(b, ()):
+                    if p not in queued:
+                        queued.add(p)
+                        heapq.heappush(work, (rank[p], p))
+
+    def _printed_live_out(self, reads: dict) -> dict:
+        """Each block's live-out registers, as `_liveness` has them but with the reads
+        `_call_reads` found added: what the printed body reads."""
+        use, dfn = {}, {}
+        for b, blk in self.blocks.items():
+            u = d = 0
+            more = reads.get(b, {})
+            for i, (_a, mn, o, _n) in enumerate(blk.insns):
+                de, us = _def_use_masks(mn, o)
+                u |= (us | more.get(i, 0)) & ~d
+                d |= de
+            use[b], dfn[b] = u, d
+        live_in: dict = {}
+
+        def step(b):
+            lo = 0
+            for s in self.blocks[b].succ:
+                lo |= live_in.get(s, 0)
+            return use[b] | (lo & ~dfn[b])
+        self._backward(step, live_in, 0)
+        return {b: _or_all(live_in.get(s, 0) for s in self.blocks[b].succ)
+                for b in self.blocks}
+
+    def _loop_rewrites(self, header, st: State) -> list:
+        """The slots the loop at `header` may come round to holding something new (#109).
+
+        A loop's walk starts from the state before it, so a slot keeps its pre-loop text
+        at the top of the body. That is right for a slot the loop only reads, and for one
+        it writes back unchanged, the invariant spill: `this` saved before a loop and
+        saved again around a call inside it. It is wrong for a slot the loop stores a new
+        value to and reads at the top of the next trip, where every trip then printed the
+        first trip's value: a counter kept in a slot read `(1 + 1) >= 0xa` and never
+        ended. These are forgotten at the header, so the reload prints its register.
+
+        Forgetting every slot a loop stores to was measured first: 6,383 changed lines on
+        the clean fixture, and the sample was mostly invariant spills that printed right
+        before and a bare register after. So a store counts only where its value cannot
+        be shown to be the one already there: its register was reloaded from that slot in
+        the same block and not changed since, or the loop never writes the register and
+        it held the slot's value on the way in.
+
+        And only a store that comes round to the header. Tier 3 keeps the edge past a
+        trap, and a throw stub with nothing after it falls into the next block, often a
+        stack-overflow slow path that jumps back to a check (#64): loops the machine never
+        runs again, whose stores set up a throw. With `_ends_path` saying no to every
+        instruction, this rule changes 105 functions on the clean fixture, a sample of
+        them printing a register where `this` was right. So the loop here is the natural
+        loop of the graph where a block holding a trap or a throw ends: the latches are
+        the predecessors the header dominates there, and the body is what reaches one
+        without passing the header. That changes no line of the two fixtures or of the
+        2.19.6, 3.4.4 and 3.10.9 corpus builds, and still forgets the counter.
+
+        Only slots live at the header count, from `_slot_crossings`' dataflow; the others
+        are stored before the loop reads them, and the walk sees the store."""
+        self._slot_crossings()
+        bit, live_in = self._slot_live
+        live = live_in.get(header, (0, 0))[0]
+        keys = [k for k in st.slot if bit.get(k, 0) & live]
+        if not keys:
+            return []
+        if self._ended is None:
+            self._ended = ended = {b for b, blk in self.blocks.items()
+                                   if any(_ends_path(t[1], t[3]) for t in blk.insns)}
+            self._ridom = _idoms(self.blocks, self.entry, lambda n: () if n in ended
+                                 else self.blocks[n].succ if n in self.blocks else ())[0]
+            self._spills = {}
+        idom, ended = self._ridom, self._ended
+
+        def dominated(n):
+            while n != header:
+                up = idom.get(n)
+                if up is None or up == n:
+                    return False
+                n = up
+            return True
+        nodes, stack = {header}, [p for p in self._preds.get(header, ())
+                                  if p not in ended and dominated(p)]
+        if not stack:
+            return []
+        while stack:
+            n = stack.pop()
+            if n not in nodes and n not in ended:
+                nodes.add(n)
+                stack.extend(self._preds.get(n, ()))
+        written, new = None, set()
+        for b in nodes:
+            got = self._spills.get(b)
+            if got is None:
+                got = self._spills[b] = self._block_spills(b)
+            if got is False:
+                return keys               # the frame moves inside a loop: claim nothing
+            for k, r, back in got:
+                if back or k not in st.slot:
+                    continue
+                if written is None:
+                    written = self._written(nodes)
+                if r in written or self._leaf(r, st) != st.slot[k]:
+                    new.add(k)
+        return [k for k in keys if k in new]
+
+    def _block_spills(self, b):
+        """(slot, register, written back) for each frame store in block `b` before
+        anything ends its path, or False when the block moves the frame. Written back
+        means the value already there; see _frame_accesses and _loop_rewrites."""
+        out = []
+        for _i, slots, delta, ops, backs in _frame_accesses(self.blocks[b].insns, True):
+            if delta:
+                return False
+            if backs is not None:
+                out.extend((k, canon(r), back) for k, r, back in zip(slots, ops, backs))
+        return out
+
+    def _postorder(self) -> dict:
+        """Each block's rank in a depth-first postorder from the entry, successors first.
+        Blocks the entry does not reach rank after every block it does."""
+        rank, seen = {}, set()
+        for root in [self.entry] + sorted(self.blocks):
+            if root in seen or root not in self.blocks:
+                continue
+            seen.add(root)
+            stack = [(root, iter(self.blocks[root].succ))]
+            while stack:
+                n, it = stack[-1]
+                for s in it:
+                    if s in self.blocks and s not in seen:
+                        seen.add(s)
+                        stack.append((s, iter(self.blocks[s].succ)))
+                        break
+                else:
+                    rank[n] = len(rank)
+                    stack.pop()
+        return rank
+
+    def _name_slot(self, st: State, at, key: str, reg: str, v: V, named: dict) -> list:
+        """Store `v` into frame slot `key`, giving it a name first if it has to have one.
+
+        A name is given where the value reads memory and `_slot_crossings` says the slot
+        is reloaded after a call. The register stored from holds the same value, so it
+        takes the name too: it is what `_pin_call` would otherwise name a second time if
+        it survives the call. `named` carries a name across the two halves of an `stp`
+        that spill one value twice."""
+        if (at, key) not in self._slot_crossings() or not _READS_MEMORY.search(v.text):
+            st.slot[key] = v
+            return []
+        out = []
+        tmp = named.get(v.text)
+        if tmp is None:
+            tmp = named[v.text] = f"t{st.tmpc[0]}"
+            st.tmpc[0] += 1
+            self.slot_names.add(tmp)
+            out.append(f"var {tmp} = {v.text};")
+        if st.reg.get(reg) == v:
+            st.reg[reg] = V(tmp, P_ATOM)
+        st.slot[key] = V(tmp, P_ATOM)
         return out
 
     # leaf rendering
@@ -2133,7 +2540,15 @@ class Lifter:
                     and _T.roles.get(canon(ops[1])) == "LR")):
             if self._ret_regs is None:
                 self._ret_regs = _return_registers(self.blocks, self.entry, self.returns)
-            return [f"return {g(self._ret_regs.get(addr, st.result)).text};"]
+            reg = self._ret_regs.get(addr)
+            if reg is None and st.result == _T.ret_fp:
+                # Nothing decided this `ret`, and it falls back to the double only because
+                # d0 was written last. That says nothing about which register comes back,
+                # and naming what d0 holds would claim it: an allocate-and-fill that keeps
+                # a spilled double named returned the field (#64). The register it would
+                # be is all this says.
+                return [f"return {_T.ret_fp};"]
+            return [f"return {g(reg or st.result).text};"]
 
         # calls
         if mn == "bl":
@@ -2228,6 +2643,7 @@ class Lifter:
 
         # stores: object field (side effect) vs stack slot (tracked, no output)
         if mn in _STORES:
+            at = addr
             src = canon(ops[0])
             addr = _addr(ops)
             if addr is None or addr[1] is _BAD_POST:
@@ -2259,11 +2675,13 @@ class Lifter:
                 # the function has since written to is a different matter, x30 doubles as
                 # a scratch register, so the test is that x30 still holds the value it
                 # came in with.
+                out, named = [], {}
                 if not (base == "x15" and _is_lr_spill(src, st)):
-                    st.slot[f"{base}{disp:+d}"] = val
+                    out += self._name_slot(st, at, f"{base}{disp:+d}", src, val, named)
                 if pair and not (base == "x15" and _is_lr_spill(pair[0], st)):
-                    st.slot[f"{base}{pair[1]:+d}"] = pair[2]
-                return []
+                    out += self._name_slot(st, at, f"{base}{pair[1]:+d}", pair[0],
+                                           pair[2], named)
+                return out
             # The high half of a split 64-bit field store. The value was already written
             # out by the store of the low half (one 64-bit assignment) so emitting this
             # one would print the same value twice under two different offsets, the second
@@ -3402,6 +3820,10 @@ class Lifter:
             loop_st.reg[r] = V(names[r], P_ATOM)
             loop_st.elem.pop(r, None)
             loop_st.poolbase.pop(r, None)
+        # A slot the body stores a new value to holds that value at the top of the next
+        # trip, not the one it came in with (#109).
+        for k in self._loop_rewrites(header, st):
+            del loop_st.slot[k]
         # The names have to be visible to the walk, because the tail below is only ONE of
         # the loop's exits. See _carry_out.
         self._carrying.append((header, names, set()))
@@ -3889,7 +4311,7 @@ _DECL_RE = re.compile(r"^(\s*)var (t\d+) = (.+);$")
 _TMP_RE = re.compile(r"\bt\d+\b")
 
 
-def _inline_single_use(lines: list, names: set) -> list:
+def _inline_single_use(lines: list, names: set, wrap=frozenset()) -> list:
     """Fold `var t0 = f(x); return t0;` back into `return f(x);`.
 
     Naming a call's result is what stops a machine register leaking into every later line,
@@ -3901,7 +4323,14 @@ def _inline_single_use(lines: list, names: set) -> list:
     spelled in terms of can have changed and no side effect is reordered; and it has one
     use in the whole body, so the call is not duplicated. Only temporaries minted for a
     call RESULT are eligible, a temporary that exists to stop an expression doubling in
-    size must not be folded back into the expression it was cut out of."""
+    size must not be folded back into the expression it was cut out of.
+
+    A slot name (#64) is eligible too, and is passed in `wrap` as well. It is given for a
+    reload after a call, and where the only use the body prints is the statement right
+    after the store, that reload is not printed and the name says no more than the field
+    read did: about 60 a build, like a class id saved across calls that only the next
+    `if` reads. Unlike a call, its value can be any expression, so it goes back in
+    brackets unless it is one term: `t0 * 2` with `t0 = a + b` is `(a + b) * 2`."""
     if not names:
         return lines
     counts: dict = {}
@@ -3927,7 +4356,10 @@ def _inline_single_use(lines: list, names: set) -> list:
             use = _TMP_RE.findall(nxt)
             if (len(use) == 1 and use[0] == m.group(2)
                     and m.group(2) in _TMP_RE.findall(nxt.split("   // ", 1)[0])):
-                out.append(re.sub(rf"\b{m.group(2)}\b", m.group(3).replace("\\", "\\\\"),
+                text = m.group(3)
+                if m.group(2) in wrap and not _one_term(text):
+                    text = f"({text})"
+                out.append(re.sub(rf"\b{m.group(2)}\b", text.replace("\\", "\\\\"),
                                   nxt))
                 skip = i + 1
                 continue
@@ -4012,6 +4444,90 @@ def _drop_unread(lines: list, names: set) -> list:
             continue
         out.append(ln)
     return out
+
+
+def _one_term(text: str) -> bool:
+    """True when `text` is one term and postfix: a name, a literal, `a.b`, `a[i]`, `f(x)`.
+
+    Asked of what is there rather than of a list of operators, so an operator the
+    precedence table does not hold still counts: `_BINOP_PREC` has no `/`, `>>>` or `%`,
+    and a check against it folded `t0 = b / c` into `a / t0` as `a / b / c` (#64). Any
+    space outside brackets, a sign or a bracket left open is more than one term."""
+    depth = 0
+    for ch in text:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif ch == " " and depth == 0:
+            return False
+    return depth == 0 and bool(text) and text[0] not in "-~!"
+
+
+def _unread(lines: list, names: set) -> set:
+    """The slot names (#64) that nothing in `lines` reads but their own declaration.
+
+    `_slot_crossings` decides from the instructions that a reload after a call is read,
+    and the walk can still print that reload as something else: a loop exit or a join
+    that forgets the slots, or a call that falls back to `(...)` for its arguments. The
+    name is then declared and never used, a line that says nothing.
+
+    Last line first, so a name read only by a declaration that goes is seen to go too:
+    one pass, where a pass per name would cost lines times names."""
+    if not names:
+        return set()
+    counts: dict = {}
+    for ln in lines:
+        for m in _TMP_RE.finditer(ln):
+            counts[m.group(0)] = counts.get(m.group(0), 0) + 1
+    out = set()
+    for ln in reversed(lines):
+        m = _DECL_RE.match(ln)
+        if m and m.group(2) in names and counts.get(m.group(2)) == 1:
+            out.add(m.group(2))
+            for u in _TMP_RE.findall(m.group(3)):
+                counts[u] -= 1
+    return out
+
+
+def _drop_unread_slots(lines: list, names: set) -> list:
+    """`lines` without the declarations of the slot names nothing reads (#64; _unread).
+
+    Except where an arm of an `if` holds nothing else: dropping those left the arm empty,
+    `if (c) {} else {}` 21 times over the two fixtures and three corpus builds, and the
+    arm is the walk's to render. So they stay, a line saying the arm read the field, and
+    so does whatever they read. Lifting again with those stores unnamed was tried
+    instead, and is wrong: both arms then hold the same field text, agree at the join,
+    and a reload after a call prints the field again, the defect being fixed."""
+    unread = _unread(lines, names)
+    if not unread:
+        return lines
+    decl = {}                              # {line index: the name it declares}
+    for i, ln in enumerate(lines):
+        m = _DECL_RE.match(ln)
+        if m and m.group(2) in unread:
+            decl[i] = m.group(2)
+    keep, inside = set(), []               # the lines of each block still open
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("}") and inside:
+            body = inside.pop()
+            if body and all(j in decl for j in body):
+                keep.update(decl[j] for j in body)
+        elif inside:
+            inside[-1].append(i)
+        if s.endswith("{"):
+            inside.append([])
+    init = {decl[i]: _DECL_RE.match(lines[i]).group(3) for i in decl}
+    todo = list(keep)
+    while todo:
+        for used in _TMP_RE.findall(init[todo.pop()]):
+            if used in init and used not in keep:
+                keep.add(used)
+                todo.append(used)
+    return [ln for i, ln in enumerate(lines) if i not in decl or decl[i] in keep]
 
 
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
@@ -4115,8 +4631,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     # No traps: tier 3 keeps the edge past a `brk` that tier 2 dropped in #57. Ending the
     # block there takes away a join that, by accident, kept a frame slot from reading as
     # the field it was loaded from, and `forEach`'s concurrent modification guard then
-    # prints as `this.field_0xc != this.field_0xc`. Naming frame slots across a call is
-    # what fixes that, and it is its own change (#64).
+    # printed as `this.field_0xc != this.field_0xc`. Naming frame slots across a call
+    # (`Lifter._slot_crossings`) was the first half of taking the rule; the false edge
+    # also hides weaknesses in the walk that the rule would expose, listed on #64.
     blocks, entry = build_cfg(stripped, traps=(), cut_end=cut_end)
     if not blocks:
         return []
@@ -4149,4 +4666,6 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         if len(read) < len(lifter.pins):
             lifter = lines = None           # not held while the second walk runs
             lifter, lines = walk(read)
-    return _inline_single_use(_drop_unread(lines, lifter.raw_names), lifter.results)
+    lines = _drop_unread_slots(_drop_unread(lines, lifter.raw_names), lifter.slot_names)
+    return _inline_single_use(lines, lifter.results | lifter.slot_names,
+                              lifter.slot_names)
