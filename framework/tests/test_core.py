@@ -4046,13 +4046,16 @@ def test_which_register_each_ret_hands_back():
                                   (lambda: asked.append(1) or said))
         return got, asked
 
-    # A function that never writes V0 is left to the old rule, and its callers are not
-    # even asked: their answer could not change what it prints.
+    # A function that never writes V0 is left to the old rule where it writes x0 on the
+    # way, and its callers are not even asked: their answer could not change what it
+    # prints. One that does not hands back its d0 argument where they read d0 (#127).
     got, asked = decide([("ldur", "x0, [x1, #7]"), ("ret", "")], said="d0")
     assert got == {} and not asked, (got, asked)
     got, asked = decide([("str", "d0, [x1, #7]"), ("ldur", "x0, [x1, #7]"), ("ret", "")],
                         said="d0")
     assert got == {} and not asked, (got, asked)      # reading V0 is not writing it
+    assert decide([("str", "d0, [x1, #7]"), ("ret", "")], said="d0")[0] == {4: "d0"}
+    assert decide([("str", "d0, [x1, #7]"), ("ret", "")], said="x0")[0] == {}
     # The callers decide when they speak: here against the field value...
     got, _ = decide(_TOP_RIGHT, said="d0")
     assert got == {36: "d0"}, got
@@ -12273,6 +12276,244 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
             ("b", "#0xc", "")]
     body = lift(loop, None)
     assert "t4 = d0;" in body and "t0 = t4 + t4;" in body, body
+
+
+def test_a_function_that_hands_back_its_double_argument_returns_d0():
+    # `Curve.transform` returns its argument where it is 0.0 or 1.0, and never writes d0
+    # itself, so no rule of the function's own code applied and it printed `return x0;`
+    # (#127). Its callers read d0, and no call comes before that `ret`.
+    from jadart.expr import lift_function
+
+    def lift(said):
+        rows = [("fcmp", "d0, #0.0", ""), ("b.eq", "#0x10", ""),
+                ("bl", "#0x100", "  ; -> foo"), ("ret", "", ""), ("ret", "", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)],
+            returns=lambda pc: said)]
+    assert lift("d0") == ["if (d0 != 0.0) {", "return foo(...);", "} else {",
+                          "return d0;", "}"]
+    # Without the callers' word it is not decided.
+    assert "return x0;" in lift(None)
+    from jadart import expr as E
+    from jadart.cfg import build_cfg
+
+    def decide(rows):
+        blocks, entry = build_cfg(_rows_at(rows, 0), traps=())
+        return E._return_registers(blocks, entry, lambda: "d0")
+    # A `ret` a path with a call also reaches, here the second to arrive, is not decided;
+    # a stub that gives every register back is no call.
+    assert decide([("fcmp", "d0, #0.0"), ("b.eq", "#0x10"), ("nop", ""), ("b", "#0x18"),
+                   ("bl", "#0x100"), ("nop", ""), ("ret", "")]) == {}
+    assert decide([("fcmp", "d0, #0.0"), ("b.eq", "#0x14"), ("bl", "#0x100"),
+                   ("cmp", "x1, #0"), ("b.ne", "#0x8"), ("ret", "")]) == {}
+    assert decide([("fcmp", "d0, #0.0"),
+                   ("bl", "#0x100", "  ; -> stub _iso_stub_WriteBarrierWrappersStub"),
+                   ("ret", "")]) == {8: "d0"}
+    # Code the instruction cut left undecoded could hold a call, so a function cut short
+    # gets none; and the question is arm64's.
+    cut = [("fcmp", "d0, #0.0"), ("b.eq", "#0x40"), ("ret", "")]
+    assert decide(cut) == {8: "d0"}
+    blocks, entry = build_cfg(_rows_at(cut, 0), traps=(), cut_end=0x100)
+    assert E._return_registers(blocks, entry, lambda: "d0") == {}
+    blocks, entry = build_cfg(_rows_at([("ret", "")], 0), traps=())
+    with E.use_target(E.ARM32):
+        assert E._return_registers(blocks, entry, lambda: "d0") == {}
+
+    # A function only the dispatch table calls has no callers to ask, and the other
+    # implementations of its selector speak for it: `_Linear.transformInternal` is
+    # `mov v1.16b, v0.16b; ret`. They are asked only where the callers say nothing.
+    blocks, entry = build_cfg(_rows_at([("mov", "v1.16b, v0.16b"), ("ret", "")], 0),
+                              traps=())
+    asked = []
+
+    def table(said):
+        return lambda: asked.append(1) or said
+    def ret_of(said, table):
+        return E._return_registers(blocks, entry, lambda: said, None, table)
+    assert ret_of(None, table("d0")) == {4: "d0"}
+    assert ret_of(None, table("x0")) == {} and ret_of(None, table(None)) == {}
+    asked.clear()
+    assert ret_of("x0", table("d0")) == {} and not asked
+    from jadart.dispatch import Selectors
+
+    def lift_alone(by_table, selectors):
+        def returns(pc):
+            return None
+        if by_table is not None:
+            returns.by_table = by_table
+        return [ln.strip() for ln in lift_function(
+            [(0x40, "mov", "v1.16b, v0.16b", ""), (0x44, "ret", "", "")],
+            selectors=selectors, returns=returns)]
+    sels = Selectors({0x9c0: "transformInternal"})
+    seen = []
+    assert lift_alone(lambda pc, s: seen.append((pc, s)) or "d0", sels) == ["return d0;"]
+    assert seen and seen[0] == (0x40, sels), seen
+    assert lift_alone(lambda pc, s: "x0", sels) == ["return x0;"]
+    assert lift_alone(None, sels) == ["return x0;"]
+    assert lift_alone(lambda pc, s: "d0", None) == ["return x0;"]       # no table
+
+    # Selectors.peers: the other functions of the family (`entries` key) the one asked
+    # about is in, smallest first, at most `limit` of them. One of another family, at
+    # the same offset or not, is not a peer.
+    sels.entries = {(0x9c0, 1): (0x80, 0x00, 0x40), (0x9c8, 1): (0x00, 0x100),
+                    (0x9c0, 2): (0x200,)}
+    assert sels.peers(0x00) == [0x80, 0x40, 0x100]
+    assert sels.peers(0x00, 1) == [0x80]
+    assert sels.peers(0x80) == [0x00, 0x40] and sels.peers(0x200) == []
+    assert sels.peers(0x300) == []
+    sels.entries = {(0x9d0, 3): (0x00, 0x300)}          # new entries are read anew
+    assert sels.peers(0x00) == [0x300]
+    # build_selector_map says which functions at an offset share one selector. B (6)
+    # and C (7), below the abstract A (5), both define `get:t`, at offset 10, and every
+    # concrete class below A holds one of them there: they do. A concrete D (8) below A
+    # whose row holds nothing there says they need not; nor do two classes that meet only
+    # at the top, Object (1), the way `Animatable` and `ParametricCurve` do.
+    from types import SimpleNamespace
+    from jadart import dispatch as D
+
+    def families(classes, fns, other=None, abstract=(5,)):
+        # fns: (class ref, name) of each function, each with its own code, placed at
+        # offset 10 in its class's row; or (class ref, name, offset).
+        cid = {ref: c for ref, _n, c, _s in classes}
+        fns = [f if len(f) == 3 else (*f, 10) for f in fns]
+        fr2 = SimpleNamespace(
+            classes=classes, types={101: 1, 102: 5, 103: 6},
+            class_state={c: D._ABSTRACT for c in abstract}, patch_class={},
+            names={60 + i: nm for i, (_o, nm, _k) in enumerate(fns)},
+            functions=[(50 + i, 60 + i, o, 0) for i, (o, _n, _k) in enumerate(fns)],
+            codes=[(0, 50 + i, i) for i in range(len(fns))])
+        cells = [None] * 40
+        for i, (o, _nm, k) in enumerate(fns):
+            cells[cid[o] + k] = i + 1
+        if other is not None:
+            cells[other] = 40                   # a function no class here has
+        got = D.build_selector_map(cells, fr2,
+                                   SimpleNamespace(symbol_names={}, pcs=[], first_code=0))
+        assert got.get(10) == fns[0][1], dict(got)
+        return got.families
+    below_a = [(1, 0, 1, 0), (2, 0, 5, 101), (3, 0, 6, 102), (4, 0, 7, 102)]
+    b_c = [(3, "get:t"), (4, "get:t")]
+    assert families(below_a, b_c) == {50: (10, "get:t"), 51: (10, "get:t")}
+    assert families(below_a + [(5, 0, 8, 102)], b_c) == {}
+    assert families(below_a + [(5, 0, 8, 102)], b_c, other=18) == {}      # D's cell
+    at_top = [(1, 0, 1, 0), (2, 0, 5, 101), (3, 0, 6, 101), (4, 0, 7, 101)]
+    assert families(at_top, b_c) == {}
+    assert families(at_top, b_c, abstract=(1, 5)) == {}     # though every row holds one
+    assert families([(1, 0, 1, 0), (2, 0, 5, 101), (3, 0, 6, 0), (4, 0, 7, 0)],
+                    b_c) == {}                                 # they share none at all
+    # The lowest class they all share, not the lowest two of them do: E (9), below B,
+    # meets B at B and C at A, and D's empty row under A says no.
+    deep = below_a + [(5, 0, 8, 102), (6, 0, 9, 103)]
+    assert families(deep, [(6, "get:t"), (4, "get:t"), (3, "get:t")]) == {}
+    # A crafted cycle of superclasses ends, whichever function is on it.
+    loop, none = {6: 7, 7: 6}, [None] * 40
+    for fs in ([("f", 6, 0, 50), ("f", 9, 1, 51)], [("f", 9, 0, 50), ("f", 6, 1, 51)]):
+        assert not D._one_selector(fs, 10, none, loop, {}, set(), [100])
+    # A private name keeps its library here: `_t` of two libraries is two selectors,
+    # though the offset is named for one.
+    assert families(below_a + [(5, 0, 8, 102)],
+                    [(3, "_t@1"), (4, "_t@1"), (5, "_t@2")]) == {}
+    # The walk is bounded over the whole table: up from B to the top (3 classes) and
+    # from C to A (1), then down from A (3).
+    old = D._MAX_FAMILY
+    try:
+        D._MAX_FAMILY = 7
+        assert families(below_a, b_c) == {50: (10, "get:t"), 51: (10, "get:t")}
+        D._MAX_FAMILY = 6
+        assert families(below_a, b_c) == {}
+        # ...over every offset: `get:u` at 20 would walk them again.
+        b_c_u = b_c + [(3, "get:u", 20), (4, "get:u", 20)]
+        D._MAX_FAMILY = 13
+        assert len(families(below_a, b_c_u)) == 2
+        D._MAX_FAMILY = 14
+        assert len(families(below_a, b_c_u)) == 4
+    finally:
+        D._MAX_FAMILY = old
+
+    # by_table on a made-up image: a peer whose caller reads d0 after the call, and one
+    # with no callers whose own code hands back d0, say d0; a peer whose caller reads x0
+    # disagrees, and then nothing is said. Nor is the table asked for a function whose
+    # own callers read a register, even where they disagree.
+    import types
+    from jadart.disasm import CodeRange
+    from jadart.expr import make_return_resolver
+
+    def bl(pc, to):
+        return 0x94000000 | (((to - pc) >> 2) & 0x3FFFFFF)
+    RET, NOP, MOV_X1_X0 = 0xD65F03C0, 0xD503201F, 0xAA0003E1
+    FMOV_D1_D0, FMOV_D0_D1, MOV_V1_V0 = 0x1E604001, 0x1E604020, 0x4EA01C01
+    words = [NOP] * 0x90
+    for at, w in ((0x00, RET), (0x04, NOP),                         # A, read as d0
+                  (0x40, bl(0x40, 0x00)), (0x44, FMOV_D1_D0), (0x48, RET),
+                  (0x80, FMOV_D0_D1), (0x84, RET),                  # B, its own d0
+                  (0xC0, RET), (0xC4, NOP),                         # C, read as x0
+                  (0x100, bl(0x100, 0xC0)), (0x104, MOV_X1_X0), (0x108, RET),
+                  (0x140, MOV_V1_V0), (0x144, RET),                 # asked about
+                  (0x180, MOV_V1_V0), (0x184, RET),                 # H, read as both
+                  (0x1C0, bl(0x1C0, 0x180)), (0x1C4, FMOV_D1_D0), (0x1C8, RET),
+                  (0x200, bl(0x200, 0x180)), (0x204, MOV_X1_X0), (0x208, RET)):
+        words[at // 4] = w
+    made_up = types.SimpleNamespace(
+        arch=None, text=b"".join(w.to_bytes(4, "little") for w in words),
+        all_ranges=[CodeRange(0x00, 8, -1), CodeRange(0x40, 12, -1),
+                    CodeRange(0x80, 8, -1), CodeRange(0xC0, 8, -1),
+                    CodeRange(0x100, 12, -1), CodeRange(0x140, 8, -1),
+                    CodeRange(0x180, 8, -1), CodeRange(0x1C0, 12, -1),
+                    CodeRange(0x200, 12, -1)])
+    _needs_capstone()
+    res = make_return_resolver(made_up)
+    assert res(0x00) == "d0" and res(0xC0) == "x0" and res(0x140) is None
+    assert res(0x180) is None
+    sels = Selectors({0x9c0: "transformInternal"})
+    sels.entries = {(0x9c0, 1): (0x140, 0x00, 0x80)}
+    assert res.by_table(0x140, sels) == "d0"
+    sels.entries = {(0x9c0, 1): (0x140, 0x80)}
+    assert res.by_table(0x140, sels) == "d0"                       # its own code
+    sels.entries = {(0x9c0, 1): (0x140, 0x00, 0x80, 0xC0)}
+    assert res.by_table(0x140, sels) is None
+    sels.entries = {(0x9c0, 1): (0x140, 0x80), (0x9c0, 2): (0xC0,)}
+    assert res.by_table(0x140, sels) == "d0"                       # C is not a peer
+    sels.entries = {(0x9c0, 1): (0x180, 0x80), (0x9c8, 1): (0x00, 0x80)}
+    fresh = make_return_resolver(made_up)
+    assert fresh.by_table(0x180, sels) is None                     # its callers spoke
+    assert fresh.by_table(0x00, sels) is None
+    # So have more than _MAX_SITES callers, read or not.
+    old = E._MAX_SITES
+    E._MAX_SITES = 1
+    try:
+        assert make_return_resolver(made_up).by_table(0x180, sels) is None
+    finally:
+        E._MAX_SITES = old
+    # At most _MAX_SITES of them are asked, the smallest first.
+    old = E._MAX_SITES
+    E._MAX_SITES = 1
+    try:
+        sels.entries = {(0x9c0, 1): (0x80, 0xC0, 0x140)}
+        assert res.by_table(0x140, sels) == "d0"
+    finally:
+        E._MAX_SITES = old
+    sels.entries = {(0x9c0, 1): (0x140,)}
+    assert res.by_table(0x140, sels) is None                       # nobody to ask
+    assert res.by_table(0x140, {0x9c0: "transformInternal"}) is None   # a plain dict
+
+    # And on the clean fixture, where `_Linear.transformInternal` printed `return x0;`.
+    import jadart
+    from jadart.disasm import load_instructions
+    from jadart.dispatch import recover_selectors
+    image, fr, hdr = load_instructions(CLEAN)
+    at = image.anchor_va
+    res = make_return_resolver(image)
+    assert res(0x28a6c4 - at) is None                  # nothing calls it directly
+    sels = recover_selectors(image, fr, hdr)
+    assert len(sels.peers(0x28a6c4 - at)) == 5, sels.peers(0x28a6c4 - at)
+    assert res.by_table(0x28a6c4 - at, sels) == "d0"
+    assert sels.entries and {off for off, _c in sels.entries} <= set(sels)
+    size = {cr.pc_offset: cr.size for cr in image.all_ranges}
+    for pcs in sels.entries.values():
+        assert [size[p] for p in pcs] == sorted(size[p] for p in pcs), pcs
+    assert jadart.decompile(CLEAN, "0x28a6c4")[0]["body"] == ["return d0;"]
+    body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x177bdc")[0]["body"]]
+    assert body[-1] == "return d0;", body                # Curve.transform
 
 
 if __name__ == "__main__":

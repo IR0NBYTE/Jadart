@@ -13,6 +13,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A function that hands back its double argument returns d0.** One that never writes d0
+  had no rule of its own code to decide which register its `ret` hands back, so
+  `Curve.transform`, which returns its argument where it is 0.0 or 1.0, printed
+  `return x0;`, and so did `_Linear.transformInternal`, which only hands its argument
+  back. A `ret` that neither a call nor a write to x0 can come before now returns d0 where
+  the function's callers read d0. Where no direct caller reads either register, as for a
+  function only the dispatch table calls, the other implementations of its selector speak
+  for it: each returns in the register its own callers read, or in d0 where its own code
+  hands back d0, and they have to agree. They are the functions the table places at one
+  offset under one name whose classes share one below `Object`, where every concrete class
+  under that one holds one of them in its row. Two selectors of one name that share an
+  offset are told apart unless their classes are all the concrete ones under the class
+  they share. A stub that gives every register back is not a call. Tier 3 exports change
+  in those two functions on the clean fixture and 3.10.9, and in none on the other builds;
+  obf's `Curve.transform`, which its export does not print, lifts to `return d0;` too.
+  obf's table names one offset, not that one, so its `_Linear.transformInternal` still
+  prints `return x0;` (#159). Closes #127.
 - **A call's double read past the next instruction is named.** A call's d0 result got a
   name only where the very next of x0 and d0 an instruction touched was a read of d0.
   After a reload of x0, an inline box or a join it printed as `d0`, the d0 the function

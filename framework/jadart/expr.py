@@ -1359,9 +1359,14 @@ def returns_in_d0(ann) -> bool:
     return bool(got) and set(got.values()) == {"d0"}
 
 
-def _return_registers(blocks, entry, evidence=None, named=None) -> dict:
+def _return_registers(blocks, entry, evidence=None, named=None, table=None) -> dict:
     """{ret address: "x0" or "d0"}, the register each `ret` hands back, or {} for a
-    function that never writes V0, where nothing below applies and `State.result` stands.
+    function that never writes d0, where nothing below applies and `State.result` stands,
+    unless a `ret` no call or write to x0 comes before hands back its argument
+    (_argument_returns). That `ret` returns d0 where its callers read d0, or, where no
+    caller speaks, the other implementations of its selector hand back d0 (`table()`,
+    make_return_resolver's by_table): `_Linear.transformInternal` is only called through
+    the dispatch table.
 
     `ret` used to print whichever of x0 and d0 the path wrote LAST. A function that
     allocates an object and fills its double fields writes x0 (the allocation) and then
@@ -1401,7 +1406,17 @@ def _return_registers(blocks, entry, evidence=None, named=None) -> dict:
     `State.result`."""
     facts = _return_facts(blocks, entry)
     if facts is None:
-        return {}
+        # It never writes d0 itself, so where d0 comes back, a `ret` no call or write to
+        # x0 can come before hands back the d0 it was given (#127).
+        if _T is not ARM64 or evidence is None:
+            return {}
+        out = _argument_returns(blocks, entry)
+        if not out:
+            return {}
+        said = evidence()
+        if said is None and table is not None:
+            said = table()
+        return out if said == "d0" else {}
     at_ret, proven, read, calls = facts
     said = evidence() if evidence is not None else None
     reg = said or ("d0" if proven else None if read else "x0")
@@ -1413,6 +1428,35 @@ def _return_registers(blocks, entry, evidence=None, named=None) -> dict:
             out[a] = "x0"
         elif not dcall or named and all(named(*calls[c]) for c in made):
             out[a] = "d0"
+    return out
+
+
+def _argument_returns(blocks, entry) -> dict:
+    """{ret address: "d0"} for each `ret` that neither a call nor a write to x0 can come
+    before on a path from `entry`, in a function that never writes d0: what it holds
+    there is its argument. A stub that gives every register back is not a call. Code the
+    decoded graph does not hold could be either, so a function cut short gets none."""
+    if any(b.past_cut or b.cut_next >= 0 for b in blocks.values()):
+        return {}
+
+    def spends(mn, op, note):
+        return bool(_rv_call(mn, note)) or "x0" in _rv_def_use(mn, op)[0]
+    spent = {entry: False}                 # block -> whether one may come before it
+    work = [entry]
+    while work:
+        b = work.pop()
+        state = spent[b] or any(spends(mn, op, note) for (_a, mn, op, note)
+                                in blocks[b].insns)
+        for s in blocks[b].succ:
+            if s in blocks and (s not in spent or (state and not spent[s])):
+                spent[s] = state
+                work.append(s)
+    out = {}
+    for b, state in spent.items():
+        for (a, mn, op, note) in blocks[b].insns:
+            if mn == "ret" and not state:
+                out[a] = "d0"
+            state = state or spends(mn, op, note)
     return out
 
 
@@ -1851,6 +1895,9 @@ class Lifter:
         #: and, built at the first `ret`, the register each `ret` hands back (#115).
         self.returns = None
         self._ret_regs = None
+        #: () -> "x0" | "d0" | None, what the other implementations of its selector
+        #: return in, asked only where no caller speaks (_return_registers).
+        self.table = None
         #: the same resolver for any address, for the calls this function makes; and
         #: which of them have their double read (_d0_result_reads).
         self.callees = None
@@ -2098,7 +2145,7 @@ class Lifter:
         _return_registers and make_return_resolver."""
         if self._ret_regs is None:
             self._ret_regs = _return_registers(self.blocks, self.entry, self.returns,
-                                               _d0_callee(self.callees))
+                                               _d0_callee(self.callees), self.table)
         return self._ret_regs
 
     def _d0_read(self, addr) -> bool:
@@ -4545,7 +4592,9 @@ def make_return_resolver(image):
     result from (#115). A value has to be read from where the callee left it, and a call
     clobbers both registers, so the first of the two a caller touches after the call,
     reading it, is the one the callee returns in. Callers that disagree, none that read
-    either, or more than _MAX_SITES of them, give None.
+    either, or more than _MAX_SITES of them, give None. Its `code_d0` says whether a
+    function's own code hands back d0, and `by_table` what the other implementations of
+    its selector return in.
 
     The index of call sites is built on the first question, one pass over the raw words
     as callgraph reads them, and a function's sites are decoded only when it is asked
@@ -4618,9 +4667,12 @@ def make_return_resolver(image):
                 if len(votes) > 1:
                     break
         cache[k] = val = next(iter(votes)) if len(votes) == 1 else None
+        if votes or len(at) > _MAX_SITES:
+            spoke.add(k)
         return val
 
     own: dict = {}
+    spoke: set = set()          # ranges whose callers read a register, or are too many
 
     def code_d0(pc):
         """Whether the function covering `pc` hands back d0 at every `ret` by its own
@@ -4633,7 +4685,34 @@ def make_return_resolver(image):
             own[k] = bool(dis) and returns_in_d0([(a, m, o, "") for (a, m, o) in dis])
         return own[k]
 
+    def by_table(pc, selectors):
+        """Which register the other implementations of the selector the dispatch table
+        places the function at `pc` under hand back their result in (Selectors.peers),
+        for a function whose direct callers, where it has any, read neither register
+        after the call (#127): each one's callers' reading, or, where those say
+        nothing, d0 where its own code hands back d0 (code_d0). A call through the
+        table reads one register whatever function it lands on, so every
+        implementation of a selector returns in the same one. Callers that disagree, or
+        more than _MAX_SITES of them, have spoken, and the table is not asked over
+        them. Those asked have to agree, and at most _MAX_SITES of them are."""
+        peers = getattr(selectors, "peers", None)
+        k = covering(pc)
+        if peers is None or k is None:
+            return None
+        of(pc)
+        if k in spoke:
+            return None
+        votes = set()
+        for p in peers(pc, _MAX_SITES):
+            got = of(p) or ("d0" if code_d0(p) else None)
+            if got:
+                votes.add(got)
+                if len(votes) > 1:
+                    return None
+        return next(iter(votes)) if votes else None
+
     of.code_d0 = code_d0
+    of.by_table = by_table
     return of
 
 
@@ -4997,7 +5076,9 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     capstone's. `cut_end` is where the range ends when the instruction cut stopped `ann`
     short of it (disasm.cut_end); see build_cfg. `returns` is a `pc -> "x0" | "d0" |
     None` resolver (make_return_resolver) saying which register the function's callers
-    read its result from; without it a `ret` is decided by the function's own code.
+    read its result from, and, where none does, its `by_table` asks the other functions
+    `selectors` places under the same selector; without it a `ret` is decided by the
+    function's own code.
 
     `arch` is the resolved target. Passing one whose roles are not modelled refuses; see
     LIFTABLE_ARCHS. Omitting it keeps the arm64 assumption every caller had before the
@@ -5101,6 +5182,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         if returns is not None:
             lifter.returns = lambda: returns(ann[0][0])
             lifter.callees = returns
+            by_table = getattr(returns, "by_table", None)
+            if by_table is not None and selectors:
+                lifter.table = lambda: by_table(ann[0][0], selectors)
         lifter.labels = label_targets(stmts)
         lifter.keep = keep
         lifter.carry_more = carry or {}
