@@ -13,6 +13,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call whose double result is read next names it.** A double comes back in d0, and a
+  call's d0 result was never named: it read as d0, which is also how the d0 the function
+  was handed reads, so `ratioOfTones` compared two calls' results as `d0 > d0`. Where the
+  next of x0 and d0 an instruction after a call touches is d0, read, and x0 is not read,
+  the result is the double, and gets the name; `eor v0.16b, v0.16b, v0.16b` writes d0 and
+  reads nothing. A result that waits past a write to x0, a reload or a box, still prints
+  as d0. A `ret` no longer reads the register it does not hand back, so d0 is not live up
+  to a `return NULL;`, where every join on the way took a phi for it that nothing read.
+  Tier 3 exports change in 149 functions on the clean fixture, 107 on 2.19.6, 135 on 3.4.4
+  and 146 on 3.10.9. Part of #134 and #127.
 - **A call to a function that reads its arguments off the stack prints what it pushed.**
   `entry_arity` counts the registers a function reads on entry and declines where it reads
   stack arguments off FP, but a frameless function reads them off SP, `ldr x0, [x15]`, and

@@ -12144,6 +12144,43 @@ def test_a_function_that_reads_its_arguments_off_the_stack_has_no_register_arity
         "return sub_0x100(...);"]
 
 
+def test_a_call_whose_double_result_is_read_names_it():
+    # A double comes back in d0, and a call's d0 result was never named: it read as d0,
+    # which is also how the d0 the function was handed reads, and `ratioOfTones`
+    # compared two calls' results as `d0 > d0` (#134).
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        rows = rows + [("ret", "", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)])]
+    assert lift([("bl", "#0x100", "  ; -> foo"), ("stur", "d0, [x29, #-8]", ""),
+                 ("bl", "#0x200", "  ; -> bar"), ("ldur", "d1, [x29, #-8]", ""),
+                 ("fcmp", "d1, d0", ""), ("cset", "x0, gt", "")]) == [
+        "var t0 = foo(...);", "var t1 = bar(...);", "return t0 > t1 ? 1 : 0;"]
+    # A `ret` reads both registers, and is no evidence: this call returns nothing read.
+    assert lift([("bl", "#0x100", "  ; -> foo"), ("mov", "x0, x22", "")]) == [
+        "foo(...);", "return NULL;"]
+    # Nor does the zero idiom, which writes d0 and reads nothing.
+    assert lift([("bl", "#0x100", "  ; -> foo"), ("eor", "v0.16b, v0.16b, v0.16b", ""),
+                 ("bl", "#0x200", "  ; -> bar"), ("mov", "x0, x22", "")]) == [
+        "foo(...);", "bar(...);", "return NULL;"]
+    # Nor does a `ret` read the register it does not hand back: d0 was live up to every
+    # `return NULL;`, and each join on the way took a phi for it that nothing reads.
+    assert lift([("bl", "#0x100", "  ; -> foo"), ("fcmp", "d0, #0.0", ""),
+                 ("b.le", "#0x14", ""), ("bl", "#0x200", "  ; -> bar"), ("nop", "", ""),
+                 ("mov", "x0, x22", "")]) == [
+        "if (foo(...) > 0.0) {", "bar(...);", "}", "return NULL;"]
+    # Where x0 is read after it, the result is x0's, as before.
+    assert lift([("bl", "#0x100", "  ; -> foo"), ("stur", "x0, [x2, #7]", "")])[:2] == [
+        "var t0 = foo(...);", "x2.field_0x8 = t0;"]
+    # A stub's result is an object; the double an allocation is for stays d0.
+    assert lift([("fmov", "d0, #1.0", ""),
+                 ("bl", "#0x300", "  ; -> stub _iso_stub_AllocateDoubleStub"),
+                 ("stur", "d0, [x0, #7]", ""), ("mov", "x0, x2", "")]) == [
+        "new double().field_0x8 = d0;", "return x2;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

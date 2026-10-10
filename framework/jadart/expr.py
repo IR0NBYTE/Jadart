@@ -1992,6 +1992,26 @@ class Lifter:
                         queued.add(p)
                         heapq.heappush(work, (rank[p], p))
 
+    def _returned(self) -> dict:
+        """{ret address: "x0" or "d0"}, which register each `ret` hands back; see
+        _return_registers and make_return_resolver."""
+        if self._ret_regs is None:
+            self._ret_regs = _return_registers(self.blocks, self.entry, self.returns)
+        return self._ret_regs
+
+    def _ret_use(self, addr, us: int) -> int:
+        """What the `ret` at `addr` reads as the printed body reads it: the register it
+        hands back, where that is decided, and not the other one too. A `ret` read both,
+        so d0 looked live up to it in a function that returns `NULL`, and every join on
+        the way took a phi for it that nothing reads."""
+        got = self._returned()
+        if not got:
+            # d0 is never written, or nothing decides it and a `ret` on d0 prints the
+            # bare register, which reads no value: x0 is the one it prints a value of.
+            return _reg_mask((_T.ret_int,))
+        reg = got.get(addr)
+        return _reg_mask((reg,)) if reg else us
+
     def _printed_liveness(self) -> tuple:
         """({block: _call_reads}, live in, live out): each block's live registers as
         `_liveness` has them, with a call's printed arguments counted as its reads. That
@@ -2005,8 +2025,10 @@ class Lifter:
             for b, blk in self.blocks.items():
                 u = d = 0
                 more = reads[b]
-                for i, (_a, mn, o, _n) in enumerate(blk.insns):
+                for i, (a, mn, o, _n) in enumerate(blk.insns):
                     de, us = _def_use_masks(mn, o)
+                    if mn == "ret":
+                        us = self._ret_use(a, us)
                     u |= (us | more.get(i, 0)) & ~d
                     d |= de
                 use[b], dfn[b] = u, d
@@ -2243,12 +2265,15 @@ class Lifter:
     def _reads_next(self, reg: str) -> bool:
         """Whether, of x0 and d0, the first one an instruction after the current one in
         its block touches is `reg`, and it reads it: the register a call's result is
-        taken from. A `ret` or another call is no evidence."""
+        taken from. A `ret` or another call is no evidence. On arm64 every spelling of V0
+        is d0, and `eor v0.16b, v0.16b, v0.16b` zeroes it rather than reading it
+        (_rv_def_use): read as a use, a call whose result nothing reads got a name."""
         regs = (_T.ret_int, _T.ret_fp)
+        exact = _rv_def_use if _T is ARM64 else _def_use
         for (_a, mn, op, _n) in self._insns[self._at + 1:]:
             if mn == "ret" or mn in _CALLS:
                 return False
-            de, us = _def_use(mn, op)
+            de, us = exact(mn, op)
             for r in regs:
                 if r in us:
                     return r == reg
@@ -2267,8 +2292,18 @@ class Lifter:
         name and the reader can follow it.
 
         Where nothing reads the result the call is emitted exactly as before, so a
-        statement whose value is discarded does not grow a variable nobody uses."""
-        reg = reg or _T.ret_int
+        statement whose value is discarded does not grow a variable nobody uses.
+
+        A double comes back in d0, and the call destroys d0 as it does x0, so a read of d0
+        before anything writes it again is a read of the result. Where the next
+        instruction of the block to touch x0 or d0 reads d0, and x0 is not read, the
+        double is the result and gets the name. It was left as d0, which is also how the
+        d0 the function was handed reads, and two calls' results compared printed
+        `if (d0 > d0)` (#134, #127). Liveness alone does not say it: a `ret` reads both
+        registers, so a call followed by `return NULL;` looked like it returned d0."""
+        if reg is None:
+            reg = (_T.ret_fp if self._reads_next(_T.ret_fp)
+                   and not self._live_after & _reg_mask((_T.ret_int,)) else _T.ret_int)
         if self._live_after & _reg_mask((reg,)):
             name = f"t{st.tmpc[0]}"
             st.tmpc[0] += 1
@@ -2690,9 +2725,7 @@ class Lifter:
                                              for t in op.strip("{} ").split(",")])
                 or (mn == "mov" and len(ops) >= 2 and canon(ops[0]) == "r15"
                     and _T.roles.get(canon(ops[1])) == "LR")):
-            if self._ret_regs is None:
-                self._ret_regs = _return_registers(self.blocks, self.entry, self.returns)
-            reg = self._ret_regs.get(addr)
+            reg = self._returned().get(addr)
             if reg is None and st.result == _T.ret_fp:
                 # Nothing decided this `ret`, and it falls back to the double only because
                 # d0 was written last. That says nothing about which register comes back,
@@ -2736,9 +2769,10 @@ class Lifter:
                 if kind == "throw_err":
                     return [f"throw {label}();"]
                 if kind == "alloc":
-                    return self._result(st, f"new {label}()")
+                    return self._result(st, f"new {label}()", _T.ret_int)
                 terse = label.replace("stub ", "").replace("_iso_stub_", "")
-                return self._result(st, f"{terse}(...)")   # terse, without the stub prefix
+                # terse, without the stub prefix; a stub's result is an object
+                return self._result(st, f"{terse}(...)", _T.ret_int)
             call = name or self._sub(target or 0)
             args = self._call_args(name, target, st)
             # after the arguments are read, not before: they live in the very registers the
@@ -3561,6 +3595,8 @@ class Lifter:
             for k in range(len(insns) - 1, -1, -1):
                 after[k] = m
                 de, us = _def_use_masks(insns[k][1], insns[k][2])
+                if insns[k][1] == "ret":
+                    us = self._ret_use(insns[k][0], us)
                 m = us | more.get(k, 0) | (m & ~de)
         self._insns = insns
         for k, (a, mn, op, note) in enumerate(insns):
