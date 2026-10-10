@@ -13,6 +13,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A raw line says what the registers it reads hold.** A raw line reads the machine
+  registers it names, and tier 3 holds most registers as expressions it prints only where
+  something reads them, so a register a raw line read could hold a value the printed
+  body never gave it: `add x1, x1, #8; adcs x1, x1, x3` printed the `adcs` alone, which
+  reads as working on the entry x1. The line now says what each such register holds,
+  `adcs x1, x1, x3   // x1 holds x1 + 8`, in a comment rather than an assignment, so the
+  printed body still assigns a register only where the machine's own instruction does.
+  On the clean fixture's `export -t 3` that is 369 raw lines in 207 functions, 114 of
+  them a `subs`, 75 a `br`, 49 an `ands`, 46 a `csel` and 31 an `ldar`; 348 in 191 on
+  3.4.4. A flag-setting instruction also no longer names the old value of a destination
+  it does not read, as `subs x1, x0, x2` named x1 (#116). Closes #120.
 - **A name is read only on paths that set it.** Tier 3 read a name on paths that never
   set it, in three ways. A goto join kept every register no block between wrote, and
   naming a value writes none, so a call's result or a phi named on one path into the

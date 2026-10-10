@@ -1266,8 +1266,16 @@ class Lifter:
         writes means what the machine put in it. A value the lifter still holds that is
         spelled with one of them would read as the new value: `add x5, x1, #1; subs x1,
         x1, #8; str x5` printed `x1 + 1` for the old x1 (#118). Each such value still read
-        later is named first, `var t0 = x1 + 1;`, as _pin does before a base moves."""
-        defs = set(_def_use(mn, op)[0]) - _SPECIAL
+        later is named first, `var t0 = x1 + 1;`, as _pin does before a base moves.
+
+        It reads the machine registers it names, and a register the lifter holds as an
+        expression was never assigned in the printed body: `add x1, x1, #8; adcs x1, x1,
+        x3` printed the `adcs` alone, which reads as working on the entry x1 (#120). The
+        line says what each register it reads holds, `adcs x1, x1, x3   // x1 holds x1 +
+        8`. A comment and not an assignment, so the printed body still assigns a register
+        only where the machine's own instruction does."""
+        def_regs, use_regs = _def_use(mn, op)
+        defs = set(def_regs) - _SPECIAL
         if dst:
             defs.add(dst)
         out = []
@@ -1275,9 +1283,12 @@ class Lifter:
         for r in sorted(defs):
             out += self._pin(st, r, live)
         self.raw_names.update(_DECL_RE.match(ln).group(2) for ln in out)
+        held = [f"{r} holds {v.text}" for r, v in sorted(st.reg.items())
+                if r in use_regs and v.text != r]
         for r in sorted(defs):
             st.set(r, V(r, P_ATOM))
-        return out + [f"{mn} {shown}".rstrip()]
+        line = f"{mn} {shown}".rstrip()
+        return out + [f"{line}   // {', '.join(held)}" if held else line]
 
     def _src(self, ops: list, i: int, st: State) -> V:
         """Source operand `i` with any shift or extend that follows it applied.
@@ -1341,8 +1352,11 @@ class Lifter:
         out = []
         if mn in _FLAG_SRC:
             regs = _regs(ops)
-            vals = {r: self._leaf(r, st) for r in regs}
             dst = canon(ops[0]) if mn not in _CMP else None
+            # The comparison is of the sources; `subs x1, x0, x2` sets the flags from x0
+            # and x2, and naming the x1 it overwrites would be a line nothing reads.
+            srcs = regs if dst is None else _regs(ops[1:])
+            vals = {r: self._leaf(r, st) for r in srcs}
             if read and dst in vals:
                 pat = re.compile(rf"\b{re.escape(dst)}\b")
                 for r, v in sorted(vals.items()):

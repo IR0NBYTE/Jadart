@@ -10283,7 +10283,13 @@ def test_a_branch_reads_the_operands_its_flags_were_set_from():
     body = lift([(0, "ldr", "x0, [x3], #8", ""), (4, "str", "x0, [x4], #8", ""),
                  (8, "subs", "x1, x1, #8", ""), (12, "b.ne", "#0x0", ""),
                  (16, "ret", "", "")])
-    assert body[body.index("subs x1, x1, #8") + 1] == "if (t0 == 8) {", body
+    at = next(i for i, ln in enumerate(body) if ln.startswith("subs x1, x1, #8"))
+    assert body[at + 1] == "if (t0 == 8) {", body
+    # The flags are set from the sources, and an x1 the instruction only writes is no
+    # source: nothing is named for it.
+    assert lift([(0, "subs", "x1, x0, x2", ""), (4, "b.ne", "#0xc", ""),
+                 (8, "str", "xzr, [x3, #7]", ""), (12, "ret", "", "")])[:2] == [
+        "subs x1, x0, x2", "if (x0 == x2) {"]
     # A compare sets the flags without writing, and reads as it always did.
     assert lift([(0, "cmp", "x1, #8", ""), (4, "b.ne", "#0xc", ""),
                  (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[0] == (
@@ -10371,12 +10377,12 @@ def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
             ("st1", "{v0.16b}, [x1], x2", {"x1"}, {"x1", "x2"}),
             ("br", "x16", set(), {"x16"})):
         assert _def_use(mn, op) == (defs, uses), (mn, _def_use(mn, op))
-    # Nothing reads x5 after the line, so nothing is named, and a name only a raw line
-    # would read is left out: the raw line reads the machine register.
+    # Nothing reads x5 after the line, so nothing is named, and a name nothing prints
+    # is left out: `ret` counts d0 as read, and this one returns x0.
     assert lift([("add", "x5, x1, #1"), ("subs", "x1, x1, #8"), ("ret", "")]) == [
         "subs x1, x1, #8", "return x0;"]
-    assert lift([("add", "x5, x1, #1"), ("adcs", "x1, x1, x3"), ("adcs", "x5, x5, x3"),
-                 ("str", "x5, [x4, #7]"), ("ret", "")])[0] == "adcs x1, x1, x3"
+    assert lift([("ldur", "d0, [x0, #7]"), ("csel", "x0, x16, x0, vc"), ("ret", "")]) == [
+        "csel x0, x16, x0, vc", "return x0;"]
 
 
 #: The shape of 3.4.4's `Rect.fromPoints` (#121): x8 holds a field read before the
@@ -10456,6 +10462,41 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
         _ann(image, disassemble_range(image, cr), p2n, pm), pm, arity=ar)]
     assert "var t1 = x0;" not in body and "var t1;" in body, body
     assert body.index("L_0xae0b0:") < body.index("t1 = x0;"), body
+
+def test_a_raw_line_says_what_the_registers_it_reads_hold():
+    # A raw line reads the machine registers it names, and a register tier 3 held as an
+    # expression was never assigned in the printed body: `add x1, x1, #8; adcs x1, x1,
+    # x3` printed the `adcs` alone, which reads as working on the entry x1 (#120). The
+    # line says what each register it reads holds, in a comment, so the printed body
+    # still assigns a register only where the machine's own instruction does.
+    from jadart.expr import lift_function
+
+    def lift(rows, **kw):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, *r, "") for i, r in enumerate(rows)], **kw)]
+    assert lift([("add", "x1, x1, #8"), ("adcs", "x1, x1, x3"), ("str", "x1, [x2, #7]"),
+                 ("ret", "")])[:2] == ["adcs x1, x1, x3   // x1 holds x1 + 8",
+                                       "x2.field_0x8 = x1;"]
+    assert lift([("add", "x17, x1, #27"), ("ldar", "w1, [x17]"), ("str", "x1, [x2, #7]"),
+                 ("ret", "")])[0] == "ldar w1, [x17]   // x17 holds x1 + 27"
+    # A value named before the line is held under its name, and that name is then read.
+    assert lift([("add", "x5, x1, #1"), ("adcs", "x1, x1, x3"), ("adcs", "x5, x5, x3"),
+                 ("str", "x5, [x4, #7]"), ("ret", "")])[:3] == [
+        "var t0 = x1 + 1;", "adcs x1, x1, x3", "adcs x5, x5, x3   // x5 holds t0"]
+    # Every register a store-release reads, a role register a value was moved into, and
+    # the target of a `br`.
+    assert lift([("add", "x1, x2, #8"), ("add", "x17, x3, #15"), ("stlr", "x1, [x17]"),
+                 ("ret", "")])[0] == (
+        "stlr x1, [x17]   // x1 holds x2 + 8, x17 holds x3 + 15")
+    assert lift([("mov", "x22, x1"), ("ldar", "x0, [x22]"), ("str", "x0, [x2, #7]"),
+                 ("ret", "")])[0] == "ldar x0, [x22]   // x22 holds x1"
+    assert lift([("ldr", "x16, [x26, #0x258]"), ("br", "x16")]) == [
+        "br x16   // x16 holds THR.field_0x258"]
+    # A register that holds itself, or the receiver it was on entry, says nothing.
+    assert lift([("adcs", "x1, x1, x3"), ("adcs", "x1, x1, x3"), ("str", "x1, [x2, #7]"),
+                 ("ret", "")])[:2] == ["adcs x1, x1, x3", "adcs x1, x1, x3"]
+    assert lift([("ldar", "w0, [x1]"), ("ret", "")], receiver={"x1": "this"})[0] == (
+        "ldar w0, [x1]")
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
