@@ -12516,6 +12516,148 @@ def test_a_function_that_hands_back_its_double_argument_returns_d0():
     assert body[-1] == "return d0;", body                # Curve.transform
 
 
+def test_a_call_to_a_function_with_register_and_stack_arguments_prints_both():
+    # Past six arguments Dart passes the rest on the stack, the last at SP+0, and a callee
+    # that reads both printed one part as the whole list: its registers, `hash6(t68, ...)`
+    # over the seventh it pushed, or, framed, only what was pushed (#148).
+    from jadart.expr import entry_arity, lift_function, StackArity
+
+    def rows(body):
+        return [(i * 4, mn, op, "") for i, (mn, op) in enumerate(body)]
+    regs = [("add", "x0, x1, x2"), ("add", "x0, x0, x3"), ("add", "x0, x0, x5"),
+            ("add", "x0, x0, x6"), ("add", "x0, x0, x7")]
+    framed = entry_arity(rows([("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15")]
+                              + regs + [("ldr", "x9, [x29, #0x18]"),
+                                        ("ldr", "x8, [x29, #0x10]"),
+                                        ("mov", "x15, x29"),
+                                        ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")]))
+    assert isinstance(framed, StackArity) and (framed, framed.need) == (6, 2)
+    frameless = entry_arity(rows(regs + [("ldr", "x8, [x15]"), ("ret", "")]))
+    assert isinstance(frameless, StackArity) and (frameless, frameless.need) == (6, 1)
+    assert not isinstance(entry_arity(rows(regs + [("ret", "")])), StackArity)
+
+    def framed_with(body):
+        return rows([("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15")] + regs
+                    + body + [("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10"),
+                              ("ret", "")])
+    # A q load reads two slots; FP+8 is the return address, not an argument; and one
+    # handed an arguments descriptor in x4 takes the stack convention, whatever it reads.
+    wide = entry_arity(framed_with([("ldr", "q8, [x29, #0x10]")]))
+    assert (wide, wide.need) == (6, 2)
+    assert not isinstance(entry_arity(framed_with([("ldr", "x8, [x29, #8]")])),
+                          StackArity)
+    assert entry_arity(framed_with([("add", "x9, x4, x1"),
+                                    ("ldr", "x8, [x29, #0x10]")])) is None
+    # Read through an index computed from FP, how far up it reads is not known.
+    via = entry_arity(rows(regs + [("add", "x9, x29, x0"), ("ldr", "x8, [x9, #0x18]"),
+                                   ("ret", "")]))
+    assert isinstance(via, StackArity) and via.need is None
+    # Nor where the instruction cut stopped the function short: the part left out could
+    # read higher.
+    short = entry_arity(rows(regs + [("ldr", "x8, [x15]")]), cut=True)
+    assert isinstance(short, StackArity) and short.need is None
+
+    def call(arity, pushes):
+        body = [("mov", f"{r}, #{n}") for n, r in enumerate(("x1", "x2", "x3", "x5",
+                                                               "x6", "x7"), 1)]
+        return [ln.strip() for ln in lift_function(
+            rows(body + pushes + [("bl", "#0x100"), ("ret", "")]),
+            arity=lambda pc: arity)]
+    both = [("stp", "x10, x11, [x15]")]
+    assert call(StackArity(6, 2), both)[0] == (
+        "return sub_0x100(1, 2, 3, 4, 5, 6, x11, x10);")
+    # The first stack arguments sit highest, so one the callee does not read is past
+    # `need`, and all that was pushed is printed.
+    assert call(StackArity(6, 2), both + [("str", "x12, [x15, #0x10]")])[0] == (
+        "return sub_0x100(1, 2, 3, 4, 5, 6, x12, x11, x10);")
+    # Fewer pushed than it reads, nothing pushed, or fewer registers than six, is not the
+    # list, and nor is one beside a double handed over in a V register
+    # (kFpuRegistersForArgs).
+    assert call(StackArity(6, 2), [("str", "x10, [x15]")])[0] == "return sub_0x100(...);"
+    assert call(StackArity(5, 2), both)[0] == "return sub_0x100(...);"
+    assert call(StackArity(6, 2, True), both)[0] == "return sub_0x100(...);"
+    assert call(StackArity(6, 0), [])[0] == "return sub_0x100(...);"
+    assert call(via, both)[0] == "return sub_0x100(...);"
+    assert call(short, both)[0] == "return sub_0x100(...);"
+    # A callee whose arity is not asked for takes what was pushed, as before.
+    assert [ln.strip() for ln in lift_function(rows(both + [("bl", "#0x100"),
+                                                           ("ret", "")]))][0] == (
+        "return sub_0x100(x11, x10);")
+    # One that reads only registers does not read what was pushed, so where they are not
+    # known nor is its list: 3.4.4's `contains` printed `contains(0)`.
+    lone = rows([("mov", "x1, #5"), ("str", "xzr, [x15]"), ("bl", "#0x100"), ("ret", "")])
+    assert [ln.strip() for ln in lift_function(lone, arity=lambda pc: 2)][0] == (
+        "return sub_0x100(...);")
+    handed = entry_arity(rows(regs + [("fadd", "d0, d1, d2"), ("ldr", "x8, [x15]"),
+                                      ("ret", "")]))
+    zeroed = entry_arity(rows(regs + [("eor", "v1.16b, v1.16b, v1.16b"),
+                                      ("fmov", "d0, d1"), ("ldr", "x8, [x15]"),
+                                      ("ret", "")]))
+    assert handed.fpu and not zeroed.fpu and not frameless.fpu
+    assert entry_arity(rows(regs + [("cbz", "x1, #0x20"), ("fadd", "d2, d0, d0"),
+                                    ("ldr", "x8, [x15]"), ("ret", "")])).fpu
+    # Each of V0 to V5 is an argument register, and V6 is not.
+    for r in ("d0", "d1", "d2", "d3", "d4", "d5", "d6"):
+        got = entry_arity(rows(regs + [("fmov", f"d7, {r}"), ("ldr", "x8, [x15]"),
+                                       ("ret", "")]))
+        assert got.fpu == (r != "d6"), r
+    # A `ret` no call and no write to x0 can come before hands back d0, the argument
+    # (#127's `Curve.transform`); one after a write to x0 returns in x0.
+    keep = [("add", "x8, x1, x2"), ("add", "x8, x8, x3"), ("add", "x8, x8, x5"),
+            ("add", "x8, x8, x6"), ("add", "x8, x8, x7"), ("ldr", "x9, [x15]")]
+    assert entry_arity(rows(keep + [("ret", "")])).fpu
+    assert not entry_arity(rows(keep + [("mov", "x0, x9"), ("ret", "")])).fpu
+    # A pair reads two slots, and a double the function writes before it reads it, on
+    # every path, was not handed to it. A framed function's own outgoing slots are not
+    # its arguments.
+    pair = entry_arity(rows(regs + [("ldp", "x8, x9, [x15]"), ("ret", "")]))
+    assert (pair, pair.need) == (6, 2)
+    own = entry_arity(rows(regs + [("fmov", "d0, #1.0"), ("cbz", "x1, #0x24"),
+                                   ("fadd", "d2, d0, d0"), ("ldr", "x8, [x15]"),
+                                   ("ret", "")]))
+    assert isinstance(own, StackArity) and not own.fpu
+    assert not isinstance(entry_arity(rows(
+        [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15")] + regs
+        + [("str", "x8, [x15]"), ("ldr", "x9, [x15]"), ("mov", "x15, x29"),
+           ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")])), StackArity)
+    import pickle
+    back = pickle.loads(pickle.dumps(StackArity(6, 2, True)))
+    assert (back, back.need, back.fpu) == (6, 2, True)
+    # ...and a call printed `...` reads no register of its own (Lifter._call_reads).
+    from jadart import expr as E
+    for k in (StackArity(5, 1), StackArity(6, 1, True), StackArity(6, None)):
+        lifter = E.Lifter({}, arity=lambda pc: k)
+        assert lifter._call_reads([(0, "bl", "#0x100", "")]) == {}
+    assert E.Lifter({}, arity=lambda pc: StackArity(6, 1))._call_reads(
+        [(0, "bl", "#0x100", "")]) == {0: E._reg_mask(E.ARG_REGS)}
+    # An address computed from FP and then overwritten reads no argument through it: a
+    # `sync*` method that takes only `this` would print `_childrenInPaintOrder(...)`.
+    assert not isinstance(entry_arity(rows(
+        [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+         ("ldur", "x2, [x1, #7]"), ("add", "x0, x29, w1, sxtw #2"),
+         ("ldur", "x0, [x0, #-8]"),
+         ("ldur", "w3, [x0, #0x17]"), ("mov", "x15, x29"),
+         ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")])), StackArity)
+    # The arity resolver tells entry_arity where the cut stopped a range short. It
+    # decodes, so it needs capstone, and the rest of this test does not.
+    if not _capstone_available():
+        return
+    import struct
+    from jadart import versions
+    from jadart.disasm import InstrImage, CodeRange, MAX_INSNS
+    from jadart.expr import make_arity_resolver
+    # add x0, x1, x2; add x0, x0, x3 / x5 / x6 / x7; ldr x8, [x15]; then nops, ret
+    head = [0x8B020020, 0x8B030000, 0x8B050000, 0x8B060000, 0x8B070000, 0xF94001E8]
+    for pad, need in ((0, 1), (MAX_INSNS, None)):
+        words = head + [0xD503201F] * pad + [0xD65F03C0]
+        cr = CodeRange(pc_offset=0, size=4 * len(words), owner_ref=-1)
+        image = InstrImage(text=b"".join(struct.pack("<I", w) for w in words), pcs=[0],
+                           first_code=0, code_ranges={}, all_ranges=[cr],
+                           arch=versions.Arch("arm64", 8, True))
+        got = make_arity_resolver(image)(0)
+        assert isinstance(got, StackArity) and (got, got.need) == (6, need), pad
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
