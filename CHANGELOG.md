@@ -13,6 +13,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A goto into a loop's head reads no name and no value the goto skipped.** A loop
+  head a goto also reaches was left out of the goto join's rules, because the loop binds
+  its own names there, and the way in the walk did not take brought a state it never
+  saw: the body read a name set only on the walked way in, and a value only that way
+  left in a register (a 5 stored where the goto's way still has the register it came
+  with). The goto join's meet, over the ways into the loop and not its latches, now
+  applies there before the loop binds its names, with the rule for names of #121. And
+  an instruction that keeps part of its destination, `movk`, `bfi`, `bfxil`, or a lane
+  insert as capstone prints it (`mov v0.s[1], w3`), counts as reading it, so liveness
+  sees the read and a raw one says what the register held. Tier 3 exports change in 11
+  functions on the clean fixture (50 lines), 9 on 2.19.6, 11 on 3.4.4 and 13 on 3.10.9,
+  each a value the ways in disagree on that now prints as its register. Closes #125.
 - **A field saved in a frame slot across a call keeps the value it had when it was
   saved.** Tier 3 tracks what a slot `[x29, #d]` holds as the text stored there, so a
   field spilled before a call and reloaded after it printed as a fresh read of the field,

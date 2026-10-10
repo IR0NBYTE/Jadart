@@ -11781,6 +11781,39 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
     assert "(d0 * x3.field_0x8) > (" not in body
 
 
+def test_a_goto_into_a_loop_head_reads_no_name_the_goto_skipped():
+    # A loop head a goto also reaches was left out of the goto join's rules, because the
+    # loop binds its own names there; the way in the walk did not take brought a state it
+    # never saw, and the body read `t0`, set only on the walked way (#125).
+    from jadart.expr import _def_use, lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, *r, "") for i, r in enumerate(rows)])]
+    body = lift([("mov", "x9, #1"), ("add", "x17, x14, #7"), ("sub", "x8, x0, x3"),
+                 ("cbnz", "x5, #0x1c"), ("adcs", "x0, x0, x4"), ("cmp", "x6, x7"),
+                 ("b.ge", "#0x28"), ("stur", "x8, [x2, #15]"), ("sub", "x9, x9, #1"),
+                 ("tbz", "x9, #63, #0x1c"), ("ret", "")])
+    assert "x2.field_0x10 = x8;" in body and "goto L_0x1c;" in body, body
+    # ...nor a value only the walked way in left in a register: the goto's way in still
+    # has the x9 it came with, and main stored the 5 the other way set.
+    body = lift([("and", "x10, x10, #7"), ("cbnz", "x5, #0x14"), ("mov", "x9, #5"),
+                 ("cmp", "x6, x7"), ("b.ge", "#0x20"), ("stur", "x9, [x2, #0xf]"),
+                 ("subs", "x10, x10, #1"), ("b.gt", "#0x14"), ("ret", "")])
+    assert "x2.field_0x10 = x9;" in body and "x2.field_0x10 = 5;" not in body, body
+    # An instruction that keeps part of its destination reads it, so a raw one says
+    # what it held.
+    assert _def_use("bfi", "x0, x1, #3, #8") == ({"x0"}, {"x0", "x1"})
+    assert _def_use("movk", "x0, #0x1234, lsl #16") == ({"x0"}, {"x0"})
+    assert _def_use("ins", "v0.d[1], x3") == ({"d0"}, {"d0", "x3"})
+    assert _def_use("ins", "v0.d[0], x3") == ({"d0"}, {"x3"})
+    # capstone spells a lane insert `mov`, and only a low doubleword one replaces dN
+    assert _def_use("mov", "v0.s[1], w3") == ({"d0"}, {"d0", "x3"})
+    assert _def_use("mov", "v0.d[0], x3") == ({"d0"}, {"x3"})
+    assert lift([("add", "x0, x2, #1"), ("bfi", "x0, x1, #3, #8"),
+                 ("str", "x0, [x4, #7]"), ("ret", "")])[0] == (
+        "bfi x0, x1, #3, #8   // x0 holds x2 + 1")
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

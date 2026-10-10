@@ -1064,7 +1064,14 @@ def _def_use_uncached(mn: str, op: str):
             return _regs(wb), _regs(ops)
         n = 2 if mn in ("ldxp", "ldaxp", "ldnp") else 1
         return _regs(ops[:min(n, at)] + wb), _regs(ops[n:])
-    return _regs(ops[:1]), _regs(ops[1:])       # alu / mov: dst, srcs
+    defs, uses = _regs(ops[:1]), _regs(ops[1:])     # alu / mov: dst, srcs
+    # movk, bfi, a lane insert: the rest is kept, and so read (#125). An insert into the
+    # low doubleword overwrites the whole of dN; what it keeps is the other lane.
+    lane = "[" in ops[0]                  # `mov v0.s[1], w1`: capstone's lane insert
+    low = lane and ops[0].replace(" ", "").endswith(".d[0]")
+    if (mn in _KEEPS_DST or (mn == "mov" and lane)) and not low:
+        uses = uses | defs
+    return defs, uses
 
 
 _ATOMIC_OP_RE = re.compile(r"(ld(add|clr|eor|set|smax|smin|umax|umin)|swp)"
@@ -3302,7 +3309,7 @@ class Lifter:
             n = self._idom.get(n)
         return frozenset(out)
 
-    def _join_kill(self, addr) -> tuple:
+    def _join_kill(self, addr, entry=False) -> tuple:
         """(registers, slots-too) a block reached by a `goto` may NOT assume it still has.
 
         `walk` renders a tree, and a goto is the one edge whose source state never reaches
@@ -3323,14 +3330,19 @@ class Lifter:
         volatile set, the same over-approximation `_render_loop` makes, so a value cannot
         survive a call on one arm and be read after the join.
         """
-        hit = self._killcache.get(addr)
+        hit = self._killcache.get((addr, entry))
         if hit is not None:
             return hit
         if self._idom is None:
             self._idom = _idoms(self.blocks, self.entry,
                                 lambda n: self.blocks[n].succ if n in self.blocks else ())[0]
         # backward: every block that can reach addr without going through it again
-        back, stack = set(), list(self._preds.get(addr, ()))
+        # `entry`: the ways into a loop's head only, not the latches it dominates, whose
+        # values the loop's own names carry (#125).
+        preds = self._preds.get(addr, ())
+        if entry:
+            preds = [p for p in preds if addr not in self._dominators(p)]
+        back, stack = set(), list(preds)
         while stack:
             n = stack.pop()
             if n in back or n == addr:
@@ -3359,7 +3371,7 @@ class Lifter:
         # join where every other line says `SP`. A role is a display constant, not a
         # tracked value, and 4,114 of the corpus's 5,002 writeback sites are the SP of a
         # push or a pop.
-        self._killcache[addr] = hit = (frozenset(self._written(back)) - _SPECIAL,
+        self._killcache[(addr, entry)] = hit = (frozenset(self._written(back)) - _SPECIAL,
                                        self._writes_stack(back),
                                        self._writes_heap(back))
         return hit
@@ -3740,6 +3752,24 @@ class Lifter:
                 prev = stmts[i - 1] if i and alive else None
                 self._loop_before = prev[1] if prev and prev[0] == "asm" else None
                 label(s[1])
+                if s[1] in self.labels:
+                    # A goto into the loop's head brings a state the walk never saw: the
+                    # goto join's meet, over the ways in and not the latches, before the
+                    # loop binds its names from it (#125).
+                    kill, mem, heap = self._join_kill(s[1], entry=True)
+                    for r in sorted(kill):
+                        st.forget(r)
+                    if mem:
+                        st.slot.clear()
+                    else:
+                        self._stale_slots(st, kill)
+                    if heap:
+                        for r, v in sorted(st.reg.items()):
+                            if v.text != r and _READS_MEMORY.search(v.text):
+                                st.forget(r)
+                        st.elem.clear()
+                    doms = self._dominators(s[1])
+                    _forget_temps(st, lambda k: self._anchor.get(k) not in doms)
                 out.extend(self._render_loop(s[1], s[2], st, indent, depth))
                 st.src = frozenset(self._breakers.get(s[1], ()))
                 alive = True
