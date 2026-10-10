@@ -1080,7 +1080,7 @@ def test_the_slot_dataflow_reaches_its_fixed_point_along_backward_branches():
     A frame move between store and reload is the other way a slot stops being the same
     address, and `_step` forgets every slot there, so nothing may be named across it."""
     from jadart.cfg import build_cfg
-    from jadart.expr import Lifter, lift_function, strip_boilerplate
+    from jadart.expr import Lifter, _liveness, lift_function, strip_boilerplate
     n = 40
     rows = [("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
             ("b", f"#{(3 + 3 * (n - 1)) * 4:#x}"), ("bl", "#0x10000"),
@@ -1093,7 +1093,7 @@ def test_the_slot_dataflow_reaches_its_fixed_point_along_backward_branches():
     assert "var t0 = x20.field_0xc;" in body and "return t0;" in body, body
     blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
     lifter = Lifter(blocks, entry=entry)
-    assert lifter._printed_live_out({}) == lifter._liveout
+    assert lifter._liveout == _liveness(blocks)[1]
     assert lifter._slot_crossings() == {(4, "x29-16")}
 
     # A register reloaded from a slot stores back the value already there only while
@@ -11943,6 +11943,51 @@ def test_a_register_list_load_writes_every_register_in_it():
     # A store of a list writes none of them.
     assert lift([("ldur", "d1, [x4, #0xf]"), ("st1", "{v0.16b, v1.16b}, [x1]"),
                  ("stur", "d1, [x5, #7]")])[1] == "x5.field_0x8 = x4.field_0x10;"
+
+
+def test_a_value_read_only_as_a_call_argument_is_live_up_to_the_call():
+    # `bl` reads no register to the machine, so a value read only as a call's argument
+    # was dead to liveness: a raw line overwriting a register it is spelled with did not
+    # name it first, and `foo(x1, x1 + 1)` passed the new x1 plus one (#122). A call
+    # whose arity is known reads the arguments it prints.
+    from jadart.expr import lift_function
+
+    def lift(rows, k):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])],
+            arity=lambda pc: k)]
+    assert lift([("add", "x2, x1, #1"), ("csel", "x1, x4, x5, eq"), ("bl", "#0x100")],
+                2) == ["var t0 = x1 + 1;", "csel x1, x4, x5, eq",
+                       "return sub_0x100(x1, t0);"]
+    # Arms that disagree on an argument give it a name at the join, where it printed
+    # as a bare register.
+    joined = [("mov", "x1, x6"), ("cbz", "x3, #0x10"), ("add", "x2, x1, #1"),
+              ("b", "#0x14"), ("add", "x2, x1, #2"), ("bl", "#0x200")]
+    assert lift(joined, 2) == ["var t0;", "if (x3 != 0) {", "t0 = x6 + 1;", "} else {",
+                               "t0 = x6 + 2;", "}", "return sub_0x200(x6, t0);"]
+    # A register the callee does not take is not read.
+    assert lift(joined, 1) == ["return sub_0x200(x6);"]
+    # An arm that loads x2 in an inner `if` whose join keeps no value for it ends with
+    # x2 spelled as itself, as on entry. The name takes x2 in that arm, after the inner
+    # `if`, and not from before the outer one, where it held something else. Either
+    # arm of the inner `if` may be the one that loads it.
+    want = ["var t1;", "if (x3 != 0) {", "var t0 = sub_0x500(...);", "t1 = t0;",
+            "} else {", "t1 = x2;", "}", "return sub_0x200(x6, t1);"]
+    for then, other in ((("ldur", "x2, [x5, #7]"), ("ldur", "x2, [x5, #0xf]")),
+                        (("add", "x7, x7, #1"), ("ldur", "x2, [x5, #0xf]")),
+                        (("ldur", "x2, [x5, #7]"), ("add", "x7, x7, #1"))):
+        assert lift([("mov", "x1, x6"), ("cbz", "x3, #0x14"), ("bl", "#0x500"),
+                     ("mov", "x2, x0"), ("b", "#0x24"), ("cbz", "x4, #0x20"), then,
+                     ("b", "#0x24"), other, ("mov", "x1, x6"), ("bl", "#0x200")],
+                    2) == want, (then, other)
+    # The same holds for a value recomputed after the loss: `x1 + 1` from x1 loaded in
+    # the inner `if` is spelled as the `x1 + 1` from before the outer one, and is not it.
+    assert lift([("add", "x2, x1, #1"), ("cbz", "x3, #0x20"), ("cbz", "x4, #0x14"),
+                 ("ldur", "x1, [x5, #7]"), ("b", "#0x18"), ("ldur", "x1, [x5, #0xf]"),
+                 ("add", "x2, x1, #1"), ("b", "#0x24"), ("mov", "x2, x7"),
+                 ("bl", "#0x200")], 2) == [
+        "var t0;", "if (x3 != 0) {", "t0 = x2;", "} else {", "t0 = x7;", "}",
+        "return sub_0x200(x1, t0);"]
 
 
 if __name__ == "__main__":

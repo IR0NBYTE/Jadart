@@ -1661,7 +1661,8 @@ class Lifter:
         self._flag_reads = frozenset()
         # Registers live after the instruction currently being lifted, as a mask.
         self._live_after = 0
-        self._livein, self._liveout = _liveness(blocks)
+        #: (call reads, live in, live out) per block; see _printed_liveness.
+        self._printed = None
         #: Temporaries minted for a call result. Only these may be folded back into their
         #: use by _inline_single_use; a temp that exists to STOP an expression growing
         #: must not be inlined back into the expression it was cut out of.
@@ -1789,9 +1790,12 @@ class Lifter:
         slot only to be passed to a call is read by the reader, and `_slot_crossings` has
         to count it (#64): `handleMessage` reloads a spilled field to pass it on, and the
         argument printed as a fresh read of the field after the calls in between. The
-        same tests `_step` makes, so a register counted here is one a call can print. An
-        indirect call needs nothing here: liveness already sees it read its target, and a
-        dispatch call's receiver is read by the class id load in front of it."""
+        tests `_call_args` makes that the block shows: a stub, an arity it cannot read.
+        The other one, an argument register the walk holds no value for, is decided by
+        the walk, and a call that prints `...` for it counts its reads all the same; the
+        cost is a name nothing reads. An indirect call needs nothing here: liveness
+        already sees it read its target, and a dispatch call's receiver is read by the
+        class id load in front of it."""
         out = {}
         for i, (_a, mn, op, note) in enumerate(insns):
             if mn != "bl":
@@ -1873,9 +1877,7 @@ class Lifter:
                 # with a call's printed arguments counted (`_call_reads`).
                 if after is None:
                     if live_out is None:
-                        reads = {n: self._call_reads(x.insns)
-                                 for n, x in self.blocks.items()}
-                        live_out = self._printed_live_out(reads)
+                        reads, _li, live_out = self._printed_liveness()
                     more = reads[b]
                     after, m = [0] * len(blk.insns), live_out.get(b, 0)
                     for k in range(len(blk.insns) - 1, -1, -1):
@@ -1951,28 +1953,44 @@ class Lifter:
                         queued.add(p)
                         heapq.heappush(work, (rank[p], p))
 
-    def _printed_live_out(self, reads: dict) -> dict:
-        """Each block's live-out registers, as `_liveness` has them but with the reads
-        `_call_reads` found added: what the printed body reads."""
-        use, dfn = {}, {}
-        for b, blk in self.blocks.items():
-            u = d = 0
-            more = reads.get(b, {})
-            for i, (_a, mn, o, _n) in enumerate(blk.insns):
-                de, us = _def_use_masks(mn, o)
-                u |= (us | more.get(i, 0)) & ~d
-                d |= de
-            use[b], dfn[b] = u, d
-        live_in: dict = {}
+    def _printed_liveness(self) -> tuple:
+        """({block: _call_reads}, live in, live out): each block's live registers as
+        `_liveness` has them, with a call's printed arguments counted as its reads. That
+        is what the printed body reads. A value read only as a call's argument was dead
+        to `_liveness`, so a raw line overwriting a register it is spelled with did not
+        name it first: `foo(x1, x1 + 1)` printed the new x1 in the second argument (#122).
+        """
+        if self._printed is None:
+            reads = {b: self._call_reads(blk.insns) for b, blk in self.blocks.items()}
+            use, dfn = {}, {}
+            for b, blk in self.blocks.items():
+                u = d = 0
+                more = reads[b]
+                for i, (_a, mn, o, _n) in enumerate(blk.insns):
+                    de, us = _def_use_masks(mn, o)
+                    u |= (us | more.get(i, 0)) & ~d
+                    d |= de
+                use[b], dfn[b] = u, d
+            live_in: dict = {}
 
-        def step(b):
-            lo = 0
-            for s in self.blocks[b].succ:
-                lo |= live_in.get(s, 0)
-            return use[b] | (lo & ~dfn[b])
-        self._backward(step, live_in, 0)
-        return {b: _or_all(live_in.get(s, 0) for s in self.blocks[b].succ)
-                for b in self.blocks}
+            def step(b):
+                lo = 0
+                for s in self.blocks[b].succ:
+                    lo |= live_in.get(s, 0)
+                return use[b] | (lo & ~dfn[b])
+            self._backward(step, live_in, 0)
+            self._printed = (reads, live_in, {
+                b: _or_all(live_in.get(s, 0) for s in self.blocks[b].succ)
+                for b in self.blocks})
+        return self._printed
+
+    @property
+    def _livein(self) -> dict:
+        return self._printed_liveness()[1]
+
+    @property
+    def _liveout(self) -> dict:
+        return self._printed_liveness()[2]
 
     def _loop_rewrites(self, header, st: State) -> list:
         """The slots the loop at `header` may come round to holding something new (#109).
@@ -3308,9 +3326,10 @@ class Lifter:
                 n = now.get(v.text) or pinned.get(v.text)
                 if n is None:
                     # The first walk writes out what can be read at all: a register live
-                    # at the target or one a call can take, which liveness does not count
-                    # (`bl` uses nothing), and a slot the function loads somewhere. Which
-                    # of those is read decides what the second walk writes out.
+                    # at the target or one a call can take, which liveness counts only
+                    # where the callee's arity is known, and a slot the function loads
+                    # somewhere. Which of those is read decides what the second walk
+                    # writes out.
                     if self.keep is not None:
                         want = (addr, side, k) in self.keep
                     elif side == "reg":
@@ -3477,10 +3496,11 @@ class Lifter:
         # mentions the field. And an instruction printed raw can be anywhere (_verbatim).
         if insns:
             after, m = [0] * len(insns), self._liveout.get(addr, 0)
+            more = self._printed_liveness()[0].get(addr, {})
             for k in range(len(insns) - 1, -1, -1):
                 after[k] = m
                 de, us = _def_use_masks(insns[k][1], insns[k][2])
-                m = us | (m & ~de)
+                m = us | more.get(k, 0) | (m & ~de)
         for k, (a, mn, op, note) in enumerate(insns):
             self._live_after = after[k] if after is not _NO_LIVE else 0
             last = (k == len(insns) - 1)
@@ -3570,7 +3590,8 @@ class Lifter:
                 return None
         return cont
 
-    def _phi(self, st: State, a: State, b: State, tlines, elines, live, pad, indent):
+    def _phi(self, st: State, a: State, b: State, tlines, elines, live, pad, indent,
+             stmts):
         """Write out the registers the two arms disagree about, and NAME the result.
 
         `_merge` keeps what both arms agree on and drops the rest, so a register each arm
@@ -3605,6 +3626,32 @@ class Lifter:
         # ...and one that prints a write to a register has changed it, even where it
         # ends up spelled as the register again, which is also how the entry value reads.
         printed = {id(lines): _printed_writes(lines) for lines in (tlines, elines)}
+        # ...and so has one whose own instructions write it and that leaves it spelled as
+        # it was before the `if`: a value lost at a join inside the arm is spelled as the
+        # register, as the entry value is, and `x1 + 1` recomputed after x1 was lost there
+        # is spelled as the `x1 + 1` from before. `lerp` loads x1 in both arms of an inner
+        # `if` whose join keeps neither, and the name took x1 from before the outer one
+        # (#122). Such an arm assigns the register itself, which is the machine's value
+        # at its end. A stub that gives every register back writes none, and a part of
+        # the arm that leaves the function does not reach its end.
+        wrote = {}
+
+        def writes(k):
+            if k not in wrote:
+                w = wrote[k] = set()
+                for blk in sorted(_stmt_blocks(stmts[k], self.blocks)):
+                    for (_a, mn, o, note) in self.blocks[blk].insns:
+                        if _rv_call(mn, note) is None:
+                            w.add(_T.ret_int)       # as `_step` takes any `bl`
+                        else:
+                            w |= _def_use(mn, o)[0]
+            return wrote[k]
+
+        def lost(k, v, r, pre):
+            if v.text != pre.text or r not in writes(k):
+                return False
+            return v.text == r or any(canon(m) in writes(k)
+                                      for m in _REG_RE.findall(v.text))
         for r in sorted(a.reg.keys() | b.reg.keys()):
             # A register only one arm tracks holds, on the other path, whatever it came in
             # with, which is the register itself, since anything the map knew before the
@@ -3665,13 +3712,15 @@ class Lifter:
             # both arms assign it, giving one anyway would DUPLICATE the entry expression
             # 506 extra byte-offset field lines on the corpus, paid for a value no path
             # reads. The declaration still dominates every use, so the name is bound.
-            sets = [changed(v) or entered[id(lines)] or r in printed[id(lines)]
-                    for lines, v in arms]
+            gone = [lost(k, v, r, pre) for k, (_lines, v) in enumerate(arms)]
+            sets = [changed(v) or entered[id(lines)] or r in printed[id(lines)] or gone[k]
+                    for k, (lines, v) in enumerate(arms)]
             decls.append(f"{pad}var {name};" if all(sets)
                          else f"{pad}var {name} = {pre.text};")
-            for (lines, v), assign in zip(arms, sets):
+            for (lines, v), assign, g in zip(arms, sets, gone):
                 if assign:
-                    lines.append(pad2 + self._assign(V(name, P_ATOM), v))
+                    lines.append(pad2 + self._assign(V(name, P_ATOM),
+                                                     V(r, P_ATOM) if g else v))
         return named, decls
     def _phi_name(self, st: State, r: str) -> str:
         """The name a phi result is bound to: always a FRESH one, never the register.
@@ -3798,7 +3847,8 @@ class Lifter:
                 if tfalls and efalls:
                     first = st.tmpc[0]
                     named, decls = self._phi(st, a, b, tlines, elines,
-                                             self._livein.get(joins[i], 0), pad, indent)
+                                             self._livein.get(joins[i], 0), pad, indent,
+                                             (then, els))
                     out.extend(decls)
                     # Declared above the `if`, at the end of the block that decides it,
                     # and set on every path through it. Where a goto enters an arm, that
@@ -4510,6 +4560,27 @@ _MAX_PINS = 2048
 _RAW_LINE_RE = re.compile(r"\s*([a-z][a-z0-9.]*)(?:\s+(.*?))?(?:\s+//.*)?$")
 _ASSIGN_LINE_RE = re.compile(r"\s*([a-z]\d+) ([-+*&|^]?=) ")
 _NOT_RAW = frozenset({"return", "throw", "rethrow", "break", "continue", "goto", "var"})
+
+
+def _stmt_blocks(stmts, blocks) -> set:
+    """The blocks a structured statement list walks, nested ones included, leaving out
+    an arm of a nested `if` that leaves the function: no path through it reaches the
+    end of the list."""
+    def leaves(arm):
+        last = arm[-1] if arm else ("",)
+        return last[0] in ("exit", "cut") or (
+            last[0] == "asm" and last[1] in blocks and not blocks[last[1]].succ)
+    out, todo = set(), [stmts]
+    while todo:
+        for s in todo.pop():
+            if s[0] == "asm":
+                out.add(s[1])
+            elif s[0] == "if":
+                todo += [arm for arm in (s[2], s[3]) if not leaves(arm)]
+            elif s[0] == "loop":
+                out.add(s[1])
+                todo.append(s[2])
+    return out
 
 
 def _printed_writes(lines: list) -> set:
