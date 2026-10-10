@@ -408,11 +408,11 @@ def run_corpus(path: str, want: int, trials: int, seed: int, verbose: bool) -> i
 #: Instructions whose printed form is a value-preserving reading of what the CPU does.
 #:
 #: The DELIBERATE reinterpretations are absent, and a run splits at one rather than
-#: running through it: `sbfiz xD, xS, #1` prints as plain `xS` because that is the Smi tag
-#: and showing it helps nobody, `sbfx xD, xS, #1, #31` prints as `xS >> 1`, and the
-#: sign/zero extensions print as the value they extend. Fuzzing those against the hardware
-#: would report the rewrite working as designed as a defect, which is how a partial oracle
-#: gets switched off.
+#: running through it: `sbfiz xD, xS, #1, #31` prints as plain `xS` because that is the
+#: Smi tag and showing it helps nobody, `sbfx xD, xS, #1, #31` prints as `xS >> 1`, and
+#: the sign/zero extensions print as the value they extend. Fuzzing those against the
+#: hardware would report the rewrite working as designed as a defect, which is how a
+#: partial oracle gets switched off.
 _PURE = frozenset({
     "mov", "movz", "movk", "movn", "mvn", "neg", "add", "sub", "mul", "madd", "msub",
     "mneg", "sdiv", "and", "orr", "eor", "lsl", "lsr", "asr", "ubfx",

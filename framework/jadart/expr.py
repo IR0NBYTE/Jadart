@@ -2198,22 +2198,47 @@ class Lifter:
                     pad = 64 - width
                     st.set(dst, _bin(_bin(src, "<<", _num(pad), P_SHIFT), ">>",
                                      _num(pad), P_SHIFT))
-            elif lsb == 1 and mn == "sbfx":                   # Smi untag (value = tagged >> 1)
+            elif lsb == 1 and width == 31 and mn == "sbfx":
+                # Smi untag (value = tagged >> 1)
                 st.set(dst, _bin(src, ">>", V("1", P_ATOM), P_SHIFT))
+            elif lsb + width >= 64:
+                # The field runs to the top bit: a plain shift, arithmetic for sbfx.
+                sym = ">>>" if mn == "ubfx" else ">>"
+                st.set(dst, _bin(src, sym, _num(lsb), P_SHIFT))
+            elif mn == "ubfx":
+                field = f"0x{(1 << width) - 1:x}"
+                st.set(dst, V(f"({_wrap(src, P_SHIFT)} >> {lsb}) & {field}", P_AND))
             else:
-                st.set(dst, V(f"({src.text} >> {lsb}) & 0x{(1 << width) - 1:x}", P_AND))
+                # sbfx carries the field's top bit up, which `& mask` would clear (#124).
+                inner = _bin(src, ">>", _num(lsb), P_SHIFT)
+                st.set(dst, V(f"{_wrap(inner, P_POST)}.toSigned({width})", P_POST))
             return []
-        if mn in ("sbfiz", "ubfiz") and len(ops) >= 3:
-            lsb = _imm(ops[2])
-            if lsb is None:
+        if mn in ("sbfiz", "ubfiz") and len(ops) >= 4:
+            lsb, width = _imm(ops[2]), _imm(ops[3])
+            if lsb is None or width is None:
                 return self._raw(st, dst, mn, op)
-            src = g(ops[1])                     # lsb 1 = Smi tag (value << 1); show the value
-            st.set(dst, src if lsb == 1 else _bin(src, "<<", _num(lsb), P_SHIFT))
+            src = g(ops[1])
+            if lsb == 1 and width in (31, 63) and mn == "sbfiz":
+                st.set(dst, src)                # Smi tag (value << 1): show the value
+            else:
+                # The low `width` bits of the source, sign- or zero-extended, then moved
+                # up; `src << lsb` alone kept the bits above the field (#124).
+                if lsb + width >= 64:
+                    field = src
+                elif mn == "ubfiz":
+                    field = _bin(src, "&", V(hex((1 << width) - 1), P_ATOM), P_AND)
+                else:
+                    # A negative literal is an atom to _wrap and not to Dart:
+                    # `-128.toSigned(8)` is `-(128.toSigned(8))`.
+                    base = (f"({src.text})" if src.text.startswith("-")
+                            else _wrap(src, P_POST))
+                    field = V(f"{base}.toSigned({width})", P_POST)
+                st.set(dst, _bin(field, "<<", _num(lsb), P_SHIFT))
             return []
         if mn in ("sxtw", "uxtw", "sxth", "uxth", "sxtb", "uxtb") and len(ops) >= 2:
             # Not the identity. `sxtb` of 0xff is -1, and printing the source register said
             # 255: a confident wrong value, which is the one thing this lifter does not
-            # emit. Two lines above, `sbfiz` already declines rather than approximate.
+            # emit.
             #
             # The unsigned forms have an exact Dart spelling, so they get it. The signed
             # ones are a shift pair, and it is exact because `>>` here IS arithmetic,

@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A bit field reads as wide as it is.** `sbfx` carries the top bit of its field up,
+  and tier 3 printed it as `(x >> lsb) & mask`, which clears it, so a negative field read
+  as a large positive one. `sbfiz` and `ubfiz` printed `x << lsb` and kept every bit
+  above the field, and at `lsb` 1 printed the bare source as a Smi tag whatever the
+  width: the clean fixture's `hashCode`s, `ubfiz x0, x0, #1, #0x1e`, returned their hash
+  without the `& 0x3fffffff` the machine applies. And `ubfx` put its source in
+  unbracketed, so `x1 & x2` read as `x1 & (x2 >> 4)`. They print `(x >>
+  lsb).toSigned(width)`, `x.toSigned(width) << lsb`, `(x & mask) << lsb` and `((x1 & x2)
+  >> 4) & mask` now, and a field that runs to the top bit as a plain shift. Only the Smi
+  untag `sbfx #1, #31` and the Smi tag `sbfiz #1, #31` or `#63` keep the reading they
+  had, `x >> 1` and the value itself (see `tools/irfuzz.py`); the hash is tagged in the
+  open now, `<< 1`. Tier 3 exports change by 6 lines on the clean fixture and 4 on each
+  of the 2.19.6, 3.4.4 and 3.10.9 corpus builds. Closes #124.
 - **A raw line says what the registers it reads hold.** A raw line reads the machine
   registers it names, and tier 3 holds most registers as expressions it prints only where
   something reads them, so a register a raw line read could hold a value the printed
