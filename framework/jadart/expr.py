@@ -528,7 +528,29 @@ class V:
 
 
 def _wrap(v: V, ctx: int) -> str:
-    return v.text if v.prec >= ctx else f"({v.text})"
+    # A negative literal is an atom here and a unary minus to Dart, so a postfix operator
+    # binds tighter than its sign: `-128.field_0x8` is `-(128.field_0x8)` (#130).
+    if v.prec >= ctx and not (ctx > P_UNARY and v.text[:1] == "-"):
+        return v.text
+    return f"({v.text})"
+
+
+_TAIL_MASK = re.compile(r"& (0x[0-9a-fA-F]+|\d+)\Z")
+
+
+def _fits(v: V, bits: int) -> bool:
+    """Whether `v` is `... & m` with a mask m under 2**bits."""
+    m = _TAIL_MASK.search(v.text) if v.prec == P_AND else None
+    return bool(m) and int(m.group(1), 0) < 1 << bits
+
+
+def _prefix(sym: str, v: V) -> V:
+    """`sym`, `-` or `~`, applied to `v`. A minus before a value that starts with a minus
+    would read as Dart's decrement, `--128`, so that one is bracketed (#130)."""
+    inner = _wrap(v, P_UNARY)
+    if sym == "-" and inner[:1] == "-":
+        inner = f"({inner})"
+    return V(sym + inner, P_UNARY)
 
 
 def _bin(a: V, op: str, b: V, prec: int) -> V:
@@ -2201,13 +2223,13 @@ class Lifter:
         elif nsrc == 1:                                 # cinc / cinv / cneg
             a = g(canon(ops[1]))
             yes = (_bin(a, "+", V("1", P_ATOM), P_ADD) if mn == "cinc"
-                   else V(("~" if mn == "cinv" else "-") + _wrap(a, P_UNARY), P_UNARY))
+                   else _prefix("~" if mn == "cinv" else "-", a))
             no = a
         else:                                           # csel / csinc / csinv / csneg
             yes, b = g(canon(ops[1])), g(canon(ops[2]))
             no = (b if mn == "csel"
                   else _bin(b, "+", V("1", P_ATOM), P_ADD) if mn == "csinc"
-                  else V(("~" if mn == "csinv" else "-") + _wrap(b, P_UNARY), P_UNARY))
+                  else _prefix("~" if mn == "csinv" else "-", b))
         st.set(canon(ops[0]),
                V(f"{cond} ? {_wrap(yes, P_TERN + 1)} : {_wrap(no, P_TERN + 1)}", P_TERN))
         return []
@@ -2736,9 +2758,8 @@ class Lifter:
             return []
         if mn in ("fneg", "fabs", "fsqrt") and len(ops) >= 2 and _scalar_fp_ops(ops):
             src = g(canon(ops[1]))
-            txt = (f"-{_wrap(src, P_UNARY)}" if mn == "fneg"
-                   else f"{_wrap(src, P_POST)}.{'abs' if mn == 'fabs' else 'sqrt'}()")
-            st.set(canon(ops[0]), V(txt, P_UNARY if mn == "fneg" else P_POST))
+            st.set(canon(ops[0]), _prefix("-", src) if mn == "fneg" else V(
+                f"{_wrap(src, P_POST)}.{'abs' if mn == 'fabs' else 'sqrt'}()", P_POST))
             return []
         if mn in ("fmax", "fmin") and len(ops) >= 3:
             # `.2d` here is NOT a Float64x2 lane-wise op. Dart's assembler builds vmaxd/vmind
@@ -2973,7 +2994,7 @@ class Lifter:
             if other is None:
                 return self._raw(st, dst, mn, op)
             if mn in ("bic", "orn", "eon"):     # the second operand is complemented
-                other = V("~" + _wrap(other, P_UNARY), P_UNARY)
+                other = _prefix("~", other)
             # orr xD, xzr, xS  is a plain move
             if mn == "orr" and canon(ops[1]) == "xzr":
                 st.set(dst, other)
@@ -2984,7 +3005,7 @@ class Lifter:
             src = self._src(ops, 1, st)
             if src is None:
                 return self._raw(st, dst, mn, op)
-            st.set(dst, V(("-" if mn == "neg" else "~") + _wrap(src, P_UNARY), P_UNARY))
+            st.set(dst, _prefix("-" if mn == "neg" else "~", src))
             return []
         if mn == "sdiv" and len(ops) >= 3:
             # `~/` is Dart's truncating integer division and arm64 sdiv truncates toward
@@ -2998,15 +3019,24 @@ class Lifter:
             st.set(dst, _bin(g(ops[3]), "+" if mn == "madd" else "-", prod, P_ADD))
             return []
         if mn == "mneg" and len(ops) >= 3:
-            st.set(dst, V("-" + _wrap(_bin(g(ops[1]), "*", g(ops[2]), P_MUL), P_UNARY),
-                          P_UNARY))
+            st.set(dst, _prefix("-", _bin(g(ops[1]), "*", g(ops[2]), P_MUL)))
             return []
         if mn in ("lsl", "lsr", "asr") and len(ops) >= 3:
             sym = _SHIFT_SYM[mn]      # one table, so the two spellings cannot drift apart
             amt = _imm(ops[2])
             # A register shift amount is not a shift by zero, which is what `or 0` made it.
             rhs = _num(amt) if amt is not None else g(ops[2])
-            st.set(dst, _bin(g(ops[1]), sym, rhs, P_SHIFT))
+            src = g(ops[1])
+            if (mn != "lsl" and ops[0].strip()[:1] == "w"
+                    and not _fits(src, 32 if mn == "lsr" else 31)):
+                # A 32-bit shift right reads only the low half: the 64-bit register's top
+                # half would shift into it (#130). Shown as a 64-bit value like every w
+                # register, so exact in the low 32 bits for an amount under 32. A value
+                # already masked to fit, as w values and hash mixing mostly are, needs
+                # neither.
+                src = (_bin(src, "&", V("0xffffffff", P_ATOM), P_AND) if mn == "lsr"
+                       else V(f"{_wrap(src, P_POST)}.toSigned(32)", P_POST))
+            st.set(dst, _bin(src, sym, rhs, P_SHIFT))
             return []
         if mn in ("ubfx", "sbfx") and len(ops) >= 4:
             lsb, width = _imm(ops[2]), _imm(ops[3])
@@ -3055,11 +3085,7 @@ class Lifter:
                 elif mn == "ubfiz":
                     field = _bin(src, "&", V(hex((1 << width) - 1), P_ATOM), P_AND)
                 else:
-                    # A negative literal is an atom to _wrap and not to Dart:
-                    # `-128.toSigned(8)` is `-(128.toSigned(8))`.
-                    base = (f"({src.text})" if src.text.startswith("-")
-                            else _wrap(src, P_POST))
-                    field = V(f"{base}.toSigned({width})", P_POST)
+                    field = V(f"{_wrap(src, P_POST)}.toSigned({width})", P_POST)
                 st.set(dst, _bin(field, "<<", _num(lsb), P_SHIFT))
             return []
         if mn in ("sxtw", "uxtw", "sxth", "uxth", "sxtb", "uxtb") and len(ops) >= 2:

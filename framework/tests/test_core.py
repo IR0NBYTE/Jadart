@@ -11814,6 +11814,63 @@ def test_a_goto_into_a_loop_head_reads_no_name_the_goto_skipped():
                  ("str", "x0, [x4, #7]"), ("ret", "")])[0] == (
         "bfi x0, x1, #3, #8   // x0 holds x2 + 1")
 
+def test_a_negative_literal_and_a_32_bit_shift_read_as_dart_reads_them():
+    # A negative literal is an atom to the lifter and a unary minus to Dart: `neg` of it
+    # printed `--128`, a decrement, and a field read off it `-128.field_0x8`, which Dart
+    # reads as `-(128.field_0x8)`; `neg` of a `neg` printed `--x1` too. And a 32-bit
+    # shift right printed as a 64-bit one, so the register's top half shifted into the
+    # low 32 bits (#130).
+    import random
+    from jadart.expr import lift_function
+
+    def first(rows):
+        body = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(
+            list(rows) + [("str", "x6, [x2, #7]"), ("ret", "")])])
+        return body[0].strip().split(" = ", 1)[1].rstrip(";")
+    assert first([("mov", "x5, #-0x80"), ("neg", "x6, x5")]) == "-(-128)"
+    assert first([("mov", "x5, #-0x80"), ("ldr", "x6, [x5, #7]")]) == "(-128).field_0x8"
+    assert first([("neg", "x5, x1"), ("neg", "x6, x5")]) == "-(-x1)"
+    assert first([("mov", "x5, #-0x80"), ("sub", "x6, x1, x5")]) == "x1 - -128"
+    assert first([("lsr", "w6, w1, #3")]) == "(x1 & 0xffffffff) >>> 3"
+    assert first([("asr", "w6, w1, #3")]) == "x1.toSigned(32) >> 3"
+    assert first([("lsr", "x6, x1, #3")]) == "x1 >>> 3"
+    # A value masked to fit already needs no second mask, as hash mixing mostly is.
+    assert first([("and", "w5, w1, #0x7fffffff"), ("lsr", "w6, w5, #0xb")]) == (
+        "(x1 & 0x7fffffff) >>> 11")
+    assert first([("ubfx", "x5, x1, #0, #0x20"), ("lsr", "w6, w5, #0xb")]) == (
+        "(x1 & 0xffffffff) >>> 11")
+    assert first([("and", "w5, w1, #0x7fffffff"), ("asr", "w6, w5, #3")]) == (
+        "(x1 & 0x7fffffff) >> 3")
+    # ...but a sign still needs carrying out of bit 31,
+    assert first([("ubfx", "x5, x1, #0, #0x20"), ("asr", "w6, w5, #3")]) == (
+        "(x1 & 0xffffffff).toSigned(32) >> 3")
+    assert first([("and", "w5, w1, #0x80000000"), ("asr", "w6, w5, #3")]) == (
+        "(x1 & 0x80000000).toSigned(32) >> 3")
+    # and a mask under an `|` bounds only its own side.
+    assert first([("and", "w5, w1, #0xff"), ("orr", "w5, w2, w5"),
+                  ("lsr", "w6, w5, #3")]) == "((x2 | x1 & 255) & 0xffffffff) >>> 3"
+
+    mask32, mask64 = (1 << 32) - 1, (1 << 64) - 1
+
+    def signed(v, n):
+        v &= (1 << n) - 1
+        return v - (1 << n) if v >> (n - 1) & 1 else v
+
+    def dart(t, x):
+        t = re.sub(r"(\w+)\.toSigned\(32\)", r"_s(\1, 32)", t)
+        t = t.replace(">>>", ">>").replace("x1", "_x")
+        return eval(t, {"_s": signed, "_x": x}) & mask64
+    rng = random.Random(130)
+    for mn in ("lsr", "asr"):
+        for n in (1, 3, 11, 31):
+            t = first([(mn, f"w6, w1, #{n}")])
+            for _ in range(200):
+                x = rng.getrandbits(64)
+                low = x & mask32
+                want = low >> n if mn == "lsr" else signed(low, 32) >> n
+                assert dart(t, x) & mask32 == want & mask32, (mn, n, t, hex(x))
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

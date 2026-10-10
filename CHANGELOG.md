@@ -13,6 +13,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A negative number and a 32-bit shift read as Dart reads them.** Tier 3 gave a
+  negative literal the precedence of a name, so `neg` of it printed `--128`, which is
+  Dart's decrement, a field read off it `-128.field_0x8`, which Dart reads as
+  `-(128.field_0x8)`, and `neg` of a `neg` printed `--x1`. They print `-(-128)`,
+  `(-128).field_0x8` and `-(-x1)` now. A 32-bit shift right, `lsr w` or `asr w`, printed
+  as a shift of the 64-bit register, which shifts its top half into the low 32 bits; it
+  reads the low half now, `(x1 & 0xffffffff) >>> 3` and `x1.toSigned(32) >> 3`, except
+  where the value is already masked to fit, as w values and hash mixing mostly are. A
+  compressed Smi untagged with `asr w` comes out negative where it is. Tier 3 exports
+  change by 42 lines on the clean fixture, 114 on 2.19.6, 52 on 3.4.4 and 40 on 3.10.9;
+  obf does not change. Closes #130.
 - **A goto into a loop's head reads no name and no value the goto skipped.** A loop
   head a goto also reaches was left out of the goto join's rules, because the loop binds
   its own names there, and the way in the walk did not take brought a state it never
