@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A frame slot past the displacement is its own slot.** A slot further from FP than the
+  9-bit displacement reaches is addressed through a register, `mov x17, #-0x158; str d0,
+  [x29, x17]`, and tier 3 read every such access as `[x29]`, so all of them were one slot
+  and a reload printed whatever was stored at another offset last. The offset is now read
+  from the `mov` right before the access, which is where all 2,758 such accesses on the
+  five fixtures set it. An offset it cannot read is printed as the instruction, and a
+  store through one, off FP or SP, forgets every slot. A call now takes x16 and x17 with
+  it too: they are scratch registers a stub or a veneer may use, and a value set in x17
+  before a call printed as still there after it. Tier 3 exports change in 6 functions on
+  the clean fixture (1,031 lines), 5 on 2.19.6, 8 on 3.4.4 and 6 on 3.10.9,
+  `ColorScheme`'s `copyWith`, `fromSeed`, `hashCode` and `lerp` and `ThemeData`'s
+  `copyWith`, `lerp` and constructor among them. obf does not change, as its export lifts
+  none of the functions with such an access. Closes #137.
 - **A negative number and a 32-bit shift read as Dart reads them.** Tier 3 gave a
   negative literal the precedence of a name, so `neg` of it printed `--128`, which is
   Dart's decrement, a field read off it `-128.field_0x8`, which Dart reads as
