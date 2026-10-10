@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A value read only as a call's argument is live up to the call.** `bl` reads no
+  register to the machine, so tier 3 took a value read only as a call's argument, or as
+  what a `throw` throws, as dead. A raw line overwriting a register it was spelled with
+  did not name it first, and `foo(x1, x1 + 1)` passed the new x1 plus one; arms that
+  disagreed on an argument left it a bare register after the join; and a call whose result
+  is thrown printed `tooFew(); throw x0;`. A call whose callee's arity is known now reads
+  the arguments it prints, and a throw reads x0: `throw tooFew();`. The extra phis exposed
+  one more case, also fixed: an arm that loses a register at a join inside it, or
+  recomputes from one it lost there, ends with the register spelled as it was before the
+  `if`, and the phi took the value from before the `if`. Such an arm now assigns the
+  register itself. Tier 3 exports change in 161 functions on the clean fixture, 117 on
+  2.19.6, 243 on 3.4.4 and 257 on 3.10.9, most of them one of those three. A loop does not
+  yet carry a register it reads only as a call argument (#142). Closes #122.
 - **A register list load writes every register in it.** `ld1 {v0.16b, v1.16b}` writes
   d0 and d1, and tier 3 took only the first register of a list as written and the rest
   as read: a store of d1 after the load printed the field d1 held before, and the raw
