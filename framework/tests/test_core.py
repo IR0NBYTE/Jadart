@@ -10355,12 +10355,107 @@ def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
                  ("str", "x5, [x4, #7]"), ("ret", "")])[1] == "x4.field_0x8 = SP + 8;"
     assert lift([("ldr", "x15, [x15, #8]!"), ("add", "x5, x15, #8"),
                  ("str", "x5, [x4, #7]"), ("ret", "")])[1] == "x4.field_0x8 = x15 + 8;"
+    # A comparison made from a value spelled with the register reads it no more.
+    assert lift([("add", "x2, x1, #1"), ("cmp", "x2, #5"), ("umulh", "x1, x1, x3"),
+                 ("csel", "x0, x4, x5, eq"), ("ret", "")])[1] == "csel x0, x4, x5, eq"
+    # What a raw line writes is what the architecture says it writes: a store-release
+    # none, an atomic its second register, a compare-and-swap its first, and `st1` the
+    # base it moves. `br` reads its target.
+    from jadart.expr import _def_use
+    for mn, op, defs, uses in (
+            ("stlr", "w0, [x17]", set(), {"x0", "x17"}),
+            ("ldaddal", "x0, x1, [x2]", {"x1"}, {"x0", "x2"}),
+            ("swp", "x0, x1, [x2]", {"x1"}, {"x0", "x2"}),
+            ("cas", "x0, x1, [x2]", {"x0"}, {"x0", "x1", "x2"}),
+            ("ldaxp", "x0, x1, [x2]", {"x0", "x1"}, {"x2"}),
+            ("st1", "{v0.16b}, [x1], x2", {"x1"}, {"x1", "x2"}),
+            ("br", "x16", set(), {"x16"})):
+        assert _def_use(mn, op) == (defs, uses), (mn, _def_use(mn, op))
     # Nothing reads x5 after the line, so nothing is named, and a name only a raw line
     # would read is left out: the raw line reads the machine register.
     assert lift([("add", "x5, x1, #1"), ("subs", "x1, x1, #8"), ("ret", "")]) == [
         "subs x1, x1, #8", "return x0;"]
     assert lift([("add", "x5, x1, #1"), ("adcs", "x1, x1, x3"), ("adcs", "x5, x5, x3"),
                  ("str", "x5, [x4, #7]"), ("ret", "")])[0] == "adcs x1, x1, x3"
+
+
+#: The shape of 3.4.4's `Rect.fromPoints` (#121): x8 holds a field read before the
+#: branches, and the only path that overwrites x2, which the read is spelled with, is the
+#: `umulh` one, so the field is named there and nowhere else. Every other path reaches the
+#: store at the end by a goto.
+_FROM_POINTS = [
+    ("ldur", "x8, [x2, #7]"), ("ldur", "x4, [x2, #15]"), ("ldur", "x5, [x3, #15]"),
+    ("cmp", "x4, x5"), ("b.le", "#0x1c"), ("mov", "x6, x5"), ("b", "#0x70"),
+    ("cmp", "x5, x4"), ("b.le", "#0x2c"), ("mov", "x6, x4"), ("b", "#0x70"),
+    ("cmp", "x4, #0"), ("b.ne", "#0x3c"), ("add", "x6, x4, x5"), ("b", "#0x70"),
+    ("cmp", "x4, #0"), ("b.ne", "#0x5c"), ("cmp", "x5, #7"), ("b.eq", "#0x5c"),
+    ("b.ne", "#0x58"), ("umulh", "x2, x5, x5"), ("cmp", "x2, #0"), ("b.lt", "#0x64"),
+    ("cmp", "x5, #9"), ("b.ne", "#0x6c"), ("mov", "x6, x5"), ("b", "#0x70"),
+    ("mov", "x6, x4"), ("stur", "x6, [x1, #15]"), ("stur", "x8, [x1, #7]"), ("ret", "")]
+
+
+def test_a_join_reads_no_name_only_some_of_its_paths_set():
+    # A name is set on the paths through the place it is set, and only those. A goto join
+    # kept every register no block between wrote, and naming a value writes none, so the
+    # join read a name only one path had set: `x1.field_0x8 = t10;` in the shape above
+    # (#121). Not knowing x8 there is the honest answer; `x2.field_0x8`, what main says,
+    # is wrong on the path through the `umulh`.
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, *r, "") for i, r in enumerate(rows)])]
+    body = lift(_FROM_POINTS)
+    assert body[-2] == "x1.field_0x8 = x8;", body
+    # What a block that dominates the join names is set on every path, so it is kept:
+    # a call's result, a phi bound above an `if` and a loop's name, each made before the
+    # branches start.
+
+    def ahead(prefix, tail):
+        n = len(prefix) - 1
+        moved = [(mn, f"#{int(op[1:], 16) + 4 * n:#x}")
+                 if mn[0] == "b" and op.startswith("#") else (mn, op)
+                 for mn, op in _FROM_POINTS[1:-2]]
+        return lift(prefix + moved + tail)
+    body = ahead([("bl", "#0x900"), ("mov", "x19, x0"), ("cbz", "x9, #0x14"),
+                  ("add", "x10, x11, #1"), ("b", "#0x18"), ("add", "x10, x11, #2")],
+                 [("stur", "x19, [x1, #0x17]"), ("stur", "x10, [x1, #0x1f]"),
+                  ("ret", "")])
+    assert body[-3:-1] == ["x1.field_0x18 = t0;", "x1.field_0x20 = t1;"], body
+    body = ahead([("mov", "x8, #0"), ("add", "x8, x8, #1"), ("cmp", "x8, x13"),
+                  ("b.lt", "#0x4")], [("stur", "x8, [x1, #7]"), ("ret", "")])
+    assert body[-2] == "x1.field_0x8 = t0;", body
+    # A raw write to a register in one arm changes it, though the register then prints as
+    # itself, which is also how the value from before the `if` prints: the phi read the
+    # entry x1 where the machine had the `umulh`.
+    body = lift([("add", "x6, x1, #1"), ("cbz", "x7, #0x10"), ("umulh", "x1, x1, x3"),
+                 ("b", "#0x14"), ("add", "x1, x1, #4"), ("stur", "x6, [x4, #7]"),
+                 ("stur", "x1, [x4, #15]"), ("ret", "")])
+    arm = body[body.index("umulh x1, x1, x3"):body.index("} else {")]
+    assert "t1 = x1;" in arm and body[-2] == "x4.field_0x10 = t1;", body
+    # ...as does a pointer the arm moves, `x4 += 8;`.
+    body = lift([("cbz", "x7, #0x10"), ("ldr", "x0, [x4], #8"), ("str", "x0, [x5, #7]"),
+                 ("b", "#0x14"), ("add", "x4, x4, #4"), ("stur", "x4, [x6, #7]"),
+                 ("ret", "")])
+    arm = body[body.index("x4 += 8;"):body.index("} else {")]
+    assert "var t2;" in body and "t2 = x4;" in arm, body
+    # A phi bound above an `if` holds what it was bound to only on the paths through the
+    # binding. The clean fixture's `resolveAs` jumps into an arm of one from two places
+    # outside it, and main declared it inside that arm: `var t1 = x0;`, which those
+    # paths never ran, and then read `t1`. The arm a goto enters assigns it itself.
+    _needs_capstone()
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
+    from jadart.expr import make_arity_resolver
+    image, fr, _hdr = load_instructions(CLEAN)
+    p2n = function_name_by_pc(image, fr)
+    pm, ar = build_pool_map(fr), make_arity_resolver(image)
+    cr = next(c for c in image.all_ranges
+              if c.pc_offset <= 0xae028 < c.pc_offset + (c.size or 0))
+    body = [ln.strip() for ln in lift_function(
+        _ann(image, disassemble_range(image, cr), p2n, pm), pm, arity=ar)]
+    assert "var t1 = x0;" not in body and "var t1;" in body, body
+    assert body.index("L_0xae0b0:") < body.index("t1 = x0;"), body
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
