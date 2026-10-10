@@ -1091,6 +1091,13 @@ def _def_use_uncached(mn: str, op: str):
         if _NO_DEF_RE.match(mn):
             return _regs(wb), _regs(ops)
         n = 2 if mn in ("ldxp", "ldaxp", "ldnp") else 1
+        if ops[0].lstrip().startswith("{"):
+            # A register list loads every register in it: `ld1 {v0.16b, v1.16b}` writes
+            # d1 too, and a store of d1 after it printed what d1 held before (#134). A
+            # lane of each, `ld2 {v4.s, v5.s}[1]`, keeps the rest, and so reads it.
+            n = next((i for i, o in enumerate(ops) if "}" in o), 0) + 1
+            if "[" in ops[n - 1]:
+                return _regs(ops[:n] + wb), _regs(ops)
         return _regs(ops[:min(n, at)] + wb), _regs(ops[n:])
     defs, uses = _regs(ops[:1]), _regs(ops[1:])     # alu / mov: dst, srcs
     # movk, bfi, a lane insert: the rest is kept, and so read (#125). An insert into the

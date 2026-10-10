@@ -13,6 +13,13 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A register list load writes every register in it.** `ld1 {v0.16b, v1.16b}` writes
+  d0 and d1, and tier 3 took only the first register of a list as written and the rest
+  as read: a store of d1 after the load printed the field d1 held before, and the raw
+  line said it read d1. Every register in the list is written now, and a load of one
+  lane of each, `ld2 {v4.s, v5.s}[1]`, reads them too, since it keeps the other lanes.
+  None of the five fixtures has a register list, so exports do not change. Part of
+  #134.
 - **A frame slot past the displacement is its own slot.** A slot further from FP than the
   9-bit displacement reaches is addressed through a register, `mov x17, #-0x158; str d0,
   [x29, x17]`, and tier 3 read every such access as `[x29]`, so all of them were one slot
