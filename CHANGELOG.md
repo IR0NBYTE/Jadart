@@ -13,6 +13,35 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A goto's target reads what the goto left.** A block only a goto reaches is lifted
+  from the state its one predecessor left, and that state was taken before the printed
+  program writes loop names back on the way there: in the goto's own write-back, and in
+  a `break`'s when the goto follows a loop. So the target read a name with the meaning it
+  had before the jump. 2.19.6's `parsePartialKeyword` returned `t4 + 1` right after
+  `t4 += 1;`, one more than the machine does, and 3.4.4's `parsePartialString` passed `t0`
+  to `chunkStringEscapeU` where the machine passes the `t0` from before `t0 = x0;`. The
+  target now starts from the state as the jump leaves it: a value spelled as one of the
+  registers the write-back copies reads as that name, any other value that mentions a
+  name about to change is written out first (`var t27 = t0;`) where the target can read
+  it, and what a `break` on the way wrote back is taken from the state past its loop. A
+  function where some of those turn out unread is lifted again without them, 98 of the
+  clean fixture's 8,194, so nothing else is renumbered. The tier 3 export changes in 4
+  functions of the clean fixture, 8 of 2.19.6, 4 of 3.4.4 and 5 of 3.10.9, and in none
+  of the obfuscated fixture; tiers 1 and 2 are unchanged. Run on a CPU with random
+  inputs, those functions reached 12 of their 26 changed targets, where main printed 38
+  register or slot values the machine contradicts: 10 now read right and 28 print the
+  bare register. No value in them reads wrong now that main had right. A value written
+  out before a goto is kept past a later join its target dominates, and a crafted
+  function's write-outs stop at 2,048, past which a value is forgotten: one with 4,000
+  slots and 250 gotos took 6 s and a gigabyte. In `tools/bench.py`, `export` and the
+  whole-image `lift` take 4 to 5% and 3 to 4% longer. `tools/irfuzz.py --nested`
+  generates a loop in a loop with a branch out of both, which no generated graph had:
+  with `--cfgmem --seed-outputs` it finds 4, 8 and 3 mismatches in 500 graphs on main at
+  seeds 1 to 3, and none now. `--cfg` scores the state the return is lifted in, as
+  `--cfgmem` does: the mismatches it reported on main at seed 2, and at seed 7 with 1,500
+  graphs (#125), came from the last block printed, not the return. Its trials draw from
+  a generator of their own per graph, so what one graph scores no longer moves the
+  graphs after it. Closes #106.
 - **A bit field reads as wide as it is.** `sbfx` carries the top bit of its field up,
   and tier 3 printed it as `(x >> lsb) & mask`, which clears it, so a negative field read
   as a large positive one. `sbfiz` and `ubfiz` printed `x << lsb` and kept every bit

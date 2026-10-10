@@ -76,6 +76,8 @@ rather than a refusal; that is what catches a join name bound on one path only.
     python3 tools/irfuzz.py --mem 500                    # generated loads and stores
     python3 tools/irfuzz.py --cfgmem 500                 # both, printed text interpreted
     python3 tools/irfuzz.py --fp BIN                     # real scalar-double runs
+    python3 tools/irfuzz.py --cfgmem 500 --seed-outputs --nested
+                                     # a loop in a loop and a branch out of both (#106)
 """
 from __future__ import annotations
 
@@ -236,14 +238,17 @@ def main() -> int:
                     help="with --cfgmem: load every destination register from memory "
                          "before the graph runs, so a loop-carried value has a decidable "
                          "start and the write-back defects become scoreable")
+    ap.add_argument("--nested", action="store_true",
+                    help="with --cfg or --cfgmem: generate a loop inside a loop with a "
+                         "branch out of both, the shape a goto's write-back meets")
     a = ap.parse_args()
     if a.cfg is not None:
-        return run_cfg(a.cfg, max(a.trials // 4, 25), a.seed, a.verbose)
+        return run_cfg(a.cfg, max(a.trials // 4, 25), a.seed, a.verbose, a.nested)
     if a.mem is not None:
         return run_mem(a.mem, max(a.trials // 4, 25), a.seed, a.verbose)
     if a.cfgmem is not None:
         return run_cfgmem(a.cfgmem, max(a.trials // 4, 25), a.seed, a.verbose,
-                          seed_outs=a.seed_outputs)
+                          seed_outs=a.seed_outputs, nested=a.nested)
     if a.fp:
         return run_fp(a.fp, a.runs, max(a.trials // 4, 25), a.seed, a.verbose)
     rc = run(a.trials, a.seed, a.verbose)
@@ -1411,6 +1416,112 @@ def _gen_function(rng, mem: bool = False, seed_outs: bool = False):
     return words
 
 
+#: The outer loop's counter in a `_gen_nested` graph. Like _FUZZ_CTR, nothing else may
+#: write it, so it is taken out of the destinations there.
+_FUZZ_CTR2 = 6
+
+
+def _gen_nested(rng, mem: bool = False, seed_outs: bool = False):
+    """A random function with a loop inside a loop and a branch out of both, as words.
+
+    `_gen_function` builds at most one loop, so the shape #106 was found in never came
+    up: a goto from the inner loop to a block past the outer one that nothing else
+    reaches. Such a block is entered with the state its one predecessor left, and the
+    goto's write-back, or the inner loop's `break` before the outer loop's goto, has
+    changed what the loop names mean on the way. The same rules as `_gen_function`
+    otherwise: forward branches besides the two back edges, reducible loops, counters
+    nothing else writes.
+
+    Blocks 0..l2 hold the loops: h2 heads the outer one and resets the inner counter, h1
+    heads the inner one, l1 and l2 are the latches, and one inner block other than l1
+    branches to T. After l2 come A, which jumps over T, then T, then F, which returns.
+    With `mem`, T stores some of the loop's registers, so what it reads is scored.
+    """
+    h2 = rng.randint(1, 2)
+    h1 = h2 + rng.randint(1, 2)
+    l1 = h1 + rng.randint(1, 2)
+    l2 = l1 + rng.randint(1, 2)
+    a_, t_, f_ = l2 + 1, l2 + 2, l2 + 3
+    n = f_ + 1
+    dests = tuple(d for d in _FUZZ_OUT if d != _FUZZ_CTR2)
+    src = _FUZZ_IN + _FUZZ_OUT + (_FUZZ_CTR,)
+    body = [[] for _ in range(n)]
+    for b in range(n):
+        for _ in range(rng.randint(1, 3)):
+            d = rng.choice(dests)
+            roll = rng.random()
+            if mem and roll < 0.22:
+                body[b].append(_enc_ldur(d, _MEM_BASE, rng.choice(_MEM_DISPS)))
+            elif mem and roll < 0.44:
+                body[b].append(_enc_stur(rng.choice(src), _MEM_BASE,
+                                         rng.choice(_MEM_DISPS)))
+            elif rng.random() < 0.25:
+                _t, enc = rng.choice(_FUZZ_IMM)
+                body[b].append(enc(d, rng.choice(src), rng.randint(1, 63)))
+            else:
+                _t, enc = rng.choice(_FUZZ_ALU)
+                body[b].append(enc(d, rng.choice(src), rng.choice(src)))
+    if mem:
+        body[t_] = [_enc_stur(rng.choice(dests), _MEM_BASE, d) for d in _MEM_DISPS
+                    if rng.random() < 0.6] + body[t_]
+    term = [rng.choice(["fall", "fall", "cbz", "cbnz", "b"]) for _ in range(n)]
+    term[l1] = term[l2] = "back"
+    out = rng.randint(h1, l1 - 1)
+    term[out] = rng.choice(["cbz", "cbnz"])
+    term[a_], term[t_], term[f_] = "b", "fall", "ret"
+    sub0, add_i, sub_i = _FUZZ_ALU[1][1], _FUZZ_IMM[0][1], _FUZZ_IMM[1][1]
+    body[0] = [sub0(_FUZZ_CTR2, _FUZZ_CTR2, _FUZZ_CTR2),
+               add_i(_FUZZ_CTR2, _FUZZ_CTR2, rng.randint(2, 4))] + body[0]
+    body[h2] = [sub0(_FUZZ_CTR, _FUZZ_CTR, _FUZZ_CTR),
+                add_i(_FUZZ_CTR, _FUZZ_CTR, rng.randint(2, 4))] + body[h2]
+    body[l1] = body[l1] + [sub_i(_FUZZ_CTR, _FUZZ_CTR, 1)]
+    body[l2] = body[l2] + [sub_i(_FUZZ_CTR2, _FUZZ_CTR2, 1)]
+    if mem:
+        body[f_] = body[f_] + [_enc_cmp(a, b) for a, b in _LIVE_TAIL]
+    if seed_outs:
+        body[0] = [_enc_ldur(d, _MEM_BASE, _MEM_DISPS[i % _MEM_SLOTS])
+                   for i, d in enumerate(_FUZZ_OUT)] + body[0]
+
+    def allowed(b):
+        """Where block `b` may branch: past no header into a loop, and never to T."""
+        if b == out:
+            return [t_]
+        if b == a_:
+            return [f_]
+        if b < h2:
+            return list(range(b + 1, h2 + 1))
+        if b < h1:
+            return list(range(b + 1, h1 + 1)) + [a_, f_]
+        return [x for x in range(b + 1, n) if x != t_]
+
+    for b in range(n):
+        if term[b] == "b" and not allowed(b):
+            term[b] = "fall"
+    starts, at = [], 0
+    for b in range(n):
+        starts.append(at)
+        at += len(body[b]) + (0 if term[b] == "fall" else 1)
+    words = []
+    for b in range(n):
+        words.extend(body[b])
+        kind = term[b]
+        here = starts[b] + len(body[b])
+        if kind == "fall":
+            continue
+        if kind == "ret":
+            words.append(_RET_WORD)
+        elif kind == "back":
+            ctr, head = (_FUZZ_CTR, h1) if b == l1 else (_FUZZ_CTR2, h2)
+            words.append(_enc_cbz(ctr, starts[head] - here, True))
+        else:
+            tgt = starts[rng.choice(allowed(b))]
+            if kind == "b":
+                words.append(_enc_b(tgt - here))
+            else:
+                words.append(_enc_cbz(rng.choice(_FUZZ_IN), tgt - here, kind == "cbnz"))
+    return words
+
+
 def _resolve_temps(text: str, subs: dict) -> str:
     """Fold `var tN = ...;` definitions back into an expression that mentions them.
 
@@ -1636,7 +1747,8 @@ def _reachable(blocks, entry):
     return seen
 
 
-def run_cfg(count: int, trials: int, seed: int, verbose: bool) -> int:
+def run_cfg(count: int, trials: int, seed: int, verbose: bool,
+            nested: bool = False) -> int:
     import ast
     uc_mod = _unicorn()
     if uc_mod is None:
@@ -1661,7 +1773,7 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool) -> int:
     withgoto = joins = loops = 0
 
     for _case in range(count):
-        words = _gen_function(rng)
+        words = _gen_nested(rng) if nested else _gen_function(rng)
         code = b"".join(struct.pack("<I", w) for w in words)
         ann = [(i.address, i.mnemonic, i.op_str, "")
                for i in md.disasm(code, BASE)]
@@ -1701,8 +1813,14 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool) -> int:
             if m:
                 subs[m.group(1)] = m.group(2)
         subs = {k: v for k, v in subs.items() if assigned.get(k) == 1}
+        # The state the RETURN is lifted in, not the one the walk ends with: with a goto
+        # in the graph the last block printed need not be the one the function leaves
+        # from, which `run_cfgmem` says at more length. `--nested` graphs nearly always
+        # have one, and their last section is a goto target that falls into the return.
+        end_blk = next((a for a, b in blocks.items() if b.term == "ret"), None)
+        fin = lif._exit.get(end_blk, st)
         trees = {}
-        for r, v in st.reg.items():
+        for r, v in fin.reg.items():
             if not (r[:1] == "x" and r[1:].isdigit() and int(r[1:]) in _FUZZ_OUT):
                 continue
             if v.text == r:
@@ -1718,8 +1836,11 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool) -> int:
             continue
 
         end = BASE + len(code)
+        # The trials draw from a generator of their own, so whether a graph is scored at
+        # all cannot move the graphs generated after it.
+        trial_rng = random.Random(seed * 1_000_003 + _case)
         for _ in range(trials):
-            env = {f"x{i}": rng.getrandbits(64) for i in range(31)}
+            env = {f"x{i}": trial_rng.getrandbits(64) for i in range(31)}
             env["xzr"] = 0
             mu = Uc(ARCH, MODE)
             mu.mem_map(BASE, 0x2000)
@@ -1783,7 +1904,7 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool) -> int:
                 if got != want_v:
                     failures += 1
                     if failures <= 5:
-                        print(f"MISMATCH cfg, {r} = {st.reg[r].text}")
+                        print(f"MISMATCH cfg, {r} = {fin.reg[r].text}")
                         for a, m, o, _n in ann:
                             print(f"    {a - BASE:#06x}  {m} {o}")
                         print("  lifted:")
@@ -1902,8 +2023,9 @@ def _exec_one(s: str, env: dict) -> None:
     cut = s.find("   //")                 # the `if Smi` note _assign appends
     if cut >= 0:
         s = s[:cut].rstrip()
-    if _STMT_RET.match(s):
-        raise _Return
+    m = _STMT_RET.match(s)
+    if m:
+        raise _Return(m.group(1))
     m = _STMT_BARE_DECL.match(s)
     if m:
         # `var t3;`, a phi whose every arm assigns needs no initialiser, so the name is
@@ -1986,8 +2108,9 @@ def _flatten(tree: list, ops: list, brk, cont, gen) -> None:
             ops.append(("label", end, None))
 
 
-def _run_printed(lines: list, env: dict) -> None:
-    """Run the printed program in `env`. Raises _Undecidable on anything unmodelled."""
+def _run_printed(lines: list, env: dict):
+    """Run the printed program in `env`; returns the text of the `return` it reached, or
+    None if it ran off the end. Raises _Undecidable on anything unmodelled."""
     tree, _i = _parse_stmts(lines, 0, False)
 
     # `if` carries (cond, else-branch) in one slot so the tuples stay uniform.
@@ -2028,8 +2151,8 @@ def _run_printed(lines: list, env: dict) -> None:
         elif kind == "stmt":
             try:
                 _exec_one(a, env)
-            except _Return:
-                return
+            except _Return as r:
+                return r.args[0] if r.args else None
             pc += 1
         elif kind == "jump":
             if a not in labels:
@@ -2048,7 +2171,7 @@ def _run_printed(lines: list, env: dict) -> None:
 
 
 def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
-               seed_outs: bool = False) -> int:
+               seed_outs: bool = False, nested: bool = False) -> int:
     uc_mod = _unicorn()
     if uc_mod is None:
         print("SKIP: unicorn is not installed")
@@ -2072,7 +2195,8 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
     joins = loops = withgoto = scored = 0
 
     for _case in range(count):
-        words = _gen_function(rng, mem=True, seed_outs=seed_outs)
+        words = (_gen_nested if nested else _gen_function)(rng, mem=True,
+                                                           seed_outs=seed_outs)
         code = b"".join(struct.pack("<I", w) for w in words)
         ann = [(i.address, i.mnemonic, i.op_str, "") for i in md.disasm(code, BASE)]
         if len(ann) != len(words):
