@@ -13,6 +13,28 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A `ret` hands back x0 unless something proves a double.** Tier 3 printed whichever
+  of x0 and d0 a path wrote last, so a function that allocates an object and then fills
+  its double fields printed its last field value as what it returns: `Rect.topRight` on
+  the 3.4.4 corpus build printed `return t1;`, the field, where it returns the Offset in
+  `t0`. The snapshot cannot say which register comes back on any of the 18 registered
+  releases: `Function::has_unboxed_double_return` reads `unboxed_parameters_info_`,
+  which the AOT runtime compiles out and the Function cluster never writes. So the code
+  says it. d0 comes back when the function's callers read d0 after their `bl` to it,
+  when a path to the `ret` never writes x0 but writes d0, or when a d0 the function wrote
+  reaches the `ret` with nothing else reading it, a slow path's restore aside; x0 when
+  its callers read x0, or when what d0 holds there was only ever stored. A `ret` none of
+  that decides, such as a double summed in a loop that leaves x0 as scratch, keeps the
+  old rule rather than a new guess. Tier 3 exports change in 112 functions on clean, 103
+  on 2.19.6, 111 on 3.4.4 and 113 on 3.10.9 (265, 255, 264 and 262 lines), and in none
+  on obf. Of those 439, 296 are confirmed by their callers and the other 143 were read
+  against the arm64, 118 of them returning a fresh allocation untouched; every one named
+  a register its function does not return. Across 52 arm64 builds, these five and 47
+  apps, 145,939 functions write V0: none the code proves returns d0 has callers that read
+  x0, and the 424 whose callers read d0 where the code chose x0 print the same either
+  way. The issue's loose count, functions that fill an object and return another temp,
+  goes from 147 to 117 on 3.4.4, and every `ret` of those 117 returns x0: the object they
+  fill is not what they return. Tiers 1 and 2 are byte for byte as before. Closes #115.
 - **A goto's target reads what the goto left.** A block only a goto reaches is lifted
   from the state its one predecessor left, and that state was taken before the printed
   program writes loop names back on the way there: in the goto's own write-back, and in

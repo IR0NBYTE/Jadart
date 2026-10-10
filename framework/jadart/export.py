@@ -289,7 +289,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
                          cut_end)
     from .signatures import names_with_signatures
     from .cfg import render_function
-    from .expr import lift_function, make_arity_resolver
+    from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors, ORIGIN_ELEMENT_ARM64
     from .fields import recover_fields
     from .program import build_program
@@ -304,6 +304,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     pc_to_name, signote = names_with_signatures(image, fr, sigs)
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     arity = make_arity_resolver(image) if tier >= 3 else None
+    returns = make_return_resolver(image) if tier >= 3 else None
     selectors = recover_selectors(image, fr, hdr) if tier >= 3 else None
     from .program import static_function_refs, receiver_for
     static_refs = static_function_refs(fr)
@@ -353,7 +354,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
                                          selectors=selectors,
                                          arch=getattr(image, "arch", None),
                                          fields=layout.for_function(ref),
-                                         show=rebaser(image), cut_end=cut_end(cr, dis)))
+                                         show=rebaser(image), cut_end=cut_end(cr, dis),
+                                         returns=returns))
             elif tier == 2:
                 ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
                 out.extend(render_function(ann, exits=exits(image, dis),

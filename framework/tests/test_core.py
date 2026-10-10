@@ -1286,6 +1286,14 @@ def test_export_writes_a_browsable_tree():
         assert "// lib: package:flubench_corpus/constructs.dart" in body
         assert "class BenchAccount" in body
         assert "this.field_0x8 -= x2;" in body, "method bodies should be lifted"
+        # and a `ret` asks the function's callers which register comes back (#115):
+        # getAsTranslation's own code cannot say, its callers read x0, not the d0 that
+        # the path to its `return null` last compared.
+        mu = open(os.path.join(out, "sources", "flutter", "src", "painting",
+                               "matrix_utils.dart")).read()
+        got = re.search(r"getAsTranslation\(\) \{[^\n]*\n(.*?)\n  \}", mu, re.S)
+        assert got and "return d0;" not in got.group(1), got and got.group(1)
+        assert re.search(r"return t\d+;", got.group(1)), got.group(1)
         # dart: libraries land under dart/. Which ones survive depends on what the app
         # uses and what tree-shaking kept, so assert the mapping, not a specific library.
         dartdir = os.path.join(out, "sources", "dart")
@@ -3436,6 +3444,360 @@ def test_the_return_register_survives_the_branch_that_set_it():
         f"returns `{got}`; d0 is the only result register either arm wrote\n{body}")
     assert got == "d0" or (f"{got} = d1 + d2;" in body and f"{got} = d1 - d2;" in body), (
         f"returns `{got}`, which no arm binds to the double it computed\n{body}")
+
+
+def _rows_at(rows, base=0):
+    """(addr, mn, op, note) from (mn, op) or (mn, op, note) rows, starting at `base`."""
+    return [(base + i * 4, r[0], r[1], r[2] if len(r) > 2 else "")
+            for i, r in enumerate(rows)]
+
+
+#: `Rect.topRight` on the 3.4.4 corpus build (0x249ef4), frame stripped: the two doubles
+#: are read and parked in the frame, the Offset is allocated, and they are stored in it.
+_TOP_RIGHT = [("ldur", "d0, [x1, #0x17]"), ("stur", "d0, [x29, #-0x10]"),
+              ("ldur", "d1, [x1, #0xf]"), ("stur", "d1, [x29, #-8]"),
+              ("bl", "#0x9528", "-> new Offset"),
+              ("ldur", "d0, [x29, #-0x10]"), ("stur", "d0, [x0, #7]"),
+              ("ldur", "d0, [x29, #-8]"), ("stur", "d0, [x0, #0xf]"), ("ret", "")]
+
+
+def test_a_filled_object_is_returned_not_its_last_field():
+    # `ret` printed whichever of x0 and d0 the path wrote last (#115). A function that
+    # allocates an object and fills its double fields writes x0 (the allocation) and then
+    # d0 (each field value on its way into the object), so `Rect.topRight` printed
+    # `return t1;`, its last field value, as what it returns. That d0 is read by a store,
+    # nothing proves a double comes back, and the Offset in x0 is the return.
+    from jadart.expr import lift_function
+    body = "\n".join(lift_function(_rows_at(_TOP_RIGHT), arch="arm64"))
+    made = re.search(r"var (t\d+) = new Offset\(", body)
+    assert made, body
+    assert body.rstrip().endswith(f"return {made.group(1)};"), body
+
+
+def test_a_double_comes_back_only_with_proof():
+    # #115. d0 is the return only when the code proves it; otherwise x0 is.
+    # A d0 nothing reads but the `ret`: `get:radiusMax` reads a double field off what a
+    # call returned. x0 holds that call's result and is not what comes back, because the
+    # compiler does not emit a write nothing reads.
+    body = _lift_asm([("bl", "#0x40"), ("ldur", "d0, [x0, #0x87]"), ("ret", "")])
+    assert body.strip() == "return sub_0x40(...).field_0x88;", body
+    # x0 never written on the way to the `ret`: a compare reads the double, so the rule
+    # above does not hold, and x0 would be whatever the function was handed.
+    body = _lift_asm([("fadd", "d0, d0, d1"), ("fcmp", "d0, d2"), ("ret", "")])
+    assert body.strip() == "return d0 + d1;", body
+    # V0 under another name is still d0: `mov v0.16b, v1.16b` is how a double reaches
+    # the return register at a join (`Threshold.transformInternal`), and an `eor` of V0
+    # with itself writes 0.0 without reading anything.
+    body = _lift_asm([("ldur", "x0, [x1, #7]"), ("ldur", "d1, [x0, #7]"),
+                      ("cbz", "x2, #0x14"), ("mov", "v0.16b, v1.16b"), ("ret", ""),
+                      ("eor", "v0.16b, v0.16b, v0.16b"), ("ret", "")])
+    assert body.count("return ") == 2 and "return x1.field_0x8;" not in body, body
+    # A slow path's restore is not such a write. `round` on 3.4.4 saves q0 around the
+    # call that boxes its result and pops it back after; nothing reads it, and what the
+    # function returns is the int it built in x0.
+    body = _lift_asm([("ldur", "d0, [x1, #7]"), ("fcvtzs", "x0, d0"),
+                      ("cbz", "x2, #0x10"), ("b", "#0x1c"), ("str", "q0, [x15, #-0x10]!"),
+                      ("bl", "#0x40"), ("ldr", "q0, [x15], #0x10"), ("ret", "")])
+    ret = re.search(r"return (t\d+);", body)
+    assert ret and f"{ret.group(1)} = x1.field_0x8.toInt();" in body, body
+    # Nothing proves either: x0 written, and the double read by a compare as well as by
+    # the `ret`. The `ret` keeps what the old rule printed, the last register written.
+    body = _lift_asm([("ldur", "x0, [x1, #7]"), ("fadd", "d0, d0, d1"),
+                      ("fcmp", "d0, d2"), ("ret", "")])
+    assert body.strip().endswith("return d0 + d1;"), body
+
+
+def test_which_register_each_ret_hands_back():
+    # The decision table behind the last two tests, on the decisions themselves (#115).
+    from jadart import expr as E
+    from jadart.cfg import build_cfg
+
+    def decide(rows, said=None, base=0):
+        blocks, entry = build_cfg(_rows_at(rows, base), traps=())
+        asked = []
+        got = E._return_registers(blocks, entry,
+                                  (lambda: asked.append(1) or said))
+        return got, asked
+
+    # A function that never writes V0 is left to the old rule, and its callers are not
+    # even asked: their answer could not change what it prints.
+    got, asked = decide([("ldur", "x0, [x1, #7]"), ("ret", "")], said="d0")
+    assert got == {} and not asked, (got, asked)
+    got, asked = decide([("str", "d0, [x1, #7]"), ("ldur", "x0, [x1, #7]"), ("ret", "")],
+                        said="d0")
+    assert got == {} and not asked, (got, asked)      # reading V0 is not writing it
+    # The callers decide when they speak: here against the field value...
+    got, _ = decide(_TOP_RIGHT, said="d0")
+    assert got == {36: "d0"}, got
+    # ...and here against a d0 only the `ret` reads.
+    got, _ = decide([("bl", "#0x40"), ("ldur", "d0, [x0, #0x87]"), ("ret", "")],
+                    said="x0")
+    assert got == {8: "x0"}, got
+    got, _ = decide(_TOP_RIGHT)
+    assert got == {36: "x0"}, got
+    # Proof without callers: x0 never written on the way (a compare reads the double, so
+    # this is not the only-the-ret-reads-it rule), on one path or on both.
+    got, _ = decide([("fadd", "d0, d0, d1"), ("fcmp", "d0, d2"), ("ret", "")])
+    assert got == {8: "d0"}, got
+    got, _ = decide([("cbz", "x2, #0x8"), ("fadd", "d0, d0, d1"), ("fcmp", "d0, d2"),
+                     ("ret", "")])
+    assert got == {12: "d0"}, got
+    # ...but x0 written on SOME path is written: what d0 holds is only stored, so x0.
+    got, _ = decide([("cbz", "x2, #0x8"), ("mov", "x0, x3"), ("fadd", "d0, d0, d1"),
+                     ("stur", "d0, [x0, #7]"), ("ret", "")])
+    assert got == {16: "x0"}, got
+    # A stub that gives every register back is not a call here: d0 survives it, and
+    # nothing but the `ret` reads it.
+    stub = "-> stub _iso_stub_StackOverflowSharedWithFPURegsStub"
+    got, _ = decide([("ldur", "x0, [x1, #7]"), ("ldur", "d0, [x0, #7]"),
+                     ("bl", "#0x40", stub), ("ret", "")])
+    assert got == {12: "d0"}, got
+    # A double the function overwrote is not what it returns: the second write is only
+    # stored, and the first, which a compare read, never reaches the `ret`.
+    got, _ = decide([("ldur", "x0, [x1, #7]"), ("fmov", "d0, #1.0"), ("fcmp", "d0, d1"),
+                     ("fmov", "d0, #2.0"), ("stur", "d0, [x0, #7]"), ("ret", "")])
+    assert got == {20: "x0"}, got
+    # A double passed to a call on one path is read there, so it is not the `ret`'s alone
+    # on the other path either.
+    got, _ = decide([("fmov", "d0, #1.0"), ("cbz", "x2, #0x10"), ("bl", "#0x40"),
+                     ("b", "#0x80"), ("mov", "x0, x3"), ("ret", "")])
+    assert got == {}, got
+    # A double handed straight back from a call: both registers hold the call's result
+    # and the lifter names it in x0, so that is the one printed.
+    got, _ = decide([("fmov", "d0, #1.0"), ("bl", "#0x40"), ("ret", "")], said="d0")
+    assert got == {8: "x0"}, got
+    got, _ = decide([("fmov", "d0, #1.0"), ("blr", "x16"), ("ret", "")], said="d0")
+    assert got == {8: "x0"}, got                    # a call through a register too
+    got, _ = decide([("fmov", "d0, #1.0"), ("bl", "#0x40"), ("bl", "#0x80", stub),
+                     ("ret", "")], said="d0")
+    assert got == {12: "x0"}, got                   # a stub between changes nothing
+    # ...but not once x0 is written after it: then only d0 has the call's double, and the
+    # lifter's d0 does not say so.
+    got, _ = decide([("fmov", "d0, #1.0"), ("bl", "#0x40"), ("mov", "x0, x2"),
+                     ("ret", "")], said="d0")
+    assert got == {}, got
+    # A call on one path and a double of its own on the other: the lifter's d0 after the
+    # call reads as the d0 the function was handed, so the join would claim the call's
+    # path returns that. This `ret` is left alone (`getOffsetX`, 3.4.4).
+    rows = [("cbnz", "x2, #0x14"), ("fmov", "d1, #16.0"), ("fsub", "d1, d1, d2"),
+            ("mov", "v0.16b, v1.16b"), ("b", "#0x18"), ("bl", "#0x40"), ("ret", "")]
+    got, _ = decide(rows, said="d0")
+    assert got == {}, got
+    # A double read by something other than a store, with x0 written as scratch: a sum
+    # kept in V0 across a loop. Nothing proves either register, and the `ret` keeps the
+    # old rule rather than a new guess; the callers can still settle it.
+    rows = [("eor", "v0.16b, v0.16b, v0.16b"), ("mov", "x2, #0"), ("cmp", "x2, x3"),
+            ("b.ge", "#0x24"), ("ldr", "d1, [x4, x2, lsl #3]"), ("fadd", "d0, d0, d1"),
+            ("add", "x0, x2, #1"), ("mov", "x2, x0"), ("b", "#0x8"), ("ret", "")]
+    assert decide(rows)[0] == {}
+    assert decide(rows, said="d0")[0] == {36: "d0"}
+    # A slow path restore is not proof. `round` reads its double (fcvtzs) and builds an
+    # int in x0; the restore after the boxing call is what made it look like a double.
+    rows = [("ldur", "d0, [x1, #7]"), ("fcvtzs", "x0, d0"), ("cbz", "x2, #0x10"),
+            ("b", "#0x1c"), ("str", "q0, [x15, #-0x10]!"), ("bl", "#0x40"),
+            ("ldr", "q0, [x15], #0x10"), ("ret", "")]
+    assert decide(rows)[0] == {}
+    # ...and only arm64 has these two registers: arm32 returns in r0 and d0, and an x0
+    # that never appears must not read as "x0 never written".
+    with E.use_target(E.ARM32):
+        got, asked = decide([("vldr", "d0, [r1, #8]"), ("vstr", "d0, [r2, #8]"),
+                             ("mov", "r0, r3"), ("bx", "lr")], said="d0")
+    assert got == {} and not asked, (got, asked)
+
+
+def test_the_return_registers_def_use_sees_every_name_of_v0():
+    # _rv_def_use answers one narrow question exactly (#115): which of x0 and d0 an
+    # instruction writes and which it reads, V0 being d0 under every spelling.
+    from jadart.expr import _rv_def_use as du
+    X, D, XD, N = {"x0"}, {"d0"}, {"x0", "d0"}, set()
+    cases = [
+        ("mov", "v0.16b, v1.16b", D, N), ("mov", "x1, x0", N, X),
+        ("ldp", "d1, d0, [x1]", D, N), ("ldr", "q0, [x15], #0x10", D, N),
+        ("ldr", "x1, [x0], #8", X, X),             # writeback moves the base
+        ("ld1", "{v0.d}[1], [x1]", D, D),          # one lane: the rest is kept
+        ("str", "d0, [x0, #7]", N, XD), ("stur", "w0, [x1, #7]", N, X),
+        ("str", "x1, [x0], #8", X, X), ("stxr", "w0, x1, [x2]", X, N),
+        ("ldadd", "x0, x1, [x2]", N, X), ("swp", "x1, x0, [x2]", X, N),
+        ("eor", "v0.16b, v0.16b, v0.16b", D, N),   # the zero idiom reads nothing
+        ("eor", "x0, x0, x1", X, X), ("movk", "x0, #1, lsl #16", X, X),
+        ("mov", "v0.d[1], x1", D, D), ("cas", "x0, x1, [x2]", X, X),
+        ("fcmp", "d0, d1", N, D), ("ccmp", "x0, #1, #0, ne", N, X),
+        ("cbz", "x0, #0x40", N, X), ("tbz", "w0, #0, #0x40", N, X),
+        ("br", "x0", N, X), ("b.eq", "#0x40", N, N), ("b", "#0x40", N, N),
+        ("blr", "x0", N, X),                       # the register it goes through
+        ("bl", "#0x40", N, N), ("ret", "", N, N), ("fmov", "x0, d0", X, D),
+        ("umov", "w0, v0.s[1]", X, D), ("fadd", "d10, d1, d20", N, N),
+        ("mov", "x10, #0xd0", N, N), ("add", "x1, x27, #0xb0", N, N),
+        ("mov", "x1, #0x0", N, N), ("blr", "x16", N, N),
+        ("add", "x0, x1, #0xd0", X, N), ("str", "d0, [x1, #0x0]", N, D),
+        ("fcvt", "s0, d1", D, N), ("ldr", "h0, [x1]", D, N), ("ldr", "b0, [x1]", D, N),
+        ("fccmp", "d0, d1, #0, ne", N, D), ("ccmn", "x0, #1, #0, ne", N, X),
+    ]
+    # writes that keep part of what was there read it too
+    for mn in ("movk", "fmla", "fmls", "mla", "mls", "bfi", "bfxil", "bfm", "sli", "sri",
+               "tbx"):
+        cases.append((mn, "v0.2d, v1.2d, v2.2d", D, D))
+    # atomics that send their first operand and load into their second
+    for mn in ("ldadd", "ldclr", "ldeor", "ldset", "ldsmax", "ldsmin", "ldumax",
+               "ldumin", "swp"):
+        cases.append((mn, "x0, x1, [x2]", N, X))
+    for mn, op, defs, uses in cases:
+        got = du(mn, op)
+        assert (set(got[0]), set(got[1])) == (defs, uses), (mn, op, got)
+    # A pop of the Dart stack is a slow path putting a register back, and only that.
+    from jadart.expr import _rv_pop as pop
+    assert pop("ldr", "q0, [x15], #0x10") and pop("ldp", "q0, q1, [x15], #0x20")
+    assert not pop("ldr", "d0, [x1], #8") and not pop("ldr", "d0, [x15, #8]")
+    assert not pop("str", "q0, [x15], #0x10") and not pop("ldr", "q0, [x15]")
+    assert not pop("ldp", "q0, q1, [x15]")
+
+
+def test_a_caller_reading_the_result_says_which_register_it_is():
+    # make_return_resolver reads the code after each `bl` for the first of x0 and d0 it
+    # touches (#115). Only a READ counts, and only before anything else could have put
+    # a value there.
+    from jadart.expr import _read_after_call as after
+
+    def rows(*pairs):
+        return [(i * 4, mn, op) for i, (mn, op) in enumerate(pairs)]
+    assert after(rows(("fadd", "d1, d0, d2"))) == "d0"
+    assert after(rows(("mov", "x1, x0"))) == "x0"
+    assert after(rows(("cbz", "x0, #0x40"))) == "x0"            # read before it branches
+    assert after(rows(("mov", "x0, #1"), ("fadd", "d1, d0, d2"))) == "d0"
+    assert after(rows(("eor", "v0.16b, v0.16b, v0.16b"), ("mov", "x1, x0"))) == "x0"
+    assert after(rows(("ret", ""), ("mov", "x1, x0"))) is None  # handed straight back
+    assert after(rows(("blr", "x0"))) == "x0"                   # a closure it returned
+    got = after(rows(("mov", "x0, #1"), ("mov", "x1, x0"), ("fadd", "d1, d0, d2")))
+    assert got == "d0", got                     # x0 read after it was written: not a vote
+    assert after(rows(("b", "#0x40"), ("mov", "x1, x0"))) is None
+    assert after(rows(("b.ne", "#0x40"), ("mov", "x1, x0"))) is None
+    assert after(rows(("tbz", "w1, #0, #0x40"), ("mov", "x1, x0"))) is None
+    assert after(rows(("bl", "#0x40"), ("mov", "x1, x0"))) is None
+    assert after(rows((".word", "0xffffffff"), ("mov", "x1, x0"))) is None
+    assert after(rows(("mov", "x0, #1"), ("fmov", "d0, #1.0"), ("mov", "x1, x0"))) is None
+    assert after(rows(("stp", "d0, x0, [x15, #-0x10]!"))) is None   # both: says nothing
+
+
+def test_the_callers_of_real_functions_say_what_they_return():
+    # On the clean fixture (3.12.2), against what main printed (#115). `Rect.topRight`
+    # (0x2c30d0) allocates its Offset through an unnamed stub and printed the last field
+    # stored into it. `MatrixUtils.getAsTranslation` (0x19b324) does the same on one path
+    # and returns null on the other, where a double it compared is still in d0: its own
+    # code cannot say which register comes back, and the callers, which read x0, do. It
+    # printed `return d0;`. `Threshold.transformInternal` (0x28a76c) returns 0.0 or 1.0
+    # in V0 and printed `return x0;`; its `ret` is now d0. The value prints as a bare
+    # `d0` until the lifter models the `eor v0.16b` that zeroes it (#114).
+    _needs_capstone()
+    import contextlib
+    import io
+    from jadart import cli
+    from jadart.disasm import load_instructions
+    from jadart.expr import make_return_resolver
+    from jadart.program import decompile_class
+    image, _fr, _hdr = load_instructions(CLEAN)
+    at = image.anchor_va
+    res = make_return_resolver(image)
+    assert res(0x2c30d0 - at) == "x0" and res(0x19b324 - at) == "x0"
+    assert res(0x16b460 - at) == "d0"                 # _adjustMaxWidth
+    assert res(0x28a76c - at) is None                 # nothing calls it directly
+    assert res(0x2d5d4c - at) is None     # a stub that gives registers back: 19 callers
+                                          # read d0 after it, and one reads x0
+    assert res(len(image.text) + 64) is None          # an address in no function
+
+    top = jadart.decompile(CLEAN, "0x2c30d0")[0]["body"]
+    made = re.match(r"var (t\d+) = sub_0x[0-9a-f]+\(\);", top[0])
+    assert made and top[-1] == f"return {made.group(1)};", top
+    from jadart.cfg import build_cfg
+    from jadart.disasm import build_pool_map, disassemble_range, function_name_by_pc
+    from jadart.expr import _return_registers, strip_boilerplate
+    p2n, pm = function_name_by_pc(image, _fr), build_pool_map(_fr)
+    cr = next(c for c in image.all_ranges if c.pc_offset == 0x28a76c - at)
+    blocks, entry = build_cfg(strip_boilerplate(
+        _ann(image, disassemble_range(image, cr), p2n, pm)), traps=())
+    regs = _return_registers(blocks, entry)
+    assert regs and set(regs.values()) == {"d0"}, regs
+
+    # Every surface that lifts asks the callers: the API, `lift`, and `decompile`.
+    def made_and_returned(lines):
+        got = [ln.strip() for ln in lines]
+        made = [m.group(1) for ln in got for m in [re.match(r"var (t\d+) = sub_0x", ln)]
+                if m]
+        rets = [ln for ln in got if ln.startswith("return ")]
+        return made, rets
+    made, rets = made_and_returned(jadart.decompile(CLEAN, "0x19b324")[0]["body"])
+    assert rets == [f"return {made[-1]};", "return NULL;"], rets
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert cli.main(["lift", CLEAN, "0x19b324"]) == 0
+    made, rets = made_and_returned(out.getvalue().splitlines())
+    assert rets == [f"return {made[-1]};", "return NULL;"], rets
+    body = re.search(r"getAsTranslation\(\) \{[^\n]*\n(.*?)\n  \}",
+                     decompile_class(CLEAN, "MatrixUtils"), re.S)
+    made, rets = made_and_returned(body.group(1).splitlines())
+    assert rets == [f"return {made[-1]};", "return NULL;"], rets
+    # ...and `ffi --full`, whose lifts no fixture reaches: it has no FFI library.
+    import inspect
+    assert "returns=returns" in inspect.getsource(cli.cmd_ffi)
+
+    # The site index is bounded per function, in memory too: a crafted image can put
+    # every word into calls to one function. A function past the bound is read not at
+    # all rather than in part.
+    import array
+    import jadart.expr as E
+    longest = [0]
+
+    class Sites(array.array):
+        def append(self, v):
+            super().append(v)
+            longest[0] = max(longest[0], len(self))
+    old, real = E._MAX_SITES, array.array
+    E._MAX_SITES, array.array = 0, Sites
+    try:
+        assert make_return_resolver(image)(0x16b460 - at) is None
+    finally:
+        E._MAX_SITES, array.array = old, real
+    assert longest[0] == 1, longest
+    # And it is arm64's question: another target is not read as one.
+    import types
+    from jadart.disasm import CodeRange
+    other = types.SimpleNamespace(arch=types.SimpleNamespace(name="arm"),
+                                  all_ranges=[CodeRange(0, 64, -1)])
+    assert make_return_resolver(other)(0) is None
+
+    # A made-up image for what the fixture cannot show. A backward call (a negative
+    # offset) is still a call; an address in no function belongs to none; a caller is
+    # read only up to its own end, never into the function placed after it; and a word
+    # that only shares a call's low bits is not one: `stur x0, [x27]` read as a `bl`
+    # would land 0xd80 bytes on.
+    def bl(pc, to):
+        return 0x94000000 | (((to - pc) >> 2) & 0x3FFFFFF)
+    RET, NOP, MOV_X1_X0, FMOV_D1_D0 = 0xD65F03C0, 0xD503201F, 0xAA0003E1, 0x1E604001
+    words = [NOP] * 0x400
+    for at, w in ((0x00, RET), (0x04, NOP),                         # A, called back
+                  (0x40, bl(0x40, 0x00)), (0x44, MOV_X1_X0), (0x48, RET),   # B
+                  (0x80, bl(0x80, 0x100)),                          # C, ends at its call
+                  (0x84, FMOV_D1_D0), (0x88, RET),                  # E, after C
+                  (0x100, RET), (0x104, NOP),                       # D, called by C
+                  (0x180, 0xF8000360), (0x184, FMOV_D1_D0),         # F, stur x0, [x27]
+                  (0xF00, RET), (0xF04, NOP)):                      # G, called by none
+        words[at // 4] = w
+    made_up = types.SimpleNamespace(
+        arch=None, text=b"".join(w.to_bytes(4, "little") for w in words),
+        all_ranges=[CodeRange(0x00, 8, -1), CodeRange(0x40, 12, -1),
+                    CodeRange(0x80, 4, -1), CodeRange(0x84, 8, -1),
+                    CodeRange(0x100, 8, -1), CodeRange(0x180, 8, -1),
+                    CodeRange(0xF00, 8, -1)])
+    res = make_return_resolver(made_up)
+    assert res(0x00) == "x0" and res(0x04) == "x0"
+    assert res(0x20) is None and res(0x100) is None and res(0xF00) is None
+    # Ranges a crafted image makes overlap: the call sits where the range found for it
+    # has already ended, and is skipped rather than ending the lift with a TypeError.
+    words = [RET, NOP] + [NOP] * 13 + [NOP, NOP, bl(0x44, 0x00), MOV_X1_X0]
+    made_up = types.SimpleNamespace(
+        arch=None, text=b"".join(w.to_bytes(4, "little") for w in words),
+        all_ranges=[CodeRange(0x00, 8, -1), CodeRange(0x3c, 16, -1),
+                    CodeRange(0x40, 4, -1)])
+    assert make_return_resolver(made_up)(0x00) is None
 
 
 def test_a_compound_assignment_means_what_the_machine_computed():
@@ -10599,10 +10961,11 @@ def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
             ("br", "x16", set(), {"x16"})):
         assert _def_use(mn, op) == (defs, uses), (mn, _def_use(mn, op))
     # Nothing reads x5 after the line, so nothing is named, and a name nothing prints
-    # is left out: `ret` counts d0 as read, and this one returns x0.
+    # is left out: `ret` counts d0 as read, and `isNaN` returns x0.
     assert lift([("add", "x5, x1, #1"), ("subs", "x1, x1, #8"), ("ret", "")]) == [
         "subs x1, x1, #8", "return x0;"]
-    assert lift([("ldur", "d0, [x0, #7]"), ("csel", "x0, x16, x0, vc"), ("ret", "")]) == [
+    assert lift([("ldur", "d0, [x0, #7]"), ("fcmp", "d0, d0"),
+                 ("csel", "x0, x16, x0, vc"), ("ret", "")]) == [
         "csel x0, x16, x0, vc", "return x0;"]
 
 

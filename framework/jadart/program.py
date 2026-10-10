@@ -245,7 +245,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                          cut_end)
     from .signatures import names_with_signatures
     from .cfg import render_function
-    from .expr import lift_function, make_arity_resolver
+    from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
     from .fields import recover_fields
     image, fr, hdr = load_instructions(path)
@@ -280,6 +280,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     # class members receive `this` in x1 (Dart AOT: the receiver is the first argument)
     static_refs = static_function_refs(fr)
     arity = make_arity_resolver(image) if lvl >= 3 else None
+    returns = make_return_resolver(image) if lvl >= 3 else None
     selectors = recover_selectors(image, fr, hdr) if lvl >= 3 else None
     layout = recover_fields(fr, getattr(image, "arch", None)) if lvl >= 3 else None
     for nm, ref, kt in sorted(method_refs)[:max_methods]:
@@ -301,7 +302,8 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                                        selectors=selectors,
                                        arch=getattr(image, "arch", None),
                                        fields=layout.for_function(ref),
-                                       show=rebaser(image), cut_end=cut_end(cr, dis)))
+                                       show=rebaser(image), cut_end=cut_end(cr, dis),
+                                       returns=returns))
         elif lvl == 2:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
             lines.extend(render_function(ann, exits=exits(image, dis),

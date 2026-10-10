@@ -1113,6 +1113,289 @@ def _live_in_header(blocks, nodes, header, preds):
     return _mask_regs(live_in[header])
 
 
+# ── which register a `ret` hands back (#115) ────────────────────────────────
+
+#: R0 under both widths, and V0 under every name capstone gives it: d0, s0, h0, b0, q0,
+#: v0.16b, v0.d[1]. Dart returns references and integers in R0 and an unboxed double in
+#: V0 (constants_arm64.h kReturnReg, kReturnFpuReg), so these are all a `ret` can mean.
+_RX0 = re.compile(r"(?<![\w.#])[xw]0(?!\w)")
+_RD0 = re.compile(r"(?<![\w.#])[vqdshb]0(?!\w)")
+_RX0_OR_D0 = re.compile(r"(?<![\w.#])[xwvqdshb]0(?!\w)")
+#: Writes that keep part of what the destination held, and so read it too.
+_KEEPS_DST = frozenset({"movk", "ins", "fmla", "fmls", "mla", "mls", "bfi", "bfxil",
+                        "bfm", "sli", "sri", "tbx"})
+#: Atomics whose FIRST operand is the value sent and whose second is the one loaded.
+_RMW = ("ldadd", "ldclr", "ldeor", "ldset", "ldsmax", "ldsmin", "ldumax", "ldumin", "swp")
+_RX0_SET, _RD0_SET = frozenset({"x0"}), frozenset({"d0"})
+_RV_BOTH = _RX0_SET | _RD0_SET
+_RV_CACHE: dict = {}
+
+
+def _rv(tokens) -> frozenset:
+    x = any(_RX0.search(t) for t in tokens)
+    d = any(_RD0.search(t) for t in tokens)
+    return _RV_BOTH if x and d else _RX0_SET if x else _RD0_SET if d else _NO_REGS
+
+
+def _rv_def_use(mn: str, op: str) -> tuple:
+    """(defs, uses) of x0 and d0 alone, for one instruction, any spelling of V0 being d0.
+
+    Separate from _def_use because the question is narrower and has to be answered
+    exactly: _def_use sees no `v0.16b`, and `mov v0.16b, v2.16b` is how a double reaches
+    the return register at a join. A call reads only the register it goes through, and
+    what it writes is the caller's business, as a `ret` is."""
+    key = (mn, op)
+    hit = _RV_CACHE.get(key)
+    if hit is None:
+        if len(_RV_CACHE) >= _SPLIT_CACHE_MAX:
+            _RV_CACHE.clear()
+        hit = _RV_CACHE[key] = _rv_def_use_uncached(mn, op)
+    return hit
+
+
+def _rv_def_use_uncached(mn: str, op: str) -> tuple:
+    if not _RX0_OR_D0.search(op):
+        return _NO_REGS, _NO_REGS
+    ops = _split_ops(op)
+    if mn.startswith(("ld", "st", "swp")):
+        wb = _rv((_writeback_base(ops),))                # `[x0], #8` moves x0 itself
+        if mn in ("stxr", "stlxr", "stxp", "stlxp"):    # the status register is written
+            return _rv(ops[:1]) | wb, _rv(ops[1:])
+        if mn.startswith(_RMW):
+            return _rv(ops[1:2]) | wb, _rv(ops[:1] + ops[2:])
+        if mn.startswith("st"):
+            return wb, _rv(ops)
+        mem = next((k for k, t in enumerate(ops) if t.startswith("[")), len(ops))
+        uses = _rv(ops[mem:])
+        if any("[" in t for t in ops[:mem]):            # one lane: the rest is kept
+            uses |= _rv(ops[:mem])
+        return _rv(ops[:mem]) | wb, uses
+    if mn in _CMP or mn in ("ccmp", "ccmn", "fccmp", "fccmpe", "br", "blr", "blx"):
+        return _NO_REGS, _rv(ops)
+    if mn in _CONDB:
+        return _NO_REGS, _rv(ops[:1])
+    if mn == "eor" and len(ops) == 3 and ops[1] == ops[2]:
+        return _rv(ops[:1]), _NO_REGS                   # the zero idiom reads nothing
+    defs, uses = _rv(ops[:1]), _rv(ops[1:])
+    if mn in _KEEPS_DST or mn.startswith("cas") or "[" in ops[0]:
+        uses |= defs
+    return defs, uses
+
+
+def _rv_pop(mn: str, op: str) -> bool:
+    """A load that pops the Dart stack: `ldr q0, [x15], #0x10`. A slow path saves the
+    live registers around its call and restores them after, so what this writes is what
+    the register held before the save, not a value the function just made."""
+    ops = _split_ops(op)
+    return mn.startswith("ld") and len(ops) >= 3 and ops[-2] == "[x15]"
+
+
+def _rv_call(mn: str, note: str):
+    """False for what is not a call, None for a stub that gives every register back,
+    True for any other call."""
+    if mn not in ("bl", "blr", "blx"):
+        return False
+    name = note.split("-> ", 1)[1].strip() if "-> " in note else ""
+    if "_iso_stub_" in name and _classify_stub(name)[0] == "suppress":
+        return None
+    return True
+
+
+def _return_registers(blocks, entry, evidence=None) -> dict:
+    """{ret address: "x0" or "d0"}, the register each `ret` hands back, or {} for a
+    function that never writes V0, where nothing below applies and `State.result` stands.
+
+    `ret` used to print whichever of x0 and d0 the path wrote LAST. A function that
+    allocates an object and fills its double fields writes x0 (the allocation) and then
+    d0 (each field value on its way into the object), so it printed its last field value
+    as what it returns. Which of the two was written last says nothing about which comes
+    back.
+
+    The snapshot cannot settle it: whether a function returns an unboxed double is
+    `Function::has_unboxed_double_return`, read off `unboxed_parameters_info_`, and that
+    field is compiled out of the AOT runtime and never serialized. raw_object.h keeps it
+    under `!defined(DART_PRECOMPILED_RUNTIME)` and the Function cluster writes only
+    `kind_tag_` for kFullAOT, whose bits are kind, recognizer and modifiers, on all 18
+    registered releases, 2.19.0-444.2.beta to 3.12.2. So the answer comes from the code,
+    and d0 needs proof:
+
+      * the callers. `evidence()` says which of x0 and d0 the code after a `bl` to this
+        function reads; see make_return_resolver. That is the ABI as the compiler used
+        it, and when it speaks it decides.
+      * a path to a `ret` on which this function never writes x0 and does write d0.
+        x0 still holds what it held on entry there, and no Dart function returns that.
+      * a write to d0 that reaches a `ret` and that nothing else reads. The optimizing
+        compiler does not emit a write nothing reads, so the `ret` is its reader. A slow
+        path's restore (_rv_pop) is the exception, and does not count.
+
+    Without any of those, x0 when what d0 holds at a `ret` was only ever stored, a value
+    on its way into memory. When something else reads it too (a double summed in a loop
+    that leaves x0 as scratch), nothing here says which register comes back, and the
+    `ret` keeps what `State.result` says: changing it would be a guess as well.
+
+    The lifter names a call's result in x0, so a `ret` returning d0 whose last write on
+    every path was a call prints x0: both registers hold that result. Where only SOME
+    paths reach it from a call the `ret` is left to `State.result`, because the lifter's
+    d0 after a call reads as the d0 the function was handed, and a join would print that
+    as what the call's path returns."""
+    facts = _return_facts(blocks, entry)
+    if facts is None:
+        return {}
+    at_ret, proven, read = facts
+    said = evidence() if evidence is not None else None
+    reg = said or ("d0" if proven else None if read else "x0")
+    if reg is None:
+        return {}
+    out = {}
+    for a, (_xw, _down, dcall, last_call) in at_ret.items():
+        if reg == "x0" or last_call:
+            out[a] = "x0"
+        elif not dcall:
+            out[a] = "d0"
+    return out
+
+
+#: What one instruction does to the return registers, for _return_facts: a `ret`, a
+#: call, a stub that gives every register back, or anything else.
+_RV_RET, _RV_CALL, _RV_KEEP, _RV_PLAIN = range(4)
+
+
+def _return_facts(blocks, entry):
+    """What the function's own code says about its return register, or None when it
+    never writes V0 (or is not arm64): ({ret address: (x0 may be written, the last write
+    to d0 may be its own, it may be a call, the last write to either is a call on every
+    path)}, whether the code proves a d0 return, whether a d0 of its own that reaches a
+    `ret` is read by something other than a store). See _return_registers."""
+    if _T is not ARM64:
+        return None
+    # Most functions never name V0 at all, and one search over all their operands says
+    # so without a call per instruction.
+    if not _RD0.search("\n".join([i[2] for blk in blocks.values() for i in blk.insns])):
+        return None
+    # Each instruction once: (address, kind, writes x0, writes d0, reads d0, is a store,
+    # is a pop of the Dart stack).
+    rows = {}
+    own_d0 = False
+    for b, blk in blocks.items():
+        row = rows[b] = []
+        for (a, mn, op, note) in blk.insns:
+            if mn == "ret":
+                row.append((a, _RV_RET, False, False, False, False, False))
+                continue
+            c = _rv_call(mn, note)
+            if c is not False:
+                row.append((a, _RV_CALL if c else _RV_KEEP, False, False, False, False,
+                            False))
+                continue
+            defs, uses = _rv_def_use(mn, op)
+            wd = "d0" in defs
+            own_d0 = own_d0 or wd
+            row.append((a, _RV_PLAIN, "x0" in defs, wd, "d0" in uses, mn.startswith("st"),
+                        wd and _rv_pop(mn, op)))
+    if not own_d0:
+        return None
+
+    # Forward, per point: x0 may have been written, the last write to d0 may be this
+    # function's own, it may be a call, and on every path the last write to either was a
+    # call. Joined by or, or, or, and.
+    def step_fwd(state, r):
+        kind = r[1]
+        if kind == _RV_CALL:
+            return True, False, True, True
+        if kind != _RV_PLAIN:
+            return state
+        if r[3]:
+            return state[0], True, False, False
+        if r[2]:
+            return True, state[1], state[2], False
+        return state
+
+    ins = {entry: (False, False, False, False)}
+    work = [entry]
+    while work:
+        b = work.pop()
+        state = ins[b]
+        for r in rows[b]:
+            state = step_fwd(state, r)
+        for s in blocks[b].succ:
+            if s not in blocks:
+                continue
+            old = ins.get(s)
+            new = state if old is None else (old[0] or state[0], old[1] or state[1],
+                                              old[2] or state[2], old[3] and state[3])
+            if new != old:
+                ins[s] = new
+                work.append(s)
+    at_ret = {}
+    for b, state in ins.items():
+        for r in rows[b]:
+            if r[1] == _RV_RET:
+                at_ret[r[0]] = state
+            state = step_fwd(state, r)
+
+    # Backward, d0 alone: whether what it holds is read by a `ret` (reach), by a store
+    # (stored) or by anything else (read) before it is written again. A call writes it,
+    # and may read it as an argument; a stub that gives every register back does
+    # neither, it puts back what it saved.
+    def step_bwd(live, r):
+        kind = r[1]
+        if kind == _RV_RET:
+            return True, live[1], live[2]
+        if kind == _RV_CALL:
+            return False, False, True
+        if kind == _RV_KEEP:
+            return live
+        if r[3]:
+            live = (False, False, False)
+        if not r[4]:
+            return live
+        if r[5]:
+            return live[0], True, live[2]
+        return live[0], live[1], True
+
+    # A worklist, as the forward pass: each block's three flags only ever turn on, so
+    # it is requeued at most three times, where sweeping every block until nothing
+    # changed was quadratic on a chain of blocks that runs backwards.
+    preds: dict = {b: [] for b in blocks}
+    for b, blk in blocks.items():
+        for s in blk.succ:
+            if s in preds:
+                preds[s].append(b)
+    outs = {}
+    live_in = {}
+    work = sorted(blocks)                  # popped from the end, highest address first
+    queued = set(work)
+    while work:
+        b = work.pop()
+        queued.discard(b)
+        live = (False, False, False)
+        for s in blocks[b].succ:
+            li = live_in.get(s)
+            if li:
+                live = (live[0] or li[0], live[1] or li[1], live[2] or li[2])
+        outs[b] = live
+        for r in reversed(rows[b]):
+            live = step_bwd(live, r)
+        if live_in.get(b) != live:
+            live_in[b] = live
+            for p in preds[b]:
+                if p not in queued:
+                    queued.add(p)
+                    work.append(p)
+    only_ret = read = False
+    for b in blocks:
+        live = outs[b]
+        for r in reversed(rows[b]):
+            if live[0] and r[3]:
+                if live[2]:
+                    read = True
+                elif not live[1] and not r[6]:
+                    only_ret = True
+            live = step_bwd(live, r)
+    proven = only_ret or any(not st[0] and st[1] for st in at_ret.values())
+    return at_ret, proven, read
+
+
 # ── the lifter ──────────────────────────────────────────────────────────────
 
 class Lifter:
@@ -1200,6 +1483,10 @@ class Lifter:
         self.pins: dict = {}
         self.keep = None
         self._loads = None
+        #: () -> "x0" | "d0" | None, what this function's callers read its result from;
+        #: and, built at the first `ret`, the register each `ret` hands back (#115).
+        self.returns = None
+        self._ret_regs = None
 
     def _clobber_call(self, st: State):
         """Forget every value a call destroys.
@@ -1755,7 +2042,8 @@ class Lifter:
             self._args_desc = True
 
         # returns. Dart returns ints and references in R0 and doubles in V0/D0
-        # (kReturnReg/kReturnFpuReg); st.result is whichever was written last.
+        # (kReturnReg/kReturnFpuReg). Which one is _return_registers' question, and
+        # st.result, whichever was written last, only answers where it has nothing to say.
         #
         # arm32 spells the return three ways and all three are one thing. `bx lr` is the
         # leaf form; `pop {..., pc}` restores the frame and jumps to the saved return
@@ -1769,7 +2057,9 @@ class Lifter:
                                              for t in op.strip("{} ").split(",")])
                 or (mn == "mov" and len(ops) >= 2 and canon(ops[0]) == "r15"
                     and _T.roles.get(canon(ops[1])) == "LR")):
-            return [f"return {g(st.result).text};"]
+            if self._ret_regs is None:
+                self._ret_regs = _return_registers(self.blocks, self.entry, self.returns)
+            return [f"return {g(self._ret_regs.get(addr, st.result)).text};"]
 
         # calls
         if mn == "bl":
@@ -3295,6 +3585,119 @@ def make_arity_resolver(image):
     return of
 
 
+#: How far past a `bl` its caller is read for the first touch of x0 or d0, and how many
+#: call sites a function may have and still be asked about. The first touch is the next
+#: instruction or two in compiled Dart. A function called from more places than that is
+#: not read at all, rather than read in part: the sites left out could disagree. A call
+#: is only seen where `disassemble_range` reads, so a site past MAX_INSNS of a range
+#: longer than that is not counted either: 119 on 3.4.4, 355 in immich.
+_AFTER_CALL = 16
+_MAX_SITES = 256
+
+
+def _read_after_call(rows):
+    """"x0" or "d0", whichever the code after a call reads first, or None when it reads
+    neither before writing both, branching, calling again or returning."""
+    from .disasm import UNDECODABLE
+    gone = set()
+    for (_a, mn, op) in rows:
+        if mn == "ret":
+            return None              # handed straight back: says nothing about which
+        defs, uses = _rv_def_use(mn, op)
+        uses = uses - gone
+        if uses:
+            return next(iter(uses)) if len(uses) == 1 else None
+        if (mn in ("bl", "blr", "b", "br", "brk", "hlt", UNDECODABLE) or cond_of(mn)
+                or mn in _CONDB):
+            return None
+        gone |= defs
+    return None
+
+
+def make_return_resolver(image):
+    """Build a cached `pc -> "x0" | "d0" | None` resolver over a whole instruction image:
+    which register the code after a direct `bl` to the function covering `pc` reads the
+    result from (#115). A value has to be read from where the callee left it, and a call
+    clobbers both registers, so the first of the two a caller touches after the call,
+    reading it, is the one the callee returns in. Callers that disagree, none that read
+    either, or more than _MAX_SITES of them, give None.
+
+    The index of call sites is built on the first question, one pass over the raw words
+    as callgraph reads them, and a function's sites are decoded only when it is asked
+    about, each site once. arm64 only, as tier 3 is."""
+    from array import array
+    from .disasm import A64Words, A64_BL, CodeRange, MAX_INSNS, disassemble_range
+    import bisect
+    arch = getattr(image, "arch", None)
+    if (arch.name if arch is not None else "arm64") != "arm64":
+        return lambda pc: None
+    ranges = sorted(image.all_ranges, key=lambda cr: cr.pc_offset)
+    starts = [cr.pc_offset for cr in ranges]
+    cache: dict = {}
+    sites: list = []
+
+    def covering(pc):
+        i = bisect.bisect_right(starts, pc) - 1
+        if 0 <= i < len(ranges) and starts[i] <= pc < starts[i] + (ranges[i].size or 0):
+            return i
+        return None
+
+    def end_of(i):
+        """Where the window disassemble_range reads for range i stops."""
+        cr = ranges[i]
+        end = min(len(image.text), cr.pc_offset + (cr.size or 512))
+        return cr.pc_offset + min(max(0, end - cr.pc_offset) // 4, MAX_INSNS) * 4
+
+    def index():
+        words = A64Words(image.text)
+        out: dict = {}                     # callee range -> word index of each `bl`
+        for i, cr in enumerate(ranges):
+            for w_at, w in words.window(cr.pc_offset, (end_of(i) - cr.pc_offset) // 4):
+                if (w & 0xFC000000) != A64_BL:
+                    continue
+                imm = w & 0x03FFFFFF
+                if imm & 0x02000000:
+                    imm -= 0x04000000
+                k = covering(w_at * 4 + imm * 4)
+                if k is None:
+                    continue
+                got = out.get(k)
+                if got is None:
+                    got = out[k] = array("I")
+                if len(got) <= _MAX_SITES:       # one past the bound marks it as over
+                    got.append(w_at)
+        return out
+
+    def of(pc):
+        k = covering(pc)
+        if k is None:
+            return None
+        if k in cache:
+            return cache[k]
+        if not sites:
+            sites.append(index())
+        at = sites[0].get(k, ())
+        votes = set()
+        for w_at in (at if len(at) <= _MAX_SITES else ()):
+            site = w_at * 4
+            caller = covering(site)       # None only where crafted ranges overlap
+            if caller is None:
+                continue
+            n = min(_AFTER_CALL, (end_of(caller) - site - 4) // 4)
+            if n <= 0:
+                continue
+            got = _read_after_call(disassemble_range(
+                image, CodeRange(site + 4, n * 4, -1), max_insns=n))
+            if got:
+                votes.add(got)
+                if len(votes) > 1:
+                    break
+        cache[k] = val = next(iter(votes)) if len(votes) == 1 else None
+        return val
+
+    return of
+
+
 # ── dispatch-table (virtual) call attribution ───────────────────────────────
 
 #: What detect_dispatch can know about one register. Exactly one at a time:
@@ -3516,7 +3919,7 @@ def _drop_unread(lines: list, names: set) -> list:
 
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
                   indent="  ", depth=1, selectors=None, arch=None, fields=None,
-                  show=None, cut_end=None) -> list:
+                  show=None, cut_end=None, returns=None) -> list:
     """Annotated disasm -> pseudo-Dart body lines (Tier 3). `receiver` is an optional
     register-alias map, e.g. {"x1": "this"} for an instance method; `arity` is an optional
     `pc -> int` resolver (see make_arity_resolver) enabling call-argument reconstruction;
@@ -3526,7 +3929,9 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     `show` prints the operand of an instruction kept as it is, rebaser(image) from disasm
     so that an `adr` target reads as a virtual address; without it the operand is
     capstone's. `cut_end` is where the range ends when the instruction cut stopped `ann`
-    short of it (disasm.cut_end); see build_cfg.
+    short of it (disasm.cut_end); see build_cfg. `returns` is a `pc -> "x0" | "d0" |
+    None` resolver (make_return_resolver) saying which register the function's callers
+    read its result from; without it a `ret` is decided by the function's own code.
 
     `arch` is the resolved target. Passing one whose roles are not modelled refuses; see
     LIFTABLE_ARCHS. Omitting it keeps the arm64 assumption every caller had before the
@@ -3542,7 +3947,7 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     with use_target(TARGETS[name] if name else ARM64):
         try:
             return _lift_function(ann, pool_map, receiver, arity, indent, depth,
-                                  selectors, fields, show, cut_end)
+                                  selectors, fields, show, cut_end, returns)
         except RecursionError:
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
@@ -3608,7 +4013,7 @@ def use_target(tgt: Target):
 
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                   fields=None, show=None, cut_end=None) -> list:
+                   fields=None, show=None, cut_end=None, returns=None) -> list:
     stripped = strip_boilerplate(ann)
     # No traps: tier 3 keeps the edge past a `brk` that tier 2 dropped in #57. Ending the
     # block there takes away a join that, by accident, kept a frame slot from reading as
@@ -3626,6 +4031,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields)
         lifter.show = show
+        if returns is not None:
+            lifter.returns = lambda: returns(ann[0][0])
         lifter.labels = label_targets(stmts)
         lifter.keep = keep
         lines, _falls = lifter.walk(stmts, State(), indent, depth)

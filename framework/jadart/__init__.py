@@ -158,7 +158,7 @@ def decompile(path: str, symbol: str) -> list:
                          function_name_by_pc, build_pool_map)
     from .branches import row_kinds
     from .disasm import rebaser, cut_end
-    from .expr import lift_function, make_arity_resolver
+    from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
     from .fields import recover_fields
 
@@ -172,6 +172,7 @@ def decompile(path: str, symbol: str) -> list:
     pc_to_name = function_name_by_pc(image, fr)
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     arity = make_arity_resolver(image)
+    returns = make_return_resolver(image)
     sels = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
     out = []
@@ -193,7 +194,8 @@ def decompile(path: str, symbol: str) -> list:
                              arity=arity, selectors=sels,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             show=rebaser(image), cut_end=cut_end(cr, dis))
+                             show=rebaser(image), cut_end=cut_end(cr, dis),
+                             returns=returns)
         out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
                     "body": [ln.strip() for ln in body]})
     return out
