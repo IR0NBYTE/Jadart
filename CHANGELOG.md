@@ -13,6 +13,43 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A field saved in a frame slot across a call keeps the value it had when it was
+  saved.** Tier 3 tracks what a slot `[x29, #d]` holds as the text stored there, so a
+  field spilled before a call and reloaded after it printed as a fresh read of the field,
+  which the callee may have rewritten, and often off a register the call had already
+  clobbered. A concurrent modification guard, the length saved before a callback against
+  the length after it, read as a field compared with itself: `_filterWhere` and
+  `updateChildren` on the clean fixture, `lastWhere` and `markNeedsLayout` on 2.19.6. Such
+  a value is now named where it is stored, `var t3 = this.field_0x10;`, when a reload of
+  it after a call is printed: a backward dataflow over the frame slots finds those
+  stores, a reload that only feeds a call's printed arguments counts as printed, and a
+  spill written back unchanged around a call is not a new store, so the store before it
+  is the one named (recognised within one block; see FINDINGS.md). Naming at the store
+  puts the name above any `if` or loop the call is in, so the arms agree at the join and a
+  loop does not read the field again on each trip. A name nothing ends up printing is
+  left out, except where it is all an arm of an `if` holds, and one whose only use is the
+  next statement folds back into it, in brackets unless it is one term. Field
+  self-comparisons in the `export -t 3` go from 4 to 2 on the clean fixture (the two left
+  are `fcmp` NaN checks), 15 to 14 on 2.19.6 and 3 to 2 on 3.10.9, and stay at 2 on 3.4.4;
+  no build gains one. On the clean fixture 1,404 of 4,982 functions change, in 174 files,
+  and the export grows from 143,760 to 147,637 lines; 4 of 166 change on the obfuscated
+  fixture, and 1,354, 1,288 and 1,287 on the 2.19.6, 3.4.4 and 3.10.9 corpus builds. On
+  8,000 generated functions that spill fields across calls and loops, run on the CPU,
+  main's printed program disagreed with it on 1,378 and never ended on 2,357; it
+  disagrees on none now and always ends. Lifting every range of the clean fixture takes
+  8.1 s against 7.1 s before. A `ret` neither its callers nor its code decide, which
+  falls back to d0 because d0 was written last, prints `return d0;` rather than what d0
+  holds: with the spill named, `StadiumBorder.lerpFrom` returned the field where the
+  machine returns the object it allocates. Part of #64; the trap rule is not in this
+  change.
+- **A loop that keeps a counter in a frame slot no longer reads the slot's first value on
+  every trip.** The walk of a loop starts from the state before it, so a slot the body
+  stores a new value to printed its pre-loop text at the top of the loop: a counter kept
+  in a slot read `(1 + 1) >= 0xa`, a loop that never ends, where the CPU counts to 10 and
+  returns. A slot the loop stores a new value to and reads at its top is forgotten there,
+  and the reload prints its register. One it only writes back with the value it already
+  held keeps it, and a store on a path that throws does not count, since tier 3's graph
+  still runs on past a trap and past a throw stub with nothing after it. Closes #109.
 - **A write to any spelling of a SIMD register reaches the double in it.** `d0`, `v0.16b`
   and `q0` are one register, and tier 3 tracked a double under the spelling it was
   written with, so a write under another left `d0` describing the value before it. `eor
@@ -32,28 +69,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   print 118, 590, 286 and 117 values right that main printed wrong, and 19 that main
   named right go bare, all in one function, the `pow` cases of `_findResultByJ`.
   `st1 {v0.16b}` now reads d0 too. Closes #114.
-- **A `ret` hands back x0 unless something proves a double.** Tier 3 printed whichever
-  of x0 and d0 a path wrote last, so a function that allocates an object and then fills
-  its double fields printed its last field value as what it returns: `Rect.topRight` on
-  the 3.4.4 corpus build printed `return t1;`, the field, where it returns the Offset in
-  `t0`. The snapshot cannot say which register comes back on any of the 18 registered
-  releases: `Function::has_unboxed_double_return` reads `unboxed_parameters_info_`,
-  which the AOT runtime compiles out and the Function cluster never writes. So the code
-  says it. d0 comes back when the function's callers read d0 after their `bl` to it,
-  when a path to the `ret` never writes x0 but writes d0, or when a d0 the function wrote
-  reaches the `ret` with nothing else reading it, a slow path's restore aside; x0 when
-  its callers read x0, or when what d0 holds there was only ever stored. A `ret` none of
-  that decides, such as a double summed in a loop that leaves x0 as scratch, keeps the
-  old rule rather than a new guess. Tier 3 exports change in 112 functions on clean, 103
-  on 2.19.6, 111 on 3.4.4 and 113 on 3.10.9 (265, 255, 264 and 262 lines), and in none
-  on obf. Of those 439, 296 are confirmed by their callers and the other 143 were read
-  against the arm64, 118 of them returning a fresh allocation untouched; every one named
-  a register its function does not return. Across 52 arm64 builds, these five and 47
-  apps, 145,939 functions write V0: none the code proves returns d0 has callers that read
-  x0, and the 424 whose callers read d0 where the code chose x0 print the same either
-  way. The issue's loose count, functions that fill an object and return another temp,
-  goes from 147 to 117 on 3.4.4, and every `ret` of those 117 returns x0: the object they
-  fill is not what they return. Tiers 1 and 2 are byte for byte as before. Closes #115.
+- **A `ret` hands back x0 unless something proves a double.** Tier 3 printed whichever of
+  x0 and d0 a path wrote last, so a function that allocates an object and then fills its
+  double fields printed its last field value as what it returns: `Rect.topRight` on the
+  3.4.4 corpus build printed `return t1;`, the field, where it returns the Offset in `t0`.
+  The snapshot cannot say which register comes back on any of the 18 registered releases:
+  `Function::has_unboxed_double_return` reads `unboxed_parameters_info_`, which the AOT
+  runtime compiles out and the Function cluster never writes. So the code says it. d0
+  comes back when the function's callers read d0 after their `bl` to it, when a path to
+  the `ret` never writes x0 but writes d0, or when a d0 the function wrote reaches the
+  `ret` with nothing else reading it, a slow path's restore aside; x0 when its callers
+  read x0, or when what d0 holds there was only ever stored. A `ret` none of that decides,
+  such as a double summed in a loop that leaves x0 as scratch, keeps the old rule, and
+  where that is d0 says only the register (see the frame-slot entry). Tier 3 exports
+  change in 112 functions on clean, 103 on 2.19.6, 111 on 3.4.4 and 113 on 3.10.9 (265,
+  255, 264 and 262 lines), and in none on obf. Of those 439, 296 are confirmed by their
+  callers and the other 143 were read against the arm64, 118 of them returning a fresh
+  allocation untouched; every one named a register its function does not return. Across 52
+  arm64 builds, these five and 47 apps, 145,939 functions write V0: none the code proves
+  returns d0 has callers that read x0, and the 424 whose callers read d0 where the code
+  chose x0 print the same either way. The issue's loose count, functions that fill an
+  object and return another temp, goes from 147 to 117 on 3.4.4, and every `ret` of those
+  117 returns x0: the object they fill is not what they return. Tiers 1 and 2 are byte for
+  byte as before. Closes #115.
 - **A goto's target reads what the goto left.** A block only a goto reaches is lifted
   from the state its one predecessor left, and that state was taken before the printed
   program writes loop names back on the way there: in the goto's own write-back, and in
@@ -546,8 +584,10 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `decompile -t 2` and `export -t 2` on arm64 as well as arm32: 87 files of the clean
   fixture's export and 47 of arm32-2.19.6's. Tier 3 keeps the old graph and its output is
   unchanged: with the rule, the concurrent modification guard in `forEach` printed as a
-  field compared with itself, which is a frame slot it cannot yet name across a call
-  (#64). Closes #57.
+  field compared with itself, a frame slot read back as the field it was loaded from.
+  Tier 3 now names such a slot across a call (#64, above), and still keeps the old
+  graph, because the edge past a trap also hides weaknesses in its walk that the rule
+  would expose. Closes #57.
 
 ## 1.2.0 - 2026-10-03
 

@@ -827,6 +827,526 @@ def test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology():
     assert checked >= 2, f"expected the compact-hash forEach bodies, saw {checked}"
 
 
+def _then_forget(rows):
+    """`rows`, then a loop that calls and stores to the frame, after which the walk
+    forgets every slot, then a reload of [x29, #-0x10] to return. A name given to a
+    spill in `rows` is then read only by what `rows` print."""
+    h = len(rows) + 1
+    return rows + [("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x18]"),
+                   ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", f"#{h * 4:#x}"),
+                   ("ldur", "x0, [x29, #-0x10]"), ("ret", "")]
+
+
+#: Spills the very next statement reads, and how that statement has to read once the
+#: name folds back into it (#64). The precedence table has no `/` or `>>>` to ask, and
+#: a sign folded in after a sign would read as a decrement, `--x20.field_0x8`.
+_FOLDS = [
+    ([("ldur", "w4, [x20, #0xb]"), ("add", "x4, x4, #1"), ("stur", "x4, [x29, #-0x10]"),
+      ("mul", "x5, x4, x6"), ("str", "x5, [x23, #7]")],
+     "x23.field_0x8 = (x20.field_0xc + 1) * x6;"),
+    ([("ldur", "d0, [x20, #7]"), ("ldur", "d1, [x20, #0xf]"), ("fdiv", "d2, d0, d1"),
+      ("stur", "d2, [x29, #-0x10]"), ("ldur", "d4, [x20, #0x17]"), ("fdiv", "d5, d4, d2"),
+      ("stur", "d5, [x20, #0x1f]")],
+     "x20.field_0x20 = x20.field_0x18 / (x20.field_0x8 / x20.field_0x10);"),
+    ([("ldur", "x4, [x20, #7]"), ("lsr", "x4, x4, #3"), ("stur", "x4, [x29, #-0x10]"),
+      ("add", "x5, x4, #1"), ("stur", "x5, [x20, #0xf]")],
+     "x20.field_0x10 = (x20.field_0x8 >>> 3) + 1;"),
+    ([("ldur", "x4, [x20, #7]"), ("neg", "x4, x4"), ("stur", "x4, [x29, #-0x10]"),
+      ("neg", "x5, x4"), ("stur", "x5, [x20, #0xf]")],
+     "x20.field_0x10 = -(-x20.field_0x8);"),
+]
+
+
+def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between():
+    """A frame slot keeps the TEXT of what was stored in it, so a field spilled before a
+    call and reloaded after it printed as a fresh read of the field, which the callee may
+    have rewritten. A concurrent modification guard, `length before == length after`,
+    then reads as a field compared with itself (#64). The value gets its name at the
+    store, and only when it reads memory and a reload after a call can see it."""
+    guard = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                       ("bl", "#0x100"), ("ldur", "w0, [x20, #0xb]"),
+                       ("ldur", "x2, [x29, #-0x10]"), ("cmp", "w0, w2"),
+                       ("b.ne", "#0x24"), ("mov", "x0, #0"), ("ret", ""),
+                       ("mov", "x0, #1"), ("ret", "")])
+    lines = [ln.strip() for ln in guard.splitlines()]
+    assert "if (x20.field_0xc == t0) {" in lines, guard
+    assert lines.index("var t0 = x20.field_0xc;") < lines.index("sub_0x100(...);"), guard
+    # The register it was stored from holds the same value and takes the same name, or
+    # `_pin_call` names the one read a second time when that register outlives the call.
+    once = _lift_asm([("ldur", "x19, [x20, #0xf]"), ("stur", "x19, [x29, #-0x10]"),
+                      ("bl", "#0x100"), ("ldur", "x2, [x29, #-0x10]"),
+                      ("add", "x0, x2, x19"), ("ret", "")])
+    assert once.count("x20.field_0x10") == 1 and "return t0 + t0;" in once, once
+    # ...and one value spilled to two slots by one `stp` is one name, not two. A pair of
+    # 32-bit registers puts its second half four bytes on, where `_step` files it.
+    pair = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stp", "x4, x4, [x29, #-0x10]"),
+                      ("bl", "#0x100"), ("ldur", "x0, [x29, #-0x10]"),
+                      ("ldur", "x1, [x29, #-0x8]"), ("add", "x0, x0, x1"), ("ret", "")])
+    assert pair.count("var ") == 1 and "return t0 + t0;" in pair, pair
+    pair = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("ldur", "w5, [x20, #0xf]"),
+                      ("stp", "w4, w5, [x29, #-0x10]"), ("bl", "#0x100"),
+                      ("ldur", "w0, [x29, #-0xc]"), ("ret", "")])
+    assert "var t0 = x20.field_0x10;" in pair and "return t0;" in pair, pair
+    # A `ret` neither its callers nor its code decide falls back to the register written
+    # last. Where that is d0, naming what d0 holds would claim it is returned, and a
+    # function that allocates and fills an object returns x0: it prints the register.
+    body = _lift_asm([("bl", "#0x100"), ("ldur", "d0, [x2, #7]"), ("fcmp", "d0, d0"),
+                      ("stur", "d0, [x0, #7]"), ("ret", "")])
+    assert body.splitlines()[-1].strip() == "return d0;", body
+
+    # Only what needs it. Each of these spills the same field, and none of them has a
+    # reload that a call stands in front of and that anything reads, so naming them would
+    # be a declaration for nothing.
+    from jadart.cfg import build_cfg
+    from jadart.expr import Lifter, lift_function, strip_boilerplate
+    for why, rows, want in (
+            ("no call before the reload",
+             [("ldur", "x0, [x29, #-0x10]"), ("ret", "")], "return x20.field_0xc;"),
+            ("the reload is overwritten unread",
+             [("bl", "#0x100"), ("ldur", "x2, [x29, #-0x10]"), ("mov", "x0, #3"),
+              ("ret", "")], "return 3;"),
+            ("the slot is stored again first",
+             [("bl", "#0x100"), ("mov", "x5, #3"), ("stur", "x5, [x29, #-0x10]"),
+              ("ldur", "x0, [x29, #-0x10]"), ("ret", "")], "return 3;"),
+            ("a stub call is no call: it keeps the heap",
+             [("bl", "#0x100"), ("ldur", "x0, [x29, #-0x10]"), ("ret", "")], None),
+            # The walk forgets the slots after a loop that stores to the frame, so the
+            # reload prints the register and the name would be read by nothing.
+            ("the reload prints as the register",
+             [("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x18]"),
+              ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0xc"),
+              ("ldur", "x0, [x29, #-0x10]"), ("ret", "")], "return x0;")):
+        rows = [("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]")] + rows
+        ann = [(i * 4, mn, op, "  ; -> _iso_stub_AllocateArrayStub"
+                if want is None and mn == "bl" else "")
+               for i, (mn, op) in enumerate(rows)]
+        body = "\n".join(lift_function(ann))
+        assert "var " not in body and not re.search(r"\{\n\s*\}", body), (why, body)
+        assert "return " + ("x20.field_0xc;" if want is None else want[7:]) in body, (
+            why, body)
+        if "prints as" not in why:
+            # Not named at all, rather than named and then found unread.
+            blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+            assert not Lifter(blocks, entry=entry)._slot_crossings(), why
+    # A name read only by the declaration of another that nothing reads goes with it:
+    # the second spill is of a field of the first, and its reload is forgotten.
+    body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                      ("bl", "#0x100"), ("ldur", "x2, [x29, #-0x10]"),
+                      ("ldur", "w5, [x2, #0xb]"), ("stur", "x5, [x29, #-0x18]"),
+                      ("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x20]"),
+                      ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0x1c"),
+                      ("ldur", "x0, [x29, #-0x18]"), ("ret", "")])
+    assert "var " not in body and "return x0;" in body, body
+    # Each arm spills its own field, the join forgets the slot they disagree on, and the
+    # names are read by nothing. Where a name is all its arm holds it stays, not leaving
+    # the arm empty; lifting again without the names instead printed the field read again
+    # after the call, `x20.field_0x48 = x20.field_0x10`, where the machine stores the
+    # value from before it.
+    for rows, sole in (
+            ([("cbz", "x1, #0x1c"), ("ldur", "w4, [x23, #0xb]"),
+              ("stur", "x4, [x29, #-0x10]"), ("str", "x5, [x24, #7]"), ("b", "#0x24"),
+              ("ldur", "w4, [x23, #0xf]"), ("stur", "x4, [x29, #-0x10]")],
+             "var t1 = x23.field_0x10;"),
+            ([("cbz", "x1, #0x1c"), ("ldur", "w4, [x23, #0xb]"),
+              ("stur", "x4, [x29, #-0x10]"), ("b", "#0x28"), ("nop", ""),
+              ("ldur", "w4, [x23, #0xf]"), ("stur", "x4, [x29, #-0x10]"),
+              ("str", "x5, [x24, #7]")], "var t0 = x23.field_0xc;")):
+        body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]")]
+                         + rows + [("bl", "#0x100"), ("ldur", "x0, [x29, #-0x10]"),
+                                   ("ret", "")])
+        assert not re.search(r"\{\n\s*\}", body) and "return x0;" in body, body
+        assert body.count("var ") == 1 and sole in body, body
+    body = _lift_asm([("ldur", "x2, [x20, #0xf]"), ("stur", "x2, [x29, #-0x18]"),
+                      ("ldur", "x5, [x20, #0x17]"), ("cbz", "x5, #0x1c"),
+                      ("ldur", "x2, [x20, #7]"), ("bl", "#0x100"), ("b", "#0x24"),
+                      ("ldur", "x3, [x20, #0xf]"), ("stur", "x3, [x29, #-0x18]"),
+                      ("ldur", "x24, [x29, #-0x18]"), ("bl", "#0x100"),
+                      ("ldur", "x3, [x29, #-0x18]"), ("stur", "x3, [x20, #0x47]"),
+                      ("ret", "")])
+    assert "x20.field_0x48 = x3;" in body, body
+    # ...and what a declaration that stays reads stays with it.
+    body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                      ("bl", "#0x100"), ("cbz", "x1, #0x24"),
+                      ("ldur", "x2, [x29, #-0x10]"),
+                      ("ldur", "w5, [x2, #0xb]"), ("stur", "x5, [x29, #-0x18]"),
+                      ("b", "#0x30"), ("nop", ""), ("ldur", "w5, [x23, #0xb]"),
+                      ("stur", "x5, [x29, #-0x18]"), ("str", "x6, [x24, #7]"),
+                      ("bl", "#0x100"), ("ldur", "x0, [x29, #-0x18]"), ("ret", "")])
+    assert "var t0 = x20.field_0xc;" in body and "var t1 = t0.field_0xc;" in body, body
+    # A name whose one printed use is the statement right after the store says no more
+    # than the field did, and folds back into it like a call's result does.
+    body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                      ("cbz", "x4, #0x10"), ("bl", "#0x200"), ("mov", "x6, #0"),
+                      ("bl", "#0x100"), ("stur", "x6, [x29, #-0x18]"),
+                      ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0x14"),
+                      ("ldur", "x0, [x29, #-0x10]"), ("ret", "")])
+    assert "var " not in body and "if (x20.field_0xc != 0) {" in body, body
+    # In brackets where it is more than one term, whatever the operator: `t0 * x6` is not
+    # `a + 1 * x6`, and the precedence table holds no `/` or `>>>` to ask; see the CPU
+    # check of these below.
+    for rows, want in _FOLDS:
+        body = _lift_asm(_then_forget(rows))
+        assert want in body and "var " not in body, (want, body)
+    # ...and a value that reads no memory cannot be changed by the callee.
+    body = _lift_asm([("add", "x4, x19, #1"), ("stur", "x4, [x29, #-0x10]"),
+                      ("bl", "#0x100"), ("ldur", "x0, [x29, #-0x10]"), ("ret", "")])
+    assert "return x19 + 1;" in body and "var " not in body, body
+
+
+def test_a_spilled_field_named_across_a_call_agrees_at_the_join_and_round_a_loop():
+    """Naming at the CALL, the first cut at #64, put the name inside the arm or the loop
+    body that made the call. The other arm still held the field, the arms disagreed at
+    the join and the reload after it dropped to a bare register; inside a loop the field
+    was read again on every trip, where the machine reads its spill. A name given at the
+    store sits before the `if` and before the `while`, on every path to the reload."""
+    join = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                      ("cbz", "x1, #0x10"), ("bl", "#0x100"),
+                      ("ldur", "x0, [x29, #-0x10]"), ("ret", "")])
+    lines = [ln.strip() for ln in join.splitlines()]
+    assert lines[0] == "var t0 = x20.field_0xc;" and "return t0;" in lines, join
+
+    loop = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                      ("mov", "x19, #0"), ("bl", "#0x100"),
+                      ("ldur", "x2, [x29, #-0x10]"), ("add", "x19, x19, x2"),
+                      ("cmp", "x19, #0x64"), ("b.lt", "#0xc"), ("mov", "x0, x19"),
+                      ("ret", "")])
+    lines = [ln.strip() for ln in loop.splitlines()]
+    assert lines.index("var t0 = x20.field_0xc;") < lines.index("while (true) {"), loop
+    assert "field_0xc" not in loop.split("while (true) {", 1)[1], loop
+    # A spill written back unchanged around the call, `ldur x24, [k]; bl; stur x24, [k]`,
+    # leaves the value from before the loop in the slot: the name is the store in front
+    # of the loop's, where reading the field inside the loop gave the second trip the
+    # field the first one wrote.
+    loop = _lift_asm([("ldur", "x2, [x20, #0xf]"), ("stur", "x2, [x29, #-0x18]"),
+                      ("mov", "x25, #0"), ("ldur", "x24, [x29, #-0x18]"),
+                      ("bl", "#0x100"), ("stur", "x24, [x29, #-0x18]"),
+                      ("stur", "x0, [x20, #0xf]"), ("stur", "x24, [x20, #7]"),
+                      ("add", "x25, x25, #1"),
+                      ("cmp", "x25, #2"), ("b.lt", "#0xc"), ("ret", "")])
+    lines = [ln.strip() for ln in loop.splitlines()]
+    assert lines.index("var t0 = x20.field_0x10;") < lines.index("while (true) {"), loop
+    assert "x20.field_0x8 = t0;" in lines and loop.count("x20.field_0x10;") == 1, loop
+    # The reload at the top of the body comes after a call too, the one the trip before
+    # made: only the back edge says so.
+    loop = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                      ("mov", "x19, #0"), ("ldur", "x2, [x29, #-0x10]"),
+                      ("add", "x19, x19, x2"), ("bl", "#0x100"), ("cmp", "x19, #0x64"),
+                      ("b.lt", "#0xc"), ("mov", "x0, x19"), ("ret", "")])
+    lines = [ln.strip() for ln in loop.splitlines()]
+    assert lines.index("var t0 = x20.field_0xc;") < lines.index("while (true) {"), loop
+    assert "field_0xc" not in loop.split("while (true) {", 1)[1], loop
+
+
+def test_a_spill_passed_to_a_call_counts_as_read():
+    """Liveness says a direct call reads no register, and a reload that only feeds a call
+    looked unread, so its slot kept no name: `handleMessage` passed a spilled field on as
+    an argument, and the argument printed as a fresh read of the field after the calls in
+    between (#64). The printed arguments are what the reader reads: the registers of a
+    call whose arity is known, and x0 for a throw."""
+    from jadart.expr import lift_function
+    spill = [("ldur", "w4, [x20, #0xb]", ""), ("stur", "x4, [x29, #-0x10]", ""),
+             ("bl", "#0x100", "")]
+
+    def lift(rows, arity=None):
+        ann = [(i * 4, mn, op, note) for i, (mn, op, note) in enumerate(spill + rows)]
+        return "\n".join(lift_function(ann, arity=arity))
+    call = [("ldur", "x1, [x29, #-0x10]", ""), ("bl", "#0x200", ""), ("ret", "", "")]
+    body = lift(call, arity=lambda pc: 1 if pc == 0x200 else None)
+    assert "var t0 = x20.field_0xc;" in body and "sub_0x200(t0)" in body, body
+    body = lift([("ldur", "x0, [x29, #-0x10]", ""),
+                 ("bl", "#0x300", "  ; -> _iso_stub_ThrowStub"), ("ret", "", "")])
+    assert "var t0 = x20.field_0xc;" in body and "throw t0;" in body, body
+    # A call that prints `(...)` reads nothing the reader can see: one whose arity is not
+    # known, and one to a stub, which `_call_args` never spells out.
+    body = lift(call, arity=lambda pc: None)
+    assert "var " not in body and "sub_0x200(...)" in body, body
+    from jadart.cfg import build_cfg
+    from jadart.expr import Lifter, strip_boilerplate
+    for note, named in (("  ; -> stub Foo", False), ("  ; -> foo", True)):
+        rows = spill + [("ldur", "x1, [x29, #-0x10]", ""), ("bl", "#0x200", note),
+                        ("ret", "", "")]
+        ann = [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)]
+        blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+        lifter = Lifter(blocks, entry=entry, arity=lambda pc: 1)
+        assert bool(lifter._slot_crossings()) == named, note
+
+
+def test_the_slot_dataflow_reaches_its_fixed_point_along_backward_branches():
+    """`_slot_crossings` runs a worklist where `_liveness` sweeps, because a fact crosses
+    one block per sweep along a chain of backward branches (#64). The answer has to be
+    the same fixed point all the same: a field spilled at the top, then a chain of 40
+    blocks each jumping back to the one before, then a call and the reload. The name
+    is only given if the reload's liveness reaches the store through the whole chain.
+    A frame move between store and reload is the other way a slot stops being the same
+    address, and `_step` forgets every slot there, so nothing may be named across it."""
+    from jadart.cfg import build_cfg
+    from jadart.expr import Lifter, lift_function, strip_boilerplate
+    n = 40
+    rows = [("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+            ("b", f"#{(3 + 3 * (n - 1)) * 4:#x}"), ("bl", "#0x10000"),
+            ("ldur", "x0, [x29, #-0x10]"), ("ret", "")]
+    for i in range(1, n):
+        rows += [("nop", ""), ("nop", ""),
+                 ("b", f"#{(3 + 3 * (i - 1)) * 4 if i > 1 else 12:#x}")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    body = "\n".join(lift_function(ann))
+    assert "var t0 = x20.field_0xc;" in body and "return t0;" in body, body
+    blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+    lifter = Lifter(blocks, entry=entry)
+    assert lifter._printed_live_out({}) == lifter._liveout
+    assert lifter._slot_crossings() == {(4, "x29-16")}
+
+    # A register reloaded from a slot stores back the value already there only while
+    # nothing else was stored to the slot in between; after one it is a store like any.
+    # Here the reload at the end reads the stale register's value, stored after the call.
+    stale = [("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+             ("ldur", "x19, [x29, #-0x10]"), ("ldur", "w5, [x20, #0xf]"),
+             ("stur", "x5, [x29, #-0x10]"), ("bl", "#0x100"),
+             ("stur", "x19, [x29, #-0x10]"), ("ldur", "x0, [x29, #-0x10]"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(stale)]
+    blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+    assert Lifter(blocks, entry=entry)._slot_crossings() == frozenset()
+
+    moved = [("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+             ("bl", "#0x100"), ("ldr", "x5, [x29, #-8]!"),
+             ("ldur", "x0, [x29, #-0x10]"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(moved)]
+    blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+    assert Lifter(blocks, entry=entry)._slot_crossings() == frozenset()
+
+
+def test_no_field_is_compared_with_itself_after_a_call_on_the_clean_fixture():
+    """The spill pattern of #64 in the clean fixture, beyond `forEach`: `_filterWhere`
+    keeps a field in a slot across the predicate call and `updateChildren` across a
+    child update, and each then compared the field with itself. Both print the value
+    from before the call against the one after it now."""
+    _needs_capstone()
+    from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
+                               function_name_by_pc)
+    from jadart.expr import lift_function, make_arity_resolver
+    image, fr, _hdr = load_instructions(CLEAN)
+    p2n = function_name_by_pc(image, fr)
+    pm, ar = build_pool_map(fr), make_arity_resolver(image)
+    seen = set()
+    for cr in image.all_ranges:
+        name = p2n.get(cr.pc_offset) or ""
+        if name.split("@")[0] not in ("forEach", "_filterWhere", "updateChildren"):
+            continue
+        dis = disassemble_range(image, cr)
+        if not dis:
+            continue
+        body = "\n".join(lift_function(_ann(image, dis, p2n, pm), pm,
+                                       receiver={"x1": "this"}, arity=ar))
+        seen.add(name.split("@")[0])
+        for a, b in re.findall(r"\(([^()]+) [=!]= ([^()]+)\)", body):
+            assert a != b or "field_" not in a, (
+                f"{name} at 0x{cr.pc_offset:x} compares {a!r} with itself:\n{body}")
+    assert seen == {"forEach", "_filterWhere", "updateChildren"}, seen
+
+
+def _encode_fold(mn, op):
+    """The word for one of the instructions in _FOLDS, or None."""
+    m = re.match(r"(\w+) ([xd])(\d+), \[x(\d+), #(-?0x[0-9a-f]+|-?\d+)\]$", f"{mn} {op}")
+    if m:
+        base = {("ldur", "x"): 0xF8400000, ("stur", "x"): 0xF8000000,
+                ("ldur", "d"): 0xFC400000, ("stur", "d"): 0xFC000000}[(m[1], m[2])]
+        return base | (int(m[5], 0) & 0x1ff) << 12 | int(m[4]) << 5 | int(m[3])
+    regs = [int(r) for r in re.findall(r"[xd](\d+)", op)]
+    imm = re.search(r"#(\d+)", op)
+    if mn == "fdiv":
+        return 0x1E601800 | regs[2] << 16 | regs[1] << 5 | regs[0]
+    if mn == "lsr":
+        return 0xD340FC00 | int(imm[1]) << 16 | regs[1] << 5 | regs[0]
+    if mn == "add" and imm:
+        return 0x91000000 | int(imm[1]) << 10 | regs[1] << 5 | regs[0]
+    return None
+
+
+def test_a_folded_slot_name_keeps_its_brackets_against_the_cpu():
+    """The two folds of _FOLDS whose operator the precedence table lacks, run on the
+    CPU: the right-hand side the lifter prints, evaluated with the fields the CPU read,
+    has to give what the CPU stored. Without the brackets it gave `a / b / c` for
+    `a / (b / c)`, and `a >>> 3 + 1` for `(a >>> 3) + 1` (#64)."""
+    if not _unicorn_available() or not _capstone_available():
+        _skip("  SKIP test_a_folded_slot_name_keeps_its_brackets_against_the_cpu")
+    import ast
+    import struct as _struct
+    import capstone
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import irfuzz
+    from jadart.expr import lift_function
+    unicorn, Uc, ARCH, MODE, a64 = irfuzz._unicorn()
+    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+
+    def ev(node, env):
+        if isinstance(node, ast.Expression):
+            return ev(node.body, env)
+        if isinstance(node, ast.Name):
+            return env[node.id]
+        if isinstance(node, ast.Constant):
+            return node.value
+        a, b = ev(node.left, env), ev(node.right, env)
+        return {ast.Add: lambda: a + b, ast.Div: lambda: a / b,
+                ast.RShift: lambda: a >> b}[type(node.op)]()
+    for (rows, want), fields, fmt, out in (
+            (_FOLDS[1], {8: 6.0, 16: 3.0, 24: 12.0}, "<d", 0x20),
+            (_FOLDS[2], {8: 0x1000}, "<Q", 0x10)):
+        words = [_encode_fold(mn, op) for mn, op in rows]
+        code = b"".join(_struct.pack("<I", w) for w in words)
+        assert [f"{i.mnemonic} {i.op_str}" for i in md.disasm(code, 0)] == [
+            f"{mn} {op}" for mn, op in rows]
+        mu = Uc(ARCH, MODE)
+        mu.mem_map(irfuzz.BASE, 0x1000)
+        mu.mem_write(irfuzz.BASE, code)
+        mu.mem_map(0x200000, 0x1000)
+        mu.mem_map(0x300000, 0x1000)
+        for off, val in fields.items():
+            mu.mem_write(0x300000 + off, _struct.pack(fmt, val))
+        mu.reg_write(a64.UC_ARM64_REG_X20, 0x300001)
+        mu.reg_write(a64.UC_ARM64_REG_X29, 0x200800)
+        mu.reg_write(a64.UC_ARM64_REG_CPACR_EL1, 0x300000)      # FP on
+        mu.emu_start(irfuzz.BASE, irfuzz.BASE + len(code))
+        cpu = _struct.unpack(fmt, mu.mem_read(0x300000 + out, 8))[0]
+        ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(_then_forget(rows))]
+        line = next(ln for ln in lift_function(ann) if f"field_{out:#x} =" in ln)
+        rhs = line.split(" = ", 1)[1].rstrip(";").replace(">>>", ">>")
+        rhs = re.sub(r"x20\.field_0x([0-9a-f]+)", lambda m: f"f{int(m[1], 16)}", rhs)
+        env = {f"f{off}": val for off, val in fields.items()}
+        assert ev(ast.parse(rhs, mode="eval"), env) == cpu, (line, cpu)
+
+
+#: A loop that keeps its counter in a frame slot, as #109 gives it: x0 starts at 1, the
+#: slot counts up to 10 and the function returns it.
+_SLOT_LOOP = [(0xD2800020, "mov x0, #1"), (0xF81F83A0, "stur x0, [x29, #-8]"),
+              (0xF85F83A1, "ldur x1, [x29, #-8]"), (0x91000421, "add x1, x1, #1"),
+              (0xF81F83A1, "stur x1, [x29, #-8]"), (0xF100283F, "cmp x1, #0xa"),
+              (0x54FFFF8B, "b.lt #8"), (0xAA0103E0, "mov x0, x1"), (0xD65F03C0, "ret")]
+
+
+def test_a_loop_that_stores_to_a_slot_does_not_read_its_pre_loop_value():
+    """The walk of a loop starts from the state before it, so a slot the body stores a
+    new value to kept its pre-loop text at the top of every trip (#109). The counter
+    above printed as `(1 + 1) >= 0xa`, a loop that never ends, where the CPU counts the
+    slot to 10 and returns. Checked against the CPU: the printed body is run, and it
+    may decline to say (a register it does not know) but not claim to loop forever."""
+    if not _unicorn_available() or not _capstone_available():
+        _skip("  SKIP test_a_loop_that_stores_to_a_slot_does_not_read_its_pre_loop_value")
+    import struct as _struct
+    import capstone
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import irfuzz
+    from jadart.expr import lift_function
+    code = b"".join(_struct.pack("<I", w) for w, _t in _SLOT_LOOP)
+    md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+    ann = [(i.address, i.mnemonic, i.op_str, "") for i in md.disasm(code, 0)]
+    assert [f"{m} {o}".strip() for _a, m, o, _n in ann] == [t for _w, t in _SLOT_LOOP]
+
+    unicorn, Uc, ARCH, MODE, a64 = irfuzz._unicorn()
+    mu = Uc(ARCH, MODE)
+    mu.mem_map(irfuzz.BASE, 0x1000)
+    mu.mem_write(irfuzz.BASE, code)
+    mu.mem_map(0x200000, 0x1000)
+    mu.reg_write(a64.UC_ARM64_REG_X29, 0x200800)
+    mu.emu_start(irfuzz.BASE, irfuzz.BASE + len(code) - 4)
+    assert mu.reg_read(a64.UC_ARM64_REG_X0) == 10
+
+    lines = lift_function(ann)
+    body = "\n".join(lines)
+    assert "(1 + 1)" not in body, body
+    env = {f"x{i}": 0 for i in range(31)}
+    env["xzr"] = 0
+    try:
+        _run, _wrote, ret = irfuzz._run_body(irfuzz._parse_body(lines)[0], env, 512)
+    except irfuzz._Undecidable as exc:
+        assert "budget" not in str(exc), f"the printed loop never ends:\n{body}"
+    else:
+        assert ret == 10, body
+
+
+def test_a_loop_keeps_a_slot_it_only_writes_back():
+    """The other half of #109. Forgetting every slot a loop stores to was measured and
+    is mostly a loss: the stores are spills of a value the loop does not change, `this`
+    saved again around a call, and the pre-loop text was right. A store keeps the slot
+    when it writes back what it reloaded, or a register the loop never writes that held
+    the slot's value on the way in; and a store on a path that throws never comes back
+    round, even where tier 3's graph runs on past the trap or the throw stub."""
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        ann = [(i * 4, r[0], r[1], r[2] if len(r) > 2 else "")
+               for i, r in enumerate(rows)]
+        return "\n".join(lift_function(ann, receiver={"x1": "this"}))
+    for why, rows in (
+            ("written back as reloaded",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"), ("bl", "#0x100"),
+              ("ldur", "x2, [x29, #-8]"), ("stur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbnz", "x0, #0x4"), ("ret", "")]),
+            ("a register the loop never writes",
+             [("mov", "x20, x1"), ("stur", "x20, [x29, #-8]"), ("bl", "#0x100"),
+              ("ldur", "x2, [x29, #-8]"), ("ldur", "x0, [x2, #7]"),
+              ("stur", "x20, [x29, #-8]"), ("cbnz", "x0, #0x8"), ("ret", "")]),
+            ("past a throw stub",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
+              ("stur", "x0, [x29, #-8]"),
+              ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
+              ("b", "#0x4")]),
+            ("past a trap",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
+              ("stur", "x0, [x29, #-8]"), ("bl", "#0x100"), ("brk", "#0"),
+              ("b", "#0x4")]),
+            ("a throw on the way round",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbnz", "x0, #0x18"), ("stur", "x0, [x29, #-8]"),
+              ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
+              ("bl", "#0x200"), ("cbnz", "x0, #0x4"), ("ret", "")]),
+            # The only way back to the top runs through the throw, so the store at the
+            # top is never read by a next trip: there is no loop.
+            ("a loop only a throw closes",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("stur", "x0, [x29, #-8]"), ("cbz", "x0, #0x18"),
+              ("ret", ""),
+              ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
+              ("b", "#0x4")])):
+        body = lift(rows)
+        assert "while (true) {" in body and "this.field_0x8" in body, (why, body)
+        assert "x2.field_0x8" not in body, (why, body)
+    # ...and one that stores something else does forget it: the loop reads its own
+    # value back at the top of the next trip, not `this`. So does a register that held
+    # the slot's value on the way in, once the loop has changed it, and a loop that moves
+    # the frame, whose slots are other addresses by the next trip.
+    for why, rows in (
+            ("another value",
+             [("stur", "x1, [x29, #-8]"), ("bl", "#0x100"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("stur", "x0, [x29, #-8]"), ("cbnz", "x0, #0x4"),
+              ("ret", "")]),
+            ("its register, changed",
+             [("mov", "x3, x1"), ("stur", "x3, [x29, #-8]"), ("mov", "x19, #0"),
+              ("ldur", "x2, [x29, #-8]"), ("ldur", "x0, [x2, #7]"),
+              ("stur", "x0, [x20, #0xf]"), ("add", "x3, x3, #8"),
+              ("stur", "x3, [x29, #-8]"), ("add", "x19, x19, #1"), ("cmp", "x19, #3"),
+              ("b.lt", "#0xc"), ("ret", "")]),
+            ("the frame moves",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("ldr", "x5, [x29, #-8]!"),
+              ("cbnz", "x0, #0x4"), ("ret", "")])):
+        body = lift(rows)
+        assert "this.field_0x8" not in body and "x2.field_0x8" in body, (why, body)
+    # The counter of #109 itself, without the CPU the test above needs.
+    body = lift([(t.split(" ", 1)[0], t.split(" ", 1)[1] if " " in t else "")
+                 for _w, t in _SLOT_LOOP])
+    assert "(1 + 1)" not in body and "if ((x1 + 1) >= 0xa) {" in body, body
+    # A write-back is judged by slot key, and once the frame moves a key is another
+    # address: a register reloaded before the move and stored after it is a new store.
+    from jadart.expr import _frame_accesses
+    rows = [("ldur", "x2, [x29, #-8]"), ("ldr", "x5, [x29, #-0x10]!"),
+            ("stur", "x2, [x29, #-8]"), ("ldur", "x3, [x29, #-8]"),
+            ("stur", "x3, [x29, #-8]")]
+    got = _frame_accesses([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    assert [t[4] for t in got if t[4] is not None] == [[False], [True]]
+
+
 def test_the_lifted_output_does_not_depend_on_the_hash_seed():
     # Python randomises string hashing per process, so iterating a SET of register names
     # is a different order in every run. The lifter invalidates a set of registers after a
@@ -3501,10 +4021,11 @@ def test_a_double_comes_back_only_with_proof():
     ret = re.search(r"return (t\d+);", body)
     assert ret and f"{ret.group(1)} = x1.field_0x8.toInt();" in body, body
     # Nothing proves either: x0 written, and the double read by a compare as well as by
-    # the `ret`. The `ret` keeps what the old rule printed, the last register written.
+    # the `ret`. The old rule would take d0, the register written last, and printing what
+    # it holds would claim a double comes back; the `ret` says only the register (#64).
     body = _lift_asm([("ldur", "x0, [x1, #7]"), ("fadd", "d0, d0, d1"),
                       ("fcmp", "d0, d2"), ("ret", "")])
-    assert body.strip().endswith("return d0 + d1;"), body
+    assert body.strip().endswith("return d0;"), body
 
 
 def test_which_register_each_ret_hands_back():
@@ -3705,8 +4226,9 @@ def test_the_callers_of_real_functions_say_what_they_return():
     assert res(len(image.text) + 64) is None          # an address in no function
 
     top = jadart.decompile(CLEAN, "0x2c30d0")[0]["body"]
-    made = re.match(r"var (t\d+) = sub_0x[0-9a-f]+\(\);", top[0])
-    assert made and top[-1] == f"return {made.group(1)};", top
+    alloc = re.compile(r"var (t\d+) = sub_0x[0-9a-f]+\(\);")
+    made = next(m for m in map(alloc.match, top) if m)
+    assert top[-1] == f"return {made.group(1)};", top
     from jadart.cfg import build_cfg
     from jadart.disasm import build_pool_map, disassemble_range, function_name_by_pc
     from jadart.expr import _return_registers, strip_boilerplate

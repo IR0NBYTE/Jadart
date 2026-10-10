@@ -472,11 +472,19 @@ output already had.
 
 ### What is still not covered
 
-- **stack slots across a call.** A slot holding a memory read has the same problem and no
-  liveness to consult. Dropping them at every call was tried and measured: the outgoing
-  area is what `_stack_args` reconstructs a stack-convention call's arguments from, so
-  emptying it costs `benchDecodeFlag` the literal `semdiff` pins it on. Naming them instead
-  is the fix, and it is not written.
+- **stack slots where the walk forgets them.** A frame slot holding a memory read had the
+  same problem across a call, and is now named where it is stored when a reload after a
+  call prints it (#64; `Lifter._slot_crossings`). Dropping slots at every call was tried
+  first and cost `benchDecodeFlag` the literal `semdiff` pins it on, since the outgoing
+  area is what `_stack_args` reads a stack-convention call's arguments from. What is left
+  is the coarse forgetting around the name: a loop that stores anywhere in the frame, or a
+  goto join below such a store, clears every slot, and the reload prints its register.
+  Tier 3 also still keeps the edge past a trap, so a throw path can look like a loop. And
+  a spill written back unchanged is recognised only in the block that reloaded it: one
+  reloaded inside an inner loop and stored back after it counts as a new value, so the
+  store before the loop is not named and the loop forgets the slot at its header. 27 of
+  the 30,400 functions of the review's generated slot fuzzer print a register there that
+  a forward pass over the blocks would name; 2 functions of the 2.19.6 build change.
 - **a field store against a live element read of another object**, and the reverse. An
   element at a dynamic index could be any offset, so covering it would invalidate almost
   everything; the two are treated as disjoint.
