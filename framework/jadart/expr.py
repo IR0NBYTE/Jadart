@@ -1315,6 +1315,17 @@ def _rv_call(mn: str, note: str):
     return True
 
 
+def returns_in_d0(ann) -> bool:
+    """Whether the function `ann` hands back a double in d0 on every `ret`, by its own
+    code (_return_registers without callers' evidence). For dispatch.recover_selectors."""
+    with use_target(ARM64):
+        blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+        if not blocks:
+            return False
+        got = _return_registers(blocks, entry)
+    return bool(got) and set(got.values()) == {"d0"}
+
+
 def _return_registers(blocks, entry, evidence=None) -> dict:
     """{ret address: "x0" or "d0"}, the register each `ret` hands back, or {} for a
     function that never writes V0, where nothing below applies and `State.result` stands.
@@ -1663,6 +1674,8 @@ class Lifter:
         self._live_after = 0
         #: (call reads, live in, live out) per block; see _printed_liveness.
         self._printed = None
+        #: The block being lifted and the index of the instruction in it; see _reads_next.
+        self._insns, self._at = (), 0
         #: Temporaries minted for a call result. Only these may be folded back into their
         #: use by _inline_single_use; a temp that exists to STOP an expression growing
         #: must not be inlined back into the expression it was cut out of.
@@ -2201,6 +2214,22 @@ class Lifter:
             return _bin(v, "<<", _num(amt), P_SHIFT) if amt else v
         return None
 
+    def _reads_next(self, reg: str) -> bool:
+        """Whether, of x0 and d0, the first one an instruction after the current one in
+        its block touches is `reg`, and it reads it: the register a call's result is
+        taken from. A `ret` or another call is no evidence."""
+        regs = (_T.ret_int, _T.ret_fp)
+        for (_a, mn, op, _n) in self._insns[self._at + 1:]:
+            if mn == "ret" or mn in _CALLS:
+                return False
+            de, us = _def_use(mn, op)
+            for r in regs:
+                if r in us:
+                    return r == reg
+            if any(r in de for r in regs):
+                return False
+        return False
+
     def _result(self, st: State, expr: str, reg: str = None) -> list:
         """Emit a call, and give its result a name when anything reads it.
 
@@ -2709,6 +2738,12 @@ class Lifter:
             if disp is not None:                         # X21 dispatch-table (virtual) call
                 recv, off = disp
                 named = self.selectors.get(off) if off is not None else None
+                if named and off in getattr(self.selectors, "doubles", ()) and (
+                        self._reads_next(_T.ret_int)):
+                    # The selector returns a double and this call's result is read from
+                    # x0: two selectors share the offset, and this is the other one. The
+                    # clean build's `._widget.textScaleFactor` was a bool getter (#128).
+                    named = None
                 base = _wrap(self._leaf(recv, st), P_POST) if recv else None
                 pins = self._pin_call(st)   # after the receiver is read, and before it dies
                 self._clobber_call(st)   # after the receiver is read; it is x0 as often as not
@@ -3501,7 +3536,9 @@ class Lifter:
                 after[k] = m
                 de, us = _def_use_masks(insns[k][1], insns[k][2])
                 m = us | more.get(k, 0) | (m & ~de)
+        self._insns = insns
         for k, (a, mn, op, note) in enumerate(insns):
+            self._at = k
             self._live_after = after[k] if after is not _NO_LIVE else 0
             last = (k == len(insns) - 1)
             if last and (mn == "b" or cond_of(mn) or mn in _CONDB):

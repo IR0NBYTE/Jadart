@@ -13,6 +13,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A dispatch offset other selectors share is not named.** The dispatch table is packed
+  by row displacement, so selectors whose classes never meet can take the same offset, and
+  a call site's immediate does not say which one it calls; the vote gave the offset to the
+  name with the most defining classes. The clean build's 0x9c0e8 tests a bool and printed
+  `.textScaleFactor`, a double getter, `controller.stream` printed `.maximumSize`, and 122
+  calls of `.length` printed `.perform()`. Each function is now placed where the table
+  puts it, in the rows of the concrete classes at or below its class that inherit it (an
+  abstract class has no row; its abstract bit is read from the Class), and an offset is
+  named only where every function placed there spells the one selector, a function with no
+  name counting as another, and no function that fits more than one offset fits it. A
+  sharer none of that can see, a getter whose `return false` some other function owns, is
+  caught at the call site: a call whose result is read from x0 is not named for a selector
+  that returns a double. 133 of the 168 names stay on the clean build, naming 607 of its
+  2,580 recovered dispatch sites (974 before), and about 51% of the sites on the 2.19.6,
+  3.4.4 and 3.10.9 builds (about 65% before). Closes #128.
 - **A value read only as a call's argument is live up to the call.** `bl` reads no
   register to the machine, so tier 3 took a value read only as a call's argument, or as
   what a `throw` throws, as dead. A raw line overwriting a register it was spelled with
