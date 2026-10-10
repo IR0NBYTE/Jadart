@@ -1749,6 +1749,12 @@ class Lifter:
         #: "slot", key), and which of them to write out, None for all; see _lift_function.
         self.pins: dict = {}
         self.keep = None
+        #: loop header -> registers to carry beyond what liveness says, the ones this
+        #: walk found a break holding something else in, and the names the carried ones
+        #: got; see _render_loop and _lift_function.
+        self.carry_more: dict = {}
+        self.exit_hazards: dict = {}
+        self.carry_names: dict = {}
         self._loads = None
         #: () -> "x0" | "d0" | None, what this function's callers read its result from;
         #: and, built at the first `ret`, the register each `ret` hands back (#115).
@@ -4057,6 +4063,7 @@ class Lifter:
             carried = (_live_in_header(self.blocks, nodes, header, self._preds,
                                        self._printed_liveness()[0])
                        & self._written(nodes)) - _SPECIAL
+            carried |= self.carry_more.get(header, frozenset())     # see below
             self.carried[header] = carried
         # A loop-carried register is a phi, and a phi reaching exactly one join has a name
         # in the source: bind it before the loop with the entry value, read that name in
@@ -4127,6 +4134,10 @@ class Lifter:
             # with the body's walk, so the body has already minted temps above these;
             # rewinding to close a gap would hand out a name the body is using.
 
+        # One carried past a printed write starts from its value before the loop as any
+        # other does: a break the walk reaches before the body writes it reads that.
+        fresh = self.carry_more.get(header, frozenset())
+        self.carry_names[header] = {names[r]: r for r in fresh if r in names}
         out = [f"{pad}var {names[r]} = {init[r].text};" for r in sorted(names)]
         out.append(f"{pad}while (true) {{")
         out.extend(blines)
@@ -4140,6 +4151,20 @@ class Lifter:
         written = self._written(self._loop_nodes(header)) - _SPECIAL
         for r in sorted(written | carried):
             st.forget(r)
+        # Forgotten, a register prints as itself, which reads as the last value a printed
+        # line put in it. Where a break holds something else in it and the code after the
+        # loop reads it, that is the wrong value: `umulh x7, ...` printed, `add x7, x5,
+        # x1` not, and the store after the loop read the `umulh` (#123). The walk is run
+        # again with such a register carried, so the breaks name what it holds; see
+        # _lift_function. A goto out of the loop hands its target its own state (_arrive).
+        for n in sorted(self._breakers.get(header, ())):
+            left = self._exit.get(n)
+            for s in self.blocks[n].succ:
+                if s in nodes or left is None:
+                    continue
+                for r in (written - carried) & _mask_regs(self._livein.get(s, 0)):
+                    if left.get(r).text != r:
+                        self.exit_hazards.setdefault(header, set()).add(r)
         # ...except the ones that got a name, whose value after the loop is that variable.
         # That is the second half of naming it: forgetting it here would put the machine
         # register back into every line that reads the result of the loop. A register whose
@@ -4718,6 +4743,18 @@ def _printed_writes(lines: list) -> set:
 _LABEL_LINE_RE = re.compile(r"\s*L_0x[0-9a-f]+:$")
 
 
+_SET_RE = re.compile(r"\s*(?:var\s+)?(t\d+)\s*(?:;|=(?!=))")
+
+
+def _never_read(lines: list, names) -> set:
+    """Those of `names` that `lines` only declare or assign to."""
+    read = set()
+    for ln in lines:
+        m = _SET_RE.match(ln)
+        read.update(n for n in _TMP_RE.findall(ln[m.end():] if m else ln) if n in names)
+    return set(names) - read
+
+
 def _drop_unread(lines: list, names: set) -> list:
     """Leave out the declaration of each of `names` that nothing else in `lines` reads.
 
@@ -4934,7 +4971,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     stmts = structure(blocks, entry)
     dispatch = detect_dispatch(stripped)
 
-    def walk(keep):
+    def walk(keep, carry=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields)
@@ -4943,10 +4980,12 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
             lifter.returns = lambda: returns(ann[0][0])
         lifter.labels = label_targets(stmts)
         lifter.keep = keep
+        lifter.carry_more = carry or {}
         lines, _falls = lifter.walk(stmts, State(), indent, depth)
         return lifter, lines
 
     lifter, lines = walk(None)
+    keep = None
     if lifter.pins:
         # Which of the values `_arrive` wrote out the body goes on to read is only known
         # once the body is printed. One nothing read still took a temporary's number, so
@@ -4958,8 +4997,23 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                 counts[m.group(0)] = counts.get(m.group(0), 0) + 1
         read = frozenset(at for n, at in lifter.pins.items() if counts.get(n, 0) > 1)
         if len(read) < len(lifter.pins):
-            lifter = lines = None           # not held while the second walk runs
-            lifter, lines = walk(read)
+            keep = read
+    # ...and which registers a loop has to carry out past a printed write (#123). One the
+    # body never prints a write to reads as its value from before, which is a decline.
+    printed = _printed_writes(lines)
+    carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
+             if r & printed}
+    if keep is not None or carry:
+        lifter = lines = None               # not held while the second walk runs
+        lifter, lines = walk(keep, carry)
+        # A name the code after the loop does not print, its only reader a call that
+        # prints `(...)`, says nothing, and the walk goes back to the bare register.
+        unread = {h: frozenset(names[n] for n in _never_read(lines, names))
+                  for h, names in lifter.carry_names.items()}
+        if any(unread.values()):
+            carry = {h: r - unread.get(h, frozenset()) for h, r in carry.items()}
+            lifter = lines = None
+            lifter, lines = walk(keep, {h: r for h, r in carry.items() if r})
     lines = _drop_unread_slots(_drop_unread(lines, lifter.raw_names), lifter.slot_names)
     return _inline_single_use(lines, lifter.results | lifter.slot_names,
                               lifter.slot_names)

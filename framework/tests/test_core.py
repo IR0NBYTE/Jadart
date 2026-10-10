@@ -12181,6 +12181,41 @@ def test_a_call_whose_double_result_is_read_names_it():
         "new double().field_0x8 = d0;", "return x2;"]
 
 
+def test_a_loop_names_what_it_computed_over_a_raw_write_it_printed():
+    # A register a loop writes is forgotten at its exits and prints as itself, which reads
+    # as the last value a printed line put in it: `umulh x7` printed, `add x7, x5, x1`
+    # not, and the store after the loop printed `x7` where the machine has `x5 + x1`
+    # (#123).
+    from jadart.expr import lift_function
+
+    def lift(tail):
+        rows = [("mov", "x9, #2"), ("umulh", "x7, x10, x3"), ("add", "x7, x5, x1"),
+                ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x4")] + tail + [("ret", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    body = lift([("stur", "x7, [x2, #95]")])
+    assert "umulh x7, x10, x3" in body and body.count("t0 = x5 + x1;") == 2, body
+    assert "x2.field_0x60 = t0;" in body, body
+    # Read only by a call that prints `(...)`, the name would say nothing: no name.
+    body = lift([("ldur", "w2, [x7, #0x13]"), ("bl", "#0x40")])
+    assert not any(ln.endswith("= x5 + x1;") for ln in body), body
+    # The name starts from the value before the loop: a break that comes before the
+    # body writes the register reads that, and an unset name read it as nothing.
+    from jadart.expr import lift_function
+    rows = [("add", "x7, x5, x1"), ("mov", "x9, #2"), ("sub", "x9, x9, #1"),
+            ("tbz", "x9, #63, #0x8"), ("stur", "x7, [x2, #95]"), ("umulh", "x7, x10, x3"),
+            ("stur", "x7, [x2, #103]"), ("ret", "")]
+    body = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    assert "var t0 = x5 + x1;" in body and "x2.field_0x60 = t0;" in body, body
+    # Where the body prints no write to it, the bare register reads as nothing it says.
+    rows = [("mov", "x9, #2"), ("add", "x7, x5, x1"), ("sub", "x9, x9, #1"),
+            ("tbz", "x9, #63, #0x4"), ("stur", "x7, [x2, #95]"), ("ret", "")]
+    body = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    assert "x2.field_0x60 = x7;" in body, body
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

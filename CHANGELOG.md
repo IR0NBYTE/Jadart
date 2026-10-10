@@ -13,6 +13,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop names what it computed over a raw write it printed.** A register a loop writes
+  is forgotten at its exits, and prints after the loop as itself, which reads as the last
+  value a printed line put in it. Where that was a raw line in the loop, `umulh x7, ...`,
+  and a line after it the loop did not print, `add x7, x5, x1`, the store after the loop
+  read the `umulh`. A first walk now notes each register a `break` holds something else
+  in, that the code after the loop reads and that the body prints a write to, and the walk
+  runs again with the loop carrying it from its value before the loop, so each `break`
+  names what it holds. A name nothing then reads, the register's only reader a call that
+  prints `(...)`, is left out. A loop inside another is not covered: its node set holds
+  the loop around it (#129). Tier 3 exports change in one function on each corpus build
+  and the clean fixture: `_append` in serialization.dart on clean, 3.4.4 and 3.10.9, and
+  `_synchronizeModifiers` on 2.19.6. Part of #123.
 - **A call whose double result is read next names it.** A double comes back in d0, and a
   call's d0 result was never named: it read as d0, which is also how the d0 the function
   was handed reads, so `ratioOfTones` compared two calls' results as `d0 > d0`. Where the
