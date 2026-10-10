@@ -13,6 +13,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A write to any spelling of a SIMD register reaches the double in it.** `d0`, `v0.16b`
+  and `q0` are one register, and tier 3 tracked a double under the spelling it was
+  written with, so a write under another left `d0` describing the value before it. `eor
+  vN.16b, vN.16b, vN.16b`, which is how the VM loads 0.0, did exactly that, and so did
+  `movi`, `ldr q0`, `ins v0.d[0]` and a call: the clean fixture's `lerp` printed its
+  clamp to [0.0, 1.0] as `(d0 * x3.field_0x8) > (...)`, comparing a product the machine
+  had just zeroed, and stores, returns and comparisons all over printed a bare `d0` or an
+  older value where the machine has 0.0. The zeroing idioms are 0.0 now, any other write
+  under another spelling makes the double unknown, and a call clobbers a V register under
+  every spelling. An `if` whose arms leave different doubles in a register, one of them
+  a literal, now names it at the join as it does for any other value, where it printed
+  nothing and left a bare `d0` after, except where the other arm's double is the bare
+  register, which a join inside that arm can leave where the value is lost. Tier 3
+  exports change in 142 functions on the clean fixture (8,484 lines in 65 files, the
+  export growing from 135,343 to 137,015 lines, most of it such an `if`), 175 on 2.19.6,
+  183 on 3.4.4 and 154 on 3.10.9; obf does not change. Run on a CPU, those functions
+  print 118, 590, 286 and 117 values right that main printed wrong, and 19 that main
+  named right go bare, all in one function, the `pow` cases of `_findResultByJ`.
+  `st1 {v0.16b}` now reads d0 too. Closes #114.
 - **A `ret` hands back x0 unless something proves a double.** Tier 3 printed whichever
   of x0 and d0 a path wrote last, so a function that allocates an object and then fills
   its double fields printed its last field value as what it returns: `Rect.topRight` on
