@@ -957,11 +957,37 @@ def _def_use_uncached(mn: str, op: str):
         return _NO_REGS, _regs(ops[:1])
     if mn in ("blr", "blx"):
         return _CALL_CLOBBERS, _regs(ops[:1])
-    if mn in ("bl", "b", "br", "bx") or cond_of(mn):
+    if mn in ("br", "bx"):
+        return _NO_REGS, _regs(ops[:1])            # the target is read (#118)
+    if mn in ("bl", "b") or cond_of(mn):
         return (_CALL_CLOBBERS if mn == "bl" else _NO_REGS), _NO_REGS
     if mn == "nop":
         return _NO_REGS, _NO_REGS
+    if any(o.lstrip().startswith("[") for o in ops):
+        # The other memory instructions, by the registers they write (#118). An atomic
+        # load-op or swap writes its second register, the old memory value, and a
+        # compare-and-swap its first; a store-release, an atomic store or a prefetch
+        # none; an exclusive or non-temporal pair load two. Every one also writes a
+        # base it moves, `st1 {v0.16b}, [x1], x2` included.
+        at = next(i for i, o in enumerate(ops) if o.lstrip().startswith("["))
+        wb = (_writeback_base(ops),)
+        if _ATOMIC_OP_RE.match(mn):
+            return _regs(ops[1:2] + wb), _regs(ops[:1] + ops[at:])
+        if _CAS_RE.match(mn):
+            n = 2 if mn.startswith("casp") else 1
+            return _regs(ops[:n] + wb), _regs(ops)
+        if _NO_DEF_RE.match(mn):
+            return _regs(wb), _regs(ops)
+        n = 2 if mn in ("ldxp", "ldaxp", "ldnp") else 1
+        return _regs(ops[:min(n, at)] + wb), _regs(ops[n:])
     return _regs(ops[:1]), _regs(ops[1:])       # alu / mov: dst, srcs
+
+
+_ATOMIC_OP_RE = re.compile(r"(ld(add|clr|eor|set|smax|smin|umax|umin)|swp)"
+                           r"(a|al|l)?[bh]?$")
+_CAS_RE = re.compile(r"casp?(a|al|l)?[bh]?$")
+_NO_DEF_RE = re.compile(r"(stl(l)?u?r[bh]?|st(add|clr|eor|set|smax|smin|umax|umin)l?[bh]?"
+                        r"|st[1-4]|stnp|prfu?m)$")
 
 
 #: Canonical register name <-> bit position. Liveness is a separate question per
@@ -1129,11 +1155,18 @@ class Lifter:
         #: use by _inline_single_use; a temp that exists to STOP an expression growing
         #: must not be inlined back into the expression it was cut out of.
         self.results: set = set()
+        #: Names _verbatim gave, which _drop_unread leaves out where nothing reads them.
+        self.raw_names: set = set()
         #: entry block, and the memoised dominator tree / per-join kill sets `_join_kill`
         #: needs. Built on first use, because most functions never reach a goto join.
         self.entry = entry if entry is not None else (min(blocks) if blocks else 0)
         self._idom = None
         self._killcache: dict = {}
+        #: {temp number: the block its declaration stands in}, and the block lifted last,
+        #: for the goto join in `walk`.
+        self._anchor: dict = {}
+        self._last_block = None
+        self._loop_before = None
         #: Whether a frame address ever reaches a general register; see _frame_escaped.
         self._escaped = None
         #: (header, {reg: name}, copied) for each loop being walked, innermost last. An
@@ -1225,9 +1258,38 @@ class Lifter:
         The same thing the unmodelled-instruction fallthrough does, reached earlier when a
         modelled instruction turns out to carry an operand we cannot render.
         """
-        if dst:
-            st.set(dst, V(dst, P_ATOM))
-        return [f"{mn} {op}".rstrip()]
+        return self._verbatim(st, mn, op, op, dst)
+
+    def _verbatim(self, st: State, mn: str, op: str, shown: str, dst: str = "") -> list:
+        """The instruction printed as it is, and every register it writes forgotten.
+
+        The printed body reads the line as having run, so from there on a register it
+        writes means what the machine put in it. A value the lifter still holds that is
+        spelled with one of them would read as the new value: `add x5, x1, #1; subs x1,
+        x1, #8; str x5` printed `x1 + 1` for the old x1 (#118). Each such value still read
+        later is named first, `var t0 = x1 + 1;`, as _pin does before a base moves.
+
+        It reads the machine registers it names, and a register the lifter holds as an
+        expression was never assigned in the printed body: `add x1, x1, #8; adcs x1, x1,
+        x3` printed the `adcs` alone, which reads as working on the entry x1 (#120). The
+        line says what each register it reads holds, `adcs x1, x1, x3   // x1 holds x1 +
+        8`. A comment and not an assignment, so the printed body still assigns a register
+        only where the machine's own instruction does."""
+        def_regs, use_regs = _def_use(mn, op)
+        defs = set(def_regs) - _SPECIAL
+        if dst in def_regs:               # a role register it loads, as before; not
+            defs.add(dst)                 # the source of `stlr x0, [x17]`
+        out = []
+        live = self._live_after & ~_reg_mask(defs)
+        for r in sorted(defs):
+            out += self._pin(st, r, live)
+        self.raw_names.update(_DECL_RE.match(ln).group(2) for ln in out)
+        held = [f"{r} holds {v.text}" for r, v in sorted(st.reg.items())
+                if r in use_regs and v.text != r]
+        for r in sorted(defs):
+            st.set(r, V(r, P_ATOM))
+        line = f"{mn} {shown}".rstrip()
+        return out + [f"{line}   // {', '.join(held)}" if held else line]
 
     def _src(self, ops: list, i: int, st: State) -> V:
         """Source operand `i` with any shift or extend that follows it applied.
@@ -1291,8 +1353,11 @@ class Lifter:
         out = []
         if mn in _FLAG_SRC:
             regs = _regs(ops)
-            vals = {r: self._leaf(r, st) for r in regs}
             dst = canon(ops[0]) if mn not in _CMP else None
+            # The comparison is of the sources; `subs x1, x0, x2` sets the flags from x0
+            # and x2, and naming the x1 it overwrites would be a line nothing reads.
+            srcs = regs if dst is None else _regs(ops[1:])
+            vals = {r: self._leaf(r, st) for r in srcs}
             if read and dst in vals:
                 pat = re.compile(rf"\b{re.escape(dst)}\b")
                 for r, v in sorted(vals.items()):
@@ -1378,7 +1443,7 @@ class Lifter:
         st.set(base, V(base, P_ATOM))
         return out
 
-    def _pin(self, st: State, name: str) -> list:
+    def _pin(self, st: State, name: str, live=None) -> list:
         """Give a name to every tracked value that mentions `name`, before `name` changes.
 
         The register map holds expressions, not results, and they are substituted into
@@ -1388,10 +1453,17 @@ class Lifter:
         has advanced, printing that text at the store describes the WRONG element.
 
         Writing the value out at the point the base changes is not a heuristic. The load
-        already happened, so the value already exists; this only says so out loud."""
+        already happened, so the value already exists; this only says so out loud.
+
+        `live`, a register mask, leaves out a register nothing reads again."""
         pat = _USE_RE.get(name)
         if pat is None:
             pat = _USE_RE[name] = re.compile(rf"\b{re.escape(name)}\b")
+        # An operand the live comparison was captured from reads as the new value from
+        # here on, so the comparison can no longer be spelled (#118).
+        if self._flags is not None and any(pat.search(v.text)
+                                           for v in self._flags[2].values()):
+            self._flags = None
         out = []
         for holder in (st.reg, st.slot):
             # Sorted by key, so the names handed out here depend only on WHICH registers
@@ -1401,6 +1473,8 @@ class Lifter:
             # check locally; one unsorted set in `_merge` was enough to break it.
             for key, v in sorted(holder.items()):
                 if key == name or name not in v.text or not pat.search(v.text):
+                    continue
+                if live is not None and holder is st.reg and not live & _reg_mask((key,)):
                     continue
                 tmp = f"t{st.tmpc[0]}"
                 st.tmpc[0] += 1
@@ -1770,7 +1844,7 @@ class Lifter:
             src = canon(ops[0])
             addr = _addr(ops)
             if addr is None or addr[1] is _BAD_POST:
-                return [f"{mn} {op}"]
+                return self._verbatim(st, mn, op, op)
             (base, disp, index, scale, wb), post = addr
             val = g(src)
             delta = disp if wb else post     # how far the base register moves, if at all
@@ -1882,8 +1956,7 @@ class Lifter:
             # fmov between an integer and an FP register REINTERPRETS the bits, it does
             # not convert. Modelling it as a move would silently invent a numeric
             # equality, so keep the raw instruction.
-            st.set(dst, V(dst, P_ATOM))
-            return [f"{mn} {op}"]
+            return self._verbatim(st, mn, op, op, dst)
         if mn in ("scvtf", "ucvtf") and len(ops) >= 2 and "." not in ops[1]:
             st.set(canon(ops[0]), V(f"{_wrap(g(canon(ops[1])), P_POST)}.toDouble()", P_POST))
             return []
@@ -1899,13 +1972,13 @@ class Lifter:
             dst = canon(ops[0])
             addr = _addr(ops)
             if addr is None or addr[1] is _BAD_POST:
-                st.set(dst, V(dst, P_ATOM))
-                return [f"{mn} {op}"]
+                return self._verbatim(st, mn, op, op, dst)
             (base, disp, index, scale, wb), post = addr
             delta = disp if wb else post
             if delta and base in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]):
-                st.set(dst, V(dst, P_ATOM))   # writeback into a loaded register: arm64
-                return [f"{mn} {op}"]         # calls it unpredictable, so neither do we
+                # writeback into a loaded register: arm64 calls it unpredictable, so
+                # neither do we
+                return self._verbatim(st, mn, op, op, dst)
             if post:
                 disp = 0                     # post-index: the access is at the OLD base
             if note.startswith("  ; = ") or note.startswith("; = "):
@@ -2158,10 +2231,8 @@ class Lifter:
         # not modelled: emit the raw arm64 (never wrong, no information lost). Of what
         # reaches here only `adr` names a code address, and `show` writes it as a virtual
         # address; the loads, stores and arithmetic kept raw above name none.
-        if dst:
-            st.set(dst, V(dst, P_ATOM))
         shown = self.show(addr, op) if self.show is not None else op
-        return [f"{mn} {shown}".rstrip()]
+        return self._verbatim(st, mn, op, shown, dst)
 
     def _elem_access(self, base_reg, index_reg, scale, st: State, disp: int = 0) -> V:
         """`base[index]` for a computed address, with the displacement folded in where it
@@ -2258,6 +2329,14 @@ class Lifter:
             return False
         return addr not in self._loop_nodes(self._carrying[-1][0])
 
+    def _dominators(self, addr) -> frozenset:
+        """The blocks every path from the entry to `addr` passes through before it."""
+        out, n = set(), self._idom.get(addr)
+        while n is not None and n not in out:
+            out.add(n)
+            n = self._idom.get(n)
+        return frozenset(out)
+
     def _join_kill(self, addr) -> tuple:
         """(registers, slots-too) a block reached by a `goto` may NOT assume it still has.
 
@@ -2331,6 +2410,7 @@ class Lifter:
         self._pend_pair = None
         lines, insns = [], blk.insns
         self._flag_reads = _flags_read(insns)
+        self._last_block, first = addr, st.tmpc[0]
         # Which registers each instruction's result is still needed by. Walked backwards
         # from what is live on the way out of the block, so it covers a value read in a
         # later block as well as one read two instructions on.
@@ -2339,8 +2419,8 @@ class Lifter:
         # memory it reads changes, and doing that for a register nothing reads again would
         # put a dead `var tN = this.field_0x8;` in front of every compound assignment,
         # benchWithdraw's `balance -= amount` grows two of them, one for each register that
-        # mentions the field.
-        if any(t[1] in _CALLS or t[1] in _STORES for t in insns):
+        # mentions the field. And an instruction printed raw can be anywhere (_verbatim).
+        if insns:
             after, m = [0] * len(insns), self._liveout.get(addr, 0)
             for k in range(len(insns) - 1, -1, -1):
                 after[k] = m
@@ -2359,6 +2439,7 @@ class Lifter:
                 st.spill.clear()
         if insns and insns[-1][1] in _CONDB:
             self._flags = None              # cbz and tbz test a register, not the flags
+        self._anchor.update(dict.fromkeys(range(first, st.tmpc[0]), addr))
         falls = blk.term not in ("ret", "br", "bx")
         # Kept for `_reenter`: a block emitted after something that did not fall through
         # needs the state of its own predecessor, not of whatever the tree put above it.
@@ -2457,6 +2538,13 @@ class Lifter:
         """
         pad2 = pad + indent
         bare, named, decls = {}, {}, []
+        # An arm a `goto` jumps into is entered below the declaration, so it cannot leave
+        # the name holding what the declaration gave it (#121); it assigns it itself.
+        entered = {id(lines): any(_LABEL_LINE_RE.match(ln) for ln in lines)
+                   for lines in (tlines, elines)}
+        # ...and one that prints a write to a register has changed it, even where it
+        # ends up spelled as the register again, which is also how the entry value reads.
+        printed = {id(lines): _printed_writes(lines) for lines in (tlines, elines)}
         for r in sorted(a.reg.keys() | b.reg.keys()):
             # A register only one arm tracks holds, on the other path, whatever it came in
             # with, which is the register itself, since anything the map knew before the
@@ -2509,10 +2597,12 @@ class Lifter:
             # both arms assign it, giving one anyway would DUPLICATE the entry expression
             # 506 extra byte-offset field lines on the corpus, paid for a value no path
             # reads. The declaration still dominates every use, so the name is bound.
-            decls.append(f"{pad}var {name};" if all(changed(v) for _l, v in arms)
+            sets = [changed(v) or entered[id(lines)] or r in printed[id(lines)]
+                    for lines, v in arms]
+            decls.append(f"{pad}var {name};" if all(sets)
                          else f"{pad}var {name} = {pre.text};")
-            for lines, v in arms:
-                if changed(v):
+            for (lines, v), assign in zip(arms, sets):
+                if assign:
                     lines.append(pad2 + self._assign(V(name, P_ATOM), v))
         return named, decls
     def _phi_name(self, st: State, r: str) -> str:
@@ -2601,6 +2691,13 @@ class Lifter:
                     kill, mem, heap = self._join_kill(s[1])
                     for r in sorted(kill):
                         st.forget(r)
+                    # A name is declared on the paths through the block its declaration
+                    # stands in, and only those. Naming a value writes no register, so the
+                    # rule above kept a register a pin in a block between had renamed, and
+                    # it read a name the other paths never declared (#121). What a block
+                    # that dominates the join declares is on every path into it.
+                    doms = self._dominators(s[1])
+                    _forget_temps(st, lambda k: self._anchor.get(k) not in doms)
                     if mem:
                         st.slot.clear()
                     else:
@@ -2626,13 +2723,21 @@ class Lifter:
                 _, cond, then, els = s
                 cond_txt = self._cond(cond, st)
                 a, b = st.copy(), st.copy()
+                head = self._last_block if self._last_block is not None else self.entry
                 tlines, tfalls = self.walk(then, a, indent, depth + 1, joins[i])
                 elines, efalls = self.walk(els, b, indent, depth + 1, joins[i])
                 named = {}
                 if tfalls and efalls:
+                    first = st.tmpc[0]
                     named, decls = self._phi(st, a, b, tlines, elines,
                                              self._livein.get(joins[i], 0), pad, indent)
                     out.extend(decls)
+                    # Declared above the `if`, at the end of the block that decides it,
+                    # and set on every path through it. Where a goto enters an arm, that
+                    # arm sets it too, and it is set on every path into the join instead.
+                    entered = any(_LABEL_LINE_RE.match(ln) for ln in tlines + elines)
+                    at = joins[i] if entered and joins[i] is not None else head
+                    self._anchor.update(dict.fromkeys(range(first, st.tmpc[0]), at))
                 out.extend(self._render_if(cond_txt, tlines, elines, pad, indent))
                 if tfalls and efalls:
                     _merge(st, a, b)
@@ -2652,6 +2757,10 @@ class Lifter:
                     falls = False
                 alive = tfalls or efalls
             elif kind == "loop":
+                # Its names are declared right after the statement before it, and only a
+                # block falls straight into them; anything else anchors them nowhere.
+                prev = stmts[i - 1] if i and alive else None
+                self._loop_before = prev[1] if prev and prev[0] == "asm" else None
                 label(s[1])
                 out.extend(self._render_loop(s[1], s[2], st, indent, depth))
                 alive = True
@@ -2720,7 +2829,9 @@ class Lifter:
         # iterating a set made that depend on the per-process hash seed.
         init = {r: st.get(r) for r in sorted(carried)}
         names = {}
+        before = self._loop_before
         for r in sorted(carried):
+            self._anchor[st.tmpc[0]] = before       # declared above the loop
             names[r] = f"t{st.tmpc[0]}"
             st.tmpc[0] += 1
         loop_st = st.copy()
@@ -2763,7 +2874,8 @@ class Lifter:
             # exactly the occurrences this function created and nothing else.
             sub = {names[r]: init[r].text for r in drop}
             pat = re.compile(r"\b(" + "|".join(map(re.escape, sub)) + r")\b")
-            blines = [pat.sub(lambda m: sub[m.group(1)], ln) for ln in blines]
+            blines = [_no_self_holds(pat.sub(lambda m: sub[m.group(1)], ln))
+                      for ln in blines]
             tail = [pat.sub(lambda m: sub[m.group(1)], ln) for ln in tail]
             for r in drop:
                 names.pop(r)
@@ -3134,12 +3246,88 @@ def _inline_single_use(lines: list, names: set) -> list:
             # had nothing defining it. Latent rather than live, 0 of the corpus's 4,642
             # folds collide, but the numbering reaches t10 in 1,600 functions, so it is
             # a coincidence away.
+            # A use in the line's comment (`// x0 holds t4`, _verbatim) is no use to fold
+            # into: the call would leave the code for the comment.
             use = _TMP_RE.findall(nxt)
-            if len(use) == 1 and use[0] == m.group(2):
+            if (len(use) == 1 and use[0] == m.group(2)
+                    and m.group(2) in _TMP_RE.findall(nxt.split("   // ", 1)[0])):
                 out.append(re.sub(rf"\b{m.group(2)}\b", m.group(3).replace("\\", "\\\\"),
                                   nxt))
                 skip = i + 1
                 continue
+        out.append(ln)
+    return out
+
+
+def _no_self_holds(ln: str) -> str:
+    """`ln` without the `x7 holds x7` a raw line's note says once a loop name it held
+    is put back to the register it stood for (_render_loop)."""
+    if " holds " not in ln or "   // " not in ln:
+        return ln
+    code, note = ln.split("   // ", 1)
+    keep = [p for p in re.split(r", (?=\w+ holds )", note)
+            if not re.fullmatch(r"(\w+) holds \1", p)]
+    return f"{code}   // {', '.join(keep)}" if keep else code
+
+
+def _forget_temps(st: State, gone) -> None:
+    """Drop every value in `st` spelled with a temp whose number `gone` is true of."""
+    def late(text):
+        return "t" in text and any(gone(int(m)) for m in _TMP_NUM_RE.findall(text))
+    for r, v in sorted(st.reg.items()):
+        if late(v.text):
+            st.forget(r)
+    for k in [k for k, v in st.slot.items() if late(v.text)]:
+        del st.slot[k]
+    for k, (b, i, _s, _f) in list(st.elem.items()):
+        if late(b.text) or late(i.text):
+            del st.elem[k]
+
+
+_TMP_NUM_RE = re.compile(r"\bt(\d+)\b")
+_RAW_LINE_RE = re.compile(r"\s*([a-z][a-z0-9.]*)(?:\s+(.*?))?(?:\s+//.*)?$")
+_ASSIGN_LINE_RE = re.compile(r"\s*([a-z]\d+) ([-+*&|^]?=) ")
+_NOT_RAW = frozenset({"return", "throw", "rethrow", "break", "continue", "goto", "var"})
+
+
+def _printed_writes(lines: list) -> set:
+    """The machine registers `lines` assign: a raw line's destinations, and the
+    left-hand side of `x4 = x4 + 8;` (_bump)."""
+    out = set()
+    for ln in lines:
+        m = _ASSIGN_LINE_RE.match(ln)
+        if m:
+            out.add(canon(m.group(1)))
+            continue
+        if ln.rstrip().endswith((";", "{", "}", ":")):
+            continue
+        m = _RAW_LINE_RE.match(ln)
+        if m and m.group(1) not in _NOT_RAW:
+            out |= _def_use(m.group(1), m.group(2) or "")[0]
+    return out
+
+
+_LABEL_LINE_RE = re.compile(r"\s*L_0x[0-9a-f]+:$")
+
+
+def _drop_unread(lines: list, names: set) -> list:
+    """Leave out the declaration of each of `names` that nothing else in `lines` reads.
+
+    _verbatim names a value where liveness says a register holding it is read again,
+    and a raw line reads the machine register, not the name. A value whose only reader
+    is another raw line, or `d0` at a `ret` that returns x0, gets a name nothing prints
+    (#118). Reading a field or a register has no side effect to keep."""
+    if not names:
+        return lines
+    counts: dict = {}
+    for ln in lines:
+        for m in _TMP_RE.finditer(ln):
+            counts[m.group(0)] = counts.get(m.group(0), 0) + 1
+    out = []
+    for ln in lines:
+        m = _DECL_RE.match(ln)
+        if m and m.group(2) in names and counts[m.group(2)] == 1:
+            continue
         out.append(ln)
     return out
 
@@ -3255,4 +3443,4 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     lifter.show = show
     lifter.labels = label_targets(stmts)
     lines, _falls = lifter.walk(stmts, State(), indent, depth)
-    return _inline_single_use(lines, lifter.results)
+    return _inline_single_use(_drop_unread(lines, lifter.raw_names), lifter.results)

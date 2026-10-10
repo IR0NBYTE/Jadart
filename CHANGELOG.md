@@ -13,6 +13,47 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A raw line says what the registers it reads hold.** A raw line reads the machine
+  registers it names, and tier 3 holds most registers as expressions it prints only where
+  something reads them, so a register a raw line read could hold a value the printed
+  body never gave it: `add x1, x1, #8; adcs x1, x1, x3` printed the `adcs` alone, which
+  reads as working on the entry x1. The line now says what each such register holds,
+  `adcs x1, x1, x3   // x1 holds x1 + 8`, in a comment rather than an assignment, so the
+  printed body still assigns a register only where the machine's own instruction does.
+  On the clean fixture's `export -t 3` that is 369 raw lines in 207 functions, 114 of
+  them a `subs`, 75 a `br`, 49 an `ands`, 46 a `csel` and 31 an `ldar`; 348 in 191 on
+  3.4.4. A name such a comment reads keeps its declaration, so a call's result it
+  mentions is no longer folded into the next line (`var t3 = lerpDouble(...)`). A
+  flag-setting instruction also no longer names the old value of a destination it does
+  not read, as `subs x1, x0, x2` named x1 (#116). Closes #120.
+- **A name is read only on paths that set it.** Tier 3 read a name on paths that never
+  set it, in three ways. A goto join kept every register no block between wrote, and
+  naming a value writes none, so a call's result or a phi named on one path into the
+  join was read on the others. A phi bound above an `if` with the value from before it
+  was skipped by a `goto` into the arm that left it alone: the clean fixture's
+  `resolveAs` declared `var t1 = x0;` inside an arm two gotos jump into, then read `t1`.
+  And an arm whose raw line or moved pointer left a register printing as itself counted
+  as having left it alone. At a goto join, a value spelled with a name set in a block
+  that does not dominate the join is now forgotten, and an arm a goto enters, or that
+  prints a write to the register, assigns the phi itself. A definite-assignment check
+  over every printed function finds a name read on a path that never set it in 108
+  functions of the clean fixture's `export -t 3` before and 8 after, 114 and 3 on
+  2.19.6, 93 and 3 on 3.4.4, 100 and 7 on 3.10.9, and in no function more often than
+  before. With the changes above and below, tier 3 exports change in 323 functions on
+  the clean fixture (2,499 lines in 65 files), 300 on 3.4.4, 298 on 3.10.9, 287 on
+  2.19.6 and 82 on obf, and the clean export grows from 141,867 to 142,084 lines.
+  Closes #121.
+- **A raw line no longer changes what an earlier value reads as.** An instruction tier 3
+  prints as it is assigns the registers it writes, so a value the lifter still held that
+  was spelled with one of them read as the new value after it: `add x5, x1, #1; subs x1,
+  x1, #8; str x5` printed `x1 + 1` for the old x1. Each such value still read later is
+  named first (`var t0 = x1 + 1;`), as tier 3 already did before a pointer moves, a
+  comparison captured from one is dropped, and every register a raw line writes is
+  forgotten. What it writes is read as the architecture defines it: an `ldp` writes its
+  second register too, a store-release or an atomic store none, an atomic load-op its
+  second register and a compare-and-swap its first, and `st1 {v0.16b}, [x1], x2` moves
+  its base; `br` reads its target. A name only another raw line would read is left out.
+  A value read only as a call's argument is not counted as read yet (#122). Closes #118.
 - **A branch reads the operands its flags were set from.** `subs x1, x1, #8` sets the
   flags from the x1 it is overwriting, and tier 3 rendered the branch after it with the
   x1 that was left: a copy loop in the clean fixture (0x2d32c8) printed `if (x1 == 8)`
