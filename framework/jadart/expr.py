@@ -289,6 +289,12 @@ _ALLOC_TYPE = {"Array": "List", "GrowableArray": "List", "Mint": "int", "Double"
                "Object": "Object", "Context": "Context", "Closure": "Closure"}
 
 
+def _returns_x0(base: str) -> bool:
+    """The suppressed stubs that hand back a value in x0: `InitLate*` the field's,
+    `Await` the awaited one, `InitAsync` and `CloneContext` an object (see _rv_call)."""
+    return base.startswith("InitLate") or base in ("InitAsync", "Await", "CloneContext")
+
+
 def _classify_stub(name: str):
     """(kind, label) for a runtime-stub call target. kind in
     throw|rethrow|throw_err|alloc|suppress|keep."""
@@ -301,7 +307,7 @@ def _classify_stub(name: str):
     if base == "ReThrow":
         return ("rethrow", None)
     if ("WriteBarrier" in base or "TypeTest" in base or base.startswith("StackOverflow")
-            or base.startswith("InitLate") or base in ("InitAsync", "Await", "CloneContext")):
+            or _returns_x0(base)):
         return ("suppress", None)
     if base.endswith("Error"):
         return ("throw_err", base)
@@ -1306,12 +1312,21 @@ def _rv_pop(mn: str, op: str) -> bool:
 
 def _rv_call(mn: str, note: str):
     """False for what is not a call, None for a stub that gives every register back,
-    True for any other call."""
+    True for any other call.
+
+    Not every stub the walk suppresses gives every register back. `Await` returns the
+    awaited value in x0, `InitLate*` the field's value, `InitAsync` and `CloneContext`
+    an object, so to the question of which register a `ret` hands back they are calls:
+    a write to d0 before one is not the last write a `ret` after it sees (#127). `_phi`
+    asks the same question of an arm, and there one of them now writes what a call does
+    where it wrote x0 alone, which can move a name's assignment into the arm."""
     if mn not in ("bl", "blr", "blx"):
         return False
     name = note.split("-> ", 1)[1].strip() if "-> " in note else ""
     if "_iso_stub_" in name and _classify_stub(name)[0] == "suppress":
-        return None
+        m = _STUB_RE.search(name)
+        if not (m and _returns_x0(m.group(1))):
+            return None
     return True
 
 

@@ -60,7 +60,7 @@ def measure(path):
     from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc)
-    from jadart.expr import lift_function, make_arity_resolver
+    from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
     from jadart.fields import recover_fields
     from jadart.program import static_function_refs, receiver_for
@@ -70,6 +70,7 @@ def measure(path):
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     static_refs = static_function_refs(fr)
     arity = make_arity_resolver(image)
+    returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
 
@@ -82,7 +83,7 @@ def measure(path):
         ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
         body = lift_function(ann, pool_map,
                              receiver=receiver_for(cr.owner_ref, static_refs),
-                             arity=arity, selectors=selectors,
+                             arity=arity, selectors=selectors, returns=returns,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref))
         c["functions"] += 1
