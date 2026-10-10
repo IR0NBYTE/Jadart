@@ -12111,6 +12111,39 @@ def test_a_loop_carries_a_register_it_reads_only_as_a_call_argument():
     assert "t0 = t2;" in body, body
 
 
+def test_a_function_that_reads_its_arguments_off_the_stack_has_no_register_arity():
+    # entry_arity counted x1..xN live on entry and gave 0 for a function that reads its
+    # arguments off the stack where it did not recognise the read, so a call to it
+    # printed `_absSub()` over the five values it pushed (#144): a frameless function
+    # reads them off SP, and one indexes them through FP.
+    from jadart.expr import entry_arity, lift_function
+
+    def arity(rows):
+        return entry_arity([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    frame = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15")]
+    assert arity([("ldr", "x0, [x15]"), ("ret", "")]) is None
+    assert arity(frame + [("add", "x1, x29, w0, sxtw #2"), ("ldr", "x1, [x1, #0x28]"),
+                          ("ret", "")]) is None
+    # A frame's own slots off SP are not arguments, nor is a field read, nor a local
+    # below FP read through an index.
+    assert arity(frame + [("sub", "x15, x15, #0x10"), ("ldr", "x0, [x15, #8]"),
+                          ("ldur", "x2, [x1, #7]"), ("ret", "")]) == 1
+    assert arity(frame + [("add", "x3, x29, w2, sxtw #2"), ("ldur", "x3, [x3, #-8]"),
+                          ("ret", "")]) == 0
+    # One that takes registers too keeps their count, as `hash6` does.
+    assert arity([("ldr", "x0, [x15]"), ("ldur", "x2, [x1, #7]"), ("ret", "")]) == 1
+    # and a call to such a function prints what was pushed, or, where a second push
+    # dropped part of it, nothing (#147)
+    def call(rows):
+        rows = rows + [("bl", "#0x100"), ("ret", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+            arity=lambda pc: None)]
+    assert call([("stp", "x6, x7, [x15, #-0x10]!")]) == ["return sub_0x100(x7, x6);"]
+    assert call([("stp", "x6, x7, [x15, #-0x10]!"), ("str", "x5, [x15, #-8]!")]) == [
+        "return sub_0x100(...);"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

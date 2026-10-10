@@ -804,6 +804,11 @@ def _is_lr_spill(reg: str, st: State) -> bool:
     return canon(reg) == lr and lr not in st.reg
 
 
+#: The slot-map key that says a push dropped part of the outgoing area; see
+#: Lifter._frame_moved. It starts with SP's name, so whatever forgets the area forgets it.
+_LOST = "x15?"
+
+
 def _drop_outgoing(st: State):
     """Forget the outgoing-argument area. A call consumes it, and leaving the slots behind
     would let one call's arguments be read back as the next call's."""
@@ -1654,10 +1659,13 @@ class Lifter:
         # optional register aliases (e.g. {"x1": "this"} for an instance method)
         self.alias = dict(receiver or {})
         # arity: pc -> callee register-argument count (None if unknown); enables call-site
-        # argument reconstruction. _args_desc tracks whether R4 (the ArgumentsDescriptor
-        # register) was set in the current block, which marks the stack calling convention.
+        # argument reconstruction. The callee's arity is None where it takes an
+        # arguments descriptor or reads stack arguments (entry_arity), and the call then
+        # prints `...` or what was pushed. A flag for "x4 set in this block" did the job
+        # here once and never fired for a `bl`: the call's own clobber of x4 set it, and
+        # the call cleared it before reading it. Where it could have fired it would have
+        # been wrong, as a descriptor comes with fixed arguments still in x1..xN (#144).
         self.arity = arity
-        self._args_desc = False
         #: The low half of a 64-bit add/sub waiting for its high half; see _pair_step.
         self._pend_pair = None
         #: (mnemonic, base, displacement, register) of the previous memory access, so the
@@ -2352,11 +2360,18 @@ class Lifter:
         Stack slots are keyed by displacement from the CURRENT base, which is the only
         thing the lifter can name. Once the base itself moves, an old key names a
         different address, and reading it back would hand a call the argument of a frame
-        that no longer exists. There is nothing to rename them to, so they go."""
+        that no longer exists. There is nothing to rename them to, so they go.
+
+        A push that drops arguments already stored leaves the outgoing area short, and a
+        call that read the rest as its argument list printed part of it, `_setFlag(true)`
+        for three values pushed (#144, #147): that is recorded, see _stack_args."""
         if not delta:
             return
-        for k in [k for k in st.slot if k.startswith(base)]:
+        gone = [k for k in st.slot if k.startswith(base)]
+        for k in gone:
             del st.slot[k]
+        if delta < 0 and _T.roles.get(base) == "SP" and any(k != _LOST for k in gone):
+            st.slot[_LOST] = V("", P_ATOM)
 
     def _bump(self, st: State, base: str, delta: int) -> list:
         """The base-register update half of a writeback addressing mode.
@@ -2522,8 +2537,7 @@ class Lifter:
         # population (generated closures, and everything in an --obfuscate build) where
         # the argument list is the only thing left to read. Where the target is not a
         # function this can measure, entry_arity still declines and the `...` stands.
-        if ((name and "stub" in name) or self._args_desc
-                or self.arity is None or target is None):
+        if (name and "stub" in name) or self.arity is None or target is None:
             return "..."
         k = self.arity(target)
         if k is None:
@@ -2539,7 +2553,7 @@ class Lifter:
             parts.append(st.reg[r].text)
         return ", ".join(parts)
 
-    def _stack_args(self, st: State, drop_receiver: bool) -> str:
+    def _stack_args(self, st: State, drop_receiver: bool, whole: bool = False) -> str:
         """Arguments a call takes on the stack, or None when they cannot be read off.
 
         Dart passes arguments in registers only when the callee's arity is statically
@@ -2559,6 +2573,8 @@ class Lifter:
 
         Argument zero sits at the HIGHEST slot, so the run reads back downwards; when the
         receiver is already printed as the call's base, it is dropped from the list."""
+        if whole and _LOST in st.slot:
+            return None                 # a push dropped part of it; see _frame_moved
         slots = {}
         sp = next((r for r, v in _T.roles.items() if v == "SP"), "x15")
         for key, val in st.slot.items():
@@ -2658,11 +2674,6 @@ class Lifter:
             if paired is not None:
                 return paired
 
-        # a write to R4 (ArgumentsDescriptor) marks the stack calling convention for the
-        # next call, which does NOT pass its arguments in x1..xN.
-        if "x4" in _def_use(mn, op)[0]:
-            self._args_desc = True
-
         # returns. Dart returns ints and references in R0 and doubles in V0/D0
         # (kReturnReg/kReturnFpuReg). Which one is _return_registers' question, and
         # st.result, whichever was written last, only answers where it has nothing to say.
@@ -2697,12 +2708,11 @@ class Lifter:
             target = _imm(ops[0]) if ops and ops[0].startswith("#") else None
             exc = g(_T.ret_int)        # captured before the call clobbers it (throw)
             st.set(_T.ret_int, V(_T.ret_int, P_ATOM))
-            self._args_desc = False
             # Read the outgoing area BEFORE dropping it, the order `blr` uses. `entry_arity`
             # declines for one reason, that the callee reads its arguments off the stack,
             # which is itself a statement that the caller pushed them. So the values are in
             # the outgoing area, and reading it after the drop always found it empty.
-            pushed = self._stack_args(st, drop_receiver=False)
+            pushed = self._stack_args(st, drop_receiver=False, whole=True)
             # A direct call consumes the outgoing area exactly as an indirect one does.
             # Leaving it behind let a bl's arguments be read back as the arguments of the
             # next blr, a fully fabricated argument list on a call that pushed nothing.
@@ -2746,7 +2756,6 @@ class Lifter:
                 args = pushed
             return pins + self._result(st, f"{call}({args})")
         if mn in ("blr", "blx"):
-            self._args_desc = False
             tgt = canon(ops[0]) if ops else None
             tgt_val = st.reg.get(tgt) if tgt else None
             st.set(_T.ret_int, V(_T.ret_int, P_ATOM))
@@ -3529,7 +3538,6 @@ class Lifter:
     def _lift_block(self, addr, st: State):
         """Return (lines, falls_through) for one basic block, mutating `st`."""
         blk = self.blocks[addr]
-        self._args_desc = False    # ArgumentsDescriptor setup + call live in the same block
         self._flags = None         # flags do not survive into a block from an unknown one
         # Both of these are adjacency claims about consecutive instructions, and adjacency
         # does not survive a branch any more than flag provenance does.
@@ -4253,10 +4261,11 @@ def entry_arity(ann: list):
     (receiver in x1 for instance methods). Returns None when the register count is not
     the signature, so a caller must not claim to know the arguments.
 
-    Two things make it return None rather than a number:
+    These make it return None rather than a number:
 
     * the function reads incoming STACK arguments (`[FP, #>=0x10]`, which is
-      `param_end_from_fp + 1`, the first incoming slot);
+      `param_end_from_fp + 1`, the first incoming slot), or, reading no register, reads
+      them off SP without a frame or through an index computed from FP (#144);
     * X4 is live on entry. X4 is ARGS_DESC_REG, so a function reading it is being handed
       an arguments descriptor, which is exactly the case Dart uses when the signature has
       optional or named parameters and therefore does NOT pass in registers.
@@ -4275,20 +4284,34 @@ def entry_arity(ann: list):
     blocks, entry = build_cfg(stripped, traps=())        # as _lift_function, see there
     if not blocks or entry not in blocks:
         return 0
+    # A function that never moves SP reads its incoming stack arguments off SP itself,
+    # `ldr x0, [x15]`, and one that indexes them computes the address from FP, `add x1,
+    # x29, w0, sxtw #2; ldr x1, [x1, #0x28]`. Where it reads no register as well, it was
+    # taken for a function of no arguments and a call to one printed `f()` over what it
+    # pushed (#144). One that takes some in registers and the rest on the stack, as
+    # `hash6` does, keeps its register count: the stack part is not printed either way.
+    frameless = not any("x15" in _def_use(row[1], row[2])[0] for row in ann)
+    off_stack, indexed = False, set()
     for b in blocks.values():
         for (_a, mn, op, _n) in b.insns:
+            parts = _split_ops(op)
             if mn in _LOADS:
-                parts = _split_ops(op)
                 m = _mem(parts[-1]) if parts else None
                 if m and m[0] == "x29" and m[1] >= 0x10:   # incoming stack argument
                     return None
+                off_stack = off_stack or bool(m and (
+                    frameless and m[0] == "x15" and m[1] >= 0
+                    or m[0] in indexed and m[1] >= 0x10))
+            elif (mn == "add" and len(parts) >= 3 and canon(parts[1]) in ("x29", "x15")
+                    and not parts[2].strip().startswith("#")):
+                indexed.add(canon(parts[0]))          # a local below FP is read below 0
     live = _live_in_header(blocks, set(blocks), entry, None)
     if "x4" in live:                  # ARGS_DESC_REG: the stack convention, not arity
         return None
     k = 0
     while k < len(ARG_REGS) and ARG_REGS[k] in live:
         k += 1
-    return k
+    return None if off_stack and not any(r in live for r in ARG_REGS) else k
 
 
 def make_arity_resolver(image):

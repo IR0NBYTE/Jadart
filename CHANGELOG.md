@@ -13,6 +13,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call to a function that reads its arguments off the stack prints what it pushed.**
+  `entry_arity` counts the registers a function reads on entry and declines where it reads
+  stack arguments off FP, but a frameless function reads them off SP, `ldr x0, [x15]`, and
+  one that indexes them computes the address from FP, `add x1, x29, w0, sxtw #2; ldr x1,
+  [x1, #0x28]`. Where such a function reads no register, it counted 0 and a call to it
+  printed `f()`: `_absSub()` for the five values `_absSubSetSign` pushes. It declines now,
+  and the call prints what was pushed, `_absSub(T5, T0, T6, T7, T8)`. One that reads
+  registers as well keeps their count (#148). A call whose pushed arguments a second push
+  cut short, as `stp ...!; str ...!` does, printed the part left as its argument list,
+  `_doSort(x16)`; it prints `...` now (#147). The check in `_call_args` for an arguments
+  descriptor in x4 never fired for a `bl`, as the call's own clobber of x4 set it and the
+  call cleared it first; it is gone, since the callee's arity already declines where x4 is
+  live on entry, and where it could have fired it would have been wrong, a descriptor
+  coming with the fixed arguments still in x1..xN. Tier 3 exports change in 42 functions
+  on the clean fixture, 35 on 3.4.4 and 37 on 3.10.9, and in 1,324 on 2.19.6, which pushes
+  its arguments that way: 2,691 of the lines it gains are a call printing `...` where it
+  printed part of its arguments. Closes #144.
 - **A loop carries a register it reads only as a call argument.** A loop decides what it
   carries from the registers its body reads before writing, and a call read none, so a
   value passed to a call and set again later in the loop printed as its value from before
