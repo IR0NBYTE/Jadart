@@ -12216,6 +12216,65 @@ def test_a_loop_names_what_it_computed_over_a_raw_write_it_printed():
     assert "x2.field_0x60 = x7;" in body, body
 
 
+def test_a_double_result_read_past_the_next_instruction_is_named():
+    # A call's d0 result read after a reload of x0, or through a join, printed as d0, the
+    # d0 the function was handed (#152), and a `ret` one path reaches from a call and one
+    # from the function's own double printed the x0 phi: `getOffsetX` (#127). Only a call
+    # to a function that returns d0 counts, by its callers or by its own code.
+    from jadart.expr import _read_after_call, lift_function
+
+    def lift(rows, said, own=None):
+        def returns(pc):
+            return said(pc) if callable(said) else said
+        returns.code_d0 = lambda pc: own
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)], returns=returns)]
+    reload = [("bl", "#0x100", "  ; -> foo"), ("ldur", "x0, [x29, #-8]", ""),
+              ("stur", "d0, [x0, #7]", ""), ("ret", "", "")]
+    assert lift(reload, "d0")[0] == "x0.field_0x8 = foo(...);"
+    assert lift(reload, None)[:2] == ["foo(...);", "x0.field_0x8 = d0;"]
+    # Where the callers say nothing, the callee's own code decides (code_d0).
+    assert lift(reload, None, own=True)[0] == "x0.field_0x8 = foo(...);"
+    assert lift(reload, None, own=False)[:2] == ["foo(...);", "x0.field_0x8 = d0;"]
+    mixed = [("cbz", "x1, #0x10", ""), ("bl", "#0x100", "  ; -> foo"), ("b", "#0x14", ""),
+             ("nop", "", ""), ("fmov", "d0, #1.0", ""), ("ret", "", "")]
+    assert lift(mixed, "d0") == ["var t1;", "if (x1 != 0) {", "var t0 = foo(...);",
+                                 "t1 = t0;", "} else {", "t1 = 1.0;", "}", "return t1;"]
+    # Not where a stub's or a register call's d0 may reach the `ret`, on any one path: a
+    # stub's result is an object, and a register call's callee is unknown.
+    three = [("cbz", "x1, #0x14", ""), ("cbz", "x2, #0x1c", ""), mixed[1],
+             ("b", "#0x20", ""), ("nop", "", ""), ("fmov", "d0, #1.0", ""),
+             ("b", "#0x20", ""), ("blr", "x9", ""), ("ret", "", "")]
+    for rows in (mixed[:1] + [("bl", "#0x300", "  ; -> stub _iso_stub_FooStub")]
+                 + mixed[2:], mixed[:1] + [("blr", "x9", "")] + mixed[2:], three):
+        body = lift(rows, "d0")
+        assert not any(ln.endswith(" = 1.0;") or ln == "return d0;" for ln in body), body
+    # A slow path's save of d0 is not a read of it: a call whose double is only saved,
+    # and a throw, which the next slow path's save follows in memory.
+    keep = "  ; -> stub _iso_stub_StackOverflowSharedWithFPURegsStub"
+    saved = [("bl", "#0x100", "  ; -> foo"), ("mov", "x0, x1", ""),
+             ("str", "q0, [x15, #-0x10]!", ""), ("bl", "#0x200", keep),
+             ("ldr", "q0, [x15], #0x10", ""), ("ret", "", "")]
+    assert lift(saved, lambda pc: "d0" if pc == 0x100 else "x0")[0] == "foo(...);"
+    # Nor is the restore, around a stub that gives every register back, a write: the d0
+    # this `ret` hands back is the call's. The `ret` itself prints `d0`, because the
+    # slot the save filled is dropped as x15 moves (#147).
+    assert lift(saved, "d0")[0] == "var t0 = foo(...);"
+    assert _read_after_call([(0, "str", "q0, [x15, #-0x10]!"),
+                             (4, "fmov", "x0, d0")]) is None
+    # A call's argument pushed is a read: `_adjustRect`'s callers pass on its Rect.
+    assert _read_after_call([(0, "stp", "x0, x16, [x15, #-0x10]!")]) == "x0"
+    assert _read_after_call([(0, "str", "d0, [x15, #-8]!")]) == "d0"
+    # A stub, here an unnamed one on the slow path of a loop's stack check, gives every
+    # register back: its callers say nothing, and the loop's d0 is not its result.
+    loop = [("fmov", "d0, #1.0", ""), ("cbz", "x1, #0x18", ""), ("cbz", "x3, #0x20", ""),
+            ("fadd", "d0, d0, d0", ""), ("sub", "x1, x1, #1", ""), ("b", "#0x4", ""),
+            ("stur", "d0, [x2, #7]", ""), ("ret", "", ""), ("bl", "#0x300", ""),
+            ("b", "#0xc", "")]
+    body = lift(loop, None)
+    assert "t4 = d0;" in body and "t0 = t4 + t4;" in body, body
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
