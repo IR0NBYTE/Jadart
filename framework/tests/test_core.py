@@ -12077,6 +12077,26 @@ def test_a_dispatch_offset_other_selectors_share_is_not_named():
     assert ".sel_m0xfeb(...) >> 4" in body and "textScaleFactor" not in body, body
 
 
+def test_a_stub_that_returns_a_value_is_a_call_to_the_return_rule():
+    # The walk suppresses `InitLate*`, `Await`, `InitAsync` and `CloneContext` as it does
+    # the stubs that give every register back, and the return rule took them that way
+    # too: a d0 written before one read as what the `ret` after it hands back. They
+    # return their value in x0 (#127).
+    from jadart.expr import lift_function
+
+    def lift(stub):
+        rows = [("ldur", "d0, [x1, #0xf]", ""), ("fadd", "d0, d0, d0", ""),
+                ("bl", "#0x200", f"  ; -> stub _iso_stub_{stub}Stub"), ("ret", "", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)])]
+    for stub in ("InitLateStaticField", "InitLateFinalInstanceField", "Await",
+                 "InitAsync", "CloneContext"):
+        assert lift(stub) == ["return x0;"], stub
+    # A stub that does give every register back leaves the double where it was.
+    assert lift("StackOverflowSharedWithoutFPURegs") == [
+        "return x1.field_0x10 + x1.field_0x10;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

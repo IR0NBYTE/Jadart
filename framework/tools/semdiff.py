@@ -95,7 +95,7 @@ def lift_named(path, symbol):
     from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                                function_name_by_pc, build_pool_map)
-    from jadart.expr import lift_function, make_arity_resolver
+    from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
     from jadart.fields import recover_fields
 
@@ -106,6 +106,7 @@ def lift_named(path, symbol):
     pc_to_name = function_name_by_pc(image, fr)
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     arity = make_arity_resolver(image)
+    returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
     out = []
@@ -116,6 +117,7 @@ def lift_named(path, symbol):
         ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
         out.extend(lift_function(ann, pool_map,
                                  receiver={"x1": "this"}, arity=arity, selectors=selectors,
+                                 returns=returns,
                                  arch=getattr(image, "arch", None),
                                  fields=layout.for_function(cr.owner_ref)))
     return out

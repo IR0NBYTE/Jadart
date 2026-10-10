@@ -13,6 +13,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A stub that returns a value is a call to the return rule.** The walk suppresses
+  `InitLate*`, `Await`, `InitAsync` and `CloneContext` as it does the stubs that give
+  every register back, and the rule that decides whether a `ret` hands back x0 or d0 took
+  them that way too: a d0 written before one read as what the `ret` after it returns. They
+  return their value in x0, so to that rule they are calls now. No tier 3 export changes
+  on the fixtures. `tools/bench.py` (`lift`), `quality.py` and `semdiff.py` lift with the
+  return rule now, as `export` does: the bench `lift` digest changes, and `quality.py`'s
+  count of bare-register lines on the clean fixture goes from 37,248 to 37,233. Part of
+  #127.
 - **A dispatch offset other selectors share is not named.** The dispatch table is packed
   by row displacement, so selectors whose classes never meet can take the same offset, and
   a call site's immediate does not say which one it calls; the vote gave the offset to the
