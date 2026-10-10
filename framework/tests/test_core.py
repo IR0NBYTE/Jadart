@@ -3729,18 +3729,24 @@ def test_tier34_names_virtual_calls_in_bodies():
     pool_map = build_pool_map(fr)
     arity = make_arity_resolver(image)
     fname = {ref: fr.strings.get(nr, "") for ref, nr, ow, kt in fr.functions}
-    # findRenderObject is `RenderObject? findRenderObject() => renderObject;` upstream:
-    # a single virtual property read, which must come back named.
-    hit = None
-    for ref, cr in image.code_ranges.items():
-        if fname.get(ref) == "findRenderObject":
-            hit = "\n".join(lift_function(
-                _ann(image, disassemble_range(image, cr), pc_to_name, pool_map),
-                pool_map, receiver={"x1": "this"}, arity=arity, selectors=sel))
-            break
-    assert hit is not None, "findRenderObject not present in the corpus"
-    assert "this.renderObject" in hit, hit
-    assert "sel_0x" not in hit, hit
+
+    def lifted(name, pc=None):
+        for ref, cr in image.code_ranges.items():
+            if fname.get(ref) == name and pc in (None, cr.pc_offset):
+                return "\n".join(lift_function(
+                    _ann(image, disassemble_range(image, cr), pc_to_name, pool_map),
+                    pool_map, receiver={"x1": "this"}, arity=arity, selectors=sel))
+        raise AssertionError(f"{name} not present in the corpus")
+    # A `build` that hands its work to a builder held in a field: one virtual call.
+    hit = lifted("build", 0x14a2f0)
+    assert "this.field_0x40.build(" in hit, hit
+    assert "sel_" not in hit, hit
+    # findRenderObject is `RenderObject? findRenderObject() => renderObject;` upstream,
+    # and it was named so until #128: its offset is also the offset of `handleTapUp`,
+    # `encodeMethodCall` and `get:notify`, which the table packs into rows of other
+    # classes, so the immediate alone does not say which one it calls.
+    hit = lifted("findRenderObject")
+    assert "this.sel_" in hit and ".renderObject" not in hit, hit
 
 
 def test_tier34_degrades_honestly_when_names_are_stripped():
@@ -11988,6 +11994,87 @@ def test_a_value_read_only_as_a_call_argument_is_live_up_to_the_call():
                  ("bl", "#0x200")], 2) == [
         "var t0;", "if (x3 != 0) {", "t0 = x2;", "} else {", "t0 = x7;", "}",
         "return sub_0x200(x1, t0);"]
+
+
+def test_a_dispatch_offset_other_selectors_share_is_not_named():
+    # The dispatch table is packed by row displacement, so selectors whose classes never
+    # meet can take the same offset, and a call site's immediate does not say which of
+    # them it calls. The clean build's 0x9c0e8 tests a bool and printed
+    # `.textScaleFactor`, a double getter (#128).
+    from jadart.disasm import (load_instructions, disassemble_range, function_name_by_pc,
+                               build_pool_map)
+    from jadart.expr import lift_function, make_arity_resolver
+    from jadart import dispatch as D
+    image, fr, hdr = load_instructions(CLEAN)
+    sel = D.recover_selectors(image, fr, hdr)
+    assert len(sel) == 133 and "build" in sel.values()
+    # `renderObject` shares -0xff2 with `handleTapUp`, `encodeMethodCall` and
+    # `get:notify`, each defined in a class whose only row is there; `controller.stream`
+    # printed `.maximumSize`, as `_StreamController.stream`, defined in an abstract class,
+    # which has no row of its own, is at that offset too.
+    assert -0xff2 not in sel and "get:maximumSize" not in sel.values()
+    # A function of an abstract class fills its subclasses' rows, not one above its
+    # offset: these names were dropped for a sharer that was not there. And a function
+    # that fits more than one offset is at its own selector's where the vote gives one.
+    for nm in ("get:side", "get:alpha", "isScheme", "updateDependencies", "dispose",
+               "didUpdateWidget"):
+        assert nm in sel.values(), nm
+    # A sharer with no name, or one that fits more than one offset, is a sharer: 122
+    # calls of `.length` printed `.perform()`, `table._checkSum` `.visitChildren`,
+    # `delegate.isSupported` `.asByteData`, `observer.didChangeTextScaleFactor` `.mount`.
+    for nm in ("perform", "decodeMethodCall", "visitChildren", "asByteData", "mount"):
+        assert nm not in sel.values(), nm
+    # -0xfeb is also a Focus getter whose code is a `return false` another function
+    # owns, invisible to the table's functions. The double getter's name is kept, and a
+    # call site that reads the result from x0 is not given it.
+    assert sel.get(-0xfeb) == "get:textScaleFactor"
+    # The placement, on a table small enough to read: A (abstract, cid 10) defines f,
+    # its subclass C (cid 12) overrides f, B (cid 11) inherits it. f fills B's row only,
+    # at offset 5, where g, defined in D (cid 20), sits too; h, in E (cid 30), alone.
+    from types import SimpleNamespace
+    fr0 = SimpleNamespace(
+        classes=[(1, 0, 10, 101), (2, 0, 11, 102), (3, 0, 12, 102), (4, 0, 20, 0),
+                 (5, 0, 30, 0)],
+        types={102: 10}, class_state={10: D._ABSTRACT},
+        functions=[(50, 60, 1, 0), (51, 60, 3, 0), (52, 61, 4, 0), (53, 62, 5, 0)],
+        names={60: "get:f@1", 61: "g", 62: "h"})
+    rows0 = {0: [16], 1: [17], 2: [25], 3: [37]}
+    slots0 = {50: 0, 51: 1, 52: 2, 53: 3}
+    cids0 = {ref: cid for ref, _n, cid, _s in fr0.classes}
+    placed0, _maybe0, _parents0, _defines0 = D._placements(fr0, rows0, slots0, {}, cids0)
+    assert {f[0] for f in placed0[5]} == {"get:f@1", "g"}, dict(placed0)
+    assert {f[0] for f in placed0[7]} == {"h"}, dict(placed0)
+    assert sorted(f[3] for f in placed0[5] if f[0] == "get:f@1") == [50, 51]
+    # A function with no name is another selector, unless a class above it defines the
+    # one at that offset: get:n in N1 (10) and N2 (11) at offset 5 shares it with one in
+    # U (20); M3 (32), below M1, overrides get:m (offset 3) with one.
+    fr1 = SimpleNamespace(
+        classes=[(1, 0, 10, 0), (2, 0, 11, 0), (3, 0, 20, 0), (4, 0, 30, 0),
+                 (5, 0, 31, 0), (6, 0, 32, 106)],
+        types={106: 30}, class_state={}, patch_class={},
+        functions=[(50, 60, 1, 0), (51, 60, 2, 0), (52, 61, 3, 0), (53, 62, 4, 0),
+                   (54, 62, 5, 0), (55, 61, 6, 0)],
+        names={60: "get:n", 61: "", 62: "get:m"},
+        codes=[(0, ref, ci) for ci, ref in enumerate(range(50, 56))])
+    cells = [None] * 40
+    for k, slot in ((15, 0), (16, 1), (25, 2), (33, 3), (34, 4), (35, 5)):
+        cells[k] = slot + 1
+    assert dict(D.build_selector_map(
+        cells, fr1, SimpleNamespace(symbol_names={}, pcs=[], first_code=0))) == {
+        3: "get:m"}
+    # and the symbol table's spelling of a name is the snapshot's selector
+    assert D._selector("get:_foo@0150898") == D._selector("_foo") == "_foo"
+    assert D._selector("hashCode") == D._selector("get:hashCode")
+    if not _capstone_available():
+        _skip("  SKIP the call-site half of the shared offset test (no capstone)")
+    assert -0xfeb in sel.doubles
+    cr = next(c for c in image.code_ranges.values() if c.pc_offset == 0x9c0a8)
+    body = "\n".join(lift_function(
+        _ann(image, disassemble_range(image, cr), function_name_by_pc(image, fr),
+             build_pool_map(fr)),
+        build_pool_map(fr), receiver={"x1": "this"}, arity=make_arity_resolver(image),
+        selectors=sel))
+    assert ".sel_m0xfeb(...) >> 4" in body and "textScaleFactor" not in body, body
 
 
 if __name__ == "__main__":

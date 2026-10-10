@@ -295,14 +295,16 @@ to a source name.
 
 ```
 $ jadart selectors libapp.so
-// 168 virtual-dispatch selectors recovered
+// 133 virtual-dispatch selectors recovered (selector_offset = call-site immediate + 4096)
 
-  _childrenInPaintOrder@153319124   selector_offset=9      call-site imm=-4087
-  _createNode@182492240             selector_offset=63     call-site imm=-4033
+  addListener                              selector_offset=1543    call-site imm=-2553
+  build                                    selector_offset=22392   call-site imm=18296
 ```
 
-So `x2.sel_0x3e2e()` becomes `x2.renderObject()` where the table knows the name, and stays
-`sel_0x3e2e` where it does not.
+So `x2.sel_m0x9f9(...)` becomes `x2.addListener(...)` where the table knows the name, and
+stays `sel_m0x9f9` where it does not. Nor is an offset named that two selectors share: the
+table packs rows of classes that never meet onto one offset, and the immediate alone does
+not say which of them a call reaches.
 
 ## 2.7 Where it refuses
 

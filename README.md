@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 359](https://img.shields.io/badge/tests-359-brightgreen.svg)](#tests)
+[![tests: 360](https://img.shields.io/badge/tests-360-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -181,7 +181,7 @@ Full walkthroughs: [docs/usage.md](docs/usage.md). Per-command help: `jadart <cm
 | 3.1 | call arguments from the callee's register arity, read at the target address and so not dependent on the callee having a recovered name (`benchWithdraw(t8, (x1.field_0x8 >> 1) ~/ 2)`). A call whose result is read gets that result named, so the value can be followed to its use | the stack convention, an arguments descriptor, and a target outside the image print `(...)` rather than a guess |
 | 3.2 | VM runtime stubs rendered as source operations: `throw`, `throw NullCastError()`, `new List()`. Pure machinery is stripped so it never reaches output: frame setup, the stack-overflow check, the write barrier, type tests, and the Smi box-or-tag idiom, which surfaces as a bogus `if (x != x)` if you leave it in | anything else stays a named `bl` |
 | 3.3 | virtual and interface calls attributed to a receiver plus a stable selector offset, `x1.sel_0xb34(...)`. About 74% of dispatch sites recover both | the rest print `(dynamic call)` |
-| 3.4 | that offset resolved to a **source selector name**: `this.renderObject`, `x1.build(...)`. 168 selectors on the clean corpus, naming 28.7% of the dispatch sites that have a recovered offset | names need two agreeing classes AND an untied vote, so the rest keep `sel_0x<off>` |
+| 3.4 | that offset resolved to a **source selector name**: `x2.toString()`, `x2.addListener(...)`. 133 selectors on the clean corpus, naming 23.5% of the dispatch sites that have a recovered offset | names need two agreeing classes, an untied vote AND an offset no other function is known to be placed at, so the rest keep `sel_0x<off>` |
 
 Two things sit outside the tier ladder and matter a lot in practice.
 
@@ -399,7 +399,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 359 tests
+cd framework && python3 -m pytest tests -q     # 360 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```

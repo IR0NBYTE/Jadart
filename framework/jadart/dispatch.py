@@ -30,12 +30,14 @@ immediate `off` and the array index `k` of the row for class `cid` relate as
 
     k = cid + selector_offset,   off = selector_offset - kOriginElement
 
-A method F defined in class C (class id c) necessarily occupies C's own row, so
+A method F defined in a concrete class C (class id c) occupies C's own row, so
 `selector_offset = k - c` for that row. Every class that defines the same selector must
 agree on that number, which both identifies the offset and self-checks it: a name is
 accepted only when at least two independent defining classes agree, and an offset
-claimed by more than one name is dropped. Unrecovered selectors keep the `sel_0x<off>`
-rendering rather than a guess.
+claimed by more than one name goes to the one more classes agree on. An abstract class
+has no row; its functions fill their concrete subclasses' (_placements). And an offset
+other selectors may share is not named at all (#128). Unrecovered selectors keep the
+`sel_0x<off>` rendering rather than a guess.
 """
 from __future__ import annotations
 
@@ -143,10 +145,100 @@ def _slot_names(fr, image) -> dict:
 
 
 #: How many names the last build_selector_map call dropped because their top two
-#: candidate offsets tied. Read by `jadart selectors` so a name that is missing has a
-#: stated reason rather than looking like the recovery quietly got worse. Module state
-#: because the return type is the public contract and stays a plain dict.
+#: candidate offsets tied, for a caller that wants to say why a name is missing. Module
+#: state because the return type is the public contract and stays a dict.
 LAST_AMBIGUOUS = 0
+
+
+#: Class::kAbstractBit in UntaggedClass::state_bits_, after kConstBit, kImplementedBit
+#: and the two-bit finalized and loading fields. Checked on 2.19.6, 3.4.4, 3.10.9 and
+#: 3.12.2: set on every class upstream declares abstract that was looked at (`Widget`,
+#: `State`, `RenderObject`, `Element`, `ShapeBorder`, `MapView`, ...) and clear on every
+#: concrete one (`Text`, `Size`, `Color`, `Focus`, `SystemTextScaler`, ...).
+_ABSTRACT = 1 << 6
+
+
+def _selector(name: str) -> str:
+    """`get:_foo@0150898` -> `_foo`: a name as the selector it spells, whichever of the
+    snapshot and the symbol table wrote it."""
+    return name.split(":", 1)[-1].split("@", 1)[0]
+
+
+class Selectors(dict):
+    """selector offset (or, from recover_selectors, call-site immediate) -> name, and
+    what a call site needs to check the name against: `impls`, the functions the table
+    places under each, and `doubles`, the ones whose implementations hand back a double
+    in d0 (recover_selectors). A plain dict to every reader that does not ask."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.impls: dict = {}
+        self.doubles: frozenset = frozenset()
+
+
+def _placements(fr, rows, func_slot, slot_name, class_cid) -> tuple:
+    """({offset: (name, class id, slot, function) of each function the table places
+    there}, the same for each function that fits there and at another offset too,
+    {class id: its superclass's}, {class id: the names its functions have}).
+
+    A function F defined in class C fills, at its selector's offset, the row of every
+    concrete class at or below C that inherits it, and no other row: an abstract class
+    has none (dispatch_table_generator.cc only fills a concrete class's cells), and a
+    class that defines F's name again, or sits below one that does, has its own. So F's
+    offset is the one at which all of those classes have F in their row. Placing F at
+    the least `row - cid(C)` instead put every function of an abstract class above its
+    offset, beside selectors it does not share a row with.
+    """
+    parent = {}
+    for _ref, _n, cid, sref in fr.classes:
+        sup = fr.types.get(sref)
+        if sup is not None and (sup & 0xFFFFFFFF) != (cid & 0xFFFFFFFF):
+            parent[cid & 0xFFFFFFFF] = sup & 0xFFFFFFFF
+    kids = defaultdict(list)
+    for c, p in parent.items():
+        kids[p].append(c)
+    state = getattr(fr, "class_state", None) or {}
+    concrete = {c for c in class_cid.values() if not state.get(c, 0) & _ABSTRACT}
+    defines = defaultdict(set)                  # class id -> the names it defines
+    owned = []
+    patched = getattr(fr, "patch_class", None) or {}
+    for ref, name_ref, owner_ref, _kt in fr.functions:
+        # A patch class's functions are its class's: Object's `==` lives in one.
+        cid = class_cid.get(owner_ref, class_cid.get(patched.get(owner_ref)))
+        if cid is None:
+            continue
+        slot = func_slot.get(ref)
+        nm = (slot_name.get(slot) if slot is not None else None) or fr.names.get(
+            name_ref, "")
+        defines[cid].add(nm)
+        if slot is not None and rows.get(slot):
+            owned.append((cid, nm, slot, ref))
+    out, maybe = defaultdict(list), defaultdict(list)
+    for cid, nm, slot, ref in owned:
+        heirs, stack, seen = [], [cid], set()
+        while stack:
+            c = stack.pop()
+            if c in seen:
+                continue
+            seen.add(c)
+            if c != cid and nm and nm in defines[c]:
+                continue                        # defines it again: its own row
+            if c in concrete:
+                heirs.append(c)
+            stack.extend(kids.get(c, ()))
+        if not heirs:
+            continue
+        # Identical code is shared between functions, so a slot's rows can be several
+        # functions' rows: the offset is one at which every heir has its row, and where
+        # more than one fits the function is not placed at all.
+        ks, low = set(rows[slot]), min(heirs)
+        fits = [k - low for k in sorted(ks) if all(h + k - low in ks for h in heirs)]
+        if len(fits) == 1:
+            out[fits[0]].append((nm, cid, slot, ref))
+        else:
+            for off in fits:                    # it may be at any of them
+                maybe[off].append((nm, cid, slot, ref))
+    return out, maybe, parent, defines
 
 
 def build_selector_map(entries: list, fr, image,
@@ -169,7 +261,7 @@ def build_selector_map(entries: list, fr, image,
         if ci is not None:
             rows[ci - 1].append(k)
     if not rows:
-        return {}
+        return Selectors()
 
     func_slot = {}                              # function ref -> instructions slot
     for _code_ref, owner_ref, ci in fr.codes:
@@ -202,18 +294,65 @@ def build_selector_map(entries: list, fr, image,
         if n >= min_agree:
             best[nm] = (off, n)
 
-    out, claimed = {}, {}
+    claimed = {}
     for nm, (off, n) in best.items():
         prev = claimed.get(off)
         if prev is None or n > prev[1]:
             claimed[off] = (nm, n)
         elif n == prev[1]:
             claimed[off] = (None, n)            # tie -> ambiguous, drop below
+    # Nor is an offset that other selectors share. The table is packed by row
+    # displacement, so selectors whose classes never meet can take the same offset, and
+    # the immediate at a call site does not say which of them it calls: the clean
+    # build's 0x9c0e8 tests a bool and printed `.textScaleFactor`, whose offset
+    # `Focus._usingExternalFocus` has too (#128). So an offset is named only where every
+    # function the table places there has that one name.
+    # A name is compared as the selector it spells: the symbol table writes `hashCode`
+    # and `_foo` where the snapshot writes `get:hashCode` and `get:_foo@0150898`. A
+    # function with no name is another selector as far as anything here can tell: nine
+    # sit where `perform` was voted, iterables' `length` getters among them, and 122
+    # calls of `.length` printed `.perform()`. So is a function that fits more than one
+    # offset, at each of them.
+    placed, maybe, parent, defines = _placements(fr, rows, func_slot, slot_name,
+                                                 class_cid)
+    # A function that fits more than one offset is at the one its own selector's vote
+    # gives, where that is among them: `MapMixin.toString` fits six, and `toString`'s 67
+    # defining classes say which. At that offset itself it still counts, as another
+    # name may have won it.
+    voted = {_selector(nm): off for nm, (off, _n) in best.items()}
+    fits = defaultdict(set)
+    for off, fs in maybe.items():
+        for f in fs:
+            fits[f[3]].add(off)
+    def elsewhere(f, off):
+        own = voted.get(_selector(f[0])) if f[0] else None
+        return own is not None and own != off and own in fits[f[3]]
+    maybe = {off: [f for f in fs if not elsewhere(f, off)] for off, fs in maybe.items()}
+    out = Selectors()
     for off, (nm, _n) in claimed.items():
-        if nm is not None:
-            out[off] = nm
-    # Surfaced rather than swallowed: `selectors` reports it, so a drop in naming has a
-    # visible cause instead of looking like the recovery got worse.
+        if nm is None:
+            continue
+        sel = _selector(nm)
+        own = [f for f in placed.get(off, ()) if f[0] and _selector(f[0]) == sel]
+
+        def under(cid, sel=sel):
+            seen = set()
+            while cid is not None and cid not in seen:
+                if any(n and _selector(n) == sel for n in defines.get(cid, ())):
+                    return True
+                seen.add(cid)
+                cid = parent.get(cid)
+            return False
+        # A function with no name is the selector where a class at or above its own
+        # defines the selector: that class's cell at the selector's offset is the
+        # selector's.
+        if any(not f[0] and not under(f[1]) or f[0] and _selector(f[0]) != sel
+               for f in placed.get(off, ())):
+            continue
+        if any(not f[0] or _selector(f[0]) != sel for f in maybe.get(off, ())):
+            continue
+        out[off] = nm
+        out.impls[off] = [f[3] for f in own]
     LAST_AMBIGUOUS = ambiguous
     return out
 
@@ -232,4 +371,27 @@ def recover_selectors(image, fr, hdr, origin: int = ORIGIN_ELEMENT_ARM64) -> dic
         return {}
     _pos, entries, _end = found
     sel = build_selector_map(entries, fr, image)
-    return {off - origin: nm for off, nm in sel.items()}
+    out = Selectors({off - origin: nm for off, nm in sel.items()})
+    out.doubles = frozenset(off - origin for off in _doubles(image, sel.impls))
+    return out
+
+
+def _doubles(image, impls: dict) -> set:
+    """The offsets whose selector returns a double in d0, read off the smallest function
+    placed under each. Every override of a selector shares its return convention, so one
+    says it for all; one that cannot be decided says nothing."""
+    from .disasm import MissingDisassembler, UnsupportedArch, disassemble_range
+    from .expr import returns_in_d0
+    out = set()
+    for off, fns in impls.items():
+        crs = [cr for cr in (image.code_ranges.get(f) for f in fns) if cr is not None]
+        if not crs:
+            continue
+        cr = min(crs, key=lambda c: (c.size or 1 << 30, c.pc_offset))
+        try:
+            dis = disassemble_range(image, cr)
+        except (MissingDisassembler, UnsupportedArch):    # no capstone: no tier 3 to tell
+            return set()
+        if dis and returns_in_d0([(a, mn, op, "") for a, mn, op in dis]):
+            out.add(off)
+    return out

@@ -28,7 +28,7 @@ Jadart's own coverage is eighteen epochs and four targets, measured further down
 | Jadart (unified) | clean | 100% | 100% | 100% | per-class decompile view | yes | fail-loud |
 | Jadart (T2) | clean | 100% | 100% | 100% | structured pseudo-Dart (if/else/loop) | yes | fail-loud |
 | Jadart (T3) | clean | 100% | 100% | 100% | pseudo-Dart **expressions** (field/arith/call/return) | yes | fail-loud |
-| Jadart (T3.4) | clean | 100% | 100% | 100% | expressions + **named virtual calls** (`this.renderObject`) | yes | fail-loud |
+| Jadart (T3.4) | clean | 100% | 100% | 100% | expressions + **named virtual calls** (`x2.addListener(...)`) | yes | fail-loud |
 | Blutter | - | pending (WP-5) | | | no (asm) | yes | per-version SDK |
 | Ghidra+scripts | - | pending | | | pseudocode (C) | yes | manual |
 
@@ -164,7 +164,7 @@ table row names a concrete function rather than a bare address.
 
 **Naming, and how it self-checks.** The dispatch register points at `&array[kOriginElement]`
 (4096 on ARM64), so a row for class `cid` sits at `k = cid + selector_offset` and a call site's
-immediate is `selector_offset - kOriginElement`. A method defined in class C necessarily
+immediate is `selector_offset - kOriginElement`. A method defined in a concrete class C
 occupies C's own row, giving `selector_offset = k - cid(C)`; every class defining the same
 selector must independently produce the same number. That redundancy is the check. On the
 corpus `get:hashCode` is corroborated by 127 distinct defining classes, `toString` by 67,
@@ -172,14 +172,31 @@ corpus `get:hashCode` is corroborated by 127 distinct defining classes, `toStrin
 Flutter widget lifecycle, each at its own offset. A name is emitted only with >= 2 agreeing
 classes, and an offset claimed by two names is dropped.
 
-Measured (clean build, 0 exceptions): 168 selectors recovered; of the 1108 dispatch sites
-whose offset is recovered, 318 get a source name (28.7%). It was 209 and 40.2% until the
-vote was required to be untied: `Counter.most_common` had been breaking a tie by insertion
-order, so 144 names rested on which candidate happened to be counted first. Those now stay
-`sel_0x<off>`, which is the honest rendering. `findRenderObject` lifts to
-`x0 = this.renderObject; return x0;`, matching the upstream
-`RenderObject? findRenderObject() => renderObject;`. Property selectors render as accessors
-(`x0 = this.renderObject;`) rather than calls.
+An offset is not always one selector's. The table is packed by row displacement, so two
+selectors whose classes never meet can take the same offset, and the immediate at a call
+site does not say which of them it calls. A function defined in class C fills its
+selector's cell in the row of every concrete class at or below C that inherits it, and no
+other (an abstract class has no row), so its offset is the one at which all of those
+classes have it. An offset is named only where every function placed there spells the one
+selector, a function with no name counting as another one unless a class above it defines
+the selector, and where no function that fits more than one offset fits it unless its own
+selector's vote places it elsewhere: `findRenderObject`'s `renderObject` shares its offset
+with `handleTapUp`, `encodeMethodCall` and `get:notify` and prints `sel_0x<off>`, and the
+offset `perform` had, where 122 calls of `.length` printed `.perform()`, holds nine
+functions with no name, iterables' `length` getters among them. A sharer can also be
+invisible to all that, a getter whose code is a `return false` some other function owns:
+the clean build's `.textScaleFactor`, a double getter, was printed for a call whose result
+is tested as a bool (#128). So where a selector's implementations return a double in d0
+and a call site reads its result from x0, the call is not given the name.
+
+Measured (clean build, 0 exceptions): 133 selectors recovered; of the 2,580 dispatch sites
+whose offset is recovered, 607 have a named offset (23.5%), counted over every function's
+`detect_dispatch` sites; the x0 check leaves 2 of them unnamed. By that count it was 974
+(37.8%) with the 168 names the vote alone accepts; the 318 of 1,108 given here before were
+counted with an older lifter. The vote has to be untied as well: `Counter.most_common` had
+been breaking a tie by insertion order, so 144 names rested on which candidate happened to
+be counted first. Those stay `sel_0x<off>`, which is the honest rendering. Property
+selectors render as accessors (`x0 = this.foo;`) rather than calls.
 
 Two honest limits, both measured rather than assumed. `--obfuscate` builds yield ~1 selector:
 the vote needs identifiers, and obfuscation removes them, so Jadart keeps `sel_0x<off>` instead
