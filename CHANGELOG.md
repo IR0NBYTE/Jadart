@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call's double read past the next instruction is named.** A call's d0 result got a
+  name only where the very next of x0 and d0 an instruction touched was a read of d0.
+  After a reload of x0, an inline box or a join it printed as `d0`, the d0 the function
+  was handed: `BoxConstraints.constrain` stored `d0` as its width, and
+  `_getYShiftPosition` multiplied `d0` for `transform`'s result. A `ret` one path reaches
+  from a call and another from the function's own double was left to the x0 phi, so
+  `getOffsetX` returned `x2.field_0x18` where it returns `_rightOffsetX`'s result. A pass
+  over d0 now finds each call whose double reaches a read or a `ret` that hands d0 back,
+  and names it, where it is a direct call to a function its callers read d0 from, or whose
+  own code hands back d0, and such a `ret` now returns d0. A named stub is not one, and a
+  slow path's save of q0 laid out after a throw no longer reads as the throw's caller
+  reading its result. Tier 3 exports change in 29 functions on the clean fixture, 17 on
+  2.19.6, 26 on 3.4.4 and 31 on 3.10.9. Closes #152, part of #127.
 - **A loop names what it computed over a raw write it printed.** A register a loop writes
   is forgotten at its exits, and prints after the loop as itself, which reads as the last
   value a printed line put in it. Where that was a raw line in the loop, `umulh x7, ...`,

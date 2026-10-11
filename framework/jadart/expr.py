@@ -1318,6 +1318,16 @@ def _rv_pop(mn: str, op: str) -> bool:
     return mn.startswith("ld") and len(ops) >= 3 and ops[-2] == "[x15]"
 
 
+def _rv_push(mn: str, op: str) -> bool:
+    """A store that pushes a whole V register on the Dart stack, `str q0, [x15,
+    #-0x10]!`: the save that a slow path's _rv_pop restores. It keeps the register; it
+    does not use it. A push of an x or d register, `stp x0, x16, [x15, #-0x10]!`, is a
+    call's argument, and reads it."""
+    ops = _split_ops(op)
+    return (mn.startswith("st") and len(ops) >= 2 and ops[0].startswith("q")
+            and ops[-1].endswith("]!") and ops[-1].replace(" ", "").startswith("[x15,"))
+
+
 def _rv_call(mn: str, note: str):
     """False for what is not a call, None for a stub that gives every register back,
     True for any other call.
@@ -1349,7 +1359,7 @@ def returns_in_d0(ann) -> bool:
     return bool(got) and set(got.values()) == {"d0"}
 
 
-def _return_registers(blocks, entry, evidence=None) -> dict:
+def _return_registers(blocks, entry, evidence=None, named=None) -> dict:
     """{ret address: "x0" or "d0"}, the register each `ret` hands back, or {} for a
     function that never writes V0, where nothing below applies and `State.result` stands.
 
@@ -1383,22 +1393,25 @@ def _return_registers(blocks, entry, evidence=None) -> dict:
 
     The lifter names a call's result in x0, so a `ret` returning d0 whose last write on
     every path was a call prints x0: both registers hold that result. Where only SOME
-    paths reach it from a call the `ret` is left to `State.result`, because the lifter's
-    d0 after a call reads as the d0 the function was handed, and a join would print that
-    as what the call's path returns."""
+    paths reach it from a call, the `ret` returns d0 where each such call is one the
+    lifter names the double of (`named`, _d0_callee): `getOffsetX` returns its own sum
+    on one path and `_rightOffsetX`'s result on the other (#127). Through a register or
+    a stub, the lifter's d0 after the call reads as the d0 the function was handed, and
+    a join would print that as what the call's path returns, so it is left to
+    `State.result`."""
     facts = _return_facts(blocks, entry)
     if facts is None:
         return {}
-    at_ret, proven, read = facts
+    at_ret, proven, read, calls = facts
     said = evidence() if evidence is not None else None
     reg = said or ("d0" if proven else None if read else "x0")
     if reg is None:
         return {}
     out = {}
-    for a, (_xw, _down, dcall, last_call) in at_ret.items():
+    for a, (_xw, _down, dcall, last_call, made) in at_ret.items():
         if reg == "x0" or last_call:
             out[a] = "x0"
-        elif not dcall:
+        elif not dcall or named and all(named(*calls[c]) for c in made):
             out[a] = "d0"
     return out
 
@@ -1408,12 +1421,86 @@ def _return_registers(blocks, entry, evidence=None) -> dict:
 _RV_RET, _RV_CALL, _RV_KEEP, _RV_PLAIN = range(4)
 
 
+def _d0_callee(callees):
+    """`(mn, op, note) -> bool`: whether a call is one whose double `_result` names past
+    the next instruction, a direct one to a function that returns d0: its callers read
+    d0 after it (`callees`, make_return_resolver), or, where they say nothing, its own
+    code hands back d0 at every `ret` (returns_in_d0). A named stub is not. An unnamed
+    one reads as a function: the stack-overflow check's gives every register back and
+    a throw's never returns, so their callers read neither register after them
+    (_read_after_call) and neither hands back d0."""
+    own = getattr(callees, "code_d0", None)
+
+    def named(mn, op, note):
+        if callees is None or mn != "bl" or "_iso_stub_" in note:
+            return False
+        target = _imm(op.strip()) if op.strip().startswith("#") else None
+        if target is None:
+            return False
+        said = callees(target)
+        return said == "d0" or said is None and own is not None and own(target)
+    return named
+
+
+def _d0_result_reads(blocks, entry, returned, named) -> frozenset:
+    """The calls whose result in d0 the code goes on to read, of those `named` says are
+    calls to a function that returns d0 (_d0_callee): what one leaves in d0 reaches an
+    instruction that reads it, or a `ret` that hands d0 back (`returned`,
+    _return_registers), with nothing writing d0 on the way. Any other call writes it. A
+    stub that gives every register back keeps it, and so does a slow path's save and
+    restore around one (_rv_push, _rv_pop). A d0 read past the next instruction, after
+    a reload of x0 or a join, was left as d0, the d0 the function was handed (#152,
+    #127). arm64 only, as _rv_def_use is."""
+    if _T is not ARM64:
+        return frozenset()
+    read_, call_, write_ = range(3)
+    rows, insn = {}, {}
+    for b, blk in blocks.items():
+        row = rows[b] = []
+        for (a, mn, op, note) in blk.insns:
+            if mn == "ret":
+                if returned.get(a) == "d0":
+                    row.append((a, read_))
+                continue
+            c = _rv_call(mn, note)
+            if c is not False:
+                if c:
+                    direct = mn == "bl" and "_iso_stub_" not in note
+                    row.append((a, call_ if direct else write_))
+                    insn[a] = (mn, op, note)
+                continue
+            if _rv_push(mn, op) or _rv_pop(mn, op) and op.lstrip().startswith("q"):
+                continue                    # a slow path's save, and its restore
+            defs, uses = _rv_def_use(mn, op)
+            if "d0" in uses:
+                row.append((a, read_))
+            if "d0" in defs:
+                row.append((a, write_))
+    read: set = set()
+    ins = {entry: frozenset()}
+    work = [entry]
+    while work:
+        b = work.pop()
+        cur = ins[b]
+        for a, kind in rows.get(b, ()):
+            if kind == read_:
+                read |= cur
+            else:
+                cur = frozenset((a,)) if kind == call_ else frozenset()
+        for s in blocks[b].succ:
+            if s in blocks and (s not in ins or not cur <= ins[s]):
+                ins[s] = ins.get(s, frozenset()) | cur
+                work.append(s)
+    return frozenset(a for a in read if named(*insn[a]))       # asked only of these
+
+
 def _return_facts(blocks, entry):
     """What the function's own code says about its return register, or None when it
     never writes V0 (or is not arm64): ({ret address: (x0 may be written, the last write
     to d0 may be its own, it may be a call, the last write to either is a call on every
-    path)}, whether the code proves a d0 return, whether a d0 of its own that reaches a
-    `ret` is read by something other than a store). See _return_registers."""
+    path, the calls that may have made the last write to d0)}, whether the code proves a
+    d0 return, whether a d0 of its own that reaches a `ret` is read by something other
+    than a store, {call address: (mnemonic, operands, note)}). See _return_registers."""
     if _T is not ARM64:
         return None
     # Most functions never name V0 at all, and one search over all their operands says
@@ -1423,6 +1510,7 @@ def _return_facts(blocks, entry):
     # Each instruction once: (address, kind, writes x0, writes d0, reads d0, is a store,
     # is a pop of the Dart stack).
     rows = {}
+    calls = {}
     own_d0 = False
     for b, blk in blocks.items():
         row = rows[b] = []
@@ -1434,6 +1522,7 @@ def _return_facts(blocks, entry):
             if c is not False:
                 row.append((a, _RV_CALL if c else _RV_KEEP, False, False, False, False,
                             False))
+                calls[a] = (mn, op, note)
                 continue
             defs, uses = _rv_def_use(mn, op)
             wd = "d0" in defs
@@ -1444,21 +1533,22 @@ def _return_facts(blocks, entry):
         return None
 
     # Forward, per point: x0 may have been written, the last write to d0 may be this
-    # function's own, it may be a call, and on every path the last write to either was a
-    # call. Joined by or, or, or, and.
+    # function's own, it may be a call, on every path the last write to either was a
+    # call, and which calls may have made the last write to d0. Joined by or, or, or,
+    # and, union.
     def step_fwd(state, r):
         kind = r[1]
         if kind == _RV_CALL:
-            return True, False, True, True
+            return True, False, True, True, frozenset((r[0],))
         if kind != _RV_PLAIN:
             return state
         if r[3]:
-            return state[0], True, False, False
+            return state[0], True, False, False, frozenset()
         if r[2]:
-            return True, state[1], state[2], False
+            return True, state[1], state[2], False, state[4]
         return state
 
-    ins = {entry: (False, False, False, False)}
+    ins = {entry: (False, False, False, False, frozenset())}
     work = [entry]
     while work:
         b = work.pop()
@@ -1470,7 +1560,8 @@ def _return_facts(blocks, entry):
                 continue
             old = ins.get(s)
             new = state if old is None else (old[0] or state[0], old[1] or state[1],
-                                              old[2] or state[2], old[3] and state[3])
+                                              old[2] or state[2], old[3] and state[3],
+                                              old[4] | state[4])
             if new != old:
                 ins[s] = new
                 work.append(s)
@@ -1541,7 +1632,7 @@ def _return_facts(blocks, entry):
                     only_ret = True
             live = step_bwd(live, r)
     proven = only_ret or any(not st[0] and st[1] for st in at_ret.values())
-    return at_ret, proven, read
+    return at_ret, proven, read, calls
 def _frame_access(mn: str, op: str):
     """(slot keys, how far FP moves, operands) for a load or store `_step` keeps in the
     slot map, else None. The keys are the ones `_step` files the access under, so an
@@ -1760,6 +1851,10 @@ class Lifter:
         #: and, built at the first `ret`, the register each `ret` hands back (#115).
         self.returns = None
         self._ret_regs = None
+        #: the same resolver for any address, for the calls this function makes; and
+        #: which of them have their double read (_d0_result_reads).
+        self.callees = None
+        self._d0_calls = None
 
     def _clobber_call(self, st: State):
         """Forget every value a call destroys.
@@ -2002,8 +2097,17 @@ class Lifter:
         """{ret address: "x0" or "d0"}, which register each `ret` hands back; see
         _return_registers and make_return_resolver."""
         if self._ret_regs is None:
-            self._ret_regs = _return_registers(self.blocks, self.entry, self.returns)
+            self._ret_regs = _return_registers(self.blocks, self.entry, self.returns,
+                                               _d0_callee(self.callees))
         return self._ret_regs
+
+    def _d0_read(self, addr) -> bool:
+        """Whether what the call at `addr` leaves in d0 is read, where it is a call to a
+        function that returns d0; see _d0_result_reads."""
+        if self._d0_calls is None:
+            self._d0_calls = _d0_result_reads(self.blocks, self.entry, self._returned(),
+                                              _d0_callee(self.callees))
+        return addr in self._d0_calls
 
     def _ret_use(self, addr, us: int) -> int:
         """What the `ret` at `addr` reads as the printed body reads it: the register it
@@ -2308,8 +2412,9 @@ class Lifter:
         `if (d0 > d0)` (#134, #127). Liveness alone does not say it: a `ret` reads both
         registers, so a call followed by `return NULL;` looked like it returned d0."""
         if reg is None:
-            reg = (_T.ret_fp if self._reads_next(_T.ret_fp)
-                   and not self._live_after & _reg_mask((_T.ret_int,)) else _T.ret_int)
+            fp = self._d0_read(self._insns[self._at][0]) or self._reads_next(_T.ret_fp)
+            reg = (_T.ret_fp if fp and not self._live_after & _reg_mask((_T.ret_int,))
+                   else _T.ret_int)
         if self._live_after & _reg_mask((reg,)):
             name = f"t{st.tmpc[0]}"
             st.tmpc[0] += 1
@@ -4414,11 +4519,14 @@ _MAX_SITES = 256
 
 def _read_after_call(rows):
     """"x0" or "d0", whichever the code after a call reads first, or None when it reads
-    neither before writing both, branching, calling again or returning."""
+    neither before writing both, branching, calling again or returning. A push of a
+    whole V register says nothing either (_rv_push): it saves it for a slow path, and
+    follows a call only where the call does not return, a throw laid out before the
+    next slow path, whose `str q0, [x15, #-0x10]!` read as the throw's d0 result."""
     from .disasm import UNDECODABLE
     gone = set()
     for (_a, mn, op) in rows:
-        if mn == "ret":
+        if mn == "ret" or _rv_push(mn, op):
             return None              # handed straight back: says nothing about which
         defs, uses = _rv_def_use(mn, op)
         uses = uses - gone
@@ -4512,6 +4620,20 @@ def make_return_resolver(image):
         cache[k] = val = next(iter(votes)) if len(votes) == 1 else None
         return val
 
+    own: dict = {}
+
+    def code_d0(pc):
+        """Whether the function covering `pc` hands back d0 at every `ret` by its own
+        code (returns_in_d0), for a call to it that no caller's reading decides."""
+        k = covering(pc)
+        if k is None:
+            return False
+        if k not in own:
+            dis = disassemble_range(image, ranges[k])
+            own[k] = bool(dis) and returns_in_d0([(a, m, o, "") for (a, m, o) in dis])
+        return own[k]
+
+    of.code_d0 = code_d0
     return of
 
 
@@ -4978,6 +5100,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.show = show
         if returns is not None:
             lifter.returns = lambda: returns(ann[0][0])
+            lifter.callees = returns
         lifter.labels = label_targets(stmts)
         lifter.keep = keep
         lifter.carry_more = carry or {}
