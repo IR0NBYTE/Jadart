@@ -42,6 +42,7 @@ other selectors may share is not named at all (#128). Unrecovered selectors keep
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from itertools import islice
 
 from .stream import ReadStream, TruncatedSnapshot
 
@@ -168,12 +169,31 @@ class Selectors(dict):
     """selector offset (or, from recover_selectors, call-site immediate) -> name, and
     what a call site needs to check the name against: `impls`, the functions the table
     places under each, and `doubles`, the ones whose implementations hand back a double
-    in d0 (recover_selectors). A plain dict to every reader that does not ask."""
+    in d0 (recover_selectors). `families` has (offset, name) for each of those
+    functions that _one_selector shows to share one selector with the others of that
+    name there, and `entries` the entry pcs of each family, smallest first, for
+    peers(). A plain dict to every reader that does not ask."""
 
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.impls: dict = {}
         self.doubles: frozenset = frozenset()
+        self.families: dict = {}
+        self.entries: dict = {}
+        self._under = None
+
+    def peers(self, pc, limit=None) -> list:
+        """The entry pcs of the other implementations of the selector the table places
+        the function at `pc` under (`families`), smallest first, at most `limit` of
+        them."""
+        if self._under is None or self._under[0] is not self.entries:
+            under: dict = {}
+            for key, pcs in self.entries.items():
+                for p in pcs:
+                    under.setdefault(p, []).append(key)
+            self._under = (self.entries, under)
+        return list(islice((p for key in self._under[1].get(pc, ())
+                            for p in self.entries.get(key, ()) if p != pc), limit))
 
 
 def _placements(fr, rows, func_slot, slot_name, class_cid) -> tuple:
@@ -328,6 +348,12 @@ def build_selector_map(entries: list, fr, image,
         own = voted.get(_selector(f[0])) if f[0] else None
         return own is not None and own != off and own in fits[f[3]]
     maybe = {off: [f for f in fs if not elsewhere(f, off)] for off, fs in maybe.items()}
+    kids = defaultdict(list)
+    for c, p in parent.items():
+        kids[p].append(c)
+    state = getattr(fr, "class_state", None) or {}
+    concrete = {c for c in class_cid.values() if not state.get(c, 0) & _ABSTRACT}
+    budget = [_MAX_FAMILY]
     out = Selectors()
     for off, (nm, _n) in claimed.items():
         if nm is None:
@@ -353,8 +379,81 @@ def build_selector_map(entries: list, fr, image,
             continue
         out[off] = nm
         out.impls[off] = [f[3] for f in own]
+        spelled = defaultdict(list)
+        for f in own:
+            spelled[f[0]].append(f)
+        for name, fs in spelled.items():
+            if len(fs) > 1 and _one_selector(fs, off, entries, parent, kids, concrete,
+                                             budget):
+                out.families.update((f[3], (off, name)) for f in fs)
     LAST_AMBIGUOUS = ambiguous
     return out
+
+
+#: How many classes _one_selector walks, over every offset of one table, before it says
+#: no to the rest. The real builds walk a few thousand.
+_MAX_FAMILY = 1 << 20
+
+
+def _one_selector(fs, off, entries, parent, kids, concrete, budget) -> bool:
+    """Whether the functions `fs`, placed at offset `off` under one name, implement one
+    selector, so that what one returns in says what all do (expr.make_return_resolver's
+    by_table).
+
+    Selectors whose classes never meet can share an offset, and a name:
+    `Animatable.transform` and `ParametricCurve.transform` could sit together, and
+    `_selector` drops a private name's library, so `fs` share one spelling. `budget`, a
+    one-item list, is what is left of _MAX_FAMILY. One selector is introduced by one
+    class, and its functions all sit under it, but the snapshot need not hold that
+    class's own function: `ParametricCurve.transformInternal` is not in the clean
+    build, every class below overrides it. So the functions have to share a class below
+    the top of the hierarchy, and every concrete class at or below the lowest one they
+    share has to hold one of them in its row at `off`. Implementations that meet only
+    through an interface or a mixin share no class below the top, and are left out. Two
+    selectors introduced apart, in classes that meet only higher up, leave the rows of
+    the classes beside theirs to something else; where theirs are the only concrete
+    classes there, nothing here tells them apart."""
+    # The lowest class they share: the first one's line up, then each other one's up to
+    # where it meets that line. Every step is charged to the budget.
+    line, at, cid = [], {}, fs[0][1]
+    while cid is not None and cid not in at:
+        budget[0] -= 1
+        if budget[0] < 0:
+            return False
+        at[cid] = len(line)
+        line.append(cid)
+        cid = parent.get(cid)
+    meet = 0
+    for f in fs[1:]:
+        cid = f[1]
+        while cid is not None and cid not in at:   # a crafted cycle runs out the budget
+            budget[0] -= 1
+            if budget[0] < 0:
+                return False
+            cid = parent.get(cid)
+        if cid not in at:
+            return False
+        meet = max(meet, at[cid])
+    low = line[meet]
+    if parent.get(low) is None:
+        return False
+    slots = {f[2] for f in fs}
+    stack, seen = [low], set()
+    while stack:
+        c = stack.pop()
+        if c in seen:
+            continue
+        seen.add(c)
+        budget[0] -= 1
+        if budget[0] < 0:
+            return False
+        if c in concrete:
+            k = c + off
+            cell = entries[k] if 0 <= k < len(entries) else None
+            if cell is None or cell - 1 not in slots:
+                return False
+        stack.extend(kids.get(c, ()))
+    return True
 
 
 def recover_selectors(image, fr, hdr, origin: int = ORIGIN_ELEMENT_ARM64) -> dict:
@@ -373,6 +472,15 @@ def recover_selectors(image, fr, hdr, origin: int = ORIGIN_ELEMENT_ARM64) -> dic
     sel = build_selector_map(entries, fr, image)
     out = Selectors({off - origin: nm for off, nm in sel.items()})
     out.doubles = frozenset(off - origin for off in _doubles(image, sel.impls))
+    out.families = {f: (off - origin, nm) for f, (off, nm) in sel.families.items()}
+    groups = defaultdict(list)
+    for f, key in out.families.items():
+        cr = image.code_ranges.get(f)
+        if cr is not None:
+            groups[key].append(cr)
+    for key, crs in groups.items():
+        crs.sort(key=lambda c: (c.size or 1 << 30, c.pc_offset))
+        out.entries[key] = tuple(cr.pc_offset for cr in crs)
     return out
 
 
