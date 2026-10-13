@@ -12219,6 +12219,222 @@ def test_a_loop_names_what_it_computed_over_a_raw_write_it_printed():
     assert "x2.field_0x60 = x7;" in body, body
 
 
+def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
+    # A goto out of a loop handed its target the state the walk had at the jump, the
+    # first trip's, where a register the loop writes later still held its value from
+    # before the loop: `x2.field_0x60 = x5 + x1;`, and the CPU leaves on the second trip
+    # with x6 + x1 (#154). The loop forgets such a register at its header.
+    from jadart.expr import lift_function
+
+    def lift(rows, **kw):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, r[0], r[1], r[2] if len(r) > 2 else "") for i, r in enumerate(rows)],
+            **kw)]
+    out = [("stur", "x7, [x2, #95]"), ("ret", "")]
+    loop = [("mov", "x9, #2"), ("cmp", "x9, #1"), ("b.eq", "#0x20"),
+            ("add", "x7, x6, x1"), ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8"),
+            ("ret", "")]
+    body = lift([("add", "x7, x5, x1")] + loop + out)
+    assert body[-3:] == ["L_0x20:", "x2.field_0x60 = x7;", "return x0;"], body
+    # One the loop does not write keeps its value, written after the loop or not.
+    body = lift([("add", "x8, x5, x1")] + loop + [("stur", "x8, [x2, #95]"),
+                                                  ("mov", "x8, #5"), ("ret", "")])
+    assert "x2.field_0x60 = x5 + x1;" in body, body
+    # Written on this trip before the goto, the value is this trip's, as before.
+    body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("add", "x7, x6, x1")]
+                + loop[1:3] + loop[4:] + out)
+    assert "x2.field_0x60 = x6 + x1;" in body, body
+    # Where a printed line writes it, the bare register would read as that line's value,
+    # so the loop carries it, as for a `break` (#123).
+    body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("cmp", "x9, #1"),
+                 ("b.eq", "#0x24"), ("umulh", "x7, x10, x3")] + loop[3:] + out)
+    assert "var t0 = x5 + x1;" in body and body.count("t0 = x6 + x1;") == 2, body
+    assert "x2.field_0x60 = t0;" in body, body
+    # Not where the target does not read it.
+    body = lift([("add", "x8, x5, x1"), ("mov", "x9, #2"), ("cmp", "x9, #1"),
+                 ("b.eq", "#0x24"), ("umulh", "x7, x10, x3")] + loop[3:]
+                + [("stur", "x8, [x2, #95]"), ("ret", "")])
+    assert "x2.field_0x60 = x5 + x1;" in body and "x6 + x1" not in str(body), body
+    # A `break` before the trip writes it still carries it from its value before the
+    # loop, as #123 has it.
+    body = lift([("mov", "x7, #0"), ("mov", "x9, #2"), ("cmp", "x9, #1"),
+                 ("b.eq", "#0x20"), ("umulh", "x7, x10, x3"), ("add", "x7, x5, x1"),
+                 ("sub", "x9, x9, #1"), ("b", "#0x8")] + out)
+    assert "var t0 = 0;" in body and "x2.field_0x60 = t0;" in body, body
+    # ...and from the register where the loop had nothing for it: #123 took that for
+    # the value before the loop, which a bare register is, and the store read the
+    # `umulh` where the CPU has x5 + x1 from the trip before.
+    body = lift([("mov", "x9, #2"), ("cbz", "x3, #0x18"), ("umulh", "x7, x10, x3"),
+                 ("add", "x7, x5, x1"), ("sub", "x3, x3, #1"), ("b", "#0x4")] + out)
+    assert "var t1 = x7;" in body and "x2.field_0x60 = t1;" in body, body
+    # A goto whose target does not read it carries nothing: x7 here is the call's at
+    # the `break`, and the store after the loop reads it bare, as before.
+    body = lift([("mov", "x9, #2"), ("cmp", "x9, #1"), ("b.eq", "#0x2c"),
+                 ("umulh", "x7, x10, x3"), ("bl", "#0x100"), ("cbz", "x0, #0x24"),
+                 ("sub", "x9, x9, #1"), ("b", "#0x4"), ("ret", "")] + out
+                + [("stur", "x8, [x2, #103]"), ("ret", "")])
+    assert "x2.field_0x60 = x7;" in body and "x2.field_0x68 = x8;" in body, body
+    # A join in the loop that names it starts from the register, not that value.
+    body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("cbz", "x3, #0x10"),
+                 ("add", "x7, x6, x1"), ("cmp", "x9, #1"), ("b.eq", "#0x24"),
+                 ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8")] + out[1:] + out)
+    assert "var t1 = x7;" in body and "x2.field_0x60 = t1;" in body, body
+    # A goto out of two loops reads what the outer one wrote, and where a printed line
+    # writes it, the outer loop carries it: on its first trip x8 is still x5 + x1.
+    body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("add", "x10, x9, #3"),
+                 ("cmp", "x10, #1"), ("b.eq", "#0x2c"), ("sub", "x10, x10, #1"),
+                 ("tbz", "x10, #63, #0xc"), ("add", "x7, x6, x1"), ("sub", "x9, x9, #1"),
+                 ("tbz", "x9, #63, #0x8"), ("ret", "")] + out)
+    assert "x2.field_0x60 = x7;" in body, body
+    body = lift([("add", "x8, x5, x1"), ("mov", "x9, #2"), ("mov", "x10, #3"),
+                 ("cmp", "x10, #1"), ("b.eq", "#0x30"), ("sub", "x10, x10, #1"),
+                 ("tbz", "x10, #63, #0xc"), ("umulh", "x8, x6, x1"),
+                 ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8"), ("ret", ""),
+                 ("ret", ""), ("stur", "x8, [x2, #95]"), ("ret", "")])
+    assert "var t0 = x5 + x1;" in body and "x2.field_0x60 = t0;" in body, body
+    # Not a loop the goto stays in: the inner loop's goto into the outer body has the
+    # `umulh` before it on every way there, and the outer loop names nothing.
+    body = lift([("mov", "x9, #2"), ("mov", "x10, #3"), ("umulh", "x7, x6, x1"),
+                 ("cmp", "x10, #1"), ("b.eq", "#0x24"), ("sub", "x10, x10, #1"),
+                 ("tbz", "x10, #63, #0x8"), ("b", "#0x28"), ("ret", ""),
+                 ("stur", "x7, [x2, #95]"), ("sub", "x9, x9, #1"),
+                 ("tbz", "x9, #63, #0x4"), ("ret", "")])
+    assert body[0] == "var t0 = 2;" and "x2.field_0x60 = x7;" in body, body
+    # Nor where the target is a join, here the block the outer loop leaves to as well:
+    # a join starts from what every way in agrees on, so it reads x7 bare whatever the
+    # loops name.
+    body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("mov", "x10, #3"),
+                 ("cmp", "x10, #1"), ("b.eq", "#0x28"), ("umulh", "x7, x6, x1"),
+                 ("sub", "x10, x10, #1"), ("tbz", "x10, #63, #0xc"),
+                 ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8")] + out)
+    assert body[0] == "var t0 = 2;" and "x2.field_0x60 = x7;" in body, body
+    # Not a loop the machine runs twice: the way back is past a trap, and the stack
+    # check's slow path strip_boilerplate cut off is not part of the loop.
+    for mid in (("brk", "#0"), ("nop", "")):
+        body = lift([("add", "x7, x5, x1"), ("cbz", "x3, #0x20"), ("cmp", "x9, #1"),
+                     ("b.eq", "#0x24"), mid, ("add", "x7, x6, x1"), ("b", "#0x4"),
+                     ("ret", ""), ("ret", "")] + out)
+        assert ("x2.field_0x60 = x5 + x1;" in body) == (mid[0] == "brk"), body
+    # Nor does a slot such a header stores to come round with that value (#109).
+    body = lift([("mov", "x5, #3"), ("stur", "x5, [x29, #-8]"),
+                 ("ldur", "x0, [x29, #-8]"), ("stur", "x0, [x2, #7]"),
+                 ("add", "x1, x0, #1"), ("stur", "x1, [x29, #-8]"), ("cbz", "x3, #0x24"),
+                 ("brk", "#0"), ("b", "#0x8"), ("ret", "")])
+    assert "x2.field_0x8 = 3;" in body, body
+    body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("ldr", "x16, [x26, #0x48]"),
+                 ("cmp", "x15, x16"), ("b.ls", "#0x2c"), ("cmp", "x9, #1"),
+                 ("b.eq", "#0x34"), ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8"),
+                 ("ret", ""), ("ret", ""), ("bl", "#0x300"), ("b", "#0x14")] + out)
+    assert "x2.field_0x60 = x5 + x1;" in body, body
+    # A register each trip reloads from the slot it was saved in, after a call takes
+    # it, still holds its value from before the loop: `compareTo` reads x6 so.
+    def reload(mid, call=("bl", "#0x100"), pre=None, reg="x6"):
+        rows = list(pre or [("mov", "x6, #5"), ("stur", "x6, [x29, #-8]")])
+        rows.append(("mov", "x19, #2"))
+        head = len(rows) * 4
+        rows += [("cmp", "x19, #1"), None, call] + mid + [
+            ("sub", "x19, x19, #1"), ("tbz", f"x19, #63, #{head:#x}"), ("ret", "")]
+        rows[head // 4 + 1] = ("b.eq", f"#{len(rows) * 4:#x}")
+        return lift(rows + [("stur", f"{reg}, [x2, #95]"), ("ret", "")])[-2]
+    assert reload([("ldur", "x6, [x29, #-8]")]) == "x2.field_0x60 = 5;"
+    assert reload([("ldur", "x2, [x29, #-8]"), ("mov", "x6, x2")]) == "x2.field_0x60 = 5;"
+    # A store beside the slot leaves it; and a double, reloaded after a call takes d6.
+    for beside in (("stur", "x0, [x29, #-0x10]"), ("stp", "q0, q1, [x29, #-0x30]"),
+                   ("sturb", "w0, [x29, #-9]"), ("sturh", "w0, [x29, #-0xa]"),
+                   ("stur", "w0, [x29, #-0xc]"), ("stur", "x0, [x29]")):
+        assert reload([beside, ("ldur", "x6, [x29, #-8]")]) == (
+            "x2.field_0x60 = 5;"), beside
+    double = [("fmov", "d6, #1.0"), ("stur", "d6, [x29, #-8]")]
+    assert reload([("ldur", "d6, [x29, #-8]")], pre=double, reg="d6") == (
+        "x2.field_0x60 = 1.0;")
+    # Not where the trip stores to any byte of the slot, or through an index; reloads it
+    # from another slot, whole or in a 128-bit load; writes it after the reload; reloads
+    # only half of it; moves FP; or does not reload it at all.
+    for mid, call in (([("ldur", "x6, [x29, #-8]"), ("stur", "x0, [x29, #-8]")], None),
+                      ([("stur", "w0, [x29, #-4]"), ("ldur", "x6, [x29, #-8]")], None),
+                      ([("sturb", "w0, [x29, #-1]"), ("ldur", "x6, [x29, #-8]")], None),
+                      ([("stur", "w0, [x29, #-0xb]"), ("ldur", "x6, [x29, #-8]")], None),
+                      ([("stp", "q0, q1, [x29, #-0x20]"), ("ldur", "x6, [x29, #-8]")],
+                       None),
+                      ([("ldur", "x6, [x29, #-8]"), ("str", "x0, [x29, x3]")], None),
+                      ([("ldur", "x6, [x29, #-0x10]")], ("nop", "")),
+                      ([("ldur", "x6, [x29, #-8]"), ("mov", "x6, x2")], None),
+                      ([("ldur", "w6, [x29, #-8]")], None),
+                      ([("ldur", "x2, [x29, #-8]"), ("mov", "w6, w2")], None),
+                      ([("ldrsw", "x6, [x29, #-8]")], None),
+                      ([("add", "x29, x29, #0x10"), ("ldur", "x6, [x29, #-8]")], None),
+                      ([("nop", "")], None)):
+        assert reload(mid, call or ("bl", "#0x100")) == "x2.field_0x60 = x6;", mid
+    for mid in ([("ldr", "q6, [x29, #-0x20]")], [("ldur", "q6, [x29, #-0x20]")],
+                [("ldp", "q6, q7, [x29, #-0x40]")], [("ldr", "d6, [x29, #-0x20]")]):
+        assert reload(mid, ("nop", ""), double, "d6") == "x2.field_0x60 = d6;", mid
+    # Nor where the register held another value before the loop than the slot it is
+    # reloaded from, or comes round with one the way in did not hand it: x6 = x7 is 9.
+    assert reload([("ldur", "x6, [x29, #-0x10]")], pre=[
+        ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"), ("mov", "x7, #7"),
+        ("stur", "x7, [x29, #-0x10]")]) == "x2.field_0x60 = x6;"
+    assert reload([("mov", "x6, x7"), ("ldur", "x7, [x29, #-8]")], ("nop", ""), [
+        ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"), ("mov", "x7, #9")]) == (
+        "x2.field_0x60 = x6;")
+    # ...or where a frame address reaches a register, and a store through it can change
+    # the slot.
+    assert reload([("ldur", "x6, [x29, #-8]"), ("sub", "x3, x29, #0x10")]) == (
+        "x2.field_0x60 = x6;")
+    # A loop inside that takes it on its own way round, with nothing to reload it, is
+    # one more way back.
+    body = lift([("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"), ("mov", "x19, #2"),
+                 ("cmp", "x19, #1"), ("b.eq", "#0x30"), ("cbz", "x20, #0x24"),
+                 ("bl", "#0x100"), ("b", "#0x14"), ("ret", ""), ("sub", "x19, x19, #1"),
+                 ("tbz", "x19, #63, #0xc"), ("ret", ""), ("stur", "x6, [x2, #95]"),
+                 ("ret", "")])
+    assert "x2.field_0x60 = x6;" in body, body
+    # Nor where the value is spelled with a register or reads memory: the slot holds
+    # `x6 + 1` from before a call took x6 and the register the same text from after,
+    # or the field, which a store in the loop changes and the reload does not.
+    body = lift([("add", "x7, x6, #1"), ("stur", "x7, [x29, #-8]"), ("bl", "#0x100"),
+                 ("add", "x7, x6, #1"), ("mov", "x19, #2"), ("cmp", "x19, #1"),
+                 ("b.eq", "#0x30"), ("bl", "#0x100"), ("ldur", "x7, [x29, #-8]"),
+                 ("sub", "x19, x19, #1"), ("tbz", "x19, #63, #0x14"), ("ret", "")] + out)
+    assert body[-3:] == ["L_0x30:", "x2.field_0x60 = x7;", "return x0;"], body
+    body = lift([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x29, #-8]"), ("mov", "x19, #2"),
+                 ("cmp", "x19, #1"), ("b.eq", "#0x28"), ("ldur", "x7, [x29, #-8]"),
+                 ("stur", "x0, [x1, #7]"), ("sub", "x19, x19, #1"),
+                 ("tbz", "x19, #63, #0xc"), ("ret", "")] + out, receiver={"x1": "this"})
+    assert "x2.field_0x60 = x7;" in body, body
+
+
+def test_a_loop_reload_costs_its_length():
+    # Which registers a trip reloads from their slots was a set of every register and
+    # slot pair, rebuilt at each instruction, so a loop that writes many registers after
+    # many slots took the two counts multiplied: 7.4 s for the first shape here. Then
+    # each frame store in the trip was checked against every slot held: 5.9 s for the
+    # second. One value per register, and a store looks up only the keys it can touch,
+    # so each costs a constant per instruction (#154). Timed, not counted: a count of
+    # the instructions stepped would not have seen the first, whose cost was per
+    # instruction.
+    import time
+    from jadart.expr import lift_function
+    regs = [0, 1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+
+    def shape(slots, body):
+        rows = [("mov", f"x{r}, #5") for r in regs]
+        for i in range(2, slots + 2):
+            rows += [("mov", f"x17, #-{8 * i:#x}"), ("str", "x0, [x29, x17]")]
+        rows.append(("mov", "x19, #2"))
+        head = len(rows) * 4
+        rows += [("cmp", "x19, #1"), None] + body + [("mov", f"x{r}, #1") for r in regs]
+        rows += [("sub", "x19, x19, #1"), ("tbz", f"x19, #63, #{head:#x}"), ("ret", "")]
+        rows[head // 4 + 1] = ("b.eq", f"#{len(rows) * 4:#x}")
+        rows += [("stur", "x0, [x2, #95]"), ("ret", "")]
+        return [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    for ann in (shape(2000, [("mov", f"x14, #{j % 7}") for j in range(8000)]),
+                shape(5000, [("stur", "x14, [x29, #-8]")] * 20000)):
+        start = time.perf_counter()
+        body = lift_function(ann)
+        assert time.perf_counter() - start < 1.5, len(ann)
+        assert body[-2].strip() == "x2.field_0x60 = x0;", body[-2:]
+
+
 def test_a_double_result_read_past_the_next_instruction_is_named():
     # A call's d0 result read after a reload of x0, or through a join, printed as d0, the
     # d0 the function was handed (#152), and a `ret` one path reaches from a call and one

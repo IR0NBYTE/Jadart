@@ -1708,6 +1708,10 @@ def _frame_access(mn: str, op: str):
 
 
 _FRAME_INDEX_RE = re.compile(r"\[(\w+), (x\d+)\]")
+#: A 64-bit general or FP register and nothing else: the source of a plain move; and a
+#: machine register under any spelling, anywhere in a text.
+_REG_ONLY = re.compile(r"[xd](?:3[01]|[12]\d|\d)\Z")
+_ANY_REG = re.compile(r"\b[xwdsqhbv](?:3[01]|[12]\d|\d)\b")
 
 
 def _fold_frame_offsets(blocks) -> None:
@@ -1868,6 +1872,8 @@ class Lifter:
         #: Blocks no path runs to the end of (_ends_path), the dominators of the graph
         #: where they end, and each block's frame stores; see _loop_rewrites.
         self._ended = self._ridom = self._spills = None
+        self._trips: dict = {}
+        self._bodies: dict = {}
         #: (header, {reg: name}, copied) for each loop being walked, innermost last. An
         #: exit inside the body has to write the carried names back itself; see _carry_out.
         self._carrying: list = []
@@ -1891,6 +1897,9 @@ class Lifter:
         #: got; see _render_loop and _lift_function.
         self.carry_more: dict = {}
         self.exit_hazards: dict = {}
+        #: loop header -> {register: the value _render_loop forgot it to at the header},
+        #: for each register the loop writes and does not carry; see _note_goto.
+        self._unset: dict = {}
         self.carry_names: dict = {}
         self._loads = None
         #: () -> "x0" | "d0" | None, what this function's callers read its result from;
@@ -2251,6 +2260,36 @@ class Lifter:
         keys = [k for k in st.slot if bit.get(k, 0) & live]
         if not keys:
             return []
+        nodes = self._trip_nodes(header)
+        if not nodes:
+            return []
+        written, new = None, set()
+        for b in nodes:
+            got = self._spills.get(b)
+            if got is None:
+                got = self._spills[b] = self._block_spills(b)
+            if got is False:
+                return keys               # the frame moves inside a loop: claim nothing
+            for k, r, back in got:
+                if back or k not in st.slot:
+                    continue
+                if written is None:
+                    written = self._written(nodes)
+                if r in written or self._leaf(r, st) != st.slot[k]:
+                    new.add(k)
+        return [k for k in keys if k in new]
+
+    def _trip_nodes(self, header) -> frozenset:
+        """The blocks a second trip round the loop at `header` runs, or none.
+
+        The natural loop of the graph where a block holding a trap or a throw ends: the
+        latches are the predecessors the header dominates there, and the body is what
+        reaches one without passing the header. Empty where no latch comes round, a loop
+        that only the edge past a trap makes, which the machine never runs twice; see
+        _loop_rewrites."""
+        got = self._trips.get(header)
+        if got is not None:
+            return got
         if self._ended is None:
             self._ended = ended = {b for b, blk in self.blocks.items()
                                    if any(_ends_path(t[1], t[3]) for t in blk.insns)}
@@ -2269,27 +2308,128 @@ class Lifter:
         nodes, stack = {header}, [p for p in self._preds.get(header, ())
                                   if p not in ended and dominated(p)]
         if not stack:
-            return []
+            nodes = set()
         while stack:
             n = stack.pop()
             if n not in nodes and n not in ended:
                 nodes.add(n)
                 stack.extend(self._preds.get(n, ()))
-        written, new = None, set()
-        for b in nodes:
-            got = self._spills.get(b)
-            if got is None:
-                got = self._spills[b] = self._block_spills(b)
-            if got is False:
-                return keys               # the frame moves inside a loop: claim nothing
-            for k, r, back in got:
-                if back or k not in st.slot:
-                    continue
-                if written is None:
-                    written = self._written(nodes)
-                if r in written or self._leaf(r, st) != st.slot[k]:
-                    new.add(k)
-        return [k for k in keys if k in new]
+        got = self._trips[header] = frozenset(nodes)
+        return got
+
+    def _trip_body(self, header) -> frozenset:
+        """Those of `_trip_nodes` the header reaches. A stack check's slow path that
+        strip_boilerplate cut off still jumps back into the loop, and its call would
+        count as writing every register the stub gives back."""
+        got = self._bodies.get(header)
+        if got is not None:
+            return got
+        trip = self._trip_nodes(header)
+        seen, stack = set(), [header] if trip else []
+        while stack:
+            n = stack.pop()
+            if n not in seen:
+                seen.add(n)
+                stack.extend(s for s in self.blocks[n].succ if s in trip)
+        got = self._bodies[header] = frozenset(seen)
+        return got
+
+    def _reloads(self, header, trip, st: State, regs) -> set:
+        """Those of `regs` that every trip round the loop at `header` puts back the value
+        they had before it into, reloaded from a frame slot that held it then (#154).
+
+        `_render_loop` forgets at the header each register the loop writes. One the trip
+        writes only with what it had is the exception: a call takes x6 in `compareTo`
+        and the trip reloads it from the slot the comparison was saved in, so the value
+        from before the loop was right at a goto out of it, and forgotten it printed a
+        bare `x6`. So a must-analysis over the trip of which value each register holds,
+        where a value is what an FP slot held before the loop, and a register gets one by
+        a 64-bit load of the slot or a move from a register that holds one. A register
+        keeps its value where it held it before the loop, and the way in and every latch
+        hand it the same one.
+
+        A slot counts where the trip stores no byte of it, and only while the frame stays
+        put: nothing in the trip writes FP, loads or stores with a write-back to it, or
+        stores through an index off it, and no frame address reaches a register anywhere
+        in the function. And only a value whose text names no register and reads no
+        memory: one spelled the same can be a different value where a register or the heap
+        changed in between. Slots of one text hold one value, so a register holds at most
+        one, a block costs its length, and with the header dominating the trip, reverse
+        postorder settles in a few rounds."""
+        fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
+        if fp is None or self._frame_escaped() or fp in self._written(trip):
+            return set()
+        held = {}                       # FP slot -> the text of its value
+        for k, v in st.slot.items():
+            if (k.startswith(fp) and k[len(fp):][:1] in "+-"
+                    and not _ANY_REG.search(v.text) and not _READS_MEMORY.search(v.text)):
+                held[k] = v.text
+        for b in trip:
+            insns = self.blocks[b].insns
+            for i, keys, delta, ops, backs in _frame_accesses(insns):
+                if delta:
+                    return set()
+                if backs is not None and held:
+                    lo = int(keys[0][len(fp):])
+                    _drop_stored(held, fp, lo,
+                                 lo + _store_width(insns[i][1], ops[0]) * len(keys))
+        values = set(held.values())
+        start = {}
+        for r in regs:
+            v = st.get(r)
+            if v.text in values:
+                start[r] = v.text
+        if not start:
+            return set()
+        post, seen, stack = [], {header}, [(header, iter(self.blocks[header].succ))]
+        while stack:
+            n, it = stack[-1]
+            for s in it:
+                if s in trip and s not in seen:
+                    seen.add(s)
+                    stack.append((s, iter(self.blocks[s].succ)))
+                    break
+            else:
+                post.append(n)
+                stack.pop()
+        out: dict = {}
+        changed = True
+        while changed:
+            changed = False
+            for b in reversed(post):
+                ins = [out[p] for p in self._preds.get(b, ()) if p in trip and p in out]
+                if b == header:
+                    ins.append(start)
+                got = self._reload_step(b, _agree(ins), held)
+                if out.get(b) != got:
+                    out[b] = got
+                    changed = True
+        return set(_agree([start] + [out[p] for p in self._preds.get(header, ())
+                                     if p in trip]))
+
+    def _reload_step(self, b, facts: dict, held: dict) -> dict:
+        """`facts`, {register: the slot value it holds}, after block `b`; see _reloads.
+        A 64-bit load or move copies all 64 bits, from a general register or an FP one
+        alike, and any other write, a wider load's included, ends what it held."""
+        facts = dict(facts)
+        for (_a, mn, op, _n) in self.blocks[b].insns:
+            dead = _def_use(mn, op)[0]
+            ops = _split_ops(op) if mn in ("mov", "fmov") else ()
+            if len(ops) == 2 and _REG_ONLY.match(ops[1].strip()):
+                v = facts.get(canon(ops[1]))
+                facts.pop(canon(ops[0]), None)
+                if v is not None:
+                    facts[canon(ops[0])] = v
+                continue
+            for r in dead:
+                facts.pop(r, None)
+            got = _frame_access(mn, op) if mn in ("ldr", "ldur", "ldp") else None
+            if got is not None:
+                keys, _delta, ops = got
+                for k, o in zip(keys, ops):
+                    if k in held and o.strip()[:1] in ("x", "d"):
+                        facts[canon(o)] = held[k]
+        return facts
 
     def _block_spills(self, b):
         """(slot, register, written back) for each frame store in block `b` before
@@ -3667,6 +3807,28 @@ class Lifter:
                                             if st.get(r).text != n)
             self._breakers.setdefault(header, set()).add(st.src)
 
+    def _note_goto(self, addr):
+        """Record the registers a goto out of a loop may hand its target unknown (#154).
+
+        `_render_loop` forgets at the header each register the loop writes and does not
+        carry, and one the trip has not written by the goto reaches it as itself, or as
+        a name a join bound to it. Where the target reads it, that reads as the last value
+        a printed line put there, which can be a raw line's from an earlier trip, the
+        hazard a `break` has (#123). So it is an exit hazard of each loop the goto leaves,
+        and _lift_function carries it there where a printed line writes it. Not of a loop
+        the goto stays in: its target reads the register only where every way there from
+        the header writes it, or the loop would carry it already, so a name there would
+        say nothing a reader needs. Nor where the target is a join: it starts from what
+        every way in agrees on (_reenter, _join_kill), not from the goto's state, so it
+        reads the register bare whatever the loop names."""
+        if len(self._preds.get(addr, ())) != 1:
+            return
+        live = _mask_regs(self._livein.get(addr, 0))
+        for header, _names, _copied in self._carrying:
+            hit = live & self._unset.get(header, {}).keys()
+            if hit and addr not in self._trip_body(header):
+                self.exit_hazards.setdefault(header, set()).update(hit)
+
     def _leaves_loop(self, addr) -> bool:
         """True when a goto to `addr` jumps out of the loop currently being walked."""
         if not self._carrying:
@@ -4186,6 +4348,8 @@ class Lifter:
                 out.append(pad + kind + ";")
                 falls = alive = False
             elif kind == "goto":
+                if self._carrying:
+                    self._note_goto(s[1])
                 if self._leaves_loop(s[1]):
                     out.extend(self._carry_out(st, pad, True, s[1]))
                 out.append(pad + f"goto L_0x{s[1]:x};")
@@ -4258,6 +4422,19 @@ class Lifter:
             loop_st.reg[r] = V(names[r], P_ATOM)
             loop_st.elem.pop(r, None)
             loop_st.poolbase.pop(r, None)
+        # A register the loop writes and does not carry is one no trip reads before
+        # writing it, and on every trip after the first it holds what the last trip left
+        # there, not its value from before the loop. Kept, that value went to the target
+        # of a goto out of the loop: `x2.field_0x60 = x5 + x1;` where the CPU leaves on
+        # the second trip with x6 + x1 (#154). Forgotten, the target reads the register;
+        # see _note_goto for where that is not enough, and _reloads for one every trip
+        # puts its value from before the loop back into.
+        trip = self._trip_body(header)
+        writes = self._written(trip) - _SPECIAL - carried
+        marks = self._unset[header] = {}
+        for r in sorted(writes - self._reloads(header, trip, st, writes)):
+            loop_st.forget(r)
+            marks[r] = loop_st.reg[r]
         # A slot the body stores a new value to holds that value at the top of the next
         # trip, not the one it came in with (#109).
         for k in self._loop_rewrites(header, st):
@@ -4329,14 +4506,17 @@ class Lifter:
         # loop reads it, that is the wrong value: `umulh x7, ...` printed, `add x7, x5,
         # x1` not, and the store after the loop read the `umulh` (#123). The walk is run
         # again with such a register carried, so the breaks name what it holds; see
-        # _lift_function. A goto out of the loop hands its target its own state (_arrive).
+        # _lift_function. So too where a break leaves before the trip writes it: it holds
+        # what the header forgot, and that was the last trip's (#154). A goto out of the
+        # loop hands its target its own state (_arrive, _note_goto).
         for n in sorted(self._breakers.get(header, ())):
             left = self._exit.get(n)
             for s in self.blocks[n].succ:
                 if s in nodes or left is None:
                     continue
                 for r in (written - carried) & _mask_regs(self._livein.get(s, 0)):
-                    if left.get(r).text != r:
+                    v = left.get(r)
+                    if v.text != r or (r in marks and v is marks[r]):
                         self.exit_hazards.setdefault(header, set()).add(r)
         # ...except the ones that got a name, whose value after the loop is that variable.
         # That is the second half of naming it: forgetting it here would put the machine
@@ -5025,6 +5205,29 @@ def _stmt_blocks(stmts, blocks) -> set:
                 out.add(s[1])
                 todo.append(s[2])
     return out
+
+
+def _agree(maps: list) -> dict:
+    """The entries all of `maps` hold alike."""
+    return {k: v for k, v in maps[0].items() if all(m.get(k) == v for m in maps)}
+
+
+def _drop_stored(held: dict, fp: str, lo: int, hi: int):
+    """Drop from `held`, FP slots of 8 bytes keyed as `State.slot` is, each one a store to
+    bytes `lo` to `hi` of the frame writes any of. A slot starts at most 7 below `lo`, so
+    this looks up a fixed number of keys, not every slot held (#154)."""
+    for off in range(lo - 7, hi):
+        held.pop(f"{fp}{off:+d}", None)
+
+
+def _store_width(mn: str, reg: str) -> int:
+    """The bytes a store of `reg` with `mn` writes, per register: a q register's 16
+    where the spelling says nothing narrower."""
+    if mn in ("strb", "sturb"):
+        return 1
+    if mn in ("strh", "sturh"):
+        return 2
+    return {"x": 8, "d": 8, "w": 4, "s": 4, "h": 2, "b": 1}.get(reg.strip()[:1], 16)
 
 
 def _printed_writes(lines: list) -> set:

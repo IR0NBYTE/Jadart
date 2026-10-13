@@ -13,6 +13,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A goto out of a loop hands on what the last trip left.** A goto out of a loop handed
+  its target the state the walk had at the jump, which is the first trip's: a register the
+  loop writes further down still held its value from before the loop, so the target of a
+  `b.eq` out of a counted loop stored `x5 + x1` where the CPU, leaving on the second trip,
+  holds `x6 + x1`. A loop now forgets at its header each register it writes and does not
+  carry, and the target reads the register. Where a printed line writes it, the bare
+  register would read as that line's value, so each loop the goto leaves carries it where
+  the goto is the target's only way in, as for a `break` (#123), now also for a `break`
+  that leaves before the trip writes it. A register each trip reloads, through 64-bit
+  loads and moves, from a frame slot that held its value before the loop and that the trip
+  does not store to, keeps that value: a call in `compareTo`'s loop takes x6, and each
+  trip reloads it. Only the loop a second trip runs counts, not a way back past a trap or
+  a throw, nor a stack check's slow path that the boilerplate strip cut off. Tier 3
+  exports change in `_removeDotSegments` and `_normalizeRelativePath` on the clean fixture
+  and 3.10.9, and in `_removeDotSegments` on 3.4.4, where a flag the loop sets printed as
+  the `false` it starts as; none on 2.19.6 or obf. Closes #154.
 - **A call to a function with register and stack arguments prints both.** A Dart function
   that takes register arguments gets its first six integer and object arguments in x1, x2,
   x3, x5, x6 and x7, its first six unboxed doubles in V0 to V5, and the rest on the stack,
