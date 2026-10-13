@@ -13,6 +13,35 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call to a function with register and stack arguments prints both.** A Dart function
+  that takes register arguments gets its first six integer and object arguments in x1, x2,
+  x3, x5, x6 and x7, its first six unboxed doubles in V0 to V5, and the rest on the stack,
+  the last one at SP+0. Some take none in registers, closures, generic functions and
+  dispatchers among them. A callee that reads both registers and the stack had two answers
+  from `entry_arity`, and the call printed one part as the whole list: framed, only what
+  was pushed, `_addEntry(x2)` and `GlyphInfo._(x16, x30)`; frameless, as `hash6` to
+  `hash20` are, only its registers (no export prints a call to one). `entry_arity` now
+  gives such a callee a `StackArity`, its register count, how many stack slots it reads
+  and whether it is handed a double in a V register. The call prints its six register
+  arguments and then all that was pushed, `GlyphInfo._(t0, x2, x3, x5, x6, x7, x16, x30)`,
+  and `...` where the list is not known: fewer than six registers read, a double handed
+  over beside them, fewer values pushed than it reads or none, a stack read through an
+  index computed from FP, or a callee the instruction cut stops short, neither of which
+  says how far up it reads, or a register argument the caller holds no value for. A double
+  counts as handed over where the callee reads d0 to d5 before writing them, or hands d0
+  back at a `ret` no call and no write to x0 can come before. One that only hands a double
+  on to a call, or hands it back after a write to x0, is not seen to take one. On the
+  fixtures none is handed one: where a callee whose call prints a full list could hand d0
+  to d5 on or back, every call to it finds them left there by a call that returns no
+  double, and none returns in d0. A callee that reads only registers no longer takes what
+  was pushed for its list where they are not known: 3.4.4's `contains` printed
+  `contains(0)`, a value its callee never reads, and prints `contains(...)`. An address
+  computed from FP and then overwritten is not taken for a read of arguments through it,
+  or a `sync*` method that takes only `this`, as `_childrenInPaintOrder` does, would look
+  like such a callee. Tier 3 exports change in 28 functions on the clean fixture, 27 on
+  3.4.4 and 31 on 3.10.9, and in none on 2.19.6 or obf. 19 or 20 calls a build print both
+  parts, each with as many pushed values as its callee reads, and 8 to 12 print `...`
+  where they printed one part. Closes #148.
 - **A function that hands back its double argument returns d0.** One that never writes d0
   had no rule of its own code to decide which register its `ret` hands back, so
   `Curve.transform`, which returns its argument where it is 0.0 or 1.0, printed
