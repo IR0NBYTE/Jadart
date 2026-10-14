@@ -828,11 +828,11 @@ def test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology():
 
 
 def _then_forget(rows):
-    """`rows`, then a loop that calls and stores to the frame, after which the walk
-    forgets every slot, then a reload of [x29, #-0x10] to return. A name given to a
-    spill in `rows` is then read only by what `rows` print."""
+    """`rows`, then a loop that calls and stores over half of [x29, #-0x10], after which
+    the walk forgets that slot, then a reload of it to return. A name given to a spill
+    in `rows` is then read only by what `rows` print."""
     h = len(rows) + 1
-    return rows + [("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x18]"),
+    return rows + [("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0xc]"),
                    ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", f"#{h * 4:#x}"),
                    ("ldur", "x0, [x29, #-0x10]"), ("ret", "")]
 
@@ -899,6 +899,13 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
     # be a declaration for nothing.
     from jadart.cfg import build_cfg
     from jadart.expr import Lifter, lift_function, strip_boilerplate
+
+    def named(rows):
+        """Whether `_slot_crossings` names a spill in `rows`, as (mnemonic, operands) or
+        as annotated rows."""
+        ann = [r if len(r) == 4 else (i * 4, r[0], r[1], "") for i, r in enumerate(rows)]
+        blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+        return bool(Lifter(blocks, entry=entry)._slot_crossings())
     for why, rows, want in (
             ("no call before the reload",
              [("ldur", "x0, [x29, #-0x10]"), ("ret", "")], "return x20.field_0xc;"),
@@ -910,10 +917,10 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
               ("ldur", "x0, [x29, #-0x10]"), ("ret", "")], "return 3;"),
             ("a stub call is no call: it keeps the heap",
              [("bl", "#0x100"), ("ldur", "x0, [x29, #-0x10]"), ("ret", "")], None),
-            # The walk forgets the slots after a loop that stores to the frame, so the
+            # The walk forgets a slot after a loop that stores over part of it, so the
             # reload prints the register and the name would be read by nothing.
             ("the reload prints as the register",
-             [("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x18]"),
+             [("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0xc]"),
               ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0xc"),
               ("ldur", "x0, [x29, #-0x10]"), ("ret", "")], "return x0;")):
         rows = [("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]")] + rows
@@ -924,19 +931,24 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
         assert "var " not in body and not re.search(r"\{\n\s*\}", body), (why, body)
         assert "return " + ("x20.field_0xc;" if want is None else want[7:]) in body, (
             why, body)
-        if "prints as" not in why:
-            # Not named at all, rather than named and then found unread.
-            blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
-            assert not Lifter(blocks, entry=entry)._slot_crossings(), why
+        # Not named at all, rather than named and then found unread; and the other way
+        # round where the loop stores over the slot (#157).
+        assert named(ann) == ("prints as" in why), why
     # A name read only by the declaration of another that nothing reads goes with it:
-    # the second spill is of a field of the first, and its reload is forgotten.
+    # the second spill is of a field of the first, and the loop stores over its slot.
     body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
                       ("bl", "#0x100"), ("ldur", "x2, [x29, #-0x10]"),
                       ("ldur", "w5, [x2, #0xb]"), ("stur", "x5, [x29, #-0x18]"),
-                      ("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x20]"),
+                      ("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x14]"),
                       ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0x1c"),
                       ("ldur", "x0, [x29, #-0x18]"), ("ret", "")])
     assert "var " not in body and "return x0;" in body, body
+    assert named([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                  ("bl", "#0x100"), ("ldur", "x2, [x29, #-0x10]"),
+                  ("ldur", "w5, [x2, #0xb]"), ("stur", "x5, [x29, #-0x18]"),
+                  ("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0x14]"),
+                  ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0x1c"),
+                  ("ldur", "x0, [x29, #-0x18]"), ("ret", "")])
     # Each arm spills its own field, the join forgets the slot they disagree on, and the
     # names are read by nothing. Where a name is all its arm holds it stays, not leaving
     # the arm empty; lifting again without the names instead printed the field read again
@@ -977,16 +989,22 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
     # than the field did, and folds back into it like a call's result does.
     body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
                       ("cbz", "x4, #0x10"), ("bl", "#0x200"), ("mov", "x6, #0"),
-                      ("bl", "#0x100"), ("stur", "x6, [x29, #-0x18]"),
+                      ("bl", "#0x100"), ("stur", "x6, [x29, #-0xc]"),
                       ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0x14"),
                       ("ldur", "x0, [x29, #-0x10]"), ("ret", "")])
     assert "var " not in body and "if (x20.field_0xc != 0) {" in body, body
+    assert named([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
+                  ("cbz", "x4, #0x10"), ("bl", "#0x200"), ("mov", "x6, #0"),
+                  ("bl", "#0x100"), ("stur", "x6, [x29, #-0xc]"),
+                  ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", "#0x14"),
+                  ("ldur", "x0, [x29, #-0x10]"), ("ret", "")])
     # In brackets where it is more than one term, whatever the operator: `t0 * x6` is not
     # `a + 1 * x6`, and the precedence table holds no `/` or `>>>` to ask; see the CPU
     # check of these below.
     for rows, want in _FOLDS:
         body = _lift_asm(_then_forget(rows))
         assert want in body and "var " not in body, (want, body)
+        assert named(_then_forget(rows)), want              # named, then found unread
     # ...and a value that reads no memory cannot be changed by the callee.
     body = _lift_asm([("add", "x4, x19, #1"), ("stur", "x4, [x29, #-0x10]"),
                       ("bl", "#0x100"), ("ldur", "x0, [x29, #-0x10]"), ("ret", "")])
@@ -12873,6 +12891,157 @@ def test_a_call_to_a_function_with_register_and_stack_arguments_prints_both():
         got = make_arity_resolver(image)(0)
         assert isinstance(got, StackArity) and (got, got.need) == (6, need), pad
 
+
+def test_a_slot_the_loop_does_not_store_to_survives_it():
+    # A loop's exit dropped every frame slot where any block of `_loop_nodes` stored to
+    # the frame, and those take in the blocks before the loop (#129). So a slot saved at
+    # entry read back after the loop as the register it was reloaded into:
+    # `_contentWidthFor` compares its first double argument and printed `d1 > t2`, which
+    # reads as the second (#157). The exit now drops only the slots the loop's own blocks
+    # may have stored to.
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, r[0], r[1], "") for i, r in enumerate(rows)])]
+
+    # `_contentWidthFor`'s shape: the doubles saved, then a stack check whose slow path,
+    # laid out after a throw, jumps back past the check. That makes a loop the machine
+    # runs once: the edge in is past the `brk`.
+    check = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"), ("b.ls", "#0x44")]
+    head = [("stur", "d0, [x29, #-0x18]"), ("stur", "d1, [x29, #-0x20]")]
+    body = [("ldur", "x0, [x1, #7]"), ("stur", "x0, [x29, #-0x10]"),
+            ("cbz", "x0, #0x38"), ("ldur", "d1, [x29, #-0x18]"),
+            ("stur", "d1, [x2, #15]"), ("ldur", "x3, [x29, #-0x10]"),
+            ("stur", "x3, [x2, #23]"), ("mov", "x0, #0"), ("ret", "")]
+    throw = [("str", "x16, [x15]"), ("bl", "#0x300"), ("brk", "#0")]
+    slow = [("bl", "#0x200"), ("b", "#0x14")]
+    out = lift(head + check + body + throw + slow)
+    assert "x2.field_0x10 = d0;" in out, out
+    # The slot the loop stores to is still forgotten, and the reload reads its register.
+    assert "x2.field_0x18 = x3;" in out, out
+    # The throw's call writes x1, which the loop carries for it; the slot saved from x1
+    # holds it all the same.
+    out = lift([head[0], ("stur", "x1, [x29, #-8]")] + check + body[:5]
+               + [("ldur", "x3, [x29, #-8]")] + body[6:] + throw + slow)
+    assert "x2.field_0x10 = d0;" in out and "x2.field_0x18 = x1;" in out, out
+    # A store in the throw's block counts, as a handler the graph does not show could
+    # run after it.
+    out = lift(head + check + body + [("stur", "x16, [x29, #-0x18]")] + throw[1:] + slow)
+    assert "x2.field_0x10 = d1;" in out, out
+
+    # A loop of its own, counting down in x9: the slot at -0x20 holds d0 from before it.
+    def counted(*inside, before=(("stur", "d0, [x29, #-0x20]"),)):
+        rows = list(before) + [("mov", "x9, #3")] + list(inside)
+        rows += [("sub", "x9, x9, #1"), ("cbnz", "x9, #%#x" % (4 * (len(before) + 1))),
+                 ("ldur", "x6, [x29, #-0x20]"), ("stur", "x6, [x2, #15]"), ("ret", "")]
+        return lift(rows)
+
+    def kept(*inside, **kw):
+        out = counted(*inside, **kw)
+        return "x2.field_0x10 = d0;" in out
+    assert kept(("add", "x5, x5, #1"))                     # it stores nothing
+    assert kept(("ldur", "x5, [x29, #-0x20]"))             # it reads it
+    assert kept(("stur", "x5, [x29, #-0x18]"))             # the slot above
+    assert kept(("stur", "x5, [x29, #-0x28]"))             # the slot below
+    assert kept(("stur", "w5, [x29, #-0x24]"))             # 4 bytes, ending below it
+    assert kept(("stp", "q5, q6, [x29, #-0x40]"))          # 32 bytes up to it
+    assert kept(("str", "x5, [x15]"))                      # the outgoing area
+    assert not kept(("stur", "x5, [x29, #-0x20]"))         # the slot itself
+    assert not kept(("stur", "w5, [x29, #-0x1c]"))         # its top half
+    assert not kept(("stur", "w5, [x29, #-0x22]"))         # straddling its bottom
+    assert not kept(("stp", "x5, x6, [x29, #-0x28]"))      # a pair over it
+    assert not kept(("stp", "q5, q6, [x29, #-0x30]"))      # 32 bytes over it
+    assert not kept(("str", "x5, [x29, x7]"))              # a place not known
+    assert not kept(("str", "x5, [x9], x10"))              # an update not read
+    assert not kept(("str", "x5, [x29, #-8]!"))            # the frame moves
+    assert not kept(("add", "x29, x29, #0x10"))            # and so
+    assert not kept(("add", "x9, x29, #0x10"), ("str", "x5, [x9]"))   # its address out
+    # The blocks with a trap or a throw can be asked for before any trip is.
+    from jadart.cfg import build_cfg
+    from jadart.expr import Lifter
+    rows = [("stur", "d0, [x29, #-0x20]"), ("mov", "x9, #3"), ("sub", "x9, x9, #1"),
+            ("cbnz", "x9, #0x8"), ("ret", "")]
+    blocks, entry = build_cfg([(i * 4, m, o, "") for i, (m, o) in enumerate(rows)],
+                              traps=())
+    lifter = Lifter(blocks, entry=entry)
+    assert lifter._ended_blocks() == set() and lifter._trip_nodes(8) == {8}
+    # A slot a q register filled is 16 bytes, and a store over its top half drops it.
+    def wide(store):
+        return lift([("stur", "q0, [x29, #-0x20]"), ("mov", "x9, #3"), store,
+                     ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"),
+                     ("ldur", "q1, [x29, #-0x20]"), ("stur", "q1, [x2, #15]"),
+                     ("ret", "")])
+    assert "x2.field_0x10 = q1;" in wide(("stur", "x5, [x29, #-0x18]"))
+    assert "x2.field_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x10]"))
+    assert "x2.field_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x28]"))
+    # The outgoing area goes whatever the loop does: a call in it takes what was pushed,
+    # and the call after it printed the 7 for its arguments.
+    out = lift([("mov", "x5, #7"), ("str", "x5, [x15]"), ("mov", "x9, #3"),
+                ("bl", "#0x100"), ("sub", "x9, x9, #1"), ("cbnz", "x9, #0xc"),
+                ("bl", "#0x200"), ("ret", "")])
+    assert out[-1] == "return sub_0x200(...);", out
+    for inside in (("add", "x8, x8, #1"), ("str", "x6, [x15, #8]")):
+        out = lift([("str", "x5, [x15, #8]"), ("mov", "x9, #3"), inside,
+                    ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"), ("ldr", "x7, [x15, #8]"),
+                    ("stur", "x7, [x2, #15]"), ("ret", "")])
+        assert "x2.field_0x10 = x7;" in out, out
+    # A text that reads memory goes where the loop stores to memory or calls, and one
+    # that names a register where the loop writes it.
+    field = (("ldur", "x4, [x1, #7]"), ("stur", "x4, [x29, #-0x20]"))
+    out = counted(("add", "x5, x5, #1"), before=field)
+    assert "x2.field_0x10 = x1.field_0x8;" in out, out
+    out = counted(("stur", "x5, [x1, #7]"), before=field)
+    assert "x2.field_0x10 = x6;" in out, out
+    # Across a call it has a name from before the loop (_slot_crossings), which holds.
+    out = counted(("bl", "#0x100"), before=field)
+    assert out[0] == "var t0 = x1.field_0x8;" and "x2.field_0x10 = t0;" in out, out
+    # Nor where the register is written between the store and the loop: the text is
+    # still spelled with it after (#140), as `_lShiftDigits`'s `x2 + x3 ~/ 32 + 1` was
+    # beside the x3 it had loaded since.
+    out = counted(("add", "x8, x8, #1"), before=(
+        ("add", "x4, x2, #1"), ("stur", "x4, [x29, #-0x20]"), ("ldur", "x2, [x2, #7]")))
+    assert "x2.field_0x10 = x6;" in out, out
+    reg = (("stur", "x5, [x29, #-0x20]"),)
+    assert "x2.field_0x10 = x5;" in counted(("add", "x7, x7, #1"), before=reg)
+    out = counted(("add", "x5, x5, #1"), before=reg)
+    assert "x2.field_0x10 = x6;" in out, out
+
+    # A loop's own stack check: its slow path, laid out after the `ret`, is a block
+    # nothing reaches that jumps into the body, which could be a handler the graph has
+    # no edge into. It is the check's, so its stub hands every register back and
+    # touches no field; another block in its place counts as writing what its call
+    # does, d0 among them, and as a call.
+    def checked(*slow, before=(("stur", "d0, [x29, #-0x20]"),), check=True):
+        n = len(before)
+        test = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"),
+                ("b.ls", "#%#x" % (4 * (n + 9)))] if check else [("nop", "")] * 3
+        return lift(list(before) + [("mov", "x9, #3")] + test + [
+            ("sub", "x9, x9, #1"),
+            ("cbnz", "x9, #%#x" % (4 * (n + 1))), ("ldur", "x6, [x29, #-0x20]"),
+            ("stur", "x6, [x2, #15]"), ("ret", "")]
+            + [(mn, "#%#x" % (4 * (n + 4)) if mn == "b" else op) for mn, op in slow])
+    quiet, busy = [("bl", "#0x200"), ("b", "")], [("bl", "#0x200"), ("mov", "x9, #1"),
+                                                   ("b", "")]
+    assert "x2.field_0x10 = d0;" in checked(*quiet)
+    assert "x2.field_0x10 = x6;" in checked(*busy)
+    assert "x2.field_0x10 = x6;" in checked(*quiet, check=False)
+    # Nor does one that jumps to the head itself, whether it calls or stores.
+    for odd in ([("bl", "#0x200"), ("mov", "x9, #1")], [("stur", "x9, [x29, #-0x20]")]):
+        out = lift([("stur", "d0, [x29, #-0x20]"), ("mov", "x9, #3"),
+                    ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"),
+                    ("ldur", "x6, [x29, #-0x20]"), ("stur", "x6, [x2, #15]"), ("ret", "")]
+                   + odd + [("b", "#0x8")])
+        assert "x2.field_0x10 = x6;" in out, out
+    field = (("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x20]"))
+    assert "x2.field_0x10 = x20.field_0xc;" in checked(*quiet, before=field)
+    assert "x2.field_0x10 = x6;" in checked(*busy, before=field)
+
+    # And on the clean fixture.
+    _needs_capstone()
+    import jadart
+    body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x161360")[0]["body"]]
+    assert "if (d0 > t2) {" in body and "t5 = d0;" in body, body
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so

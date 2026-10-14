@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from sys import intern
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, _idoms, cut_goto, flat, TRAPS)
+                  cond_of, _idoms, cut_goto, flat, TRAPS, _target)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -860,11 +860,12 @@ def _regs_in_list(op: str) -> list:
     return [canon(t) for t in op.strip().strip("{}").split(",") if t.strip()]
 
 
-def strip_boilerplate(ann: list) -> list:
+def strip_boilerplate(ann: list, slow: set = None) -> list:
     """Nop out the compiler-emitted prologue/epilogue and the stack-overflow check.
     They become nops rather than being dropped, so addresses stay stable and branch
     targets still resolve. The stack check's slow-path block is then unreachable and
-    structure() skips it."""
+    structure() skips it. `slow`, where given, gets the address of each such slow path:
+    one laid out after a throw still looks reached from it (#157)."""
     out = list(ann)
     n = len(out)
 
@@ -910,6 +911,8 @@ def strip_boilerplate(ann: list) -> list:
                 nop(i)
                 nop(i + 1)
                 nop(i + 2)                         # b.ls -> nop: slow path unreachable
+                if slow is not None:
+                    slow.add(_target(br[2]))
         # write barrier after a pointer store: tst TMP, x28(, lsr #32); b.cc skip; bl <stub>.
         # x28 is HEAP_BASE (reserved), so a tst against it can only be the barrier. The
         # preceding tags loads and `and` become dead, and the lifter drops them.
@@ -1871,7 +1874,10 @@ class Lifter:
         self._rank = None
         #: Blocks no path runs to the end of (_ends_path), the dominators of the graph
         #: where they end, and each block's frame stores; see _loop_rewrites.
-        self._ended = self._ridom = self._spills = None
+        self._ended = self._ridom = self._spills = self._wide = None
+        #: The stack checks' slow paths strip_boilerplate took the branch to; see
+        #: _quiet.
+        self.slow_paths: frozenset = frozenset()
         self._trips: dict = {}
         self._bodies: dict = {}
         #: (header, {reg: name}, copied) for each loop being walked, innermost last. An
@@ -2290,9 +2296,8 @@ class Lifter:
         got = self._trips.get(header)
         if got is not None:
             return got
-        if self._ended is None:
-            self._ended = ended = {b for b, blk in self.blocks.items()
-                                   if any(_ends_path(t[1], t[3]) for t in blk.insns)}
+        if self._ridom is None:
+            ended = self._ended_blocks()
             self._ridom = _idoms(self.blocks, self.entry, lambda n: () if n in ended
                                  else self.blocks[n].succ if n in self.blocks else ())[0]
             self._spills = {}
@@ -2316,6 +2321,13 @@ class Lifter:
                 stack.extend(self._preds.get(n, ()))
         got = self._trips[header] = frozenset(nodes)
         return got
+
+    def _ended_blocks(self) -> set:
+        """The blocks holding a trap or a throw, which no path runs to the end of."""
+        if self._ended is None:
+            self._ended = {b for b, blk in self.blocks.items()
+                           if any(_ends_path(t[1], t[3]) for t in blk.insns)}
+        return self._ended
 
     def _trip_body(self, header) -> frozenset:
         """Those of `_trip_nodes` the header reaches. A stack check's slow path that
@@ -4529,11 +4541,105 @@ class Lifter:
         # Which return register the function last wrote is a fact about the BODY, and the
         # body is what just ran.
         st.result = loop_st.result
-        if self._writes_stack(nodes):
-            st.slot.clear()          # a spill slot the body rewrote says nothing either
-        else:
-            self._stale_slots(st, written | carried)
+        self._exit_slots(st, header)
         return out
+
+    def _back_loop(self, header) -> set:
+        """The natural loop at `header`: the predecessors it dominates are its latches,
+        and the body is what reaches one without passing it. `_loop_nodes` takes the
+        edge in from before the loop for a latch too, and with it every block before the
+        loop (#129). A predecessor no path from the entry reaches counts as a latch, as
+        it may be a handler the graph has no edge into."""
+        if self._idom is None:
+            self._idom = _idoms(self.blocks, self.entry, lambda n: (
+                self.blocks[n].succ if n in self.blocks else ()))[0]
+        latches = [p for p in self._preds.get(header, ())
+                   if p not in self._idom or header in self._dominators(p)]
+        nodes, stack = {header}, latches
+        while stack:
+            n = stack.pop()
+            if n not in nodes and n in self.blocks:
+                nodes.add(n)
+                stack.extend(self._preds.get(n, ()))
+        return nodes
+
+    def _quiet(self, b) -> bool:
+        """True for a stack check's slow path, `bl` to the stub and `b` back: the stub
+        gives back every register it is handed live and stores to no slot (#157)."""
+        return (b in self.slow_paths
+                and [t[1] for t in self.blocks[b].insns] == ["bl", "b"])
+
+    def _exit_slots(self, st: State, header) -> None:
+        """Drop from `st` the slots the loop at `header` may leave holding something else.
+
+        The loop is its own blocks, `_back_loop`, less a stack check's slow path. Main
+        dropped every slot where any block of `_loop_nodes` stored to the frame, and
+        those take in the blocks before the loop, which store to it as a rule: a double
+        `_contentWidthFor` saved at entry then read back after the loop as the register
+        it was reloaded into, `d1`, which reads as its second argument (#157).
+
+        A store drops the slots it overlaps, 16 bytes of one a q register filled
+        (_wide_slots) and 8 of any other. The outgoing area goes whatever the loop does: a
+        call in it takes what was pushed before it, and a call after it would print that
+        for its arguments. A store whose place in the frame is not known, a frame that
+        moves or whose address reaches a register, drops them all. A slot whose text
+        reads memory goes where the loop stores to memory or makes a call. One whose text
+        names a register goes where `_loop_nodes` writes it: the walk keeps a slot's text
+        past a write to a register it names (#140), and the blocks before the loop stand
+        for the ones between the store and the loop, where `_lShiftDigits` overwrites the
+        x2 and x3 its slot was computed from. A block with a trap or a throw is left out
+        there, as no path runs on from it, but its stores and calls count, for a handler
+        the graph does not show may run after them."""
+        loop = {b for b in self._back_loop(header) if not self._quiet(b)}
+        fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
+        sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
+        if fp is None or self._frame_escaped() or fp in self._written(loop):
+            st.slot.clear()
+            return
+        if sp is not None:
+            for k in [k for k in st.slot if k.startswith(sp)]:
+                del st.slot[k]
+        wide = self._wide_slots()
+        for b in sorted(loop):
+            insns = self.blocks[b].insns
+            for (_a, mn, op, _n) in insns:
+                if mn in _STORES:
+                    got = _addr(_split_ops(op))
+                    if got is None or got[1] is _BAD_POST:
+                        st.slot.clear()
+                        return
+            for i, keys, delta, ops, backs in _frame_accesses(insns):
+                if delta:
+                    st.slot.clear()
+                    return
+                if backs is not None:
+                    lo = int(keys[0][len(fp):])
+                    _drop_stored(st.slot, fp, lo,
+                                 lo + _store_width(insns[i][1], ops[0]) * len(keys))
+                    for off in range(lo - 15, lo - 7):
+                        if f"{fp}{off:+d}" in wide:
+                            st.slot.pop(f"{fp}{off:+d}", None)
+        if self._writes_heap(loop) or any(mn in ("bl", "blr") for b in loop
+                                          for (_a, mn, _o, _n) in self.blocks[b].insns):
+            for k in [k for k, v in st.slot.items() if _READS_MEMORY.search(v.text)]:
+                del st.slot[k]
+        ended = self._ended_blocks()
+        near = {b for b in self._loop_nodes(header)
+                if b not in ended and not self._quiet(b)}
+        self._stale_slots(st, self._written(near) - _SPECIAL)
+
+    def _wide_slots(self) -> set:
+        """The FP slots a store of a q register fills anywhere in the function, which
+        hold 16 bytes from their key and not 8; see _exit_slots."""
+        if self._wide is None:
+            self._wide = set()
+            for blk in self.blocks.values():
+                insns = blk.insns
+                for i, keys, _d, ops, backs in _frame_accesses(insns):
+                    if backs is not None and any(
+                            _store_width(insns[i][1], o) == 16 for o in ops[:len(keys)]):
+                        self._wide.update(keys)
+        return self._wide
 
     def _frame_escaped(self) -> bool:
         """True when this function ever puts a FRAME ADDRESS in a general register.
@@ -5466,7 +5572,8 @@ def use_target(tgt: Target):
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None, cut_end=None, returns=None) -> list:
-    stripped = strip_boilerplate(ann)
+    slow = set()
+    stripped = strip_boilerplate(ann, slow)
     # No traps: tier 3 keeps the edge past a `brk` that tier 2 dropped in #57. Ending the
     # block there takes away a join that, by accident, kept a frame slot from reading as
     # the field it was loaded from, and `forEach`'s concurrent modification guard then
@@ -5485,6 +5592,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields)
         lifter.show = show
+        lifter.slow_paths = frozenset(slow)
         if returns is not None:
             lifter.returns = lambda: returns(ann[0][0])
             lifter.callees = returns

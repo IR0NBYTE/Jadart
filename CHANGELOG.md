@@ -13,6 +13,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A slot the loop does not store to survives it.** A loop's exit forgot every frame slot
+  where a block of `_loop_nodes` stored to the frame, and those take in the blocks before
+  the loop too (#129), which store to it as a rule. So a value saved before the loop read
+  back after it as the register it was reloaded into: `_contentWidthFor` compares its
+  first double argument with a call's result and printed `if (d1 > t2)`, which reads as
+  its second (#157). The exit now drops only the slots a store in the loop's own blocks
+  overlaps, 16 bytes of one a q register filled and 8 of any other: the natural loop of
+  its back edges less a stack check's slow path, whose stub hands back every live register
+  and stores to no slot; `strip_boilerplate` records the slow paths of the checks it takes
+  out. The outgoing area goes at every exit, as a call in the loop takes what was pushed.
+  A store it cannot place, a frame that moves or whose address reaches a register still
+  drops them all. A slot whose text reads memory still goes where the loop stores to
+  memory or calls, and one whose text names a register where the loop or the code before
+  it writes that register, a block with a trap or a throw aside. `_contentWidthFor` now
+  prints `if (d0 > t2)`, and `readValue` calls `readValueOfType(this, t2, x2)` where it
+  printed `(x1, t2, x3)`. Tier 3 exports change in 183 functions on the clean fixture, 76
+  on 2.19.6, 160 on 3.4.4 and 190 on 3.10.9, and in none on obf, where a bare register
+  after a loop now reads as what its slot holds. Closes #157.
 - **A goto out of a loop hands on what the last trip left.** A goto out of a loop handed
   its target the state the walk had at the jump, which is the first trip's: a register the
   loop writes further down still held its value from before the loop, so the target of a
