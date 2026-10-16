@@ -29,6 +29,7 @@ x22=NULL (true=+0x20, false=+0x30), x21=DISPATCH_TABLE.
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import heapq
 import re
@@ -799,15 +800,24 @@ def _mentions(names):
     return lambda text: any(p.search(text) for p in pats)
 
 
+def _lr() -> str:
+    """The link register's machine name on the current target."""
+    return next(r for r, v in _T.roles.items() if v == "LR")
+
+
 def _is_lr_spill(reg: str, st: State) -> bool:
-    """True when `reg` is the link register still holding the incoming return address."""
-    lr = next((r for r, v in _T.roles.items() if v == "LR"), None)
+    """True when `reg` is the link register still holding the incoming return address.
+    A call writes it, so after one it is not (#162)."""
+    lr = _lr()
     return canon(reg) == lr and lr not in st.reg
 
 
 #: The slot-map key that says a push dropped part of the outgoing area; see
 #: Lifter._frame_moved. It starts with SP's name, so whatever forgets the area forgets it.
 _LOST = "x15?"
+#: What the slot 8 bytes into a q register's 16 holds: its top half, no value the walk
+#: can name (#162).
+_UPPER = V("", P_ATOM)
 
 
 def _drop_outgoing(st: State):
@@ -816,6 +826,17 @@ def _drop_outgoing(st: State):
     sp = next((r for r, v in _T.roles.items() if v == "SP"), "x15")
     for key in [k for k in st.slot if k.startswith(sp)]:
         del st.slot[key]
+
+
+def _forget_frame(st: State):
+    """Forget every slot, for a store that may have written any of them. Where the
+    outgoing area held a value, it is marked short, so no call takes what is pushed after
+    for its whole argument list (_stack_args)."""
+    sp = next((r for r, v in _T.roles.items() if v == "SP"), "x15")
+    lost = any(k.startswith(sp) for k in st.slot)
+    st.slot.clear()
+    if lost:
+        st.slot[_LOST] = V("", P_ATOM)
 
 
 def _merge(dst: State, a: State, b: State):
@@ -1020,7 +1041,10 @@ def _flags_read(insns) -> frozenset:
 #: x16 and x17 too. They are not in that list because Dart never allocates them, they are
 #: TMP and TMP2, and a stub or a veneer between the call and its target may use them: a
 #: value set in x17 before a call printed as still there after it (#137).
-_A64_CLOBBERS = frozenset({f"x{i}" for i in range(15)} | {"x16", "x17"}
+#:
+#: And x30, LR, which the call itself writes with its own return address. Kept, it read
+#: `LR` after a call as before it, two values under one name in one loop (#162).
+_A64_CLOBBERS = frozenset({f"x{i}" for i in range(15)} | {"x16", "x17", "x30"}
                           | {f"d{i}" for i in range(31)})
 _CALL_CLOBBERS = _A64_CLOBBERS
 
@@ -1681,11 +1705,37 @@ def _return_facts(blocks, entry):
             live = step_bwd(live, r)
     proven = only_ret or any(not st[0] and st[1] for st in at_ret.values())
     return at_ret, proven, read, calls
-def _frame_access(mn: str, op: str):
+def _raw_store(mn: str) -> bool:
+    """Whether `mn` writes memory and is not one of `_STORES`, which `_step` models: a
+    non-temporal pair, a store-release, an exclusive store, `st1` to `st4`, an atomic. It
+    is printed raw, and its address counts as a store all the same (#162)."""
+    got = _RAW_STORE.get(mn)
+    if got is None:
+        got = _RAW_STORE[mn] = mn not in _STORES and (
+            mn.startswith("st") or bool(_ATOMIC_OP_RE.match(mn) or _CAS_RE.match(mn)))
+    return got
+
+
+_RAW_STORE: dict = {}
+
+
+def _off_frame(ops) -> bool:
+    """Whether the memory operand in `ops` may be off SP or FP: it is, or it does not
+    parse, which is no evidence about where it points."""
+    got = _addr(ops)
+    return got is None or _T.roles.get(got[0][0]) in ("SP", "FP")
+
+
+def _frame_access(mn: str, op: str, apart: bool = True):
     """(slot keys, how far FP moves, operands) for a load or store `_step` keeps in the
     slot map, else None. The keys are the ones `_step` files the access under, so an
-    analysis over them agrees with what the walk reads back."""
+    analysis over them agrees with what the walk reads back. A store these cannot place
+    has no keys and moves the frame by 1, which every analysis takes as the frame moving:
+    one through an offset in a register, one `_step` leaves raw, and one through SP where
+    `apart` is False, that it may write a slot off FP (_frame_meets)."""
     if mn not in _STORES and mn not in _LOADS:
+        if _raw_store(mn) and _off_frame(_split_ops(op)):
+            return [], 1, _split_ops(op)
         return None
     fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
     ops = _split_ops(op)
@@ -1699,15 +1749,317 @@ def _frame_access(mn: str, op: str):
         # which these analyses take as they take the frame moving.
         return ([], 1, ops) if mn in _STORES else None
     if base != fp:
+        if not apart and mn in _STORES and _T.roles.get(base) == "SP":
+            return [], 1, ops
         return None
     delta = disp if wb else post
     if mn in _LOADS and delta and fp in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]):
         return None                                   # left raw by _step, see there
     if post:
         disp = 0
-    pair = mn in ("stp", "ldp", "ldpsw") and len(ops) >= 3
-    width = 4 if pair and ops[1].strip()[:1] == "w" else 8
-    return [f"{fp}{disp:+d}"] + ([f"{fp}{disp + width:+d}"] if pair else []), delta, ops
+    if mn in _STORES:
+        disp -= delta           # keyed off FP where the move leaves it, as _step files it
+    if mn in ("stp", "ldp", "ldpsw") and len(ops) >= 3:
+        second = disp + _access_width(mn, ops[0])
+        return [f"{fp}{disp:+d}", f"{fp}{second:+d}"], delta, ops
+    return [f"{fp}{disp:+d}"], delta, ops
+
+
+def _frame_slots(mn: str, op: str):
+    """(base, [(key, bytes)]) for a store `_step` files in the slot map, one entry per
+    register, keyed as `_step` keys it: off the base where a write-back has left it. None
+    for any other instruction."""
+    if mn not in _STORES:
+        return None
+    ops = _split_ops(op)
+    got = _addr(ops)
+    if got is None or got[1] is _BAD_POST:
+        return None
+    (base, disp, index, _scale, wb), post = got
+    if index is not None or _T.roles.get(base) not in ("SP", "FP"):
+        return None
+    at = (0 if post else disp) - (disp if wb else post)
+    width = _access_width(mn, ops[0])
+    n = 2 if mn == "stp" and len(ops) >= 3 else 1
+    return base, [(f"{base}{at + i * width:+d}", width) for i in range(n)]
+
+
+def _frame_regs() -> tuple:
+    """(SP, FP) on the current target, by machine name."""
+    got = _FRAME_REGS.get(id(_T))
+    if got is None:
+        got = _FRAME_REGS[id(_T)] = (next(r for r, v in _T.roles.items() if v == "SP"),
+                                     next(r for r, v in _T.roles.items() if v == "FP"))
+    return got
+
+
+_FRAME_REGS: dict = {}
+
+
+def _sp_neutral(mn: str, op: str) -> bool:
+    """Whether an instruction leaves _sp_step's state as it is, whatever it is: it writes
+    neither SP nor FP and stores nothing through either, as most instructions do."""
+    key = (id(_T), mn, op)
+    got = _SP_NEUTRAL.get(key)
+    if got is None:
+        if len(_SP_NEUTRAL) >= _SPLIT_CACHE_MAX:
+            _SP_NEUTRAL.clear()
+        sp, fp = _frame_regs()
+        got = _SP_NEUTRAL[key] = not (
+            (mn in _STORES or _raw_store(mn)) and _off_frame(_split_ops(op))
+            or set(_def_use(mn, op)[0]) & {sp, fp})
+    return got
+
+
+#: _sp_neutral's answer per instruction text.
+_SP_NEUTRAL: dict = {}
+
+
+#: How many FP values saved on the stack _sp_step follows at once, and how far below
+#: where it was an alignment may have put SP.
+_MAX_SAVED_FP = 4
+_MAX_SLACK = 63
+
+
+def _sp_step(state, here, mn: str, op: str):
+    """The frame state after one instruction at address `here`, from `state` before it;
+    see _frame_meets. It is (SP - FP, how much lower SP may be, the FP values saved on
+    the stack, which frame FP points into, and where in it).
+
+    SP - FP is None where it is not known. It is the most it can be, and an alignment,
+    `and x15, x15, #-16` before an FFI call's stack arguments, puts SP up to 15 below.
+    A saved value is (where it is, what it was), both from FP as it is now, so that an
+    FFI call's `str x29, [x15, #-8]!; mov x29, x15; ...; mov x15, x29; ldr x29, [x15],
+    #8`, which gives the C call a frame of its own, ends where it began. The frame is
+    the address where FP last moved by an amount not known, and where in it is how far
+    FP has moved since by amounts that are."""
+    if _sp_neutral(mn, op):
+        return state
+    d, slack, saved, frame, f = state
+    sp, fp = _frame_regs()
+    ops = _split_ops(op)
+
+    def moved(d, slack, saved, k):
+        """FP moved by k: SP - FP and every saved place and value with it."""
+        if k is None:
+            return None, 0, (), here, 0
+        return ((None if d is None else d - k), slack,
+                tuple((p - k, v - k) for p, v in saved), frame, f + k)
+
+    if mn in ("mov", "add", "sub", "and") and 2 <= len(ops) <= 3:
+        dst, src = canon(ops[0]), canon(ops[1])
+        imm = 0 if len(ops) == 2 else _imm(ops[2])
+        if mn == "and" and dst == src == sp and imm is not None and d is not None:
+            align = (1 << 64) - imm         # `#0xff..f0` keeps SP 16-aligned
+            if 0 < align and align & (align - 1) == 0 and slack + align - 1 <= _MAX_SLACK:
+                return d, slack + align - 1, saved, frame, f
+            return None, 0, saved, frame, f
+        if mn != "and" and dst in (sp, fp) and src in (sp, fp):
+            if imm is None or (mn == "mov") != (len(ops) == 2):
+                return ((None, 0, saved, frame, f) if dst == sp
+                        else moved(None, 0, (), None))
+            imm = -imm if mn == "sub" else imm
+            if dst == sp:
+                if src == fp:
+                    return imm, 0, saved, frame, f
+                return (None if d is None else d + imm), slack, saved, frame, f
+            if src == fp:
+                return moved(d, slack, saved, imm)
+            exact = d is not None and not slack
+            return (-imm, 0) + moved(d, slack, saved, d + imm if exact else None)[2:]
+    defs = set(_def_use(mn, op)[0])
+    got = _addr(ops) if any(o.lstrip().startswith("[") for o in ops) else None
+    if got is None or got[1] is _BAD_POST:
+        if fp in defs:
+            return moved(None, 0, (), None)
+        return (None, 0, saved, frame, f) if sp in defs else state
+    (base, disp, index, _scale, wb), post = got
+    at = None if index is not None else 0 if post else disp
+    low = 0                                  # how much lower the address may be
+    if base == sp:
+        at, low = (None, 0) if d is None or at is None else (d + at, slack)
+    elif base != fp:
+        at = None
+    width = _access_width(mn, ops[0])
+    n = 2 if mn in ("stp", "ldp", "ldpsw") and len(ops) >= 3 else 1
+    if (mn in _STORES or _raw_store(mn)) and base in (sp, fp):
+        if at is None or mn not in _STORES:
+            saved = ()
+        elif saved or fp in {canon(o) for o in ops[:n]}:
+            saved = tuple((p, v) for p, v in saved
+                          if not at - low - 7 <= p < at + width * n)
+            if not low:
+                saved += tuple((at + i * width, 0) for i in range(n)
+                               if canon(ops[i]) == fp)
+            saved = tuple(sorted(saved))[-_MAX_SAVED_FP:]
+    if low:
+        at = None                            # no saved value is read from there
+    state = d, slack, saved, frame, f
+    delta = disp if wb else post
+    if delta and base == sp:
+        state = (None if d is None else d + delta,) + state[1:]
+    elif delta and base == fp:
+        state = moved(d, slack, saved, delta)
+    d, slack, saved, frame, f = state
+    loaded = {canon(o) for o in ops[:n]} if mn in _LOADS else set()
+    if fp in loaded:
+        k = None
+        for i in range(n):
+            if canon(ops[i]) == fp and at is not None:
+                k = dict(saved).get(at + i * width)
+        state = moved(d, slack, saved, k)
+    elif fp in defs - {base}:
+        state = moved(None, 0, (), None)     # an atomic's or a raw line's destination
+    if sp in loaded or sp in defs - {base} or (
+            sp in defs and mn not in _LOADS and mn not in _STORES):
+        state = (None, 0) + state[2:]       # `ldr x15, [x15]` loads SP through itself
+    return state
+
+
+def _frame_meets(blocks, entry, raw) -> frozenset:
+    """The addresses of the frame stores the walk sees that may write a slot it keys off
+    the other frame register (#162).
+
+    The walk keeps the slots off SP and off FP apart: a store through one was not
+    checked against the other's. Dart's frame is why that holds. The prologue reserves
+    the spill slots and the outgoing area with one `sub`, and the arguments are stored
+    below the spill slots. Where SP sits higher, a store through SP changed a slot the
+    walk went on reading through FP as before, and a store through FP one a call takes
+    its arguments from. So this follows SP - FP through the graph (_sp_step), with what
+    strip_boilerplate changed read back from `raw` (address -> mnemonic and operands),
+    and compares the bytes each store through SP writes with those each store through
+    FP writes with FP where it was then: an FFI call's frame has an FP of its own, and
+    the walk keys a slot off FP wherever it is. Loads take no part, as the walk keeps a
+    slot only where a store filled it.
+
+    A store through SP that may reach a store through FP is one, and so is a store
+    through FP that may reach a store through SP the entry reaches. A store through SP
+    where SP - FP is not known is one, and one the entry reaches makes every store
+    through FP one: it is somewhere the walk cannot place. No state is carried past a
+    trap or a throw, over the edge tier 3 keeps there and no path runs (#64).
+
+    A block is walked again only when what reaches it changes: SP - FP goes unknown at
+    most once, the frame changes once, and the saved FP values only shrink, at most
+    _MAX_SAVED_FP of them, so each block is walked a few times at most. A store adds
+    its width and at most _MAX_SLACK bytes to compare."""
+    sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
+    fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
+    if sp is None or fp is None or entry not in blocks:
+        return frozenset()
+    if not any(mn in _STORES and (sp in op or "sp" in op)      # `sp` canonicalises to SP
+               and (_frame_slots(mn, op) or ("",))[0] == sp
+               for blk in blocks.values() for (_a, mn, op, _n) in blk.insns):
+        return frozenset()
+
+    def insn(t):
+        return raw.get(t[0], t[1:3]) if t[1] == "nop" else t[1:3]
+
+    # Per block, only what can change the state or ends a path, in order.
+    steps = {}
+    for b, blk in blocks.items():
+        steps[b] = [(t, *insn(t), _ends_path(t[1], t[3])) for t in blk.insns
+                    if not _sp_neutral(*insn(t)) or _ends_path(t[1], t[3])]
+
+    # The edges strip_boilerplate took out: to a stack check's slow path, which runs
+    # with SP where the check found it and goes back with it there, and on past a
+    # box-or-tag check it made unconditional, into the slow path that boxes a Mint.
+    cut = {}
+    for b, blk in blocks.items():
+        for t in blk.insns:
+            if cond_of(raw.get(t[0], ("",))[0]):
+                to = _target(raw[t[0]][1]) if t[1] == "nop" else t[0] + 4
+                cut.setdefault(b, []).append(to)
+    seen = object()                     # not reached yet
+    into = {b: seen for b in blocks}
+
+    def meet(a, b, at):
+        if a[3:] != b[3:]:
+            return None, 0, (), at, 0
+        return (a[:2] if a[:2] == b[:2] else (None, 0)) + (
+            tuple(e for e in a[2] if e in b[2]),) + a[3:]
+    fixed = set()
+    for root in [entry] + sorted(blocks):
+        # The entry first, then each block it does not reach, in address order: the
+        # body behind a second entry point, or a catch handler, which sets SP from FP
+        # itself. What the entry reaches is not changed from one of those: the walk
+        # takes no edge from them, and a stack check's slow path, cut off from the check
+        # by strip_boilerplate, runs back into the body with SP where the check left it.
+        if into[root] is not seen:
+            continue
+        into[root] = (None, 0, (), root, 0)
+        work, queued = [root], {root}
+        while work:
+            b = work.pop()
+            queued.discard(b)
+            d, ends = into[b], False
+            for t, mn, op, ends in steps[b]:
+                d = _sp_step(d, t[0], mn, op)
+                if ends:
+                    break           # the edge past a throw, which tier 3 keeps (#64)
+            for s in list(blocks[b].succ) + cut.get(b, []):
+                if s not in into or s in fixed or ends:
+                    continue
+                got = d if into[s] is seen else meet(into[s], d, s)
+                if got == into[s]:
+                    continue
+                into[s] = got
+                if s not in queued:
+                    queued.add(s)
+                    work.append(s)
+        if root == entry:
+            fixed = {b for b in blocks if into[b] is not seen}
+    # Each store through FP as (FP where the store leaves it, first byte, end, its
+    # address), keyed as _frame_access keys it; each store through SP as (FP, first byte
+    # it may write, end, its address, whether the entry reaches it). Loads take no part:
+    # the walk keeps a slot only where a store filled it.
+    reached: dict = {}
+    pushed, out, lost = [], set(), False
+    for b in blocks:
+        d = into[b]
+        for t, rmn, rop, _ends in steps[b]:
+            d = _sp_step(d, t[0], rmn, rop)
+            mn, op = t[1], t[2]
+            if mn not in _STORES:
+                continue
+            got = _frame_access(mn, op)
+            if got is not None and got[0]:
+                for k, o in zip(got[0], got[2]):
+                    lo = int(k[len(fp):])
+                    reached.setdefault(d[3:], []).append(
+                        (lo, lo + _access_width(mn, o), t[0]))
+            slots = _frame_slots(mn, op)
+            if slots is not None and slots[0] == sp:
+                if d[0] is None:
+                    out.add(t[0])
+                    lost = lost or b in fixed
+                    continue
+                for key, width in slots[1]:
+                    lo = d[0] + int(key[len(sp):])
+                    pushed.append((d[3:], lo - d[1], lo + width, t[0], b in fixed))
+    if not reached:
+        return frozenset()              # no slot off FP for a store through SP to meet
+    # An access is at most 16 bytes, so one that a store's bytes meet starts at most 15
+    # before them: sorted by where they start, the candidates are a slice.
+    starts = {}
+    for k, accs in reached.items():
+        accs.sort(key=lambda a: a[0])
+        starts[k] = [a[0] for a in accs]
+    for where, lo, hi, at, walked in pushed:
+        accs = reached.get(where)
+        if not accs:
+            continue
+        i = bisect.bisect_left(starts[where], lo - 15)
+        j = bisect.bisect_left(starts[where], hi)
+        for k in range(i, j):
+            a_lo, a_hi, store = accs[k]
+            if a_hi > lo:
+                out.add(at)
+                if walked:
+                    out.add(store)
+    if lost:
+        out.update(a for blk in blocks.values() for (a, mn, op, _n) in blk.insns
+                   if (_frame_slots(mn, op) or ("",))[0] == fp)
+    return frozenset(out)
 
 
 _FRAME_INDEX_RE = re.compile(r"\[(\w+), (x\d+)\]")
@@ -1757,17 +2109,19 @@ def _ends_path(mn: str, note: str) -> bool:
     return False
 
 
-def _frame_accesses(insns, stop=False):
+def _frame_accesses(insns, stop=False, meets=frozenset()):
     """(index, slot keys, how far FP moves, operands, write-backs) for each load and store
     of one block that `_step` keeps in the slot map, in order. `write-backs` is None for a
     load, and for a store says per key whether the register stored was reloaded from that
     slot in this block with nothing written to either since: the value already there.
-    `stop` ends the block at the first instruction no path runs past (_ends_path)."""
+    `stop` ends the block at the first instruction no path runs past (_ends_path), and
+    `meets` holds the stores that may write a slot off the other frame register
+    (_frame_meets)."""
     fresh = {}                             # {register: the slot it was reloaded from}
     for i, (_a, mn, op, note) in enumerate(insns):
         if stop and _ends_path(mn, note):
             return
-        got = _frame_access(mn, op)
+        got = _frame_access(mn, op, _a not in meets)
         if got is None:
             for r in _def_use(mn, op)[0]:
                 fresh.pop(r, None)
@@ -1878,8 +2232,18 @@ class Lifter:
         #: The stack checks' slow paths strip_boilerplate took the branch to; see
         #: _quiet.
         self.slow_paths: frozenset = frozenset()
+        #: The frame stores that may write a slot off the other frame register
+        #: (_frame_meets). _lift_function works them out; the graph alone does not show
+        #: where SP is.
+        self.frame_meets: frozenset = frozenset()
         self._trips: dict = {}
         self._bodies: dict = {}
+        #: Per header and per block, what nested loops ask again for each loop around
+        #: them; see _loop_nodes, _written, _accesses and _reload_step (#162).
+        self._loops: dict = {}
+        self._defs: dict = {}
+        self._frame_list: dict = {}
+        self._reload_ops: dict = {}
         #: (header, {reg: name}, copied) for each loop being walked, innermost last. An
         #: exit inside the body has to write the carried names back itself; see _carry_out.
         self._carrying: list = []
@@ -1941,17 +2305,18 @@ class Lifter:
         Only registers that would render as something other than their own name are
         recorded. `st.get` already falls back to the bare name for a register it has never
         heard of, so writing the other forty-odd in would cost map churn at every call site
-        and change no output.
+        and change no output. LR is one that would: untouched, it renders as `LR`, the
+        function's return address, and the call has just put its own there (#162).
         """
         touched = (set(st.reg) | set(st.elem) | set(st.poolbase) | set(st.pair)
-                   | set(st.pair.values()) | set(self.alias))
+                   | set(st.pair.values()) | set(self.alias) | {_lr()})
         # A V register is clobbered under every spelling: `ldr q0; bl f; str q0` printed
         # the load as what was stored (#114).
         for r in sorted(r for r in touched if r in _CALL_CLOBBERS
                         or (_fp_n(r) is not None and f"d{_fp_n(r)}" in _CALL_CLOBBERS)):
             st.forget(r)
 
-    def _pin_call(self, st: State) -> list:
+    def _pin_call(self, st: State, dying=None) -> list:
         """Name every live value that READS MEMORY, before a call that may rewrite it.
 
         `_clobber_call` covers the registers the ABI destroys. The callee-saved ones keep
@@ -1972,10 +2337,14 @@ class Lifter:
         every slot at a call was tried first: the outgoing area is what `_stack_args`
         reconstructs a stack-convention call's arguments from, so emptying it cost
         `benchDecodeFlag` the literal semdiff pins it on.
+
+        A store `_step` prints raw asks the same question, with `dying` the registers it
+        writes in place of the call's (_raw_write).
         """
+        dying = _CALL_CLOBBERS if dying is None else dying
         out = []
         for key, v in sorted(st.reg.items()):
-            if key in _CALL_CLOBBERS or not _READS_MEMORY.search(v.text):
+            if key in dying or not _READS_MEMORY.search(v.text):
                 continue
             if not (self._live_after & _reg_mask((key,))):
                 continue
@@ -2051,7 +2420,8 @@ class Lifter:
         reads = live_out = None
         for b, blk in self.blocks.items():
             ev, after = [], None
-            frame = {t[0]: t[1:] for t in _frame_accesses(blk.insns)}
+            frame = {t[0]: t[1:]
+                     for t in _frame_accesses(blk.insns, meets=self.frame_meets)}
             for i, (a, mn, op, note) in enumerate(blk.insns):
                 if mn in _CALLS:
                     name = note.split("-> ", 1)[1].strip() if "-> " in note else None
@@ -2270,13 +2640,21 @@ class Lifter:
         if not nodes:
             return []
         written, new = None, set()
+        held, wide = set(keys), self._wide_slots()
+        fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
         for b in nodes:
             got = self._spills.get(b)
             if got is None:
                 got = self._spills[b] = self._block_spills(b)
             if got is False:
                 return keys               # the frame moves inside a loop: claim nothing
-            for k, r, back in got:
+            for k, r, back, width in got:
+                # A store over part of another slot changes it, whatever it stores (#162).
+                lo = int(k[len(fp):])
+                for off in range(lo - 15, lo + width):
+                    o = f"{fp}{off:+d}"
+                    if o != k and o in held and (off > lo - 8 or o in wide):
+                        new.add(o)
                 if back or k not in st.slot:
                     continue
                 if written is None:
@@ -2363,7 +2741,8 @@ class Lifter:
         A slot counts where the trip stores no byte of it, and only while the frame stays
         put: nothing in the trip writes FP, loads or stores with a write-back to it, or
         stores through an index off it, and no frame address reaches a register anywhere
-        in the function. And only a value whose text names no register and reads no
+        in the function. No store narrower than 8 bytes may fill it (_reload). And only a
+        value whose text names no register and reads no
         memory: one spelled the same can be a different value where a register or the heap
         changed in between. Slots of one text hold one value, so a register holds at most
         one, a block costs its length, and with the header dominating the trip, reverse
@@ -2372,19 +2751,20 @@ class Lifter:
         if fp is None or self._frame_escaped() or fp in self._written(trip):
             return set()
         held = {}                       # FP slot -> the text of its value
+        narrow = self._narrow_slots()
         for k, v in st.slot.items():
-            if (k.startswith(fp) and k[len(fp):][:1] in "+-"
+            if (k.startswith(fp) and k[len(fp):][:1] in "+-" and k not in narrow
                     and not _ANY_REG.search(v.text) and not _READS_MEMORY.search(v.text)):
                 held[k] = v.text
         for b in trip:
             insns = self.blocks[b].insns
-            for i, keys, delta, ops, backs in _frame_accesses(insns):
+            for i, keys, delta, ops, backs in self._accesses(b):
                 if delta:
                     return set()
                 if backs is not None and held:
                     lo = int(keys[0][len(fp):])
                     _drop_stored(held, fp, lo,
-                                 lo + _store_width(insns[i][1], ops[0]) * len(keys))
+                                 lo + _access_width(insns[i][1], ops[0]) * len(keys))
         values = set(held.values())
         start = {}
         for r in regs:
@@ -2424,35 +2804,44 @@ class Lifter:
         A 64-bit load or move copies all 64 bits, from a general register or an FP one
         alike, and any other write, a wider load's included, ends what it held."""
         facts = dict(facts)
-        for (_a, mn, op, _n) in self.blocks[b].insns:
-            dead = _def_use(mn, op)[0]
-            ops = _split_ops(op) if mn in ("mov", "fmov") else ()
-            if len(ops) == 2 and _REG_ONLY.match(ops[1].strip()):
-                v = facts.get(canon(ops[1]))
-                facts.pop(canon(ops[0]), None)
+        steps = self._reload_ops.get(b)
+        if steps is None:
+            steps = self._reload_ops[b] = []
+            for (_a, mn, op, _n) in self.blocks[b].insns:
+                ops = _split_ops(op) if mn in ("mov", "fmov") else ()
+                if len(ops) == 2 and _REG_ONLY.match(ops[1].strip()):
+                    steps.append((canon(ops[0]), canon(ops[1]), ()))
+                    continue
+                got = _frame_access(mn, op) if mn in ("ldr", "ldur", "ldp") else None
+                steps.append((None, _def_use(mn, op)[0], [
+                    (k, canon(o)) for k, o in zip(got[0], got[2])
+                    if o.strip()[:1] in ("x", "d")] if got is not None else ()))
+        for dst, src, loads in steps:
+            if dst is not None:                 # a move from a register
+                v = facts.get(src)
+                facts.pop(dst, None)
                 if v is not None:
-                    facts[canon(ops[0])] = v
+                    facts[dst] = v
                 continue
-            for r in dead:
+            for r in src:                       # what the instruction writes
                 facts.pop(r, None)
-            got = _frame_access(mn, op) if mn in ("ldr", "ldur", "ldp") else None
-            if got is not None:
-                keys, _delta, ops = got
-                for k, o in zip(keys, ops):
-                    if k in held and o.strip()[:1] in ("x", "d"):
-                        facts[canon(o)] = held[k]
+            for k, r in loads:
+                if k in held:
+                    facts[r] = held[k]
         return facts
 
     def _block_spills(self, b):
-        """(slot, register, written back) for each frame store in block `b` before
-        anything ends its path, or False when the block moves the frame. Written back
-        means the value already there; see _frame_accesses and _loop_rewrites."""
+        """(slot, register, written back, bytes) for each frame store in block `b`
+        before anything ends its path, or False when the block moves the frame. Written
+        back means the value already there; see _frame_accesses and _loop_rewrites."""
         out = []
-        for _i, slots, delta, ops, backs in _frame_accesses(self.blocks[b].insns, True):
+        insns = self.blocks[b].insns
+        for i, slots, delta, ops, backs in _frame_accesses(insns, True, self.frame_meets):
             if delta:
                 return False
             if backs is not None:
-                out.extend((k, canon(r), back) for k, r, back in zip(slots, ops, backs))
+                out.extend((k, canon(r), back, _access_width(insns[i][1], r))
+                           for k, r, back in zip(slots, ops, backs))
         return out
 
     def _postorder(self) -> dict:
@@ -2535,7 +2924,9 @@ class Lifter:
         8`. A comment and not an assignment, so the printed body still assigns a register
         only where the machine's own instruction does."""
         def_regs, use_regs = _def_use(mn, op)
-        defs = set(def_regs) - _SPECIAL
+        # The role registers stay as they are, all but LR: its role name says it holds the
+        # return address, and after this line it does not (#162).
+        defs = set(def_regs) - (_SPECIAL - {_lr()})
         if dst in def_regs:               # a role register it loads, as before; not
             defs.add(dst)                 # the source of `stlr x0, [x17]`
         out = []
@@ -2703,6 +3094,71 @@ class Lifter:
                V(f"{cond} ? {_wrap(yes, P_TERN + 1)} : {_wrap(no, P_TERN + 1)}", P_TERN))
         return []
 
+    def _raw_write(self, st: State, mn: str, op: str) -> list:
+        """What a store `_step` prints raw does to the state, ahead of its line (#162).
+
+        One off SP or FP may have written any slot, as may one whose address does not
+        parse, so the slot map goes. One anywhere else may have written any memory a
+        value reads, as a call may, so each live register value that reads memory is
+        named first (_pin_call), and each slot whose text reads memory goes. Before
+        this, `stnp x0, x1, [x29, #-0x10]` left the slot reading what was there before
+        it, and a raw store to a field left a value loaded from it reading the new one."""
+        ops = _split_ops(op)
+        if _off_frame(ops):
+            _forget_frame(st)
+            if _addr(ops) is not None:
+                return []
+        out = self._pin_call(st, _def_use(mn, op)[0])
+        for k in [k for k, v in st.slot.items() if _READS_MEMORY.search(v.text)]:
+            del st.slot[k]
+        return out
+
+    def _reload(self, st: State, key: str, mn: str, reg: str) -> V:
+        """What a load of `reg` with `mn` from slot `key` reads: the slot's value, else
+        the register's own name. A load of 8 bytes or more reads it where no narrower
+        store fills the slot anywhere in the function, and a narrower load where every
+        store that fills it is as wide as the load. Otherwise a load reads part of the
+        value, or bytes the store left alone, and either read as the whole of it (#162).
+        A 16-byte slot reads as before: its low 8 bytes are the value's."""
+        width, held = _access_width(mn, reg), self._slot_widths()[0].get(key, ())
+        got = st.slot.get(key, _UPPER)
+        if (held and min(held) < 8) if width >= 8 else held != {width}:
+            got = _UPPER
+        return got if got.text else V(canon(reg), P_ATOM)
+
+    def _overwrite(self, st: State, at, base: str, lo: int, width: int, second):
+        """Forget the slots off `base` that the store at `at` of `width` bytes to `lo`,
+        and of as many again to `second` for a pair, writes any of, ahead of the store
+        filling its own (#162).
+
+        A slot holds 8 bytes from its key, or 16 where a q register fills it
+        (_wide_slots), and fewer where a narrower store does. Only the store's own keys
+        were replaced, so `stur x0, [x29, #-0xc]; stur x1, [x29, #-8]` left the first
+        slot reading x0 with its top half x1's. Each key a store can touch is looked
+        up, not each slot held (#154). A slot off SP that goes marks the outgoing area
+        short, as a push does (_frame_moved).
+
+        A store that may write a slot off the other frame register (_frame_meets) may
+        have written any of them, and every slot goes. Clearing costs what was stored,
+        where dropping one register's slots would read every slot each time."""
+        if at in self.frame_meets:
+            _forget_frame(st)
+            return
+        if self._slot_widths()[3]:
+            return          # Dart's spills: 8 bytes at a multiple of 8, so only its own
+        own = {f"{base}{lo:+d}"} | (set() if second is None else {f"{base}{second:+d}"})
+        hi = lo + width * (1 if second is None else 2)
+        sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
+        wide = self._wide_slots()
+        gone = False
+        for off in range(lo - 15 if wide else lo - 7, hi):
+            key = f"{base}{off:+d}"
+            if key in st.slot and (off >= lo - 7 or key in wide):
+                del st.slot[key]
+                gone = gone or key not in own
+        if gone and base == sp:
+            st.slot[_LOST] = V("", P_ATOM)
+
     def _frame_moved(self, st: State, base: str, delta: int):
         """SP or FP moved by a writeback, so every slot keyed on it is stale.
 
@@ -2715,6 +3171,11 @@ class Lifter:
         call that read the rest as its argument list printed part of it, `_setFlag(true)`
         for three values pushed (#144, #147): that is recorded, see _stack_args."""
         if not delta:
+            return
+        if _T.roles.get(base) == "FP":
+            # SP's slots too: _frame_meets compares them with FP's only while FP stays
+            # where it is (#162).
+            _forget_frame(st)
             return
         gone = [k for k in st.slot if k.startswith(base)]
         for k in gone:
@@ -2940,7 +3401,9 @@ class Lifter:
 
         Argument zero sits at the HIGHEST slot, so the run reads back downwards; when the
         receiver is already printed as the call's base, it is dropped from the list.
-        `values` asks for the values themselves rather than the list printed."""
+        `values` asks for the values themselves rather than the list printed. A run that
+        reaches the top half of a q register (_UPPER) is registers saved round the call,
+        not its arguments, and says nothing (#162)."""
         if whole and _LOST in st.slot:
             return None                 # a push dropped part of it; see _frame_moved
         slots = {}
@@ -2955,6 +3418,8 @@ class Lifter:
             return None
         n = 0
         while n * 8 in slots:
+            if not slots[n * 8].text:        # the top half of a q register (_UPPER)
+                return None
             n += 1
         args = [slots[i * 8] for i in range(n - 1, -1, -1)]
         if drop_receiver:
@@ -3093,6 +3558,8 @@ class Lifter:
                     # preserves everything but its own answer. Suppressing the CALL while
                     # clobbering as though it happened would forget the whole loop body a
                     # header stack check sits in front of, for a call that provably keeps it.
+                    # All but LR, which the `bl` itself writes (#162).
+                    st.forget(_lr())
                     return []
                 self._clobber_call(st)
                 if kind == "throw":
@@ -3163,36 +3630,43 @@ class Lifter:
             return pins + self._result(st, f"(dynamic call)({shown})")
 
         # stores: object field (side effect) vs stack slot (tracked, no output)
+        if _raw_store(mn):
+            return self._raw_write(st, mn, op) + self._verbatim(st, mn, op, op)
         if mn in _STORES:
             at = addr
             src = canon(ops[0])
             addr = _addr(ops)
             if addr is None or addr[1] is _BAD_POST:
-                return self._verbatim(st, mn, op, op)
+                return self._raw_write(st, mn, op) + self._verbatim(st, mn, op, op)
             (base, disp, index, scale, wb), post = addr
             val = g(src)
             delta = disp if wb else post     # how far the base register moves, if at all
             if post:
                 disp = 0                     # post-index: the access is at the OLD base
-            if base == "x15" and wb:
+            frame = _T.roles.get(base) in ("SP", "FP")
+            if frame and delta:
+                # Slots are keyed off where the frame register is once the store retires.
                 # `stp a, b, [SP, #-0x10]!` moves SP first and stores at the NEW SP, so the
-                # values land at SP+0 and SP+8 once the instruction retires. Keying them on
-                # the written displacement would file them under an SP that no longer
-                # exists, which is how 2.19's argument pushes went unseen.
-                disp = 0
+                # values land at SP+0 and SP+8. Keying them on the written displacement
+                # would file them under an SP that no longer exists, which is how 2.19's
+                # argument pushes went unseen. A post-index store lands where the register
+                # was, one move below where it is now, off FP as off SP (#162).
+                disp -= delta
             # `stp a, b, [base, #d]` writes TWO registers: a at d and b at d + one slot.
             # Recording only the first silently loses the second, which is how a call's
-            # arguments went missing, they are pushed as pairs.
+            # arguments went missing, they are pushed as pairs. One slot is as wide as
+            # the register: `stp q0, q1` puts q1 16 bytes on (#162).
             pair = None
             if mn == "stp" and len(ops) >= 3:
                 second = canon(ops[1])
-                width = 4 if ops[1].strip().startswith("w") else 8
-                pair = (second, disp + width, g(second))
-            if _T.roles.get(base) in ("SP", "FP") and index is not None:
+                pair = (second, disp + _access_width(mn, ops[1]), g(second))
+            if frame and index is not None:
                 st.slot.clear()              # an offset _fold_frame_offsets left
                 return self._verbatim(st, mn, op, op)
-            if _T.roles.get(base) in ("SP", "FP"):           # spill to a stack slot
+            if frame:                                        # spill to a stack slot
                 self._frame_moved(st, base, delta)
+                width = _access_width(mn, ops[0])
+                self._overwrite(st, at, base, disp, width, pair[1] if pair else None)
                 # Saving the untouched link register is a callee-saved spill, not an
                 # argument push. `str x30, [SP, #-8]!` lands at SP+0 exactly like a real
                 # push, and _stack_args read it back as argument zero: `f(LR)`. A register
@@ -3205,6 +3679,12 @@ class Lifter:
                 if pair and not (base == "x15" and _is_lr_spill(pair[0], st)):
                     out += self._name_slot(st, at, f"{base}{pair[1]:+d}", pair[0],
                                            pair[2], named)
+                if width == 16:
+                    # The top half of a q register, which no 8-byte argument is: a run
+                    # from SP+0 that reaches one is saves, `stp q1, q3; blr; ldp q1, q3`,
+                    # and _stack_args says nothing (#147, #162). A reload reads nothing.
+                    for k in [disp] + ([pair[1]] if pair else []):
+                        st.slot[f"{base}{k + 8:+d}"] = _UPPER
                 return out
             # The high half of a split 64-bit field store. The value was already written
             # out by the store of the low half (one 64-bit assignment) so emitting this
@@ -3346,7 +3826,7 @@ class Lifter:
             # `ldp a, b, [base, #d]` loads TWO registers, the second one slot further on.
             second = None
             if mn in ("ldp", "ldpsw") and len(ops) >= 3:
-                second = (canon(ops[1]), disp + (4 if ops[1].strip()[:1] == "w" else 8))
+                second = (canon(ops[1]), disp + _access_width(mn, ops[1]))
             if _T.roles.get(base) in ("SP", "FP") and index is not None:
                 return self._verbatim(st, mn, op, op, dst)       # as for a store
             if _T.roles.get(base) in ("SP", "FP"):           # reload a stack slot
@@ -3361,10 +3841,10 @@ class Lifter:
                     self._last_mem = None
                     self._frame_moved(st, base, delta)
                     return []
-                st.set(dst, st.slot.get(f"{base}{disp:+d}", V(dst, P_ATOM)))
+                st.set(dst, self._reload(st, f"{base}{disp:+d}", mn, ops[0]))
                 if second:
-                    st.set(second[0], st.slot.get(f"{base}{second[1]:+d}",
-                                                  V(second[0], P_ATOM)))
+                    st.set(second[0],
+                           self._reload(st, f"{base}{second[1]:+d}", mn, ops[1]))
                 self._last_mem = ("load", base, disp, dst)
                 self._frame_moved(st, base, delta)
                 return []
@@ -4411,7 +4891,7 @@ class Lifter:
         if carried is None:
             carried = (_live_in_header(self.blocks, nodes, header, self._preds,
                                        self._printed_liveness()[0])
-                       & self._written(nodes)) - _SPECIAL
+                       & self._written(nodes)) - (_SPECIAL - {_lr()})
             carried |= self.carry_more.get(header, frozenset())     # see below
             self.carried[header] = carried
         # A loop-carried register is a phi, and a phi reaching exactly one join has a name
@@ -4442,7 +4922,7 @@ class Lifter:
         # see _note_goto for where that is not enough, and _reloads for one every trip
         # puts its value from before the loop back into.
         trip = self._trip_body(header)
-        writes = self._written(trip) - _SPECIAL - carried
+        writes = self._written(trip) - (_SPECIAL - {_lr()}) - carried
         marks = self._unset[header] = {}
         for r in sorted(writes - self._reloads(header, trip, st, writes)):
             loop_st.forget(r)
@@ -4451,6 +4931,16 @@ class Lifter:
         # trip, not the one it came in with (#109).
         for k in self._loop_rewrites(header, st):
             del loop_st.slot[k]
+        # The outgoing area too, where a trip may write it or a call in it takes it: the
+        # next trip starts with what the last one left there, which _loop_rewrites, over
+        # FP's slots alone, did not see (#162).
+        if self._writes_outgoing(trip):
+            sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
+            gone = [k for k in loop_st.slot if sp and k.startswith(sp)]
+            for k in gone:
+                del loop_st.slot[k]
+            if any(k != _LOST for k in gone):
+                loop_st.slot[_LOST] = V("", P_ATOM)
         # The names have to be visible to the walk, because the tail below is only ONE of
         # the loop's exits. See _carry_out.
         self._carrying.append((header, names, set()))
@@ -4510,7 +5000,7 @@ class Lifter:
         # assigns WITHOUT reading first holding its value from before the loop: set x9 to
         # 5, write 7 to it in the body, and the code after the loop printed 5. The loop
         # body is where the value now comes from, so the name is what the reader gets.
-        written = self._written(self._loop_nodes(header)) - _SPECIAL
+        written = self._written(self._loop_nodes(header)) - (_SPECIAL - {_lr()})
         for r in sorted(written | carried):
             st.forget(r)
         # Forgotten, a register prints as itself, which reads as the last value a printed
@@ -4608,14 +5098,14 @@ class Lifter:
                     if got is None or got[1] is _BAD_POST:
                         st.slot.clear()
                         return
-            for i, keys, delta, ops, backs in _frame_accesses(insns):
+            for i, keys, delta, ops, backs in self._accesses(b):
                 if delta:
                     st.slot.clear()
                     return
                 if backs is not None:
                     lo = int(keys[0][len(fp):])
                     _drop_stored(st.slot, fp, lo,
-                                 lo + _store_width(insns[i][1], ops[0]) * len(keys))
+                                 lo + _access_width(insns[i][1], ops[0]) * len(keys))
                     for off in range(lo - 15, lo - 7):
                         if f"{fp}{off:+d}" in wide:
                             st.slot.pop(f"{fp}{off:+d}", None)
@@ -4629,16 +5119,30 @@ class Lifter:
         self._stale_slots(st, self._written(near) - _SPECIAL)
 
     def _wide_slots(self) -> set:
-        """The FP slots a store of a q register fills anywhere in the function, which
-        hold 16 bytes from their key and not 8; see _exit_slots."""
+        """The frame slots a store of a q register fills anywhere in the function, which
+        hold 16 bytes from their key and not 8; see _exit_slots and _overwrite."""
+        return self._slot_widths()[1]
+
+    def _narrow_slots(self) -> set:
+        """The frame slots a store of fewer than 8 bytes fills anywhere in the function;
+        see _reload and _reloads."""
+        return self._slot_widths()[2]
+
+    def _slot_widths(self) -> tuple:
+        """({frame slot: the widths of the stores that fill it}, the slots one of 16
+        fills, the slots one of fewer than 8 fills, and whether every one is 8 bytes at
+        a multiple of 8), over the function, once."""
         if self._wide is None:
-            self._wide = set()
+            widths: dict = {}
+            plain = True
             for blk in self.blocks.values():
-                insns = blk.insns
-                for i, keys, _d, ops, backs in _frame_accesses(insns):
-                    if backs is not None and any(
-                            _store_width(insns[i][1], o) == 16 for o in ops[:len(keys)]):
-                        self._wide.update(keys)
+                for (_a, mn, op, _n) in blk.insns:
+                    got = _frame_slots(mn, op)
+                    for key, width in got[1] if got else ():
+                        widths.setdefault(key, set()).add(width)
+                        plain = plain and width == 8 and not int(key[len(got[0]):]) % 8
+            self._wide = (widths, {k for k, w in widths.items() if 16 in w},
+                          {k for k, w in widths.items() if min(w) < 8}, plain)
         return self._wide
 
     def _frame_escaped(self) -> bool:
@@ -4690,7 +5194,7 @@ class Lifter:
         """
         for b in nodes:
             for (_a, mn, op, _n) in self.blocks[b].insns:
-                if mn not in _STORES:
+                if mn not in _STORES and not _raw_store(mn):
                     continue
                 got = _addr(_split_ops(op))
                 if got is None or got[1] is _BAD_POST:
@@ -4717,7 +5221,7 @@ class Lifter:
         read the base" is not evidence about where it points."""
         for b in nodes:
             for (_a, mn, op, _n) in self.blocks[b].insns:
-                if mn not in _STORES:
+                if mn not in _STORES and not _raw_store(mn):
                     continue
                 got = _addr(_split_ops(op))
                 if got is None or got[1] is _BAD_POST:
@@ -4740,9 +5244,11 @@ class Lifter:
                   if any(canon(m) in written for m in _REG_RE.findall(v.text))]:
             del st.slot[k]
 
-    def _loop_nodes(self, header):
-        latches = [n for n in self.blocks if header in self.blocks[n].succ]
-        nodes, stack = {header}, list(latches)
+    def _loop_nodes(self, header) -> frozenset:
+        got = self._loops.get(header)
+        if got is not None:
+            return got
+        nodes, stack = {header}, list(self._preds.get(header, ()))
         while stack:
             n = stack.pop()
             if n in nodes or n not in self.blocks:
@@ -4751,15 +5257,44 @@ class Lifter:
             for p in self._preds.get(n, ()):
                 if p not in nodes:
                     stack.append(p)
-        return nodes
+        got = self._loops[header] = frozenset(nodes)
+        return got
 
     def _written(self, nodes) -> set:
         w = set()
         for b in nodes:
-            for (_a, mn, o, _n) in self.blocks[b].insns:
-                de, _u = _def_use(mn, o)
-                w |= de
+            got = self._defs.get(b)
+            if got is None:
+                got = self._defs[b] = frozenset().union(
+                    *(_def_use(mn, o)[0] for (_a, mn, o, _n) in self.blocks[b].insns))
+            w |= got
         return w
+
+    def _writes_outgoing(self, nodes) -> bool:
+        """Whether `nodes` hold a call, or a store that may write a slot off SP: one
+        through SP, one `_step` prints raw, one through a frame register at an offset
+        held in a register, or one _frame_meets found."""
+        sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
+        for b in nodes:
+            for (a, mn, op, _n) in self.blocks[b].insns:
+                if mn in _CALLS or a in self.frame_meets:
+                    return True
+                if mn in _STORES or _raw_store(mn):
+                    got = _addr(_split_ops(op))
+                    if got is None or got[0][0] == sp or (
+                            _T.roles.get(got[0][0]) == "FP" and got[0][2] is not None):
+                        return True
+                    if _raw_store(mn) and _T.roles.get(got[0][0]) in ("SP", "FP"):
+                        return True
+        return False
+
+    def _accesses(self, b) -> list:
+        """_frame_accesses of block `b`, worked out once."""
+        got = self._frame_list.get(b)
+        if got is None:
+            got = self._frame_list[b] = list(_frame_accesses(self.blocks[b].insns,
+                                                             meets=self.frame_meets))
+        return got
 
 
 # ── argument-count analysis (for call-site argument reconstruction) ──────────
@@ -5326,13 +5861,15 @@ def _drop_stored(held: dict, fp: str, lo: int, hi: int):
         held.pop(f"{fp}{off:+d}", None)
 
 
-def _store_width(mn: str, reg: str) -> int:
-    """The bytes a store of `reg` with `mn` writes, per register: a q register's 16
-    where the spelling says nothing narrower."""
-    if mn in ("strb", "sturb"):
+def _access_width(mn: str, reg: str) -> int:
+    """The bytes a load or store of `reg` with `mn` moves, per register: a q register's
+    16 where the spelling says nothing narrower."""
+    if mn in ("strb", "sturb", "ldrb", "ldurb", "ldrsb", "ldursb"):
         return 1
-    if mn in ("strh", "sturh"):
+    if mn in ("strh", "sturh", "ldrh", "ldurh", "ldrsh", "ldursh"):
         return 2
+    if mn in ("ldrsw", "ldursw", "ldpsw"):
+        return 4
     return {"x": 8, "d": 8, "w": 4, "s": 4, "h": 2, "b": 1}.get(reg.strip()[:1], 16)
 
 
@@ -5551,8 +6088,8 @@ def use_target(tgt: Target):
     _RET_USES = frozenset({tgt.ret_int, tgt.ret_fp})
     _CALL_CLOBBERS = (_A64_CLOBBERS if tgt is ARM64 else
                       # arm32: R0-R3 and R12 are AAPCS volatile, and Dart adds R9. The FPU
-                      # side is D0-D7 (constants_arm.h kAbiVolatileFpuRegs).
-                      frozenset({f"r{i}" for i in (0, 1, 2, 3, 9, 12)}
+                      # side is D0-D7 (constants_arm.h kAbiVolatileFpuRegs). And LR.
+                      frozenset({f"r{i}" for i in (0, 1, 2, 3, 9, 12, 14)}
                                 | {f"d{i}" for i in range(8)}))
     _CANON_CACHE.clear()
     _MEM_CACHE.clear()
@@ -5586,6 +6123,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     _fold_frame_offsets(blocks)
     stmts = structure(blocks, entry)
     dispatch = detect_dispatch(stripped)
+    meets = _frame_meets(blocks, entry, {t[0]: t[1:3] for t, s in zip(ann, stripped)
+                                         if s[1:3] != t[1:3]})
 
     def walk(keep, carry=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
@@ -5593,6 +6132,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                         fields=fields)
         lifter.show = show
         lifter.slow_paths = frozenset(slow)
+        lifter.frame_meets = meets
         if returns is not None:
             lifter.returns = lambda: returns(ann[0][0])
             lifter.callees = returns

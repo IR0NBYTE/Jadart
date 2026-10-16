@@ -13,6 +13,34 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **LR after a call, and a slot a store changed out of sight, read as changed.** A call
+  writes LR with its own return address, and LR read the same after one as before it, two
+  values under one name in one loop. A store replaced only the slots it filled, so one at
+  -8 left the slot at -0xc with its top half changed, there and round a loop, and a load
+  narrower or wider than the store before it read that store's whole value. A store
+  `_step` prints raw (`stnp`, `stlr`, `st1`, an exclusive store, an atomic) changed no
+  slot and named no field read it may have changed, and a store through SP was not checked
+  against the slots kept through FP, nor one through FP against the arguments a call takes
+  through SP, nor either round a loop. Now a call forgets LR, and a loop with one carries
+  it; a store forgets each slot it writes a byte of, and a load reads a slot only at the
+  width it was stored; a raw store off the frame forgets every slot and one elsewhere
+  names each field read first; a loop header forgets the outgoing area where a trip may
+  write it; and `_frame_meets` follows SP - FP through the function, an FFI call's frame
+  and the slow paths `strip_boilerplate` cuts off included, so that only a store that may
+  reach the other register's slots forgets them. FP moving takes SP's slots with it, and
+  SP loaded, through itself too, is not known. A pair of q registers put the second 8
+  bytes on, not 16, and a write-back store through FP, and a post-index one through SP,
+  was filed where the register had been. The top half of a q register is no argument, so a
+  q register saved round a call no longer reads as one: `pool_0x2650.field_0x7(q0)`, the
+  inline box's slow path saving q0 round its allocation, prints `(...)`. Tier 3 exports
+  change in 11 functions on the clean fixture, 10 on 2.19.6, 17 on 3.4.4 and 11 on 3.10.9,
+  and in none on obf: 8, 10, 14 and 8 of those q saves; 2, 0, 3 and 2 that named the
+  dispatch target a call then overwrites in LR; and `WidgetStateMapper.resolve` on clean
+  and 3.10.9, whose temporaries are numbered one lower, where a store reached only past a
+  throw is one of those `_frame_meets` finds, in 2 to 8 functions a build. The loop reload
+  cost test compares two sizes rather than a time in seconds, and nested loops cost about
+  half what they did, 0.58 s for 300 deep against 1.02 s, as each block's frame accesses,
+  writes and reload steps are worked out once for all the loops around it. Closes #162.
 - **A slot the loop does not store to survives it.** A loop's exit forgot every frame slot
   where a block of `_loop_nodes` stored to the frame, and those take in the blocks before
   the loop too (#129), which store to it as a rule. So a value saved before the loop read

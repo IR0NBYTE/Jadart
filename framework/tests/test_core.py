@@ -6650,8 +6650,9 @@ def test_a_call_clobbers_every_volatile_register():
             assert r in defs, f"{mn} does not clobber {r}"
         for r in ("x15", "x19", "x22", "x26", "x27", "x28", "d31"):
             assert r not in defs, f"{mn} wrongly clobbers preserved/reserved {r}"
-    # and TMP/TMP2, x16 and x17, which a stub or a veneer may use (#137)
-    assert len(_CALL_CLOBBERS) == 15 + 2 + 31
+    # and TMP/TMP2, x16 and x17, which a stub or a veneer may use (#137), and LR, which
+    # the call itself writes (#162)
+    assert len(_CALL_CLOBBERS) == 15 + 2 + 1 + 31 and "x30" in _CALL_CLOBBERS
 
 
 def test_static_bit_is_calibrated_not_hardcoded():
@@ -11967,8 +11968,13 @@ def test_a_register_list_load_writes_every_register_in_it():
     assert lift([("ldur", "d5, [x4, #0xf]"), ("ld2", "{v4.s, v5.s}[1], [x3]"),
                  ("stur", "d5, [x5, #7]")])[:2] == [
         "ld2 {v4.s, v5.s}[1], [x3]   // d5 holds x4.field_0x10", "x5.field_0x8 = d5;"]
-    # A store of a list writes none of them.
+    # A store of a list writes none of them. It may write the field d1 was read from,
+    # so that read is named first; through FP it cannot (#162).
     assert lift([("ldur", "d1, [x4, #0xf]"), ("st1", "{v0.16b, v1.16b}, [x1]"),
+                 ("stur", "d1, [x5, #7]")])[:3] == [
+        "var t0 = x4.field_0x10;", "st1 {v0.16b, v1.16b}, [x1]   // d1 holds t0",
+        "x5.field_0x8 = t0;"]
+    assert lift([("ldur", "d1, [x4, #0xf]"), ("st1", "{v0.16b, v1.16b}, [x29]"),
                  ("stur", "d1, [x5, #7]")])[1] == "x5.field_0x8 = x4.field_0x10;"
 
 
@@ -12429,7 +12435,9 @@ def test_a_loop_reload_costs_its_length():
     # second. One value per register, and a store looks up only the keys it can touch,
     # so each costs a constant per instruction (#154). Timed, not counted: a count of
     # the instructions stepped would not have seen the first, whose cost was per
-    # instruction.
+    # instruction. Timed as a ratio, each shape at a size and at half of it, the best of
+    # three runs: linear gives 2 and quadratic 4, and a loaded machine slows both alike,
+    # where a limit in seconds had less than three times headroom on CI (#162).
     import time
     from jadart.expr import lift_function
     regs = [0, 1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13]
@@ -12445,12 +12453,17 @@ def test_a_loop_reload_costs_its_length():
         rows[head // 4 + 1] = ("b.eq", f"#{len(rows) * 4:#x}")
         rows += [("stur", "x0, [x2, #95]"), ("ret", "")]
         return [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
-    for ann in (shape(2000, [("mov", f"x14, #{j % 7}") for j in range(8000)]),
-                shape(5000, [("stur", "x14, [x29, #-8]")] * 20000)):
+    def took(ann):
         start = time.perf_counter()
         body = lift_function(ann)
-        assert time.perf_counter() - start < 1.5, len(ann)
         assert body[-2].strip() == "x2.field_0x60 = x0;", body[-2:]
+        return time.perf_counter() - start
+    for slots, body in ((2000, [("mov", f"x14, #{j % 7}") for j in range(8000)]),
+                        (5000, [("stur", "x14, [x29, #-8]")] * 20000)):
+        half, whole = shape(slots // 2, body[:len(body) // 2]), shape(slots, body)
+        times = [(took(half), took(whole)) for _ in range(3)]
+        small, large = min(t[0] for t in times), min(t[1] for t in times)
+        assert large < 3 * small, (slots, small, large)
 
 
 def test_a_double_result_read_past_the_next_instruction_is_named():
@@ -12902,8 +12915,19 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     from jadart.expr import lift_function
 
     def lift(rows):
+        # In a frame, as `_contentWidthFor` is, with SP below every slot: where SP - FP
+        # is not known, a store through SP may be to any slot (#162). The frame's three
+        # instructions move every branch target in the function on by 12 bytes.
+        def moved(mn, op):
+            if mn == "b" or mn.startswith(("b.", "cb", "tb")):
+                rest, _, at = op.rpartition("#")
+                return mn, f"{rest}#{int(at, 0) + 12:#x}"
+            return mn, op
+        frame = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+                 ("sub", "x15, x15, #0x50")]
         return [ln.strip() for ln in lift_function(
-            [(i * 4, r[0], r[1], "") for i, r in enumerate(rows)])]
+            [(i * 4, mn, op, "")
+             for i, (mn, op) in enumerate(frame + [moved(*r) for r in rows])])]
 
     # `_contentWidthFor`'s shape: the doubles saved, then a stack check whose slow path,
     # laid out after a throw, jumps back past the check. That makes a loop the machine
@@ -13042,6 +13066,221 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     import jadart
     body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x161360")[0]["body"]]
     assert "if (d0 > t2) {" in body and "t5 = d0;" in body, body
+
+
+def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
+    # What the review of #154 left (#162). A call writes LR, and LR read the same after
+    # it. A store replaced only the slots it filled, so one it covered part of kept its
+    # text, and a store `_step` prints raw, or one through SP over a slot kept through
+    # FP, changed none. Each of these printed a value the machine no longer holds.
+    from jadart.expr import StackArity, lift_function, _frame_meets
+
+    def lift(rows, **kw):
+        # A string row is a label, and `@name` in the operands is its address.
+        rows = rows + [("ret", "")]
+        at, n = {}, 0
+        for r in rows:
+            if isinstance(r, str):
+                at[r] = n * 4
+            else:
+                n += 1
+        ann = []
+        for r in (r for r in rows if not isinstance(r, str)):
+            op = r[1]
+            for name, a in at.items():
+                op = op.replace("@" + name, "#%#x" % a)
+            ann.append((len(ann) * 4, r[0], op, r[2] if len(r) > 2 else ""))
+        return [ln.strip() for ln in lift_function(ann, **kw)]
+
+    def frame(size, *rows):
+        # Dart's frame: FP at the saved pair, SP `size` below it.
+        return [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+                ("sub", "x15, x15, #%#x" % size)] + list(rows)
+
+    def loop(*inside):
+        return [("mov", "x9, #3"), "top", *inside, ("sub", "x9, x9, #1"),
+                ("cbnz", "x9, @top")]
+    keep = [("stur", "x3, [x2, #7]")]
+    throw = "  ; -> stub _iso_stub_ThrowStub"
+    # LR after a call, after a stub that gives every register back, and after an atomic
+    # that loads into it.
+    assert lift([("stur", "x30, [x29, #-8]"), ("bl", "#0x200"), ("mov", "x6, x30"),
+                 ("stur", "x6, [x2, #7]")])[1] == "x2.field_0x8 = x30;"
+    check = "  ; -> stub _iso_stub_StackOverflowSharedWithFPURegsStub"
+    assert lift([("bl", "#0x200", check), ("mov", "x6, x30"),
+                 ("stur", "x6, [x2, #7]")])[0] == "x2.field_0x8 = x30;"
+    assert lift([("ldadd", "x0, x30, [x1]"),
+                 ("stur", "x30, [x2, #7]")])[1] == "x2.field_0x8 = x30;"
+    # A store over part of a slot, and a load of a part, or of more than a part filled.
+    load = ("ldur", "x3, [x29, #-0xc]")
+    assert lift([("stur", "x0, [x29, #-0xc]"), ("stur", "x1, [x29, #-8]"), load]
+                + keep)[0] == "x2.field_0x8 = x3;"
+    load = ("ldur", "x3, [x29, #-8]")
+    assert lift([("stur", "x0, [x29, #-8]"), ("sturb", "w1, [x29, #-8]"), load]
+                + keep)[0] == "x2.field_0x8 = x3;"
+    assert lift([("stur", "x0, [x29, #-8]"), ("ldurb", "w3, [x29, #-8]")]
+                + keep)[0] == "x2.field_0x8 = x3;"
+    assert lift([("stur", "w0, [x29, #-8]"), ("ldur", "w3, [x29, #-8]")]
+                + keep)[0] == "x2.field_0x8 = x0;"           # as wide as it was stored
+    # Nor does a trip's reload of a slot a byte store filled put back what was there:
+    # the slot reads 5, and its 8 bytes are 0x1205.
+    assert lift([("mov", "x0, #0x1234"), ("stur", "x0, [x29, #-8]"), ("mov", "x6, #5"),
+                 ("strb", "w6, [x29, #-8]"), ("mov", "x19, #2"), "top",
+                 ("cmp", "x19, #1"), ("b.eq", "@out"), ("bl", "#0x100"),
+                 ("ldur", "x6, [x29, #-8]"), ("sub", "x19, x19, #1"),
+                 ("tbz", "x19, #63, @top"), ("ret", ""), "out",
+                 ("stur", "x6, [x2, #95]")])[-2] == "x2.field_0x60 = x6;"
+    # q1 of a pair sits 16 bytes on, and 8 bytes into q0 is no slot.
+    assert lift([("stp", "q0, q1, [x29, #-0x20]"), ("ldur", "d3, [x29, #-0x18]"),
+                 ("stur", "d3, [x2, #7]")])[0] == "x2.field_0x8 = d3;"
+    # A write-back store lands off FP where it was, and FP is then 8 lower.
+    assert lift([("str", "x0, [x29, #-8]!"), ("ldur", "x3, [x29, #-8]"), keep[0],
+                 ("ldr", "x4, [x29]"), ("stur", "x4, [x2, #15]")])[:2] == [
+        "x2.field_0x8 = x3;", "x2.field_0x10 = x0;"]
+    # Stores `_step` leaves raw: off the frame, also in a loop, and to the heap a field,
+    # or a slot holding one, was read from.
+    assert lift([("stur", "x0, [x29, #-0x10]"), ("stnp", "x4, x5, [x29, #-0x10]"),
+                 ("ldur", "x3, [x29, #-0x10]")] + keep)[1] == "x2.field_0x8 = x3;"
+    assert lift([("stur", "d0, [x29, #-0x20]")] + loop(("stnp", "x5, x6, [x29, #-0x20]"))
+                + [("ldur", "x3, [x29, #-0x20]")] + keep)[-2] == "x2.field_0x8 = x3;"
+    assert lift([("ldur", "x5, [x1, #7]"), ("stlr", "x0, [x16]"),
+                 ("stur", "x5, [x2, #7]")])[:3] == [
+        "var t0 = x1.field_0x8;", "stlr x0, [x16]", "x2.field_0x8 = t0;"]
+    assert lift([("ldur", "x5, [x1, #7]"), ("stur", "x5, [x29, #-8]"),
+                 ("stlr", "x0, [x16]"), load] + keep)[1] == "x2.field_0x8 = x3;"
+    # What a call takes off the stack, where a store broke the run of what was pushed:
+    # one over half a slot, a raw one off the frame, one over a q register's top half.
+    # Taken without them, the run reads as the whole list.
+    assert lift([("stp", "x10, x9, [x15]"), ("bl", "#0x100")]) == [
+        "return sub_0x100(x9, x10);"]
+    assert lift([("stp", "x10, x9, [x15]"), ("str", "w12, [x15, #0xc]"),
+                 ("bl", "#0x100")]) == ["return sub_0x100(...);"]
+    assert lift([("str", "x9, [x15, #8]"), ("str", "x10, [x15]"),
+                 ("stnp", "x4, x5, [x29, #-0x10]"), ("str", "x11, [x15]"),
+                 ("bl", "#0x100")])[1] == "return sub_0x100(...);"
+    regs = [("mov", f"{r}, #{n}") for n, r in enumerate(("x1", "x2", "x3", "x5",
+                                                           "x6", "x7"), 1)]
+    two = {"arity": lambda pc: StackArity(6, 2)}
+    assert lift(regs + [("str", "q0, [x15, #-0x10]!"), ("str", "x9, [x15, #8]"),
+                        ("bl", "#0x100")], **two) == ["return sub_0x100(...);"]
+    # A q register pushed round a call is two of its 8-byte slots, and saved, not an
+    # argument: `str q0; bl; ldr q0` round an allocation printed `f(q0)`.
+    assert lift([("str", "q0, [x15, #-0x10]!"), ("bl", "#0x100"),
+                 ("ldr", "q0, [x15], #0x10")]) == ["return sub_0x100(...);"]
+
+    # Through SP over a slot kept off FP: the frame puts SP 16 below FP, so SP+8 is
+    # FP-8. So is a push to FP-0x18, SP moved to FP-0x10 off FP, and a store below SP
+    # once SP is aligned, which may be up to 15 lower. And through FP over an argument
+    # pushed through SP, at SP+0. Each also in a loop, which drops the slot at its exit.
+    over = [("stur", "x0, [x29, #-8]"), ("str", "x1, [x15, #8]"), load] + keep
+    assert lift(frame(0x10, *over))[0] == "x2.field_0x8 = x3;"
+    assert lift(frame(0x10, over[0], ("str", "x1, [sp, #8]"), *over[2:]))[0] == (
+        "x2.field_0x8 = x3;")                           # SP by its other name
+    assert lift(frame(0x20, *over))[0] == "x2.field_0x8 = x0;"    # SP+8 is FP-0x18
+    assert lift(frame(0x10, ("stur", "x0, [x29, #-0x18]"), ("str", "x1, [x15, #-8]!"),
+                      ("ldur", "x3, [x29, #-0x18]"), *keep))[0] == "x2.field_0x8 = x3;"
+    assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("sub", "x15, x29, #0x10"),
+                      *over[1:]))[0] == "x2.field_0x8 = x3;"
+    assert lift(frame(0x10, ("stur", "x0, [x29, #-0x18]"),
+                      ("and", "x15, x15, #0xfffffffffffffff0"), ("str", "x1, [x15]"),
+                      ("ldur", "x3, [x29, #-0x18]"), *keep))[0] == "x2.field_0x8 = x3;"
+    assert lift(frame(0x10, ("stur", "d0, [x29, #-0x10]"), *loop(("str", "x5, [x15]")),
+                      ("ldur", "x3, [x29, #-0x10]"), *keep))[-2] == "x2.field_0x8 = x3;"
+    push = regs + [("str", "x9, [x15]"), ("stur", "x10, [x29, #-0x10]"), ("bl", "#0x100")]
+    one = {"arity": lambda pc: StackArity(6, 1)}
+    assert lift(frame(0x10, *push), **one)[0] == "return sub_0x100(...);"
+    assert lift(frame(0x20, *push), **one)[0] == (
+        "return sub_0x100(1, 2, 3, 4, 5, 6, x9);")
+    # SP where the code that reaches a push leaves it: not over a throw's edge, which
+    # tier 3 keeps (#64), from code that took the frame down, and through the slow path
+    # strip_boilerplate cut off a box-or-tag check, there reached over a throw's edge.
+    saves = [("str", "x3, [x15, #-8]!"), ("bl", "#0x500"), ("ldr", "x3, [x15], #8")]
+    for after in ((), (("mov", "x9, #0"),), (("sub", "x15, x15, #0x10"),)):
+        # The throw ends its block or not, and what follows it moves SP or not.
+        assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
+                          ("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10"),
+                          ("bl", "#0x600", throw), *after, "J", *saves, load,
+                          *keep))[-2] == "x2.field_0x8 = x0;", after
+    assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
+                      ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
+                      ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"), ("b", "@K"),
+                      "T", ("bl", "#0x600", throw), "P", *saves, ("b", "@K"),
+                      "K", load, *keep))[-2] == "x2.field_0x8 = x0;"
+
+    # A write-back store through FP is filed where FP is left, by the walk and by what
+    # names a slot across a call alike, pre-index and post-index. SP's slots go when FP
+    # moves, and SP loaded, through itself too, is not known.
+    field = [("ldur", "x0, [x1, #7]")]
+    named = ["var t0 = x1.field_0x8;", "var t1 = sub_0x100(...);", "x2.field_0x8 = t0;"]
+    assert lift(field + [("str", "x0, [x29, #-8]!"), ("bl", "#0x100"),
+                         ("ldr", "x3, [x29]")] + keep)[:3] == named
+    assert lift(field + [("str", "x0, [x29], #8"), ("bl", "#0x100"),
+                         ("ldur", "x3, [x29, #-8]")] + keep)[:3] == named
+    assert lift(frame(0x20, ("str", "x0, [x29, #-0x10]!"), ("str", "x1, [x15, #0x10]"),
+                      ("ldr", "x3, [x29], #0x10"), *keep))[0] == "x2.field_0x8 = x3;"
+    assert lift(frame(0x10, *regs, ("str", "x9, [x15]"), ("str", "x10, [x29, #-0x10]!"),
+                      ("bl", "#0x100")), **one)[0] == "return sub_0x100(...);"
+    assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("sub", "x16, x29, #8"),
+                      ("str", "x16, [x15]"), ("ldr", "x15, [x15]"), ("str", "x1, [x15]"),
+                      load, *keep))[0] == "x2.field_0x8 = x3;"
+    # A post-index store through SP lands where SP was, 8 above where it is.
+    assert lift(regs + [("str", "x9, [x15], #-8"), ("bl", "#0x100")], **one)[0] == (
+        "return sub_0x100(...);")
+    # Round a loop: LR after its call; a slot a store covers part of; the outgoing area
+    # a trip stores to, through SP or FP over it; a slot SP overwrites under a reload.
+    out = lift([("mov", "x6, #0"), "top", ("stur", "x30, [x2, #7]"), ("bl", "#0x100"),
+                ("cbnz", "x4, @top"), ("stur", "x30, [x2, #15]")])
+    assert "var t1 = LR;" in out and "t1 = x30;" in out, out
+    assert lift([("stur", "x0, [x29, #-8]"), "top", load, *keep,
+                 ("sturb", "w1, [x29, #-5]"), ("cbnz", "x4, @top")])[1] == (
+        "x2.field_0x8 = x3;")
+    assert lift([("str", "x5, [x15]"), "top", ("ldr", "x3, [x15]"), *keep,
+                 ("str", "x6, [x15]"), ("cbnz", "x4, @top")])[1] == "x2.field_0x8 = x3;"
+    assert lift(frame(0x10, ("str", "x5, [x15]"), "top", ("ldr", "x3, [x15]"), *keep,
+                      ("stur", "x6, [x29, #-0x10]"), ("cbnz", "x4, @top")))[1] == (
+        "x2.field_0x8 = x3;")
+    assert lift(loop(("bl", "#0x100")) + [("mov", "x6, x30"),
+                                          ("stur", "x6, [x2, #7]")])[-2] == (
+        "x2.field_0x8 = x30;")                          # LR after a loop that calls
+    assert lift(frame(0x10, *regs, ("str", "x9, [x15]"), "top", ("bl", "#0x200"),
+                      ("stur", "x10, [x29, #-0x10]"), ("cbnz", "x20, @top")),
+                **one)[7] == "var t6 = sub_0x200(...);"
+    assert lift(frame(0x10, ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"),
+                      "top", ("cbz", "x9, @out"), ("bl", "#0x200"),
+                      ("str", "x7, [x15, #8]"), ("ldur", "x6, [x29, #-8]"),
+                      ("cbnz", "x4, @top"), ("ret", ""), "out",
+                      ("stur", "x6, [x2, #7]")))[-2] == "x2.field_0x8 = x6;"
+    # A slot that starts below a push and ends in it; and what a call takes off the stack
+    # before a loop, which a call in the loop takes, as `_drop_outgoing` has it.
+    assert lift(frame(0x10, ("stur", "x0, [x29, #-0x14]"), ("str", "x1, [x15]"),
+                      ("ldur", "x3, [x29, #-0x14]"), *keep))[0] == "x2.field_0x8 = x3;"
+    assert lift(regs + [("str", "x9, [x15]"), "top", ("bl", "#0x200"),
+                        ("cbnz", "x20, @top")], **one)[7] == "var t6 = sub_0x200(...);"
+    # A block the entry does not reach, that loses SP, says nothing of one it does.
+    assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), "J", *saves, load, *keep,
+                      ("ret", ""), ("mov", "x15, x0"), ("b", "@J")))[1] == (
+        "x2.field_0x8 = x0;")
+
+    # The frame an FFI call builds for C ends where it began: what its calls push
+    # meets no slot. Where SP is not known at a push, the push may meet any.
+    from jadart.cfg import build_cfg
+    from jadart.expr import strip_boilerplate
+
+    def meets(rows):
+        ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])]
+        stripped = strip_boilerplate(ann)
+        blocks, entry = build_cfg(stripped, traps=())
+        return _frame_meets(blocks, entry, {a[0]: a[1:3] for a, s in zip(ann, stripped)
+                                            if s[1:3] != a[1:3]})
+    ffi = [("stur", "x0, [x29, #-8]"), ("str", "x29, [x15, #-8]!"), ("mov", "x29, x15"),
+           ("sub", "x15, x15, #0x10"), ("and", "x15, x15, #0xfffffffffffffff0"),
+           ("str", "x1, [x15]"), ("blr", "x9"), ("mov", "x15, x29"),
+           ("ldr", "x29, [x15], #8"), ("str", "x2, [x15]"), ("ldur", "x3, [x29, #-8]")]
+    assert meets(frame(0x10, *ffi)) == frozenset()
+    # The two pushes, and the store through FP the second one may have been under.
+    assert meets(frame(0x10, *ffi[:2], ("mov", "x15, x0"), *ffi[5:])) == {
+        0xc, 0x18, 0x28}
+
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
