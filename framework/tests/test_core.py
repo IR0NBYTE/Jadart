@@ -830,11 +830,13 @@ def test_a_concurrent_modification_guard_is_not_rendered_as_a_tautology():
 def _then_forget(rows):
     """`rows`, then a loop that calls and stores over half of [x29, #-0x10], after which
     the walk forgets that slot, then a reload of it to return. A name given to a spill
-    in `rows` is then read only by what `rows` print."""
+    in `rows` is then read only by what `rows` print. The reload is from the register
+    file the slot was stored from, as one from the other is no reload of it (#165)."""
     h = len(rows) + 1
+    r = "d0" if any(op[:1] == "d" for _m, op in rows if "[x29, #-0x10]" in op) else "x0"
     return rows + [("mov", "x6, #0"), ("bl", "#0x100"), ("stur", "x6, [x29, #-0xc]"),
                    ("add", "x6, x6, #1"), ("cmp", "x6, #3"), ("b.lt", f"#{h * 4:#x}"),
-                   ("ldur", "x0, [x29, #-0x10]"), ("ret", "")]
+                   ("ldur", f"{r}, [x29, #-0x10]"), ("ret", "")]
 
 
 #: Spills the very next statement reads, and how that statement has to read once the
@@ -12951,14 +12953,17 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     assert "x2.field_0x10 = d0;" in out and "x2.field_0x18 = x1;" in out, out
     # A store in the throw's block counts, as a handler the graph does not show could
     # run after it.
-    out = lift(head + check + body + [("stur", "x16, [x29, #-0x18]")] + throw[1:] + slow)
+    out = lift(head + check + body + [("stur", "d16, [x29, #-0x18]")] + throw[1:] + slow)
     assert "x2.field_0x10 = d1;" in out, out
 
     # A loop of its own, counting down in x9: the slot at -0x20 holds d0 from before it.
+    # It is read back from the register file it was stored from (#165).
     def counted(*inside, before=(("stur", "d0, [x29, #-0x20]"),)):
+        r = "d6" if any(op[:1] == "d" for _m, op in before if "#-0x20" in op) else "x6"
         rows = list(before) + [("mov", "x9, #3")] + list(inside)
         rows += [("sub", "x9, x9, #1"), ("cbnz", "x9, #%#x" % (4 * (len(before) + 1))),
-                 ("ldur", "x6, [x29, #-0x20]"), ("stur", "x6, [x2, #15]"), ("ret", "")]
+                 ("ldur", f"{r}, [x29, #-0x20]"), ("stur", f"{r}, [x2, #15]"),
+                 ("ret", "")]
         return lift(rows)
 
     def kept(*inside, **kw):
@@ -12971,10 +12976,10 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     assert kept(("stur", "w5, [x29, #-0x24]"))             # 4 bytes, ending below it
     assert kept(("stp", "q5, q6, [x29, #-0x40]"))          # 32 bytes up to it
     assert kept(("str", "x5, [x15]"))                      # the outgoing area
-    assert not kept(("stur", "x5, [x29, #-0x20]"))         # the slot itself
+    assert not kept(("stur", "d5, [x29, #-0x20]"))         # the slot itself
     assert not kept(("stur", "w5, [x29, #-0x1c]"))         # its top half
     assert not kept(("stur", "w5, [x29, #-0x22]"))         # straddling its bottom
-    assert not kept(("stp", "x5, x6, [x29, #-0x28]"))      # a pair over it
+    assert not kept(("stp", "d5, d6, [x29, #-0x28]"))      # a pair over it
     assert not kept(("stp", "q5, q6, [x29, #-0x30]"))      # 32 bytes over it
     assert not kept(("str", "x5, [x29, x7]"))              # a place not known
     assert not kept(("str", "x5, [x9], x10"))              # an update not read
@@ -13038,25 +13043,26 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     # does, d0 among them, and as a call.
     def checked(*slow, before=(("stur", "d0, [x29, #-0x20]"),), check=True):
         n = len(before)
+        r = "d6" if any(op[:1] == "d" for _m, op in before if "#-0x20" in op) else "x6"
         test = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"),
                 ("b.ls", "#%#x" % (4 * (n + 9)))] if check else [("nop", "")] * 3
         return lift(list(before) + [("mov", "x9, #3")] + test + [
             ("sub", "x9, x9, #1"),
-            ("cbnz", "x9, #%#x" % (4 * (n + 1))), ("ldur", "x6, [x29, #-0x20]"),
-            ("stur", "x6, [x2, #15]"), ("ret", "")]
+            ("cbnz", "x9, #%#x" % (4 * (n + 1))), ("ldur", f"{r}, [x29, #-0x20]"),
+            ("stur", f"{r}, [x2, #15]"), ("ret", "")]
             + [(mn, "#%#x" % (4 * (n + 4)) if mn == "b" else op) for mn, op in slow])
     quiet, busy = [("bl", "#0x200"), ("b", "")], [("bl", "#0x200"), ("mov", "x9, #1"),
                                                    ("b", "")]
     assert "x2.field_0x10 = d0;" in checked(*quiet)
-    assert "x2.field_0x10 = x6;" in checked(*busy)
-    assert "x2.field_0x10 = x6;" in checked(*quiet, check=False)
+    assert "x2.field_0x10 = d6;" in checked(*busy)
+    assert "x2.field_0x10 = d6;" in checked(*quiet, check=False)
     # Nor does one that jumps to the head itself, whether it calls or stores.
-    for odd in ([("bl", "#0x200"), ("mov", "x9, #1")], [("stur", "x9, [x29, #-0x20]")]):
+    for odd in ([("bl", "#0x200"), ("mov", "x9, #1")], [("stur", "d9, [x29, #-0x20]")]):
         out = lift([("stur", "d0, [x29, #-0x20]"), ("mov", "x9, #3"),
                     ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"),
-                    ("ldur", "x6, [x29, #-0x20]"), ("stur", "x6, [x2, #15]"), ("ret", "")]
+                    ("ldur", "d6, [x29, #-0x20]"), ("stur", "d6, [x2, #15]"), ("ret", "")]
                    + odd + [("b", "#0x8")])
-        assert "x2.field_0x10 = x6;" in out, out
+        assert "x2.field_0x10 = d6;" in out, out
     field = (("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x20]"))
     assert "x2.field_0x10 = x20.field_0xc;" in checked(*quiet, before=field)
     assert "x2.field_0x10 = x6;" in checked(*busy, before=field)
@@ -13142,7 +13148,8 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     assert lift([("stur", "x0, [x29, #-0x10]"), ("stnp", "x4, x5, [x29, #-0x10]"),
                  ("ldur", "x3, [x29, #-0x10]")] + keep)[1] == "x2.field_0x8 = x3;"
     assert lift([("stur", "d0, [x29, #-0x20]")] + loop(("stnp", "x5, x6, [x29, #-0x20]"))
-                + [("ldur", "x3, [x29, #-0x20]")] + keep)[-2] == "x2.field_0x8 = x3;"
+                + [("ldur", "d3, [x29, #-0x20]"), ("stur", "d3, [x2, #7]")])[-2] == (
+        "x2.field_0x8 = d3;")
     assert lift([("ldur", "x5, [x1, #7]"), ("stlr", "x0, [x16]"),
                  ("stur", "x5, [x2, #7]")])[:3] == [
         "var t0 = x1.field_0x8;", "stlr x0, [x16]", "x2.field_0x8 = t0;"]
@@ -13185,22 +13192,22 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
                       ("and", "x15, x15, #0xfffffffffffffff0"), ("str", "x1, [x15]"),
                       ("ldur", "x3, [x29, #-0x18]"), *keep))[0] == "x2.field_0x8 = x3;"
     assert lift(frame(0x10, ("stur", "d0, [x29, #-0x10]"), *loop(("str", "x5, [x15]")),
-                      ("ldur", "x3, [x29, #-0x10]"), *keep))[-2] == "x2.field_0x8 = x3;"
+                      ("ldur", "d3, [x29, #-0x10]"), ("stur", "d3, [x2, #7]")))[-2] == (
+        "x2.field_0x8 = d3;")
     push = regs + [("str", "x9, [x15]"), ("stur", "x10, [x29, #-0x10]"), ("bl", "#0x100")]
     one = {"arity": lambda pc: StackArity(6, 1)}
     assert lift(frame(0x10, *push), **one)[0] == "return sub_0x100(...);"
     assert lift(frame(0x20, *push), **one)[0] == (
         "return sub_0x100(1, 2, 3, 4, 5, 6, x9);")
     # SP where the code that reaches a push leaves it: not over a throw's edge, which
-    # tier 3 keeps (#64), from code that took the frame down, and through the slow path
+    # tier 3 keeps (#64), from code that took SP down, and through the slow path
     # strip_boilerplate cut off a box-or-tag check, there reached over a throw's edge.
     saves = [("str", "x3, [x15, #-8]!"), ("bl", "#0x500"), ("ldr", "x3, [x15], #8")]
     for after in ((), (("mov", "x9, #0"),), (("sub", "x15, x15, #0x10"),)):
         # The throw ends its block or not, and what follows it moves SP or not.
         assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
-                          ("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10"),
-                          ("bl", "#0x600", throw), *after, "J", *saves, load,
-                          *keep))[-2] == "x2.field_0x8 = x0;", after
+                          ("mov", "x15, x29"), ("bl", "#0x600", throw), *after, "J",
+                          *saves, load, *keep))[-2] == "x2.field_0x8 = x0;", after
     assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
                       ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
                       ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"), ("b", "@K"),
@@ -13280,6 +13287,137 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     # The two pushes, and the store through FP the second one may have been under.
     assert meets(frame(0x10, *ffi[:2], ("mov", "x15, x0"), *ffi[5:])) == {
         0xc, 0x18, 0x28}
+
+
+def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
+    # What the review of #162 left (#165). A frame register moved where the walk did not
+    # see it, a store went through a frame address held in a register, and a load that
+    # extends read the stored text as it was: each printed a slot the machine no longer
+    # holds, or holds as another value.
+    from jadart.expr import lift_function
+
+    def lift(rows, **kw):
+        # A string row is a label, and `@name` in the operands is its address.
+        rows = rows + [("ret", "")]
+        at, n = {}, 0
+        for r in rows:
+            if isinstance(r, str):
+                at[r] = n * 4
+            else:
+                n += 1
+        ann = []
+        for r in (r for r in rows if not isinstance(r, str)):
+            op = r[1]
+            for name, a in at.items():
+                op = op.replace("@" + name, "#%#x" % a)
+            ann.append((len(ann) * 4, r[0], op, r[2] if len(r) > 2 else ""))
+        return [ln.strip() for ln in lift_function(ann, **kw)]
+
+    def frame(size, *rows):
+        return [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+                ("sub", "x15, x15, #%#x" % size)] + list(rows)
+
+    def loop(*inside):
+        return [("mov", "x9, #3"), "top", *inside, ("sub", "x9, x9, #1"),
+                ("cbnz", "x9, @top")]
+    keep = [("stur", "x3, [x2, #7]")]
+    spill, load = ("stur", "x0, [x29, #-8]"), ("ldur", "x3, [x29, #-8]")
+    gone, held = "x2.field_0x8 = x3;", "x2.field_0x8 = x0;"
+
+    # 1. FP moved by a move strip_boilerplate blanks, by arithmetic, and by a load into
+    # it; SP by a blanked `sub` or `add`, an `and`, and a load through itself.
+    assert lift([spill, ("mov", "x29, x15"), load] + keep)[0] == gone
+    assert lift(frame(0x20, spill, ("mov", "x29, x15"), load, *keep))[0] == gone
+    assert lift(frame(0x20, spill, ("ldr", "x29, [x1]"), load, *keep))[0] == gone
+    # FP moved by an amount known reads its slots where they now are.
+    assert lift(frame(0x20, spill, ("add", "x29, x29, #8"), load, *keep))[0] == gone
+    assert lift(frame(0x20, spill, ("add", "x29, x29, #8"), ("ldur", "x3, [x29, #-0x10]"),
+                      *keep))[0] == held
+    push, top = ("str", "x0, [x15, #8]"), ("ldr", "x3, [x15, #8]")
+    for move in (("sub", "x15, x15, #8"), ("add", "x15, x15, #8"),
+                 ("and", "x15, x15, #0xfffffffffffffff0"), ("ldr", "x15, [x15]")):
+        assert lift(frame(0x20, push, move, top, *keep))[0] == gone, move
+    assert lift(frame(0x20, push, ("sub", "x15, x15, #8"), ("ldr", "x3, [x15, #0x10]"),
+                      *keep))[0] == gone    # dropped, not moved with it: passes on main
+    # An FFI call's frame and a leaf call's put FP back where it was: a slot kept from
+    # before reads the same after, an access through the moved FP is to where it points,
+    # and a store through it changes the slot it lands in.
+    ffi = [("str", "x29, [x15, #-8]!"), ("mov", "x29, x15"),
+           ("and", "x15, x15, #0xfffffffffffffff0")]
+    out = [("blr", "x9"), ("mov", "x15, x29"), ("ldr", "x29, [x15], #8")]
+    leaf = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+            ("and", "x15, x15, #0xfffffffffffffff0")]
+    back = [("blr", "x10"), ("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10")]
+    field = [("ldur", "x0, [x1, #7]"), spill]
+    for enter, leave, up in ((ffi, out, 0x20), (leaf, back, 0x28)):
+        got = lift(frame(0x20, *field, *enter, *leave, load, *keep))
+        assert got[0] == "var t0 = x1.field_0x8;" and got[2] == "x2.field_0x8 = t0;", (
+            got)                                          # a guard: passes on main
+        got = lift(frame(0x20, spill, *enter, ("ldur", "x3, [x29, #%#x]" % up), *keep,
+                         *leave))
+        assert got[0] == held, got                        # FP-8 through the moved FP
+        got = lift(frame(0x20, spill, *enter, ("stur", "x5, [x29, #%#x]" % up), *leave,
+                         load, *keep))
+        assert got[-2] == "x2.field_0x8 = x5;", got
+    # A cell the push starts an FFI call's frame with and a leaf call's store into its
+    # own frame use at different times, and cost no slot (`__constructor`).
+    got = lift(frame(0x20, *field, *ffi, *out, *leaf, ("str", "x10, [x29, #8]"), *back,
+                     load, *keep))
+    assert got[-2] == "x2.field_0x8 = t0;", got         # and this
+    # Where paths meet with FP in different places, the slots go.
+    assert lift(frame(0x20, spill, ("cbz", "x4, @J"), *ffi[:2], "J", load,
+                      *keep))[-2] == gone
+    # A loop whose trip moves FP, or SP, where the walk does not see it starts with
+    # neither's slots: on the second trip they are somewhere else.
+    assert gone in lift(frame(0x20, spill, *loop(load, *keep, ("mov", "x29, x15"))))
+    assert gone in lift(frame(0x20, push, *loop(top, *keep, ("sub", "x15, x15, #8"))))
+
+    # 2. A store through a register that may hold a frame address: off FP or SP, through
+    # a copy of one, and from one arm of a join, raw stores among them. Not one through
+    # a register written since by a load or a call, which gives it a value of its own.
+    sub = ("sub", "x16, x29, #8")
+    assert lift(frame(0x20, spill, sub, ("str", "x1, [x16]"), load, *keep))[1] == gone
+    assert lift(frame(0x20, push, ("add", "x16, x15, #8"), ("str", "x1, [x16]"), top,
+                      *keep))[1] == gone
+    assert lift(frame(0x20, spill, ("mov", "x17, x29"), ("mov", "x16, x17"),
+                      ("stur", "x1, [x16, #-8]"), load, *keep))[1] == gone
+    assert lift(frame(0x20, spill, ("cbz", "x4, @L"), sub, "L", ("str", "x1, [x16]"),
+                      load, *keep))[-2] == gone
+    assert lift(frame(0x20, spill, sub, ("stlr", "x4, [x16]"), load, *keep))[1] == gone
+    assert lift(frame(0x20, spill, sub, ("ldur", "x16, [x1, #7]"), ("str", "x4, [x16]"),
+                      load, *keep))[1] == held            # guard: passes on main
+    assert lift(frame(0x20, spill, ("sub", "x9, x29, #8"), ("bl", "#0x400"),
+                      ("str", "x4, [x9]"), load, *keep))[2] == held     # and this
+    assert lift(frame(0x20, spill, ("sub", "x19, x29, #8"), ("bl", "#0x400"),
+                      ("str", "x4, [x19]"), load, *keep))[2] == gone
+    # In a loop, the slot it may write, and the outgoing area, go at the top.
+    assert gone in lift(frame(0x20, spill, sub, *loop(load, *keep, ("str", "x9, [x16]"))))
+    assert gone in lift(frame(0x20, push, ("add", "x16, x15, #8"),
+                              *loop(top, *keep, ("str", "x9, [x16]"))))
+
+    # 3. A load that extends reads the slot as `sxtw` and `uxth` print it, and one into
+    # the other register file reads none: it is `fmov`'s reinterpretation.
+    for st, ld, want in (("stur w0", "ldursw x3", "x0 << 32 >> 32"),
+                         ("sturh w0", "ldursh x3", "x0 << 48 >> 48"),
+                         ("sturb w0", "ldursb w3", "x0 << 56 >> 56"),
+                         ("sturh w0", "ldurh w3", "x0 & 0xffff"),
+                         ("sturb w0", "ldurb w3", "x0 & 0xff"),
+                         ("stur w0", "ldur w3", "x0")):        # as `mov w3, w0`: guard
+        got = lift([(st.split()[0], st.split()[1] + ", [x29, #-8]"),
+                    (ld.split()[0], ld.split()[1] + ", [x29, #-8]")] + keep)
+        assert got[0] == "x2.field_0x8 = %s;" % want, (st, ld, got)
+    assert lift([("stp", "w0, w1, [x29, #-8]"), ("ldpsw", "x3, x4, [x29, #-8]"),
+                 ("stur", "x4, [x2, #7]")])[0] == "x2.field_0x8 = x1 << 32 >> 32;"
+    assert lift([("and", "x0, x1, #0xff"), ("sturb", "w0, [x29, #-8]"),
+                 ("ldurb", "w3, [x29, #-8]")] + keep)[0] == (
+        "x2.field_0x8 = x1 & 255;")                       # it fits: passes on main
+    assert lift([spill, ("ldur", "d3, [x29, #-8]"), ("fadd", "d4, d3, d3"),
+                 ("stur", "d4, [x2, #7]")])[0] == "x2.field_0x8 = d3 + d3;"
+    assert lift([("fadd", "d0, d1, d2"), ("stur", "d0, [x29, #-8]"), load]
+                + keep)[0] == gone
+    assert lift([("fadd", "d0, d1, d2"), ("stur", "d0, [x29, #-8]"),
+                 ("ldur", "d3, [x29, #-8]"), ("stur", "d3, [x2, #7]")])[0] == (
+        "x2.field_0x8 = d1 + d2;")                        # guard: passes on main
 
 
 if __name__ == "__main__":

@@ -13,6 +13,30 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A frame written out of sight, or read back wider, read as it was.** Three cases the
+  review of #162 left, each on `main` too. A frame register moved where the walk did not
+  see it moved: `strip_boilerplate` blanks every `mov x29, x15` and every `add` or `sub`
+  of SP, not only the prologue's, so an FFI call's frame, which gives the C call a frame
+  of its own and puts FP back after, and an SP adjust past the prologue, both kept the old
+  slots, and a slot read through the moved register printed what was stored where it
+  pointed before. A store through a register holding a frame address, built with `sub x16,
+  x29, #8` or an FFI call's `add xD, SP, #imm`, left the slot it wrote reading as before.
+  A load that extends what it reads printed the stored text whole: `stur w0; ldursw x3`
+  read x3 as x0 where `sxtw x3, w0` reads it as `x0 << 32 >> 32`, and a narrow load took
+  the low bits of a wider value as the whole of it. Now the walk is handed the frame moves
+  `strip_boilerplate` blanked and drops the moved register's slots there, an FFI or leaf
+  call's accesses through the moved FP are keyed into the frame it points into so a slot
+  kept from before the call reads the same after, a store through a register that may hold
+  a frame address (a forward analysis over the functions where one reaches a register)
+  forgets the slots it may write, and a reload reads a slot only through the register file
+  it was stored from and extends a narrow read as `sxtw` and `uxth` print it. Tier 3
+  exports change in 110 functions on the clean fixture, 107 on 3.4.4, 110 on 3.10.9 and
+  in none on obf or 2.19.6, almost all a saved FP printed as a native runtime call's
+  argument, `THR.field_0x7d9(x29)`, now `(...)`, and a load past the FFI frame it is
+  keyed into, `THR.field_0x6c8 = x0.field_0x7d9`. A store through a frame address in a
+  register changes essentially no output, as the corpus reads through such addresses far
+  more than it writes through them, but it was wrong where it did. Closes #165.
+
 - **LR after a call, and a slot a store changed out of sight, read as changed.** A call
   writes LR with its own return address, and LR read the same after one as before it, two
   values under one name in one loop. A store replaced only the slots it filled, so one at
