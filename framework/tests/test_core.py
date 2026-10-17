@@ -11616,7 +11616,9 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
     cr = next(c for c in image.all_ranges if c.pc_offset == 0x18d4e4)
     body = [ln.strip() for ln in lift_function(
         _ann(image, disassemble_range(image, cr), p2n, pm), pm, arity=ar)]
-    assert "var t5 = pool_0x2650.field_0x7(t4, t3);" in body, body
+    # The call declines its argument list: the `stp x0, x1` before it is x0 and x1 saved
+    # round the call and reloaded after, not two pushed arguments (#147).
+    assert "var t5 = pool_0x2650.field_0x7(...);" in body, body
 
 def test_a_raw_line_says_what_the_registers_it_reads_hold():
     # A raw line reads the machine registers it names, and a register tier 3 held as an
@@ -12161,8 +12163,10 @@ def test_a_function_that_reads_its_arguments_off_the_stack_has_no_register_arity
                           ("ret", "")]) == 0
     # One that takes registers too keeps their count, as `hash6` does.
     assert arity([("ldr", "x0, [x15]"), ("ldur", "x2, [x1, #7]"), ("ret", "")]) == 1
-    # and a call to such a function prints what was pushed, or, where a second push
-    # dropped part of it, nothing (#147)
+    # and a call to such a function prints what was pushed, all of it: a second push
+    # that moves SP renames the first push's slots rather than dropping them, so the
+    # three values pushed as two pushes stay the three-argument list (#147). The lost
+    # third argument of `_setFlag` was main's.
     def call(rows):
         rows = rows + [("bl", "#0x100"), ("ret", "")]
         return [ln.strip() for ln in lift_function(
@@ -12170,7 +12174,38 @@ def test_a_function_that_reads_its_arguments_off_the_stack_has_no_register_arity
             arity=lambda pc: None)]
     assert call([("stp", "x6, x7, [x15, #-0x10]!")]) == ["return sub_0x100(x7, x6);"]
     assert call([("stp", "x6, x7, [x15, #-0x10]!"), ("str", "x5, [x15, #-8]!")]) == [
-        "return sub_0x100(...);"]
+        "return sub_0x100(x7, x6, x5);"]
+
+
+def test_registers_saved_round_a_call_are_not_its_arguments():
+    # A slow path spills volatile registers before a runtime call and reloads them after.
+    # The spill lands in the outgoing area exactly as a pushed argument does, so main read
+    # it back as the call's argument list, `pool_0x2650.field_0x7(t4, t3)` for a saved
+    # `stp x0, x1` (#147). A save is told from an argument by what the code does after the
+    # call: a save is reloaded into the registers it came from, an argument is dropped
+    # with the outgoing area. A call whose pushes are reloaded reads no stack arguments.
+    from jadart.expr import lift_function
+
+    def call(rows):
+        rows = rows + [("ret", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+            arity=lambda pc: None)]
+    # x0 saved round the call and reloaded after: not an argument.
+    saved = call([("str", "x0, [x15, #-8]!"), ("mov", "x0, #0x46"), ("bl", "#0x100"),
+                  ("ldr", "x0, [x15], #8")])
+    assert saved == ["sub_0x100(...);", "return x0;"], saved
+    # a pair saved with stp and reloaded with ldp, as 0x18d4e4 does.
+    pair = call([("stp", "x0, x1, [x15, #-0x10]!"), ("mov", "x0, #0x42"),
+                 ("bl", "#0x100"), ("ldp", "x0, x1, [x15], #0x10")])
+    assert pair == ["sub_0x100(...);", "return x0;"], pair
+    # the same push with no reload after is a real argument and still reads.
+    arg = call([("str", "x0, [x15, #-8]!"), ("bl", "#0x100")])
+    assert arg == ["return sub_0x100(x0);"], arg
+    # a push dropped with the outgoing area (add x15), not reloaded, is an argument too.
+    dropped = call([("str", "x0, [x15, #-8]!"), ("bl", "#0x100"),
+                    ("add", "x15, x15, #8")])
+    assert dropped == ["return sub_0x100(x0);"], dropped
 
 
 def test_a_call_to_a_function_that_takes_a_double_does_not_list_its_other_arguments():
