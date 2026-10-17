@@ -11,6 +11,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Changed
+
+- **Declarations nothing reads, bound by a phi, are dropped.** `_phi` and `_render_loop`
+  bind a name at a join or a loop header whenever the paths disagree about a register,
+  before the body is printed and so before it is known whether the result is read. Where
+  nothing reads it, the declaration and the writes to it on each arm say nothing, and a
+  loop that carried six argument registers for a call that then declined to `(...)` left
+  a dozen such lines. They are now dropped, together, declaration and every assignment;
+  a phi stays whole where dropping it would leave an if-arm or a loop body holding
+  nothing else (the one line that says the arm ran, as a dead slot name is kept), and
+  where an assignment makes a call, the call being a side effect. Dropping a dead name
+  can leave the value it was copied from read once, which then folds into its use, so a
+  few lines read tighter too (`var t = this.field_0xc; ... t.field_0xc` becomes
+  `this.field_0xc.field_0xc`). Tier 3 exports lose dead lines in 340 functions on the
+  clean fixture, 223 on 2.19.6, 334 on 3.4.4 and 343 on 3.10.9, and none on obf; every
+  change is a line removal or that fold, no live value moves, and no block is left
+  empty. Closes #169.
+
 ### Fixed
 
 - **A write to a V register's upper lane no longer forgets the double in its low lane.**

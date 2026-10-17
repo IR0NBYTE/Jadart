@@ -12243,6 +12243,70 @@ def test_an_insert_into_an_upper_lane_keeps_the_double_in_the_low_lane():
             "h[3]", "b[8]", "b[7]")] == [True, False, True, False, True, False, True, False]
 
 
+def test_a_phi_name_nothing_reads_is_dropped():
+    # `_phi` and `_render_loop` bind a name at a join or loop header whenever the paths
+    # disagree about a register, before it is known whether the result is read. Where
+    # nothing reads it, the declaration and the writes to it say nothing, `var t10 = t1;`
+    # on an allocation slow path among them (#169). They go together, and stay whole where
+    # dropping them would empty an if-arm or a loop body.
+    from jadart.expr import _drop_dead_phis, lift_function, StackArity
+
+    # the pass itself: a dead phi goes, decl and every assignment
+    L = ["  var t0 = x1;", "  return x0;"]
+    assert _drop_dead_phis(L, {"t0"}) == ["  return x0;"]
+    split = ["  var t0;", "  if (c) {", "    t0 = x1;", "    keep();", "  } else {",
+             "    t0 = x2;", "    other();", "  }", "  return x0;"]
+    assert all("t0" not in ln for ln in _drop_dead_phis(split, {"t0"}))
+    # a live phi stays
+    live = ["  var t0 = x1;", "  t0 = t0 + 1;", "  return t0;"]
+    assert _drop_dead_phis(live, {"t0"}) == live
+    # kept whole where dropping would leave an arm holding nothing else
+    alone = ["  var t0;", "  if (c) {", "    t0 = x1;", "  } else {", "    foo();", "  }",
+             "  return x0;"]
+    assert _drop_dead_phis(alone, {"t0"}) == alone
+    # never dropped where an assignment makes a call: the call is a side effect
+    call = ["  var t0;", "  t0 = foo(...);", "  bar();", "  return x0;"]
+    assert _drop_dead_phis(call, {"t0"}) == call
+
+    def lift(rows, **kw):
+        rows = list(rows) + [("ret", "")]
+        at, n = {}, 0
+        for r in rows:
+            if isinstance(r, str):
+                at[r] = n * 4
+            else:
+                n += 1
+        ann = []
+        for r in (r for r in rows if not isinstance(r, str)):
+            op = r[1]
+            for nm, a in at.items():
+                op = op.replace("@" + nm, "#%#x" % a)
+            ann.append((len(ann) * 4, r[0], op, ""))
+        return [ln.strip() for ln in lift_function(ann, **kw)]
+    regs = [("mov", f"{r}, #{n}") for n, r in enumerate(("x1", "x2", "x3", "x5", "x6",
+                                                         "x7"), 1)]
+    one = {"arity": lambda pc: StackArity(6, 1)}
+    # a loop carries the six argument registers for a call that declines to `...`, and
+    # nothing reads them: the dead carries go, the call and the loop stay.
+    out = lift(regs + [("str", "x9, [x15]"), "top", ("bl", "#0x200"),
+                       ("stur", "x10, [x29, #-0x10]"), ("cbnz", "x20, @top")], **one)
+    assert "var t6 = sub_0x200(...);" in out
+    assert not any(ln.startswith("var t0") or ln == "t0 = x1;" for ln in out), out
+    assert not any(re.search(r"\{\s*\}", ln) for ln in out)
+    # a loop whose carry is read keeps it
+    out = lift([("mov", "x19, x1"), "top", ("bl", "#0x100"), ("add", "x19, x19, #1"),
+                ("cbnz", "x20, @top"), ("stur", "x19, [x2, #7]")])
+    assert "var t0 = x1;" in out and "x2.field_0x8 = t0;" in out, out
+
+    # and the if-join phi `_phi` binds: `values` on the clean fixture leaves a value NULL
+    # unless a field is set, then nothing reads it, `var t = NULL; if (..) { t = ..; }`.
+    _needs_capstone()
+    import jadart
+    body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x29ce18")[0]["body"]]
+    assert not any(ln.endswith("= NULL;") for ln in body), body
+    assert "var t0 = pool_0x218.field_0x7(...);" in body, body
+
+
 def test_a_call_whose_double_result_is_read_names_it():
     # A double comes back in d0, and a call's d0 result was never named: it read as d0,
     # which is also how the d0 the function was handed reads, and `ratioOfTones`
@@ -13319,9 +13383,9 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     assert lift(loop(("bl", "#0x100")) + [("mov", "x6, x30"),
                                           ("stur", "x6, [x2, #7]")])[-2] == (
         "x2.field_0x8 = x30;")                          # LR after a loop that calls
-    assert lift(frame(0x10, *regs, ("str", "x9, [x15]"), "top", ("bl", "#0x200"),
-                      ("stur", "x10, [x29, #-0x10]"), ("cbnz", "x20, @top")),
-                **one)[7] == "var t6 = sub_0x200(...);"
+    assert "var t6 = sub_0x200(...);" in lift(
+        frame(0x10, *regs, ("str", "x9, [x15]"), "top", ("bl", "#0x200"),
+              ("stur", "x10, [x29, #-0x10]"), ("cbnz", "x20, @top")), **one)
     assert lift(frame(0x10, ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"),
                       "top", ("cbz", "x9, @out"), ("bl", "#0x200"),
                       ("str", "x7, [x15, #8]"), ("ldur", "x6, [x29, #-8]"),
@@ -13331,8 +13395,9 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     # before a loop, which a call in the loop takes, as `_drop_outgoing` has it.
     assert lift(frame(0x10, ("stur", "x0, [x29, #-0x14]"), ("str", "x1, [x15]"),
                       ("ldur", "x3, [x29, #-0x14]"), *keep))[0] == "x2.field_0x8 = x3;"
-    assert lift(regs + [("str", "x9, [x15]"), "top", ("bl", "#0x200"),
-                        ("cbnz", "x20, @top")], **one)[7] == "var t6 = sub_0x200(...);"
+    assert "var t6 = sub_0x200(...);" in lift(
+        regs + [("str", "x9, [x15]"), "top", ("bl", "#0x200"),
+                ("cbnz", "x20, @top")], **one)
     # A block the entry does not reach, that loses SP, says nothing of one it does.
     assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), "J", *saves, load, *keep,
                       ("ret", ""), ("mov", "x15, x0"), ("b", "@J")))[1] == (
