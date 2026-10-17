@@ -12212,6 +12212,37 @@ def test_a_call_to_a_function_that_takes_a_double_does_not_list_its_other_argume
     assert call(1) == ["return sub_0x100(5);"]
 
 
+def test_an_insert_into_an_upper_lane_keeps_the_double_in_the_low_lane():
+    # d0, v0.16b and q0 are one register, and #114 forgot the double under dN on any
+    # write to a wider spelling. An insert into a lane entirely in the upper 64 bits
+    # (`ins v0.d[1], x5`, `mov v0.d[1], ...`, `fmov v0.d[1], x5`, `.s[2]` and up) leaves
+    # the low 64, which dN names, unchanged, so forgetting dN there declined a double the
+    # machine still holds (#134). An insert into the low lane does change dN.
+    from jadart.expr import lift_function, _upper_lane
+
+    def lift(mid):
+        rows = [("fadd", "d0, d1, d2"), mid, ("stur", "d0, [x2, #7]"), ("ret", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    # upper-lane inserts keep d0 = d1 + d2
+    assert lift(("ins", "v0.d[1], x5"))[-2] == "x2.field_0x8 = d1 + d2;"
+    assert lift(("mov", "v0.d[1], v3.d[0]"))[-2] == "x2.field_0x8 = d1 + d2;"
+    assert lift(("fmov", "v0.d[1], x5"))[-2] == "x2.field_0x8 = d1 + d2;"
+    assert lift(("ins", "v0.s[2], w5"))[-2] == "x2.field_0x8 = d1 + d2;"
+    # the insert still prints, its upper lane not being modelled
+    assert any(ln.startswith("ins v0.d[1]") for ln in lift(("ins", "v0.d[1], x5")))
+    # a write to the low lane changes dN, so it is forgotten and reads as itself
+    assert lift(("ins", "v0.d[0], x5"))[-2] == "x2.field_0x8 = d0;"
+    assert lift(("ins", "v0.s[0], w5"))[-2] == "x2.field_0x8 = d0;"
+    assert lift(("ins", "v0.s[1], w5"))[-2] == "x2.field_0x8 = d0;"
+    # a full-width write still forgets d0, as before (#114)
+    assert lift(("mov", "v0.16b, v3.16b"))[-2] == "x2.field_0x8 = d3;"
+    assert lift(("eor", "v0.16b, v0.16b, v0.16b"))[-2] == "x2.field_0x8 = 0.0;"
+    # _upper_lane: the low element of each size is not upper
+    assert [_upper_lane("v0." + s) for s in ("d[1]", "d[0]", "s[2]", "s[1]", "h[4]",
+            "h[3]", "b[8]", "b[7]")] == [True, False, True, False, True, False, True, False]
+
+
 def test_a_call_whose_double_result_is_read_names_it():
     # A double comes back in d0, and a call's d0 result was never named: it read as d0,
     # which is also how the d0 the function was handed reads, and `ratioOfTones`

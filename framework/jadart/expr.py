@@ -112,6 +112,20 @@ _FP_VIEW_RE = re.compile(r"^[dvqhb](3[01]|[12]\d|\d)(?:\.\w+(?:\[\d+\])?|\[\d+\]
 #: What `eor` of a register with itself, or `movi #0`, zeroes the whole double in.
 _ZEROED = re.compile(r"(v(3[01]|[12]\d|\d)\.(16b|8b|2d))|d(3[01]|[12]\d|\d)")
 
+#: A lane insert's destination lane: `v0.d[1]`, `v0.s[2]`, `v0.b[9]`.
+_LANE_RE = re.compile(r"\.([dshb])\[(\d+)\]\s*$")
+
+
+def _upper_lane(opspec: str) -> bool:
+    """Whether `opspec` is an insert into a lane entirely in the upper 64 bits of a V
+    register, so the low 64, which dN names, is untouched: `.d[1]`, `.s[2]`/`.s[3]`,
+    `.h[4]` and up, `.b[8]` and up. The low lane (`.d[0]`, `.s[0..1]`, ...) is not one,
+    as an insert there changes what dN holds (#134)."""
+    m = _LANE_RE.search(opspec.strip())
+    if m is None:
+        return False
+    return int(m.group(2)) * {"d": 8, "s": 4, "h": 2, "b": 1}[m.group(1)] >= 8
+
 
 _FP_N_CACHE: dict = {}
 
@@ -724,6 +738,16 @@ class State:
         self.poolbase.pop(reg, None)
         self._unpair(reg)
         self._other_views(reg)
+
+    def forget_hi(self, n):
+        """Forget the wider spellings of FP register `n` (v*.16b, q*, v*.2d, lane
+        inserts), keeping its low 64 bits d*. An upper-lane insert changes those wider
+        values but not d* (#134). `views[n]` holds only the non-d spellings."""
+        for k in list(self.views.get(n, ())):
+            self.reg.pop(k, None)
+            self.elem.pop(k, None)
+            self.poolbase.pop(k, None)
+        self.views.pop(n, None)
 
     def _other_views(self, reg: str):
         """Forget what the other spellings of `reg`'s FP/SIMD register hold.
@@ -3094,7 +3118,8 @@ class Lifter:
         """
         return self._verbatim(st, mn, op, op, dst)
 
-    def _verbatim(self, st: State, mn: str, op: str, shown: str, dst: str = "") -> list:
+    def _verbatim(self, st: State, mn: str, op: str, shown: str, dst: str = "",
+                  keep=frozenset()) -> list:
         """The instruction printed as it is, and every register it writes forgotten.
 
         The printed body reads the line as having run, so from there on a register it
@@ -3111,8 +3136,10 @@ class Lifter:
         only where the machine's own instruction does."""
         def_regs, use_regs = _def_use(mn, op)
         # The role registers stay as they are, all but LR: its role name says it holds the
-        # return address, and after this line it does not (#162).
-        defs = set(def_regs) - (_SPECIAL - {_lr()})
+        # return address, and after this line it does not (#162). `keep` holds a register
+        # the line leaves alone, the low lane of a V register an upper-lane insert does
+        # not touch (#134).
+        defs = set(def_regs) - (_SPECIAL - {_lr()}) - keep
         if dst in def_regs:               # a role register it loads, as before; not
             defs.add(dst)                 # the source of `stlr x0, [x17]`
         out = []
@@ -3975,6 +4002,18 @@ class Lifter:
                 out.append(self._assign(tgt, v))
             self._last_mem = ("store", base, disp, src0)
             return out + self._bump(st, base, delta)
+
+        # A lane insert into the upper 64 bits of a V register (`ins v0.d[1], x5`, `mov
+        # v0.d[1], v3.d[0]`, `fmov v0.d[1], x5`, a lane above the low doubleword of any
+        # element size) leaves the low 64 bits, which dN names, unchanged. #114 forgot
+        # dN on any write to a wider spelling, which declined a double the machine still
+        # holds; here dN is kept, the wider spellings change and are forgotten, and the
+        # insert prints raw, its upper lane not being modelled (#134).
+        if ops and _upper_lane(ops[0]) and _fp_n(canon(ops[0])) is not None:
+            n = _fp_n(canon(ops[0]))
+            st.forget_hi(n)
+            shown = self.show(addr, op) if self.show is not None else op
+            return self._verbatim(st, mn, op, shown, keep=frozenset(("d" + n,)))
 
         # ── scalar floating point ────────────────────────────────────────────────
         # Scalar forms only. Anything with a vector arrangement falls through to the raw
