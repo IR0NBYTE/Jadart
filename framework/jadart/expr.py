@@ -661,7 +661,7 @@ MAX_INLINE_CHARS = 200
 
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
-                 "src", "views")
+                 "src", "views", "lost", "lost_slot")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
@@ -695,6 +695,15 @@ class State:
         # FP/SIMD register number -> the spellings other than dN it is held under (q0,
         # v0.16b), so a write under one need not search the whole map for the others.
         self.views: dict = {}
+        # Registers holding a value a join lost: the bare name a `_merge` dropped them to,
+        # which reads like the entry value and like a raw line's result. A slot must not
+        # store one, as the register will mean something else when the slot is read back
+        # (#140). Cleared when the register is set to a real value.
+        self.lost: set = set()
+        # frame slot key -> the lost register whose value it holds, so the slot can be
+        # dropped when that register is reassigned and its spelling means something else
+        # (#140). Only lost values are tracked; a stable value in a slot stays.
+        self.lost_slot: dict = {}
 
     def copy(self) -> "State":
         s = State()
@@ -705,6 +714,8 @@ class State:
         s.poolbase = dict(self.poolbase)
         s.pair = dict(self.pair)
         s.views = {n: set(v) for n, v in self.views.items()}
+        s.lost = set(self.lost)
+        s.lost_slot = dict(self.lost_slot)
         s.tmpc = self.tmpc
         s.src = self.src
         return s
@@ -738,6 +749,15 @@ class State:
         self.poolbase.pop(reg, None)
         self._unpair(reg)
         self._other_views(reg)
+        self._stale_lost(reg)
+        self.lost.discard(reg)
+
+    def _stale_lost(self, reg: str):
+        """Drop the slots holding `reg` as a lost value, now `reg` is reassigned and its
+        bare name names something else (#140)."""
+        for k in [k for k, r in self.lost_slot.items() if r == reg]:
+            self.slot.pop(k, None)
+            del self.lost_slot[k]
 
     def forget_hi(self, n):
         """Forget the wider spellings of FP register `n` (v*.16b, q*, v*.2d, lane
@@ -793,6 +813,8 @@ class State:
         self.poolbase.pop(reg, None)
         self._unpair(reg)
         self._other_views(reg)
+        self._stale_lost(reg)
+        self.lost.discard(reg)
         if reg in (_T.ret_int, _T.ret_fp):
             self.result = reg
 
@@ -865,6 +887,9 @@ def _forget_frame(st: State):
 
 def _merge(dst: State, a: State, b: State):
     """Post-if state: keep registers/slots the two arms agree on, else drop to symbolic.
+    A register the arms disagree about is LOST: its bare name reads like the entry value
+    and like a raw line's result, so a slot that holds it is tied to it and dropped once
+    it is reassigned, when that name means something else (#140, State.lost).
 
     Dropping a register has to be RECORDED, not just omitted. An omitted register falls
     back to the receiver alias in _leaf, so an instance method whose then-arm overwrote x1
@@ -877,11 +902,19 @@ def _merge(dst: State, a: State, b: State):
     # binary give the same two values the names `t10` and `t11` the other way round,
     # roughly one run in five differed. The same lesson is recorded at the loop header; it
     # applies to every write into `reg`, not only that one.
+    dropped = set()
     for r in sorted(a.reg.keys() | b.reg.keys()):
         if r not in agreed:
             agreed[r] = V(r, P_ATOM)
+            dropped.add(r)
     dst.reg = agreed
     dst.slot = {k: a.slot[k] for k in a.slot if k in b.slot and b.slot[k] == a.slot[k]}
+    # A slot's lost tie survives where both arms agree on it; a slot tied to a register
+    # the arms disagree about is itself lost and goes (#140).
+    dst.lost_slot = {k: r for k, r in a.lost_slot.items()
+                     if k in dst.slot and b.lost_slot.get(k) == r and r not in dropped}
+    for k in [k for k, r in a.lost_slot.items() if k in dst.slot and r in dropped]:
+        dst.slot.pop(k, None)
     dst.elem = {r: a.elem[r] for r in a.elem if b.elem.get(r) == a.elem[r]}
     # Which register the function last wrote a RESULT to is a fact about the arms, exactly
     # as the register map is, and it decided the wrong thing when it was left behind: a
@@ -890,6 +923,7 @@ def _merge(dst: State, a: State, b: State):
     # `_render_loop` already takes the body's answer; this is the same rule for the join.
     if a.result == b.result:
         dst.result = a.result
+    dst.lost = dropped | (a.lost & b.lost)
 
 
 # ── boilerplate stripping (frame + thread stack-overflow check) ─────────────
@@ -3085,6 +3119,18 @@ class Lifter:
         takes the name too: it is what `_pin_call` would otherwise name a second time if
         it survives the call. `named` carries a name across the two halves of an `stp`
         that spill one value twice."""
+        fp = next((r for r, vv in _T.roles.items() if vv == "FP"), None)
+        if reg in st.lost and fp is not None and key.startswith(fp):
+            # A value a join lost, spilled to a frame slot: its bare name will mean
+            # something else once the register is reassigned, so the slot is tied to that
+            # register and dropped then, and a reload reads the register afresh (#140).
+            # While the register still holds it, the slot reads right. Only an FP spill,
+            # not the outgoing area (SP), whose arguments a call reads before any reassign
+            # and `_drop_outgoing` clears.
+            st.slot[key] = v
+            st.lost_slot[key] = reg
+            return []
+        st.lost_slot.pop(key, None)
         if (at, key) not in self._slot_crossings() or not _READS_MEMORY.search(v.text):
             st.slot[key] = v
             return []
@@ -5100,9 +5146,11 @@ class Lifter:
                     # value and then forgetting it puts the machine register back into
                     # every line that reads the result.
                     for r, name in sorted(named.items()):
+                        st._stale_lost(r)       # the register's old lost value is gone
                         st.reg[r] = V(name, P_ATOM)
                         st.elem.pop(r, None)
                         st.poolbase.pop(r, None)
+                        st.lost.discard(r)      # a named phi is a stable name, not lost
                 elif tfalls:
                     st.reg, st.slot, st.elem, st.result = a.reg, a.slot, a.elem, a.result
                 elif efalls:

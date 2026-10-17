@@ -11,6 +11,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Fixed
+
+- **A value a join lost is no longer read back from a frame slot as the register.** A
+  register the two arms of an `if` disagree about is dropped to its bare name, which
+  reads like the entry value and like a raw line's result. A frame slot that spilled one
+  kept the text `x6` while a later join left `x6` meaning something else, so a reload read
+  the wrong value: two field stores printed `x6` for values the machine holds apart
+  (#140). The slot is now tied to the lost register (`State.lost`, `State.lost_slot`) and
+  dropped when that register is reassigned, when its name no longer describes the slot;
+  until then the slot reads right, and the reload after reads the register afresh rather
+  than a stale name. The outgoing argument area is untouched, its values read at the call
+  before any reassignment. Tier 3 exports change in 497 functions on the clean fixture,
+  363 on 2.19.6, 523 on 3.4.4 and 534 on 3.10.9, and none on obf: each a reload that read
+  a stale register now reading the loaded value under its own name, which cannot be a
+  wrong value, only a decline. Closes #140.
+
 ### Changed
 
 - **Declarations nothing reads, bound by a phi, are dropped.** `_phi` and `_render_loop`

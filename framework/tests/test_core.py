@@ -13208,6 +13208,53 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     assert "if (d0 > t2) {" in body and "t5 = d0;" in body, body
 
 
+def test_a_value_a_join_lost_is_not_read_back_from_a_slot_as_the_register():
+    # A register the arms of an `if` disagree about is dropped to its bare name, which
+    # reads like the entry value and like a raw line\'s result. A frame slot that stored
+    # it kept the text `x6` while a later join left `x6` meaning something else, and a
+    # reload read the wrong one: two field stores both printed `x6` though the machine
+    # holds different values (#140). The slot is now tied to the lost register and
+    # dropped when it is reassigned, so the reload reads the register afresh.
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        rows = list(rows) + [("ret", "")]
+        at, n = {}, 0
+        for r in rows:
+            if isinstance(r, str):
+                at[r] = n * 4
+            else:
+                n += 1
+        ann = []
+        for r in (r for r in rows if not isinstance(r, str)):
+            op = r[1]
+            for nm, a in at.items():
+                op = op.replace("@" + nm, "#%#x" % a)
+            ann.append((len(ann) * 4, r[0], op, ""))
+        return [ln.strip() for ln in lift_function(ann)]
+
+    out = lift([("cmp", "x5, #0"), ("csel", "x6, x1, x2, eq"), ("stur", "x6, [x20, #7]"),
+                ("cbz", "x5, @L1"), ("ldr", "x6, [x20, #0x17]"), ("b", "@J1"),
+                "L1", ("ldr", "x6, [x20, #0x1f]"),
+                "J1", ("stur", "x6, [x29, #-8]"),
+                ("cbz", "x5, @L2"), ("ldr", "x6, [x20, #0x27]"), ("b", "@J2"),
+                "L2", ("ldr", "x6, [x20, #0x2f]"),
+                "J2", ("stur", "x6, [x20, #0x37]"),
+                ("ldur", "x0, [x29, #-8]"), ("stur", "x0, [x20, #0x3f]")])
+    # the slot read (field_0x40) must not share the bare `x6` the direct store has: the
+    # two are different values. The reload reads its own register.
+    assert "x20.field_0x38 = x6;" in out, out
+    assert "x20.field_0x40 = x6;" not in out, out
+    assert "x20.field_0x40 = x0;" in out, out
+    # a slot holding a lost register whose register is never reassigned still reads it:
+    # here x6 is lost at the join, spilled, and read straight back.
+    out = lift([("cbz", "x5, @A"), ("ldr", "x6, [x1, #7]"), ("b", "@B"),
+                "A", ("ldr", "x6, [x1, #0xf]"),
+                "B", ("stur", "x6, [x29, #-8]"), ("ldur", "x3, [x29, #-8]"),
+                ("stur", "x3, [x20, #7]")])
+    assert "x20.field_0x8 = x6;" in out, out      # still named, x6 not reassigned
+
+
 def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     # What the review of #154 left (#162). A call writes LR, and LR read the same after
     # it. A store replaced only the slots it filled, so one it covered part of kept its
