@@ -2417,6 +2417,8 @@ class Lifter:
         self._crossings = None
         #: The names those stores gave; see _lift_function.
         self.slot_names: set = set()
+        #: Names `_phi` and `_render_loop` bind at a join or loop header (#169).
+        self.phi_names: set = set()
         #: ({slot: bit}, {block: (live, crossing) masks}) from _slot_crossings, and the
         #: block order its worklist runs in; see _backward.
         self._slot_live = ({}, {})
@@ -5082,6 +5084,7 @@ class Lifter:
                     named, decls = self._phi(st, a, b, tlines, elines,
                                              self._livein.get(joins[i], 0), pad, indent,
                                              (then, els))
+                    self.phi_names.update(named.values())
                     out.extend(decls)
                     # Declared above the `if`, at the end of the block that decides it,
                     # and set on every path through it. Where a goto enters an arm, that
@@ -5291,6 +5294,7 @@ class Lifter:
         # other does: a break the walk reaches before the body writes it reads that.
         fresh = self.carry_more.get(header, frozenset())
         self.carry_names[header] = {names[r]: r for r in fresh if r in names}
+        self.phi_names.update(names.values())
         out = [f"{pad}var {names[r]} = {init[r].text};" for r in sorted(names)]
         out.append(f"{pad}while (true) {{")
         out.extend(blines)
@@ -6392,6 +6396,63 @@ def _unread(lines: list, names: set) -> set:
     return out
 
 
+#: A call in a line: `name(`, `)(`, or a virtual/indirect call. Anything else a phi arm
+#: binds, a field read or arithmetic, has no side effect to keep (#169).
+_CALL_IN_LINE = re.compile(r"[\w\])]\(|\(dynamic call\)")
+
+
+def _drop_dead_phis(lines: list, names: set) -> list:
+    """Drop the declaration and assignments of each phi name in `names` nothing reads.
+
+    `_phi` and `_render_loop` bind a name at a join or a loop header whenever the paths
+    disagree about a register, before the body is printed and so before it is known
+    whether anything goes on to read the result. Where nothing does, the declaration and
+    the writes to it on each arm say nothing: a value computed into a name no reader
+    wants, `var t10 = t1;` on an allocation slow path among them (#169).
+
+    A phi's lines go together, declaration and every assignment, or the output would
+    assign a name it never declares. They stay, whole, where dropping them would leave an
+    if-arm or a loop body holding nothing else: the one line that an arm ran, which is the
+    walk's to render, as `_drop_unread_slots` keeps a slot name. An assignment whose value
+    makes a call is a side effect and is never dropped; a phi arm binds no call, so this
+    only guards against one reaching here by another path."""
+    if not names:
+        return lines
+    read, lhs_of = set(), {}
+    for i, ln in enumerate(lines):
+        m = _SET_RE.match(ln)
+        read.update(_TMP_RE.findall(ln[m.end():] if m else ln))
+        if m and m.group(1) in names:
+            lhs_of[i] = m.group(1)
+    dead = {n for n in names if n not in read}
+    if not dead:
+        return lines
+    # A phi's lines go together: group them, and never drop a name any of whose lines
+    # makes a call, or the kept call would reference a name no line declares.
+    by_name = {}
+    for i, n in lhs_of.items():
+        if n in dead:
+            by_name.setdefault(n, []).append(i)
+    by_name = {n: idxs for n, idxs in by_name.items()
+               if not any(_CALL_IN_LINE.search(lines[i]) for i in idxs)}
+    drop_line = {i: n for n, idxs in by_name.items() for i in idxs}
+    # Keep whole a phi any of whose lines is in a block that would otherwise empty.
+    keep, stack = set(), []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        opens, closes = s.endswith("{"), s.startswith("}")
+        if closes and stack:
+            body = stack.pop()
+            if body and all(j in drop_line for j in body):
+                keep.update(drop_line[j] for j in body)
+        if not opens and not closes and stack:
+            stack[-1].append(i)
+        if opens:
+            stack.append([])
+    drop = {i for i, n in drop_line.items() if n not in keep}
+    return [ln for i, ln in enumerate(lines) if i not in drop]
+
+
 def _drop_unread_slots(lines: list, names: set) -> list:
     """`lines` without the declarations of the slot names nothing reads (#64; _unread).
 
@@ -6600,5 +6661,6 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
             lifter = lines = None
             lifter, lines = walk(keep, {h: r for h, r in carry.items() if r})
     lines = _drop_unread_slots(_drop_unread(lines, lifter.raw_names), lifter.slot_names)
+    lines = _drop_dead_phis(lines, lifter.phi_names)
     return _inline_single_use(lines, lifter.results | lifter.slot_names,
                               lifter.slot_names)
