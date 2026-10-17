@@ -13,6 +13,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A write to a V register's upper lane no longer forgets the double in its low lane.**
+  d0, v0.16b and q0 are one register, and #114 forgot the double tracked under dN on any
+  write to a wider spelling. An insert into a lane entirely in the upper 64 bits (`ins
+  v0.d[1], x5`, `mov v0.d[1], v3.d[0]`, `fmov v0.d[1], x5`, `.s[2]` and up) leaves the
+  low 64 bits, which dN names, unchanged, so forgetting dN there declined a double the
+  machine still holds. Now such an insert keeps dN, forgets only the wider spellings, and
+  prints raw. An insert into the low lane (`.d[0]`, `.s[0]`, `.s[1]`, ...) still changes
+  dN. No corpus export changes (none of the four builds inserts into an upper lane over
+  a tracked double), so this restores a value the shape would lose rather than altering
+  any current output. Part of #134.
+
 - **A call to a function that takes a double left the double out of its argument list.**
   Dart passes a function's first six doubles in V0 to V5, apart from the x registers it
   passes integers and objects in. `entry_arity` counted only the x registers, so a
