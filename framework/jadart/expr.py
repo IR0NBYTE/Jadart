@@ -909,11 +909,13 @@ def _merge(dst: State, a: State, b: State):
             dropped.add(r)
     dst.reg = agreed
     dst.slot = {k: a.slot[k] for k in a.slot if k in b.slot and b.slot[k] == a.slot[k]}
-    # A slot's lost tie survives where both arms agree on it; a slot tied to a register
-    # the arms disagree about is itself lost and goes (#140).
+    # A slot's lost tie survives only where both arms agree on it and the register is not
+    # itself dropped. A slot either arm held as a lost value whose tie does not survive is
+    # unstable on that path, so it goes rather than lingering untied (#140).
     dst.lost_slot = {k: r for k, r in a.lost_slot.items()
                      if k in dst.slot and b.lost_slot.get(k) == r and r not in dropped}
-    for k in [k for k, r in a.lost_slot.items() if k in dst.slot and r in dropped]:
+    for k in [k for k in dst.slot
+              if (k in a.lost_slot or k in b.lost_slot) and k not in dst.lost_slot]:
         dst.slot.pop(k, None)
     dst.elem = {r: a.elem[r] for r in a.elem if b.elem.get(r) == a.elem[r]}
     # Which register the function last wrote a RESULT to is a fact about the arms, exactly
@@ -5153,8 +5155,10 @@ class Lifter:
                         st.lost.discard(r)      # a named phi is a stable name, not lost
                 elif tfalls:
                     st.reg, st.slot, st.elem, st.result = a.reg, a.slot, a.elem, a.result
+                    st.lost, st.lost_slot = a.lost, a.lost_slot
                 elif efalls:
                     st.reg, st.slot, st.elem, st.result = b.reg, b.slot, b.elem, b.result
+                    st.lost, st.lost_slot = b.lost, b.lost_slot
                 else:
                     falls = False
                 alive = tfalls or efalls
@@ -5263,9 +5267,11 @@ class Lifter:
             st.tmpc[0] += 1
         loop_st = st.copy()
         for r in sorted(carried):
+            loop_st._stale_lost(r)      # its lost value is gone, carried as a name (#140)
             loop_st.reg[r] = V(names[r], P_ATOM)
             loop_st.elem.pop(r, None)
             loop_st.poolbase.pop(r, None)
+            loop_st.lost.discard(r)
         # A register the loop writes and does not carry is one no trip reads before
         # writing it, and on every trip after the first it holds what the last trip left
         # there, not its value from before the loop. Kept, that value went to the target

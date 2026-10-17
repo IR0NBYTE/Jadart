@@ -22,8 +22,8 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   dropped when that register is reassigned, when its name no longer describes the slot;
   until then the slot reads right, and the reload after reads the register afresh rather
   than a stale name. The outgoing argument area is untouched, its values read at the call
-  before any reassignment. Tier 3 exports change in 497 functions on the clean fixture,
-  363 on 2.19.6, 523 on 3.4.4 and 534 on 3.10.9, and none on obf: each a reload that read
+  before any reassignment. Tier 3 exports change in 498 functions on the clean fixture,
+  374 on 2.19.6, 525 on 3.4.4 and 536 on 3.10.9, and none on obf: each a reload that read
   a stale register now reading the loaded value under its own name, which cannot be a
   wrong value, only a decline. Closes #140.
 

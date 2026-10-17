@@ -13254,6 +13254,24 @@ def test_a_value_a_join_lost_is_not_read_back_from_a_slot_as_the_register():
                 ("stur", "x3, [x20, #7]")])
     assert "x20.field_0x8 = x6;" in out, out      # still named, x6 not reassigned
 
+    # A loop that carries a lost register renames it; the slot that spilled it is dropped
+    # there too, so a reload in the body reads the register, not the dangling name.
+    out = lift([("cbz", "x5, @L1"), ("ldr", "x6, [x20, #0x17]"), ("b", "@J1"),
+                "L1", ("ldr", "x6, [x20, #0x1f]"), "J1", ("stur", "x6, [x29, #-8]"),
+                "LH", ("ldur", "x9, [x29, #-8]"), ("stur", "x9, [x20, #0x40]"),
+                ("add", "x6, x6, #1"), ("subs", "x3, x3, #1"), ("cbnz", "x3, @LH"),
+                ("stur", "x6, [x20, #0x48]")])
+    assert "x20.field_0x41 = x9;" in out and "x20.field_0x41 = x6;" not in out, out
+
+    # A lost value tied in only the else arm of a join: the slot is dropped, not left
+    # untied, so a later reassignment cannot leave it reading stale.
+    out = lift([("cbz", "x5, @E"), ("ldur", "x6, [x1, #7]"), ("b", "@M"),
+                "E", ("cbz", "x4, @F"), ("ldur", "x6, [x1, #0xf]"), ("b", "@G"),
+                "F", ("ldur", "x6, [x1, #0x17]"), "G", ("stur", "x6, [x29, #-8]"),
+                "M", ("stur", "x6, [x29, #-8]"), ("ldur", "x6, [x1, #0x1f]"),
+                ("ldur", "x9, [x29, #-8]"), ("stur", "x9, [x20, #0x27]")])
+    assert "x20.field_0x28 = x9;" in out and "x20.field_0x28 = x6;" not in out, out
+
 
 def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     # What the review of #154 left (#162). A call writes LR, and LR read the same after
