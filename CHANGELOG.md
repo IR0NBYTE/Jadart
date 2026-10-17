@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call's pushed arguments survive a second push, and saved registers no longer read
+  as arguments.** `_stack_args` reads a call's arguments off the SP-relative slots, and
+  two things went wrong (#147). A second push that moved SP dropped what the first push
+  stored, so `stp x6, x7; str x5; bl` read one argument where three were pushed; the
+  slots are now renamed by the move instead of dropped, and the whole list reads. That
+  exposed the second: a slow path that spills volatile registers round a runtime call and
+  reloads them after left the spill in the outgoing area, and the call printed it as its
+  arguments, `pool_0x2650.field_0x7(t4, t3)` for a saved `stp x0, x1` on the clean
+  fixture. A save is now told from an argument by what the code does after the call
+  (`_save_wrapped_calls`): a run of pushes a run of pops reloads into the same registers
+  is a save, and the call reads no stack arguments. Tier 3 exports change in 30 functions
+  on the clean fixture, 1455 on 2.19.6, 36 on 3.4.4 and 31 on 3.10.9, and none on obf:
+  dropped argument lists now read in full, and saved registers decline. Closes #147.
 - **A value a join lost is no longer read back from a frame slot as the register.** A
   register the two arms of an `if` disagree about is dropped to its bare name, which
   reads like the entry value and like a raw line's result. A frame slot that spilled one

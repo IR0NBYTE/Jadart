@@ -1856,6 +1856,119 @@ def _frame_regs() -> tuple:
 _FRAME_REGS: dict = {}
 
 
+def _sp_mem(op: str):
+    """Split a memory operand into (registers, mem) where mem starts at '['.
+
+    `str x0, [x15, #-8]!` -> (["x0"], "[x15, #-8]!"). None where there is no memory
+    operand. The registers are everything before the first bracket."""
+    i = op.find("[")
+    if i < 0:
+        return None, None
+    regs = [r.strip() for r in op[:i].rstrip(", ").split(",") if r.strip()]
+    return regs, op[i:]
+
+
+def _sp_base(mem: str):
+    """The base register of a `[reg...]` memory operand, else None."""
+    j = mem.find("]")
+    if j < 0:
+        return None
+    return mem[1:j].split(",", 1)[0].strip()
+
+
+def _push_regs(mn: str, op: str):
+    """Registers a pre-index SP store write-back pushes (`str/stp R, [sp,#-k]!`), or None.
+
+    A push moves SP down and leaves the registers in the outgoing area; see
+    _save_wrapped_calls."""
+    if mn not in ("str", "stp", "stur"):
+        return None
+    regs, mem = _sp_mem(op)
+    if not regs or mem is None or not mem.rstrip().endswith("]!"):
+        return None
+    base = _sp_base(mem)
+    if base is None or _T.roles.get(canon(base)) != "SP":
+        return None
+    return [canon(r) for r in regs]
+
+
+def _pop_regs(mn: str, op: str):
+    """Registers a post-index SP load write-back pops (`ldr/ldp R, [sp], #k`), or None."""
+    if mn not in ("ldr", "ldp", "ldur"):
+        return None
+    regs, mem = _sp_mem(op)
+    if not regs or mem is None:
+        return None
+    j = mem.find("]")
+    if j < 0 or "#" not in mem[j:]:     # post-index: the imm is OUTSIDE the bracket
+        return None
+    base = _sp_base(mem)
+    if base is None or _T.roles.get(canon(base)) != "SP":
+        return None
+    return [canon(r) for r in regs]
+
+
+def _call_setup(mn: str, op: str) -> bool:
+    """A register-defining row that is call set-up or result capture, so it may sit
+    between a save and the call it guards (`mov x0, #1`, `ldr x30, [x27, #..]`, the
+    `mov x1, x0` that takes the result). Anything that stores, branches, returns, or
+    moves SP ends the straight run and is not skipped (_save_wrapped_calls)."""
+    if mn in _CALLS or mn in _STORES or mn == "ret":
+        return False
+    if mn[:1] == "b" or mn[:2] in ("cb", "tb"):
+        return False
+    regs, _mem = _sp_mem(op)
+    dst = canon(op.split(",", 1)[0].strip()) if regs is None and op else None
+    if dst is not None and _T.roles.get(dst) == "SP":
+        return False                    # a frame move, not set-up
+    return True
+
+
+def _save_wrapped_calls(rows) -> set:
+    """PCs of calls whose stack pushes are registers saved round the call, not arguments.
+
+    `_stack_args` reads a contiguous run of SP slots as a call's pushed argument list.
+    A slow path that spills volatile registers before a runtime call and reloads them
+    after leaves that same run in the outgoing area, and the call printed them as its
+    arguments: `pool_0x2650.field_0x7(t4, t3)` for a saved `stp x0, x1` (#147). A save
+    is told from an argument by what the code does after the call: a save is reloaded
+    into the registers it came from; arguments are dropped with the outgoing area. So a
+    run of pre-index pushes right before a call whose registers a run of post-index pops
+    right after the call reloads is a save, and the call reads no stack arguments."""
+    out: set = set()
+    n = len(rows)
+    for i in range(n):
+        if rows[i][1] not in _CALLS:
+            continue
+        pushed: list = []               # closest-to-call first
+        j = i - 1
+        while j >= 0:
+            pr = _push_regs(rows[j][1], rows[j][2])
+            if pr is not None:
+                pushed.extend(pr)
+                j -= 1
+                continue
+            if pushed or not _call_setup(rows[j][1], rows[j][2]):
+                break                   # pushes are contiguous; set-up only precedes them
+            j -= 1
+        if not pushed:
+            continue
+        popped: list = []
+        k = i + 1
+        while k < n:
+            qr = _pop_regs(rows[k][1], rows[k][2])
+            if qr is not None:
+                popped.extend(qr)
+                k += 1
+                continue
+            if popped or not _call_setup(rows[k][1], rows[k][2]):
+                break
+            k += 1
+        if popped and set(pushed) == set(popped):
+            out.add(rows[i][0])
+    return out
+
+
 def _frame_moves(blocks, raw) -> dict:
     """{address: (whether FP moves, how far SP moves)} for each instruction that moves
     a frame register where `_step` does not see it move (#165). `_step` follows the
@@ -2473,6 +2586,9 @@ class Lifter:
         #: (_frame_moves). _lift_function works them out.
         self.frame_moves: dict = {}
         self.fp_moves: frozenset = frozenset()
+        #: Calls whose stack pushes are saved registers, not arguments (#147); see
+        #: _save_wrapped_calls. _lift_function works them out.
+        self.save_wrapped: frozenset = frozenset()
         self.frame_joins: frozenset = frozenset()
         #: {store through SP or FP: (SP less where its frame starts, slack) or None};
         #: see _frame_plan and _cross_write.
@@ -3494,10 +3610,26 @@ class Lifter:
             # where it is (#162).
             _forget_frame(st)
             return
-        gone = [k for k in st.slot if k.startswith(base)]
+        if delta % 8 == 0:
+            # SP moved by a push or a pop of a known amount: a slot keyed off it is still
+            # there, now at a different displacement. Rename them by the move rather than
+            # drop, so a second push does not lose what the first stored and a call then
+            # read short, `_setFlag` for three values pushed as two pushes (#144, #147). A
+            # slot the move takes below SP (a pop past it) is gone.
+            renamed = {}
+            for k, v in st.slot.items():
+                if k == _LOST or not k.startswith(base):
+                    renamed[k] = v
+                    continue
+                off = int(k[len(base):]) - delta
+                if off >= 0:
+                    renamed[f"{base}{off:+d}"] = v
+            st.slot = renamed
+            return
+        gone = [k for k in st.slot if k != _LOST and k.startswith(base)]
         for k in gone:
             del st.slot[k]
-        if delta < 0 and _T.roles.get(base) == "SP" and any(k != _LOST for k in gone):
+        if delta < 0 and gone:
             st.slot[_LOST] = V("", P_ATOM)
 
     def _moved_unseen(self, st: State, fp: bool, delta):
@@ -3876,7 +4008,9 @@ class Lifter:
             # declines for one reason, that the callee reads its arguments off the stack,
             # which is itself a statement that the caller pushed them. So the values are in
             # the outgoing area, and reading it after the drop always found it empty.
-            pushed = self._stack_args(st, drop_receiver=False, whole=True, values=True)
+            pushed = (None if addr in self.save_wrapped
+                      else self._stack_args(st, drop_receiver=False, whole=True,
+                                            values=True))
             # A direct call consumes the outgoing area exactly as an indirect one does.
             # Leaving it behind let a bl's arguments be read back as the arguments of the
             # next blr, a fully fabricated argument list on a call that pushed nothing.
@@ -3925,7 +4059,8 @@ class Lifter:
             tgt_val = st.reg.get(tgt) if tgt else None
             st.set(_T.ret_int, V(_T.ret_int, P_ATOM))
             disp = self.dispatch.get(addr)
-            stack_args = self._stack_args(st, drop_receiver=bool(disp and disp[0]))
+            stack_args = (None if addr in self.save_wrapped
+                          else self._stack_args(st, drop_receiver=bool(disp and disp[0])))
             _drop_outgoing(st)          # consumed by this call; must not reach the next
             if disp is not None:                         # X21 dispatch-table (virtual) call
                 recv, off = disp
@@ -6659,6 +6794,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     dispatch = detect_dispatch(stripped)
     raw = {t[0]: t[1:3] for t, s in zip(ann, stripped) if s[1:3] != t[1:3]}
     meets, moves, joins, cross = _frame_plan(blocks, entry, raw)
+    save_wrapped = _save_wrapped_calls(stripped)
 
     def walk(keep, carry=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
@@ -6668,6 +6804,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.slow_paths = frozenset(slow)
         lifter.frame_meets = meets
         lifter.frame_moves = moves
+        lifter.save_wrapped = save_wrapped
         lifter.frame_joins = joins
         lifter.frame_cross = cross
         lifter.raw = raw
