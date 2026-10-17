@@ -13,6 +13,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call to a function that takes a double left the double out of its argument list.**
+  Dart passes a function's first six doubles in V0 to V5, apart from the x registers it
+  passes integers and objects in. `entry_arity` counted only the x registers, so a
+  register-only callee that also took a double had its double dropped: a call to
+  `f(Object a, double b)`, which reads x1 and d0, printed `f(x1)`, and a call to
+  `lerp(double, double, double)` printed the fields its caller happened to hold in x1
+  and x2, a list that did not even start at the first argument. A register argument list
+  cannot say where the doubles fall, so such a callee now declines to `...`, the same way
+  a callee that takes both register and stack arguments and is handed a double already
+  does (#148). `entry_arity` reads the V argument registers with `_fpu_args_live`,
+  ignoring a `ret` that hands d0 back, which a function that only reads x registers and
+  returns its object in x0 has too. Tier 3 exports change at 219 call sites on the clean
+  fixture, 223 on 3.4.4 and 225 on 3.10.9, and at none on obf or 2.19.6, each a double
+  taker's list, `lerp(x1.field_0x8, x2.field_0x10)` and `scale(this.field_0x8)` among
+  them, now `(...)`. Closes #155.
+
 - **A frame written out of sight, or read back wider, read as it was.** Three cases the
   review of #162 left, each on `main` too. A frame register moved where the walk did not
   see it moved: `strip_boilerplate` blanks every `mov x29, x15` and every `add` or `sub`
