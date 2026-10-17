@@ -12173,6 +12173,45 @@ def test_a_function_that_reads_its_arguments_off_the_stack_has_no_register_arity
         "return sub_0x100(...);"]
 
 
+def test_a_call_to_a_function_that_takes_a_double_does_not_list_its_other_arguments():
+    # Dart passes doubles in V0 to V5, apart from the x registers (kFpuRegistersForArgs).
+    # entry_arity counted only the x registers, so a call to `f(Object a, double b)`,
+    # which reads x1 and d0, printed `f(x1)`, and one to `lerp(double, double, double)`
+    # printed its arguments as the fields its caller happened to pass in x1 and x2 (#155).
+    # A register argument list cannot say where the doubles go, so such a callee declines.
+    from jadart.expr import entry_arity, lift_function
+
+    def arity(rows):
+        return entry_arity([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    # reads x1 and a double in d0: no register list says where the double goes
+    assert arity([("ldur", "x9, [x1, #7]"), ("fadd", "d2, d0, d0"), ("ret", "")]) is None
+    # a double in d0 and nothing else, where main printed `()`
+    assert arity([("fadd", "d2, d0, d0"), ("ret", "")]) is None
+    # a later double argument, in d3
+    assert arity([("ldur", "x9, [x1, #7]"), ("ldur", "x9, [x2, #7]"),
+                  ("fadd", "d4, d3, d3"), ("ret", "")]) is None
+    # one that reads a double before a write of it does take it; the zero idiom and a
+    # write first do not
+    assert arity([("eor", "v0.16b, v0.16b, v0.16b"), ("ret", "")]) == 0
+    assert arity([("fmov", "d0, #1.0"), ("fadd", "d2, d0, d0"), ("ret", "")]) == 0
+    # A `ret` that hands d0 back is not a double argument: a function reading only x1 and
+    # returning its object in x0 writes neither d0 nor x0 and makes no call, so it has
+    # the same bare `ret`. It keeps its register count. (Passes on main.)
+    assert arity([("ldur", "x9, [x1, #7]"), ("ret", "")]) == 1
+    assert arity([("ldur", "x0, [x1, #7]"), ("ret", "")]) == 1
+    # but a real read of the double in the body, beside that `ret`, does count
+    assert arity([("fcmp", "d0, #0.0"), ("b.eq", "#0x8"), ("ret", ""),
+                  ("ret", "")]) is None
+
+    def call(k):
+        rows = [("mov", "x1, #5"), ("fmov", "d0, #1.0"), ("bl", "#0x100"), ("ret", "")]
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)], arity=lambda pc: k)]
+    # a callee that takes a double declines; a register-only one still lists (as before)
+    assert call(None) == ["return sub_0x100(...);"]
+    assert call(1) == ["return sub_0x100(5);"]
+
+
 def test_a_call_whose_double_result_is_read_names_it():
     # A double comes back in d0, and a call's d0 result was never named: it read as d0,
     # which is also how the d0 the function was handed reads, and `ratioOfTones`

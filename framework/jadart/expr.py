@@ -5674,7 +5674,7 @@ class StackArity(int):
         return int(self), self.need, self.fpu
 
 
-def _fpu_args_live(blocks, entry) -> bool:
+def _fpu_args_live(blocks, entry, with_ret: bool = True) -> bool:
     """Whether one of FPU_ARG_REGS is read before it is written, from `entry`: the
     function is handed a double in it. The zero idiom reads nothing. A `ret` reads d0
     only where no call and no write to x0 can come before it (_argument_returns): what
@@ -5682,9 +5682,16 @@ def _fpu_args_live(blocks, entry) -> bool:
     own; elsewhere it returns in x0, or d0 a call or the function itself wrote. A call
     is not taken to read them: one with more than six arguments that passes a double on
     untouched would be missed, where taking every call for a read left almost every
-    such callee unprinted."""
+    such callee unprinted.
+
+    `with_ret` is False where the `ret` must not count: a function that reads x1 and
+    returns the object in x0 writes neither d0 nor x0 and makes no call, so
+    _argument_returns marks its `ret` as handing back d0 all the same, which is a read
+    only a caller's own reading could confirm. For counting a double ARGUMENT that
+    decides a call's argument list (#155), that bare `ret` is not evidence, where a real
+    read of d0 in the body is."""
     want = frozenset(FPU_ARG_REGS)
-    back = _argument_returns(blocks, entry)
+    back = _argument_returns(blocks, entry) if with_ret else {}
     use, dfn = {}, {}
     for b, blk in blocks.items():
         u, d = set(), set()
@@ -5787,7 +5794,14 @@ def entry_arity(ann: list, cut: bool = False):
     while k < len(ARG_REGS) and ARG_REGS[k] in live:
         k += 1
     if not off_stack:
-        return k
+        # A function handed a double in a V register (`_fpu_args_live`) passes it beside
+        # the x registers, in an order the registers alone do not give: `f(Object a,
+        # double b)` reads x1 and d0 and printed `f(x1)`, and where the double comes
+        # first the list did not even start at the first argument. So the list is not
+        # known, the same decline a mixed register-and-stack callee handed a double
+        # already makes (#148, #155). A `ret` that hands d0 back is not counted here: a
+        # function reading only x registers and returning its object in x0 has one too.
+        return None if _fpu_args_live(blocks, entry, with_ret=False) else k
     if not any(r in live for r in ARG_REGS):
         return None
     return StackArity(k, need if reach and not cut else None,
