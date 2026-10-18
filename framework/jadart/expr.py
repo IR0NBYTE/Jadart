@@ -2630,6 +2630,20 @@ class Lifter:
         #: for each register the loop writes and does not carry; see _note_goto.
         self._unset: dict = {}
         self.carry_names: dict = {}
+        #: A goto-reached join (addr with >1 predecessors) is the one join `_merge`/`_phi`
+        #: never saw, and `_join_kill` drops its disagreed registers to bare, which reads
+        #: as the last printed line put them: a raw line's or a value a loop lost (#123).
+        #: A first walk records {join addr -> registers it may need a phi for}; the second
+        #: builds one, a name written on every edge in and read at the join, like `_phi`
+        #: does for the if/else join. See _join_write and the `join` branch of walk.
+        self._join_phi_set: dict = {}
+        #: Input to the second walk, as `carry_more` is: join addr -> registers to phi.
+        self.join_phi: dict = {}
+        #: (join addr, register) -> the name its phi is bound to, minted once and written
+        #: by every edge into the join; and which edges have written it, so the join binds
+        #: the register to the name only where every way in set it.
+        self._join_name: dict = {}
+        self._join_wrote: dict = {}
         self._loads = None
         #: () -> "x0" | "d0" | None, what this function's callers read its result from;
         #: and, built at the first `ret`, the register each `ret` hands back (#115).
@@ -4794,9 +4808,10 @@ class Lifter:
         the header writes it, or the loop would carry it already, so a name there would
         say nothing a reader needs. Nor where the target is a join: it starts from what
         every way in agrees on (_reenter, _join_kill), not from the goto's state, so it
-        reads the register bare whatever the loop names."""
-        if len(self._preds.get(addr, ())) != 1:
-            return
+        reads the register bare whatever the loop names. Where the target IS a join, the
+        loop still has to carry the register: a join-phi (see _join_write) reads a name
+        written on each edge in, and the goto's write-back gives it the loop-carried value
+        rather than the bare register the loop forgot at its header (#123)."""
         live = _mask_regs(self._livein.get(addr, 0))
         for header, _names, _copied in self._carrying:
             hit = live & self._unset.get(header, {}).keys()
@@ -4883,6 +4898,39 @@ class Lifter:
                                        self._writes_stack(back),
                                        self._writes_heap(back))
         return hit
+
+    def _join_write(self, addr, st: State, pad: str) -> list:
+        """Write each phi register of goto-join `addr` to its shared name, from `st`.
+
+        The second walk calls this on every edge into the join, a goto's source (after
+        its loop write-back) and the block that falls through to it, so the name holds the
+        value that way in has. `_merge`/`_phi` do the same for the if/else join by writing
+        each arm; a goto-reached join is the one the structurer could not nest, and
+        `_join_kill` dropped its registers to bare (#123). The name is minted once, kept
+        in `_join_name`, declared above the function body by `_lift_function`, and read at
+        the join. `_join_wrote` records which predecessor set it, so the join binds the
+        register to the name only where every way in did; anywhere else it stays a bare
+        register, the honest spelling of a value this walk cannot name."""
+        regs = self.join_phi.get(addr)
+        if not regs:
+            return []
+        src = st.src
+        pairs = []
+        for r in sorted(regs):
+            key = (addr, r)
+            name = self._join_name.get(key)
+            if name is None:
+                name = self._join_name[key] = f"t{st.tmpc[0]}"
+                st.tmpc[0] += 1
+                self._anchor[int(name[1:])] = self.entry
+                self.phi_names.add(name)
+            pairs.append((name, st.get(r)))
+            w = self._join_wrote.setdefault(key, set())
+            if isinstance(src, int):
+                w.add(src)
+            elif isinstance(src, frozenset):
+                w.update(src)
+        return self._parallel_copy(st, pairs, pad)
 
     def _lift_block(self, addr, st: State):
         """Return (lines, falls_through) for one basic block, mutating `st`."""
@@ -5214,6 +5262,12 @@ class Lifter:
         for i, s in enumerate(stmts):
             kind = s[0]
             if kind == "asm":
+                join = (s[1] in self.labels and len(self._preds.get(s[1], ())) > 1
+                        and s[1] not in self.carried)
+                # The fall-through edge into a goto-join writes its phi names BEFORE the
+                # label, so a goto that jumps to the label does not re-run them (#123).
+                if join and alive and s[1] in self.join_phi:
+                    out.extend(pad + ln for ln in self._join_write(s[1], st, ""))
                 label(s[1])
                 if not alive:
                     self._reenter(s[1], st)
@@ -5221,10 +5275,27 @@ class Lifter:
                 # `_render_loop` has already given its carried registers names and bound
                 # them in this state; killing them here would put the machine register back
                 # into every line of the body.
-                if (s[1] in self.labels and len(self._preds.get(s[1], ())) > 1
-                        and s[1] not in self.carried):
+                if join:
                     kill, mem, heap = self._join_kill(s[1])
+                    # Each register the join disagrees about and the code after it
+                    # reads is one the first walk recorded for a phi; the second walk
+                    # wrote a name on every edge in (above and at each goto), so the join
+                    # reads the name, not the bare register a printed line would misname.
+                    live = _mask_regs(self._livein.get(s[1], 0))
+                    self._join_phi_set.setdefault(s[1], set()).update(
+                        r for r in kill if r in live)
+                    phis = self.join_phi.get(s[1], frozenset())
+                    preds = set(self._preds.get(s[1], ()))
                     for r in sorted(kill):
+                        key = (s[1], r)
+                        if (r in phis and key in self._join_name
+                                and self._join_wrote.get(key, set()) >= preds):
+                            st.reg[r] = V(self._join_name[key], P_ATOM)
+                            st.elem.pop(r, None)
+                            st.poolbase.pop(r, None)
+                            st._unpair(r)
+                            st.lost.discard(r)
+                            continue
                         st.forget(r)
                     # A name is declared on the paths through the block its declaration
                     # stands in, and only those. Naming a value writes no register, so the
@@ -5335,6 +5406,10 @@ class Lifter:
                     self._note_goto(s[1])
                 if self._leaves_loop(s[1]):
                     out.extend(self._carry_out(st, pad, True, s[1]))
+                # This edge into the join writes its phi names, after the loop write-back
+                # so they hold the carried value, not the register the loop forgot (#123).
+                if s[1] in self.join_phi:
+                    out.extend(self._join_write(s[1], st, pad))
                 out.append(pad + f"goto L_0x{s[1]:x};")
                 falls = alive = False
             elif kind in ("exit", "cut"):
@@ -6796,7 +6871,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     meets, moves, joins, cross = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
 
-    def walk(keep, carry=None):
+    def walk(keep, carry=None, join_phi=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields)
@@ -6818,6 +6893,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.labels = label_targets(stmts)
         lifter.keep = keep
         lifter.carry_more = carry or {}
+        lifter.join_phi = join_phi or {}
         lines, _falls = lifter.walk(stmts, State(), indent, depth)
         return lifter, lines
 
@@ -6840,17 +6916,44 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     printed = _printed_writes(lines)
     carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
              if r & printed}
-    if keep is not None or carry:
+    # ...and which registers a goto-reached join needs a phi for (#123). Only ones a loop
+    # carries past it: a killed register nothing carried is genuinely lost, and naming it
+    # would claim a value no path has. See _join_write.
+    carried_regs = frozenset().union(*carry.values()) if carry else frozenset()
+    join_phi = {j: frozenset(rs & carried_regs)
+                for j, rs in lifter._join_phi_set.items() if rs & carried_regs}
+    if keep is not None or carry or join_phi:
         lifter = lines = None               # not held while the second walk runs
-        lifter, lines = walk(keep, carry)
+        lifter, lines = walk(keep, carry, join_phi)
         # A name the code after the loop does not print, its only reader a call that
         # prints `(...)`, says nothing, and the walk goes back to the bare register.
         unread = {h: frozenset(names[n] for n in _never_read(lines, names))
                   for h, names in lifter.carry_names.items()}
         if any(unread.values()):
             carry = {h: r - unread.get(h, frozenset()) for h, r in carry.items()}
+            carry = {h: r for h, r in carry.items() if r}
             lifter = lines = None
-            lifter, lines = walk(keep, {h: r for h, r in carry.items() if r})
+            lifter, lines = walk(keep, carry, join_phi)
+        # A goto-join phi nothing reads says nothing, and minting its name shifted every
+        # later temp for a line then dropped. The walk runs once more without the joins
+        # whose names went unread, so those numbers go back and only a join a reader
+        # wants changes the output.
+        if join_phi:
+            dead = _never_read(lines, set(lifter._join_name.values()))
+            if dead:
+                drop = {k for k, n in lifter._join_name.items() if n in dead}
+                join_phi = {j: frozenset(r for r in rs if (j, r) not in drop)
+                            for j, rs in join_phi.items()}
+                join_phi = {j: rs for j, rs in join_phi.items() if rs}
+                lifter = lines = None
+                lifter, lines = walk(keep, carry, join_phi)
+    # A goto-join phi is declared once, above the body, since no single edge into the
+    # join dominates it; `_drop_dead_phis` drops the ones nothing read.
+    if lifter._join_name:
+        pad = indent * depth
+        decls = [f"{pad}var {n};" for n in sorted(set(lifter._join_name.values()),
+                                                  key=lambda n: int(n[1:]))]
+        lines = decls + lines
     lines = _drop_unread_slots(_drop_unread(lines, lifter.raw_names), lifter.slot_names)
     lines = _drop_dead_phis(lines, lifter.phi_names)
     return _inline_single_use(lines, lifter.results | lifter.slot_names,
