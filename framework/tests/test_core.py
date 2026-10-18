@@ -12495,14 +12495,14 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                  ("stur", "x7, [x2, #95]"), ("sub", "x9, x9, #1"),
                  ("tbz", "x9, #63, #0x4"), ("ret", "")])
     assert body[0] == "var t0 = 2;" and "x2.field_0x60 = x7;" in body, body
-    # Nor where the target is a join, here the block the outer loop leaves to as well:
-    # a join starts from what every way in agrees on, so it reads x7 bare whatever the
-    # loops name.
+    # The target is a join, the block the outer loop leaves to as well. It now names the
+    # value each way in holds, the goto's and the outer loop's own exit, rather than
+    # reading x7 bare, which read the `umulh` a path that left first never ran (#123).
     body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("mov", "x10, #3"),
                  ("cmp", "x10, #1"), ("b.eq", "#0x28"), ("umulh", "x7, x6, x1"),
                  ("sub", "x10, x10, #1"), ("tbz", "x10, #63, #0xc"),
                  ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8")] + out)
-    assert body[0] == "var t0 = 2;" and "x2.field_0x60 = x7;" in body, body
+    assert "var t0 = x5 + x1;" in body and "x2.field_0x60 = t5;" in body, body
     # Not a loop the machine runs twice: the way back is past a trap, and the stack
     # check's slow path strip_boilerplate cut off is not part of the loop.
     for mid in (("brk", "#0"), ("nop", "")):
@@ -13653,6 +13653,29 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     assert lift([("fadd", "d0, d1, d2"), ("stur", "d0, [x29, #-8]"),
                  ("ldur", "d3, [x29, #-8]"), ("stur", "d3, [x2, #7]")])[0] == (
         "x2.field_0x8 = d1 + d2;")                        # guard: passes on main
+
+
+def test_a_goto_out_of_nested_loops_names_what_the_join_reads():
+    # A goto out of an inner loop to a block the outer loop also leaves to is a join the
+    # structured walk never met: `_join_kill` dropped the register to its bare name, which
+    # reads as the last printed line put it. `umulh x7` prints inside the loop and `add
+    # x7, x5, x1` before it, so the store at the join read the `umulh` where the CPU, when
+    # it leaves on the first inner trip, has `x5 + x1`. On main this prints `x2.field_0x1
+    # = x7;`. A loop inside another was left open by #156; this is the join half (#123).
+    from jadart.expr import lift_function
+    rows = [("add", "x7, x5, x1"), ("mov", "x9, #2"), ("mov", "x10, #3"),
+            ("cbz", "x3, #0x28"), ("umulh", "x7, x6, x1"), ("sub", "x10, x10, #1"),
+            ("cbnz", "x10, #0xc"), ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"),
+            ("nop", ""), ("str", "x7, [x2]"), ("ret", "")]
+    body = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    store = next(ln for ln in body if ln.startswith("x2.field_0x1 ="))
+    # The value carried out of the loops is bound before them and read at the join.
+    assert "var t0 = x5 + x1;" in body, body
+    name = store[len("x2.field_0x1 = "):].rstrip(";")
+    assert re.fullmatch(r"t\d+", name), body          # a phi name, not the bare `x7`
+    # It is written on every edge into the join: the goto out and the loops' own exit.
+    assert sum(1 for ln in body if re.match(rf"{name} = ", ln)) >= 2, body
 
 
 if __name__ == "__main__":

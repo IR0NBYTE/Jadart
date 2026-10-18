@@ -13,6 +13,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A goto out of nested loops to a join names the value it carries, not the bare
+  register.** A goto from an inner loop to a block the outer loop also leaves to reaches
+  a join the structured walk never met, and `_join_kill` dropped the registers it
+  disagrees about to their bare names, which read as the last printed line put them: a
+  raw line's from inside the loop. With `umulh x7` printed in the loop and `add x7, x5,
+  x1` before it, the store at the join read the `umulh`, where a path that leaves on the
+  first inner trip has `x5 + x1` (#123). The loop now carries such a register past the
+  join (`_note_goto` no longer stops where the target is a join), and the join reads a
+  phi name written on every edge into it, the goto's and the loop's own exit, as the
+  if/else join already does (`_join_write`). The single-loop case was #156; this is the
+  nested half it left open, and the join half of #129. Tier 3 exports are unchanged on
+  the clean fixture, 2.19.6, 3.4.4, 3.10.9 and obf: the shape needs the carried value
+  read at the join, which the fixtures do not do, so the fix shows on the generated
+  graphs of `tools/irfuzz.py --cfgmem --nested`, which it leaves clean. One crafted case
+  in the tests that recorded the bare-register limit now asserts the named value. Part
+  of #123.
+
 - **A call's pushed arguments survive a second push, and saved registers no longer read
   as arguments.** `_stack_args` reads a call's arguments off the SP-relative slots, and
   two things went wrong (#147). A second push that moved SP dropped what the first push
