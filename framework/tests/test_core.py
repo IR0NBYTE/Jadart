@@ -1289,7 +1289,8 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
     saved again around a call, and the pre-loop text was right. A store keeps the slot
     when it writes back what it reloaded, or a register the loop never writes that held
     the slot's value on the way in; and a store on a path that throws never comes back
-    round, even where tier 3's graph runs on past the trap or the throw stub."""
+    round. A throw stub is a call, so tier 3's graph still runs on from it; a trap ends
+    its block (#64), so the `b` after one closes no loop."""
     from jadart.expr import lift_function
 
     def lift(rows):
@@ -1311,11 +1312,6 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
               ("stur", "x0, [x29, #-8]"),
               ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
               ("b", "#0x4")]),
-            ("past a trap",
-             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
-              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
-              ("stur", "x0, [x29, #-8]"), ("bl", "#0x100"), ("brk", "#0"),
-              ("b", "#0x4")]),
             ("a throw on the way round",
              [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
               ("ldur", "x0, [x2, #7]"), ("cbnz", "x0, #0x18"), ("stur", "x0, [x29, #-8]"),
@@ -1332,6 +1328,15 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
         body = lift(rows)
         assert "while (true) {" in body and "this.field_0x8" in body, (why, body)
         assert "x2.field_0x8" not in body, (why, body)
+    # Past a trap there is no loop at all: the `brk` ends its block, so the `b` after it
+    # is unreachable and closes nothing (#64). The slot still keeps `this`, not the
+    # register it was reloaded into.
+    body = lift([("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+                 ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
+                 ("stur", "x0, [x29, #-8]"), ("bl", "#0x100"), ("brk", "#0"),
+                 ("b", "#0x4")])
+    assert "while (true) {" not in body and "this.field_0x8" in body, body
+    assert "x2.field_0x8" not in body, body
     # ...and one that stores something else does forget it: the loop reads its own
     # value back at the top of the next trip, not `this`. So does a register that held
     # the slot's value on the way in, once the loop has changed it, and a loop that moves
@@ -13101,8 +13106,8 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
              for i, (mn, op) in enumerate(frame + [moved(*r) for r in rows])])]
 
     # `_contentWidthFor`'s shape: the doubles saved, then a stack check whose slow path,
-    # laid out after a throw, jumps back past the check. That makes a loop the machine
-    # runs once: the edge in is past the `brk`.
+    # laid out after a throw, jumps back past the check. The only back edge comes in past
+    # the `brk`, so honouring the trap (#64) leaves no loop, and the slots read as stored.
     check = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"), ("b.ls", "#0x44")]
     head = [("stur", "d0, [x29, #-0x18]"), ("stur", "d1, [x29, #-0x20]")]
     body = [("ldur", "x0, [x1, #7]"), ("stur", "x0, [x29, #-0x10]"),
@@ -13113,17 +13118,17 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     slow = [("bl", "#0x200"), ("b", "#0x14")]
     out = lift(head + check + body + throw + slow)
     assert "x2.field_0x10 = d0;" in out, out
-    # The slot the loop stores to is still forgotten, and the reload reads its register.
-    assert "x2.field_0x18 = x3;" in out, out
+    # With no loop the slot is not forgotten: the reload reads the value stored, named.
+    assert "x2.field_0x18 = x1.field_0x8;" in out, out
     # The throw's call writes x1, which the loop carries for it; the slot saved from x1
     # holds it all the same.
     out = lift([head[0], ("stur", "x1, [x29, #-8]")] + check + body[:5]
                + [("ldur", "x3, [x29, #-8]")] + body[6:] + throw + slow)
     assert "x2.field_0x10 = d0;" in out and "x2.field_0x18 = x1;" in out, out
-    # A store in the throw's block counts, as a handler the graph does not show could
-    # run after it.
+    # The store in the throw's block is on the path that throws, which the trap ends: it
+    # never reaches the read on the way out, so the slot still reads as the entry double.
     out = lift(head + check + body + [("stur", "d16, [x29, #-0x18]")] + throw[1:] + slow)
-    assert "x2.field_0x10 = d1;" in out, out
+    assert "x2.field_0x10 = d0;" in out, out
 
     # A loop of its own, counting down in x9: the slot at -0x20 holds d0 from before it.
     # It is read back from the register file it was stored from (#165).
@@ -13241,6 +13246,22 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     import jadart
     body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x161360")[0]["body"]]
     assert "if (d0 > t2) {" in body and "t5 = d0;" in body, body
+
+
+def test_a_trap_prunes_the_arm_that_calls_a_throw_and_traps():
+    # Honouring a trap in tier 3 (#64): an arm that sets a value, calls a throw stub and
+    # then traps never hands that value to the code after the `if`. With the false edge
+    # past the `brk` (the old graph), this lifted to `var t1; ...; t1 = t0; return t1;`,
+    # merging a value the machine never carries out. Tier 2 took the rule in #57; tier 3
+    # takes it now, so the live arm's constant is the whole result.
+    from jadart.expr import lift_function
+    rows = [("cmp", "x1, #0"), ("b.ne", "#0x10"), ("mov", "x0, #7"), ("b", "#0x1c"),
+            ("mov", "x0, #5"), ("bl", "#0x100"), ("brk", "#0"), ("ret", "")]
+    body = "\n".join(lift_function([(i * 4, m, o, "")
+                                    for i, (m, o) in enumerate(rows)]))
+    assert "return 7;" in body, body
+    # No phi over the trapping arm's value: it is not declared and not merged in.
+    assert "var t" not in body and "return t" not in body, body
 
 
 def test_a_value_a_join_lost_is_not_read_back_from_a_slot_as_the_register():
