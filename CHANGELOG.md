@@ -13,6 +13,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Tier 3 honours traps in its CFG.** A `brk`, `hlt`, `udf` or `bkpt` ends its block
+  with no edge past it, the rule tier 2 took in #57; `_lift_function` and `entry_arity`
+  no longer build the graph with `traps=()`. Dart emits a trap after a call that cannot
+  return, and the false edge past it let the walk run on. An arm that sets a value, calls
+  a throw stub and traps now hands nothing to the code after the `if`: `cmp x1, #0; b.ne;
+  mov x0, #7; b; mov x0, #5; bl; brk` lifts to `return 7;`, where it was `var t1; ...;
+  t1 = t0; return t1;`. Removing the edge is sound, the machine never falls through a
+  trap, so it only drops spurious joins: on the clean fixture 3,017 lines of code the
+  walk ran on past a trap go, 932 bare-register declines become named values, and 445
+  more reads spell `this`. Naming frame slots across a call (#64, landed earlier) is
+  what keeps `_CompactLinkedHashBase.forEach`'s guard from reading `this.field_0xc !=
+  this.field_0xc`: field self-comparisons on the clean fixture stay at 2, where the rule
+  without the slot naming had 7. Exports change 87 files on the clean fixture and none
+  on obf. Closes #64.
+
 - **A goto out of nested loops to a join names the value it carries, not the bare
   register.** A goto from an inner loop to a block the outer loop also leaves to reaches
   a join the structured walk never met, and `_join_kill` dropped the registers it

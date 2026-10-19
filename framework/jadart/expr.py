@@ -6061,7 +6061,7 @@ def entry_arity(ann: list, cut: bool = False):
     reach is then not known.
     """
     stripped = strip_boilerplate(ann)
-    blocks, entry = build_cfg(stripped, traps=())        # as _lift_function, see there
+    blocks, entry = build_cfg(stripped, traps=TRAPS)   # honours traps, like the lift
     if not blocks or entry not in blocks:
         return 0
     # A function that never moves SP reads its incoming stack arguments off SP itself,
@@ -6855,13 +6855,12 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None, cut_end=None, returns=None) -> list:
     slow = set()
     stripped = strip_boilerplate(ann, slow)
-    # No traps: tier 3 keeps the edge past a `brk` that tier 2 dropped in #57. Ending the
-    # block there takes away a join that, by accident, kept a frame slot from reading as
-    # the field it was loaded from, and `forEach`'s concurrent modification guard then
-    # printed as `this.field_0xc != this.field_0xc`. Naming frame slots across a call
-    # (`Lifter._slot_crossings`) was the first half of taking the rule; the false edge
-    # also hides weaknesses in the walk that the rule would expose, listed on #64.
-    blocks, entry = build_cfg(stripped, traps=(), cut_end=cut_end)
+    # Tier 3 honours traps, the rule tier 2 took in #57: a block ends at a `brk`/`udf`
+    # with no edge past it. The false edge used to drop a join that, by accident, kept a
+    # frame slot from reading as the field it was loaded from; naming frame slots across
+    # a call (`Lifter._slot_crossings`) now covers that, so `forEach`'s concurrent
+    # modification guard no longer prints `this.field_0xc != this.field_0xc` (#64).
+    blocks, entry = build_cfg(stripped, traps=TRAPS, cut_end=cut_end)
     if not blocks:
         return []
     _fold_frame_offsets(blocks)
