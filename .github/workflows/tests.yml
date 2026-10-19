@@ -33,7 +33,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: install
-        run: python -m pip install --upgrade pip && pip install ./framework[disasm]
+        run: python -m pip install --upgrade pip && pip install ./framework[disasm,test]
 
       - name: the package works without being run from its own directory
         working-directory: /tmp
@@ -53,8 +53,7 @@ jobs:
       - name: tests
         working-directory: framework
         run: |
-          python -m pip install pytest
-          python -m pytest tests -q -rs | tee /tmp/pytest.out
+          python -m pytest tests -q -rs -n auto | tee /tmp/pytest.out
           skipped=$(sed -n 's/.*[^0-9]\([0-9]\+\) skipped.*/\1/p' /tmp/pytest.out | tail -1)
           skipped=${skipped:-0}
           echo "skipped: $skipped"
