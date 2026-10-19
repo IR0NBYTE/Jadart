@@ -27,11 +27,16 @@ step() {
 
 if [ ! -x "$PY" ]; then
   echo "No interpreter at $PY."
-  echo "Set one up with:  python3 -m venv .venv && .venv/bin/pip install -e './framework[disasm]' pytest"
+  echo "Set one up with:"
+  echo "  python3 -m venv .venv && .venv/bin/pip install -e './framework[disasm,test]'"
   exit 2
 fi
 
-step "test suite" env -C framework "$PY" -m pytest tests -q -rs
+# The suite is order-independent, so run it in parallel when pytest-xdist is installed
+# (framework[test]); this is wall-clock only. Fall back to serial if it is absent.
+PAR=
+if "$PY" -c 'import xdist' 2>/dev/null; then PAR="-n auto"; fi
+step "test suite" env -C framework "$PY" -m pytest tests -q -rs $PAR
 
 # Byte-exact, and the reason a wrong grammar is caught rather than guessed at. The exit
 # code is the contract: 0 when every applicable Tier-A gate passed.

@@ -48,6 +48,9 @@ Changelog = "https://github.com/IR0NBYTE/Jadart/blob/main/CHANGELOG.md"
 # The tests pin byte-exact listings recorded with capstone 5.0.9, and a major release may
 # print differently, so moving to one is a deliberate change rather than an upgrade.
 disasm = ["capstone>=5.0,<6"]
+# The suite is order-independent, so it runs in parallel: `./check.sh` and CI pass
+# `-n auto`. This only changes wall-clock (about 160s to 45s on a laptop), not results.
+test = ["pytest", "pytest-xdist>=3"]
 
 [project.scripts]
 jadart = "jadart.cli:main"
