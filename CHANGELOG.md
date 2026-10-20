@@ -53,6 +53,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   reachable (clean 0x16afcc) the classification gains the correct `x0` where the dead
   block had left it unresolved. A crafted test pins the case. Closes #182.
 
+- **A function's own d0 is a d0 write the CPU can reach.** #182 made the return proof use
+  the reachable blocks; the gate that decides a function writes d0 at all, and so goes
+  through that proof rather than to `_argument_returns`, still ran over every block. A
+  function whose only d0 write is in a block a CPU never enters was read as writing d0 of
+  its own, so a reachable pass-through `ret` was labelled x0 with no caller to ask, where
+  the honest answer is the argument's register once a caller or the peers of its selector
+  speak. The gate now counts a d0 write only where the CPU can reach it, the basis #182
+  gave the rest of the proof. No exported byte changes on either fixture, and no return
+  verdict flips (6,849 functions on the clean fixture, 238 on obf); 22 and 21 now defer to
+  `_argument_returns`, each either with no reachable `ret` or rendering the same register
+  through `State.result`. Two crafted tests pin it. Closes #184.
+
 - **A goto out of nested loops to a join names the value it carries, not the bare
   register.** A goto from an inner loop to a block the outer loop also leaves to reaches
   a join the structured walk never met, and `_join_kill` dropped the registers it
