@@ -1440,7 +1440,9 @@ def returns_in_d0(ann) -> bool:
     """Whether the function `ann` hands back a double in d0 on every `ret`, by its own
     code (_return_registers without callers' evidence). For dispatch.recover_selectors."""
     with use_target(ARM64):
-        blocks, entry = build_cfg(strip_boilerplate(ann), traps=())
+        # Honour traps so a `ret` only a trap's false fall-through reaches is not
+        # counted as a return (#178), as the lift and entry_arity do.
+        blocks, entry = build_cfg(strip_boilerplate(ann), traps=TRAPS)
         if not blocks:
             return False
         got = _return_registers(blocks, entry)

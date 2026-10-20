@@ -12939,6 +12939,35 @@ def test_a_function_that_hands_back_its_double_argument_returns_d0():
     assert body[-1] == "return d0;", body                # Curve.transform
 
 
+def test_returns_in_d0_ignores_a_ret_only_a_traps_fall_through_reaches():
+    # #178. returns_in_d0 asks whether a function hands back d0 at every `ret`. A `ret`
+    # that only the false fall-through past a trap reaches is dead (a CPU never resumes
+    # after a brk), so it must not count. Here the live ret returns d0; a dead ret after a
+    # brk, whose last write to a return register is a call, is classed x0. With the trap
+    # honoured only the live d0 ret is reachable, so the function returns d0.
+    from jadart.expr import (returns_in_d0, strip_boilerplate, build_cfg,
+                             use_target, ARM64, _return_registers, TRAPS)
+
+    rows = [("fmov", "d0, #1.0", ""),   # d0 written on the live path, never x0
+            ("cbz",  "x1, #0x14", ""),  # x1 == 0 -> the live ret at 0x14
+            ("bl",   "#0x100", ""),     # otherwise a call, the last write to x0
+            ("brk",  "#0", ""),         # a trap: no fall-through on a CPU
+            ("ret",  "", ""),           # dead ret, in only on the trap's false edge
+            ("ret",  "", "")]           # the live ret
+    ann = [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)]
+    assert returns_in_d0(ann) is True
+
+    # The dead ret is what the trap's false edge adds: counting it (traps=()) sees x0 too,
+    # so returns_in_d0 said False on main. Honouring the trap drops it.
+    with use_target(ARM64):
+        b_off, e_off = build_cfg(strip_boilerplate(ann), traps=())
+        b_on, e_on = build_cfg(strip_boilerplate(ann), traps=TRAPS)
+        off = set(_return_registers(b_off, e_off).values())
+        on = set(_return_registers(b_on, e_on).values())
+    assert off == {"d0", "x0"}          # the dead ret counted, as main did
+    assert on == {"d0"}                 # only the live ret, the trap honoured
+
+
 def test_a_call_to_a_function_with_register_and_stack_arguments_prints_both():
     # Past six arguments Dart passes the rest on the stack, the last at SP+0, and a callee
     # that reads both printed one part as the whole list: its registers, `hash6(t68, ...)`
