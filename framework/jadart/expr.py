@@ -1645,7 +1645,6 @@ def _return_facts(blocks, entry):
     # is a pop of the Dart stack).
     rows = {}
     calls = {}
-    own_d0 = False
     for b, blk in blocks.items():
         row = rows[b] = []
         for (a, mn, op, note) in blk.insns:
@@ -1660,10 +1659,21 @@ def _return_facts(blocks, entry):
                 continue
             defs, uses = _rv_def_use(mn, op)
             wd = "d0" in defs
-            own_d0 = own_d0 or wd
             row.append((a, _RV_PLAIN, "x0" in defs, wd, "d0" in uses, mn.startswith("st"),
                         wd and _rv_pop(mn, op)))
-    if not own_d0:
+    # The d0 writes that count are the ones the CPU can reach, the basis #182 gave the
+    # rest of the proof (at_ret, only_ret, read). A block only a trap's false fall-through
+    # reaches is not the function's own code, so a d0 write there does not make it return
+    # a double (#184). Without a reachable one, a `ret` that hands back its d0 argument is
+    # left to _argument_returns, as it is for a function that never writes d0 at all.
+    reach = {entry}
+    stack = [entry]
+    while stack:
+        for s in blocks[stack.pop()].succ:
+            if s in blocks and s not in reach:
+                reach.add(s)
+                stack.append(s)
+    if not any(r[3] for b in reach for r in rows[b]):
         return None
 
     # Forward, per point: x0 may have been written, the last write to d0 may be this

@@ -12987,8 +12987,8 @@ def test_a_return_is_not_proven_d0_by_a_block_the_cpu_cannot_reach():
                              ("ret",  "", ""),          # 0x4 the live ret
                              ("fmov", "d0, #1.0", ""),  # 0x8 unreachable, no in-edge
                              ("ret",  "", "")])         # 0xc
-    assert d0_only is False          # main proved d0 off the dead block and said True
-    assert mapping == {4: "x0"}      # the live ret, correctly x0 (was 'd0' on main)
+    assert d0_only is False      # main proved d0 off the dead block and said True
+    assert mapping == {}         # #184: dead d0 is not the fn's own; defers, renders x0
 
     # The same leak as it arises after #64/#178: the unreachable block sits past a `brk`,
     # so only the trap's removed false edge ever reached it.
@@ -13002,7 +13002,52 @@ def test_a_return_is_not_proven_d0_by_a_block_the_cpu_cannot_reach():
                              ("mov",  "x0, x2", ""),      # 0x1c live: returns x0
                              ("ret",  "", "")])           # 0x20
     assert d0_only is False
-    assert mapping == {32: "x0"}     # the live ret at 0x20, correctly x0 (was 'd0')
+    assert mapping == {}         # #184: same; defers to _argument_returns, renders x0
+
+
+def test_return_facts_counts_only_reachable_d0_writes():
+    # #184. _return_facts decides a function writes d0 at all, and proves a d0 return,
+    # over the blocks the CPU can reach. A d0 write only a trap's false fall-through
+    # reaches is not the function's own, so a function whose d0 writes are all unreachable
+    # is left to _argument_returns, like one that never writes d0. Follow-up to #182, with
+    # the same reachable basis #182 gave at_ret, only_ret and read.
+    from jadart.expr import (returns_in_d0, strip_boilerplate, build_cfg,
+                             use_target, ARM64, _return_registers, _return_facts, TRAPS)
+
+    def facts_regs(rows, ev=None):
+        a = [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)]
+        with use_target(ARM64):
+            blocks, entry = build_cfg(strip_boilerplate(a), traps=TRAPS)
+            got = (_return_registers(blocks, entry) if ev is None
+                   else _return_registers(blocks, entry, lambda: ev))
+            return _return_facts(blocks, entry) is None, returns_in_d0(a), got
+
+    # A reachable pass-through `ret` whose only d0 write is in a dead block. Main counted
+    # the dead write and labelled the ret d0 with no caller to ask. Now it has no d0 of
+    # its own, so it defers: nothing without evidence, d0 once a caller says d0.
+    passthrough = [("cbz",  "x1, #0x10", ""),  # 0x0 live -> 0x10
+                   ("brk",  "#0", ""),         # 0x4 trap
+                   ("fmov", "d0, #1.0", ""),   # 0x8 unreachable d0 write
+                   ("ret",  "", ""),           # 0xc unreachable ret
+                   ("ret",  "", "")]           # 0x10 live pass-through ret
+    none0, d0_0, regs0 = facts_regs(passthrough)
+    assert none0 and d0_0 is False and regs0 == {}   # defers, undecided with no caller
+    assert facts_regs(passthrough, ev="d0")[2] == {16: "d0"}   # caller saying d0 decides
+
+    # A reachable d0 write still counts, so the proof runs; an unreachable dead
+    # d0-write-then-ret does not prove d0 for the live x0 ret (only_ret stays reachable,
+    # #182). This exercises the proof that the pass-through above skips.
+    mixed = [("fmov", "d0, #1.0", ""),  # 0x0 reachable d0 write
+             ("str",  "d0, [x2]", ""),  # 0x4 stored
+             ("cbz",  "x1, #0x18", ""),  # 0x8 -> 0x18
+             ("brk",  "#0", ""),        # 0xc trap
+             ("fmov", "d0, #2.0", ""),  # 0x10 unreachable d0 write
+             ("ret",  "", ""),          # 0x14 unreachable ret
+             ("mov",  "x0, x3", ""),    # 0x18 reachable x0 write
+             ("ret",  "", "")]          # 0x1c reachable ret: returns x0
+    none1, d0_1, regs1 = facts_regs(mixed)
+    assert not none1                              # a reachable d0 write: the proof runs
+    assert d0_1 is False and regs1 == {28: "x0"}  # the live ret is x0, not the dead d0
 
 
 def test_a_call_to_a_function_with_register_and_stack_arguments_prints_both():
