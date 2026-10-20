@@ -28,6 +28,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   without the slot naming had 7. Exports change 87 files on the clean fixture and none
   on obf. Closes #64.
 
+- **`returns_in_d0` honours traps too.** #64 flipped the lift and `entry_arity` to
+  `traps=TRAPS` but left the third library call site, the selector-recovery helper
+  `returns_in_d0`, at `traps=()`. It asks whether a function hands back a double at every
+  `ret`, and the false edge past a trap kept a dead `ret` reachable, so a function whose
+  only live `ret` returns d0 but which traps after a throw on another arm read as
+  returning d0 and x0 both, and the helper said no where yes was right. It now ends a
+  block at a trap, as the lift does. No exported byte changes on the clean fixture or obf:
+  the helper runs 127 times on the clean build and once on obf, and its answer is the same
+  with the trap honoured on every one, so this is a latent fix the two fixtures do not
+  reach; a crafted test pins the corrected answer. Closes #178.
+
 - **A goto out of nested loops to a join names the value it carries, not the bare
   register.** A goto from an inner loop to a block the outer loop also leaves to reaches
   a join the structured walk never met, and `_join_kill` dropped the registers it
