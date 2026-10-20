@@ -1756,7 +1756,11 @@ def _return_facts(blocks, entry):
                     queued.add(p)
                     work.append(p)
     only_ret = read = False
-    for b in blocks:
+    # Forward-reachable blocks only, the basis at_ret uses above. A block a CPU never
+    # enters (its one in-edge was a trap's false fall-through, gone once the trap is
+    # honoured) can write d0 and ret, which would prove a d0 return the live code never
+    # makes (#182).
+    for b in ins:
         live = outs[b]
         for r in reversed(rows[b]):
             if live[0] and r[3]:

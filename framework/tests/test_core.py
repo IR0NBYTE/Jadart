@@ -12968,6 +12968,43 @@ def test_returns_in_d0_ignores_a_ret_only_a_traps_fall_through_reaches():
     assert on == {"d0"}                 # only the live ret, the trap honoured
 
 
+def test_a_return_is_not_proven_d0_by_a_block_the_cpu_cannot_reach():
+    # #182. _return_facts proves a d0 return from a write that reaches a `ret`, but it ran
+    # that proof over every block, forward-unreachable ones included, where at_ret is
+    # reachable-only. A block a CPU never enters can `fmov d0; ret`, which proved d0 for a
+    # live `ret` that actually hands back x0. The proof now uses reachable blocks only.
+    from jadart.expr import (returns_in_d0, strip_boilerplate, build_cfg,
+                             use_target, ARM64, _return_registers, TRAPS)
+
+    def regs(rows):
+        ann = [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)]
+        with use_target(ARM64):
+            blocks, entry = build_cfg(strip_boilerplate(ann), traps=TRAPS)
+            return returns_in_d0(ann), _return_registers(blocks, entry)
+
+    # The live `ret` returns x0; a block that only `fmov d0; ret`s has no in-edge at all.
+    d0_only, mapping = regs([("mov",  "x0, x2", ""),   # 0x0 entry: returns x0
+                             ("ret",  "", ""),          # 0x4 the live ret
+                             ("fmov", "d0, #1.0", ""),  # 0x8 unreachable, no in-edge
+                             ("ret",  "", "")])         # 0xc
+    assert d0_only is False          # main proved d0 off the dead block and said True
+    assert mapping == {4: "x0"}      # the live ret, correctly x0 (was 'd0' on main)
+
+    # The same leak as it arises after #64/#178: the unreachable block sits past a `brk`,
+    # so only the trap's removed false edge ever reached it.
+    d0_only, mapping = regs([("cbz",  "x1, #0x1c", ""),  # 0x00 live: x1==0 -> 0x1c
+                             ("brk",  "#0", ""),          # 0x04 trap, no fall-through
+                             ("bl",   "#0x100", ""),      # 0x08 (dead past the brk)
+                             ("ret",  "", ""),            # 0x0c
+                             ("fmov", "d0, #1.0", ""),    # 0x10 unreachable
+                             ("ret",  "", ""),            # 0x14
+                             ("nop",  "", ""),            # 0x18
+                             ("mov",  "x0, x2", ""),      # 0x1c live: returns x0
+                             ("ret",  "", "")])           # 0x20
+    assert d0_only is False
+    assert mapping == {32: "x0"}     # the live ret at 0x20, correctly x0 (was 'd0')
+
+
 def test_a_call_to_a_function_with_register_and_stack_arguments_prints_both():
     # Past six arguments Dart passes the rest on the stack, the last at SP+0, and a callee
     # that reads both printed one part as the whole list: its registers, `hash6(t68, ...)`

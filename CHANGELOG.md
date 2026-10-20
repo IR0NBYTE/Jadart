@@ -39,6 +39,20 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   with the trap honoured on every one, so this is a latent fix the two fixtures do not
   reach; a crafted test pins the corrected answer. Closes #178.
 
+- **A return is not proven a double by a block the CPU cannot reach.** `_return_facts`
+  decides a `ret` hands back d0 when a write to d0 reaches it, but it ran that proof over
+  every block, forward-unreachable ones included, where the set of returns it classifies
+  is reachable-only. A block a CPU never enters (its one in-edge was a trap's false
+  fall-through, gone since #64) can `fmov d0; ret`, which proved d0 for a live `ret` that
+  returns x0, so the function read as returning a double where it returns a tagged value.
+  Honouring traps in `returns_in_d0` (#178) exposed one more such block. The proof now
+  runs over the reachable blocks, the basis the return set already used. No exported byte
+  changes on either fixture and no return verdict flips across every function (6,849 on
+  the clean fixture, 238 on obf). The `read` flag this corrects differs on 10 of them and
+  9 on obf, all with a forward-unreachable block; on the one whose `ret` is itself
+  reachable (clean 0x16afcc) the classification gains the correct `x0` where the dead
+  block had left it unresolved. A crafted test pins the case. Closes #182.
+
 - **A goto out of nested loops to a join names the value it carries, not the bare
   register.** A goto from an inner loop to a block the outer loop also leaves to reaches
   a join the structured walk never met, and `_join_kill` dropped the registers it
