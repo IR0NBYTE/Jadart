@@ -4056,8 +4056,11 @@ class Lifter:
         ops = _split_ops(op)
         g = lambda r: self._leaf(r, st)
 
-        if mn in ("nop", "brk", "hlt") or (not ops and mn not in ("ret",)):
-            return []                           # brk/hlt: unreachable trap after a noreturn
+        # A trap renders nothing, like a nop: the machine never runs past brk, hlt, udf,
+        # bkpt or trap, so none leaves text. Only brk and hlt were named here, so udf and
+        # bkpt (an all-zero word read as code decodes to udf) leaked through as verbatim.
+        if mn in TRAPS or mn == "nop" or (not ops and mn not in ("ret",)):
+            return []
 
         flagged = self._note_flags(st, mn, op, ops, addr in self._flag_reads)
         if flagged:
@@ -5377,6 +5380,20 @@ class Lifter:
                 label(s[1])
                 if not alive:
                     self._reenter(s[1], st)
+                    # A trap ends a block with no successor, so a block reached here out
+                    # of normal flow (a goto, not fall-through) that ends in a trap hands
+                    # its state to no later line. That state can spell a value with a temp
+                    # no `var` on the way to this block declared, the live path's own
+                    # declaration dropped or never printed, so the block reads a name
+                    # nothing binds: nextInt's divide-by-zero throw read t0 and t1,
+                    # declared nowhere. A register's temp name holds only until it is
+                    # reassigned, so the bare register is the same value; read the
+                    # undeclared temps as their registers, and keep the declared (#179).
+                    if self.blocks[s[1]].term in TRAPS:
+                        bound = _declared_temps(out)
+                        bound |= {int(n[1:]) for n in self.pins}
+                        bound |= {int(n[1:]) for n in self.phi_names}
+                        _forget_temps(st, lambda n: n not in bound)
                 # The meet a goto join never got. A loop header is excluded because
                 # `_render_loop` has already given its carried registers names and bound
                 # them in this state; killing them here would put the machine register back
@@ -6572,6 +6589,15 @@ def _no_self_holds(ln: str) -> str:
     keep = [p for p in re.split(r", (?=\w+ holds )", note)
             if not re.fullmatch(r"(\w+) holds \1", p)]
     return f"{code}   // {', '.join(keep)}" if keep else code
+
+
+_VAR_DECL_RE = re.compile(r"\bvar (t\d+)\b")
+
+
+def _declared_temps(lines) -> set:
+    """The numbers of the temps a `var` line in `lines` declares, so a block reached out
+    of flow can tell a name the way to it bound from one nothing here does (`walk`)."""
+    return {int(m[1:]) for ln in lines for m in _VAR_DECL_RE.findall(ln)}
 
 
 def _forget_temps(st: State, gone) -> None:

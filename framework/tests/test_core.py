@@ -9042,6 +9042,56 @@ def test_code_after_a_trap_is_still_shown():
     assert not any(ln.startswith("goto") for ln in body), body
 
 
+def test_a_trap_mnemonic_is_not_printed_raw():
+    # TRAPS are brk, hlt, udf, bkpt and trap: each ends a block and the machine runs past
+    # none, so tier 3 prints no text for one. The suppression named only brk and hlt, so
+    # udf, bkpt and trap fell through to the raw-instruction path and printed verbatim. An
+    # all-zero word read as code decodes to `udf #0`, so this reaches the lifter from data
+    # a crafted file presents as a function (#179).
+    for trap in ("brk", "hlt", "udf", "bkpt", "trap"):
+        body = _lift_asm([("mov", "x0, #1"), (trap, "#0")])
+        assert trap not in body, f"{trap} printed raw: {body!r}"
+
+
+def test_a_trap_in_a_reconstructed_branch_is_not_printed_raw():
+    # A test reaches a trap-terminated block the structurer renders as a dead `else`. brk
+    # was suppressed there already; udf was not, so it leaked into the lifted body (#179).
+    body = _lift_asm([("cbz", "x1, #0x10"), ("mov", "x0, #2"), ("ret", ""),
+                      ("nop", ""), ("udf", "#0")])
+    assert "udf" not in body, f"udf leaked into a reconstructed branch:\n{body}"
+
+
+def test_a_dead_trap_block_reads_no_undeclared_temp():
+    # A trap-terminated block reached out of normal flow is a dead slow path, a guard the
+    # machine never falls into. Its one predecessor's state can spell a value with a temp
+    # the live path never declared, so the block read a name nothing bound: Random.nextInt
+    # printed its divide-by-zero throw as `THR.field_0x210(..., t1, t0)` with t0 and t1
+    # declared nowhere. Those now read as the bare registers they stood for (#179).
+    _needs_capstone()
+    body = _lift("nextInt")
+    declared = set(re.findall(r"\bvar (t\d+)", body))
+    used = set(re.findall(r"\b(t\d+)\b", body))
+    assert not (used - declared), f"undeclared temps in body: {sorted(used - declared)}"
+
+
+def test_the_dead_trap_forget_drops_only_undeclared_temps():
+    # The capstone-free half of the one above: the forget a trap block runs keeps a temp a
+    # `var` on the way to it declares and drops one nothing does, which then reads as its
+    # bare register. `_declared_temps` reads the declared set off those lines (#179).
+    from jadart.expr import State, V, P_ATOM, P_ADD, _declared_temps, _forget_temps
+    assert _declared_temps(["  var t3 = x1;", "  foo(t3, t9);"]) == {3}
+    assert _declared_temps(["var t0;", "  var t10 = y;"]) == {0, 10}
+    st = State()
+    st.reg["x0"] = V("t9", P_ATOM)          # a temp no line declared
+    st.reg["x1"] = V("t3", P_ATOM)          # a declared temp
+    st.reg["x2"] = V("t9 + 1", P_ADD)       # an expression over the undeclared one
+    bound = _declared_temps(["  var t3 = x1;"])
+    _forget_temps(st, lambda n: n not in bound)
+    assert st.reg["x0"].text == "x0"        # undeclared t9 reads as its register
+    assert st.reg["x2"].text == "x2"        # and so does the expression over it
+    assert st.reg["x1"].text == "t3"        # the declared temp stays
+
+
 def test_a_goto_out_of_the_function_leaves_the_labels_after_it():
     """`render` printed `goto sub_0x..` for a branch out of the function by rebinding the
     name of its own label printer, so every `L_0x..:` after it in the same body printed
