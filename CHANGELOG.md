@@ -13,6 +13,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A trap block reads no undeclared temp, and tier 3 prints no trap mnemonic raw.**
+  Tier 3 renders a block the machine reaches out of normal flow (a goto, not fall-through)
+  that ends in a trap as its one predecessor left it. A trap ends a block with no
+  successor, so that state reaches no later line, and it could spell a value with a temp
+  the live path never declared, so the block read a name nothing bound: `Random.nextInt`'s
+  divide-by-zero throw printed `THR.field_0x210(..., t1, t0)` with t0 and t1 declared
+  nowhere. A register keeps its temp name only while it is not reassigned, so the bare
+  register is the same value; such a block now reads a name no `var` on the way to it
+  declares as that register, and keeps the temps that are declared. The change is one line
+  of the clean export, the nextInt throw, and none on obf. Separately,
+  the tier-3 rule that prints no text for a trap listed only `brk` and `hlt`, so `udf`,
+  `bkpt` and `trap` fell through and printed verbatim; all of `TRAPS` is dropped now, as
+  `brk` was. No fixture holds a `udf` or `bkpt`, and an all-zero word read as code decodes
+  to `udf`, so this changes no exported byte and covers crafted or other-toolchain input.
+  Closes #179.
+
 - **A frame slot reads its register afresh once a register its text names is reassigned.**
   A slot that spills a stable register keeps that register's name as its text, so a reload
   read the register's new value where the machine holds the one stored: `stur x6; mov x6,
