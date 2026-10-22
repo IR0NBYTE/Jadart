@@ -659,9 +659,22 @@ def _smi_note(lhs: V, rhs: V) -> str:
 MAX_INLINE_CHARS = 200
 
 
+#: Text -> the canonical registers it names, memoised. A slot's text is asked for its
+#: registers when the slot is filed and again when one of them is written, and the texts
+#: repeat (a bare `x6`, a field read), so the parse is worth keeping (#173).
+_SLOT_REGS_CACHE: dict = {}
+
+
+def _slot_regs(text: str) -> frozenset:
+    hit = _SLOT_REGS_CACHE.get(text)
+    if hit is None:
+        hit = _SLOT_REGS_CACHE[text] = frozenset(canon(m) for m in _REG_RE.findall(text))
+    return hit
+
+
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
-                 "src", "views", "lost", "lost_slot")
+                 "src", "views", "lost", "lost_slot", "slot_by_reg")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
@@ -704,6 +717,14 @@ class State:
         # dropped when that register is reassigned and its spelling means something else
         # (#140). Only lost values are tracked; a stable value in a slot stays.
         self.lost_slot: dict = {}
+        # register -> the slot keys whose text names it, the reverse of what each slot's
+        # text mentions. A slot's text stops describing the slot once a register it names
+        # is reassigned on a straight-line path, so a reload reads the register afresh
+        # rather than the value stored (#173). This indexes the drop so a write costs a
+        # lookup, not a scan of every slot (the loop cost #154 removed). A superset is
+        # safe: a key read back is re-checked against the slot it still holds, and a key
+        # left out only misses a drop, never invents one.
+        self.slot_by_reg: dict = {}
 
     def copy(self) -> "State":
         s = State()
@@ -716,6 +737,7 @@ class State:
         s.views = {n: set(v) for n, v in self.views.items()}
         s.lost = set(self.lost)
         s.lost_slot = dict(self.lost_slot)
+        s.slot_by_reg = {r: set(ks) for r, ks in self.slot_by_reg.items()}
         s.tmpc = self.tmpc
         s.src = self.src
         return s
@@ -758,6 +780,50 @@ class State:
         for k in [k for k, r in self.lost_slot.items() if r == reg]:
             self.slot.pop(k, None)
             del self.lost_slot[k]
+
+    def note_slot(self, key: str, v: V):
+        """Record that slot `key` holds `v`, whose text names registers it goes stale
+        with (#173). Called wherever an FP-relative slot is filed with a value; the
+        caller gates on that, as the outgoing area off SP is a call's arguments, read
+        before any reassign and cleared by `_drop_outgoing` (#140)."""
+        for r in _slot_regs(v.text):
+            self.slot_by_reg.setdefault(r, set()).add(key)
+
+    def reindex_slots(self):
+        """Rebuild the register -> slot index from the slot map, where the keys or texts
+        changed outside `note_slot`: a join builds a fresh slot map, a frame move renames
+        the keys, and a reenter carries another block's. Only FP-relative slots, as
+        `note_slot` indexes."""
+        fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
+        idx: dict = {}
+        if fp is not None:
+            for key, v in self.slot.items():
+                if key.startswith(fp):
+                    for r in _slot_regs(v.text):
+                        idx.setdefault(r, set()).add(key)
+        self.slot_by_reg = idx
+
+    def stale_on_write(self, written, keep=()):
+        """Drop the slots whose text names a register in `written`, reassigned here on a
+        straight-line path (#173). The index gives the candidate keys without a scan; each
+        is re-checked against the slot it still holds, so a key left by an overwrite or a
+        drop cannot take a slot that no longer names the register with it.
+
+        `keep` is the slot a frame reload reads back: dropping it would collide the reload
+        with the one that spilled, so it stays (and stays indexed), while the other slots
+        the reload's register names still go (#173)."""
+        for reg in written:
+            survivors = set()
+            for k in self.slot_by_reg.pop(reg, ()):
+                v = self.slot.get(k)
+                if v is None or reg not in _slot_regs(v.text):
+                    continue
+                if k in keep:
+                    survivors.add(k)
+                else:
+                    del self.slot[k]
+            if survivors:
+                self.slot_by_reg[reg] = survivors
 
     def forget_hi(self, n):
         """Forget the wider spellings of FP register `n` (v*.16b, q*, v*.2d, lane
@@ -917,6 +983,7 @@ def _merge(dst: State, a: State, b: State):
     for k in [k for k in dst.slot
               if (k in a.lost_slot or k in b.lost_slot) and k not in dst.lost_slot]:
         dst.slot.pop(k, None)
+    dst.reindex_slots()         # the agreed slots are a fresh map (#173)
     dst.elem = {r: a.elem[r] for r in a.elem if b.elem.get(r) == a.elem[r]}
     # Which register the function last wrote a RESULT to is a fact about the arms, exactly
     # as the register map is, and it decided the wrong thing when it was left behind: a
@@ -3277,10 +3344,13 @@ class Lifter:
             # and `_drop_outgoing` clears.
             st.slot[key] = v
             st.lost_slot[key] = reg
+            st.note_slot(key, v)
             return []
         st.lost_slot.pop(key, None)
         if (at, key) not in self._slot_crossings() or not _READS_MEMORY.search(v.text):
             st.slot[key] = v
+            if fp is not None and key.startswith(fp):
+                st.note_slot(key, v)
             return []
         out = []
         tmp = named.get(v.text)
@@ -3655,6 +3725,7 @@ class Lifter:
                 if off >= 0:
                     renamed[f"{base}{off:+d}"] = v
             st.slot = renamed
+            st.reindex_slots()      # keys moved, so the register index has to (#173)
             return
         gone = [k for k in st.slot if k != _LOST and k.startswith(base)]
         for k in gone:
@@ -4989,6 +5060,23 @@ class Lifter:
             lines.extend(self._step(st, a, mn, op, note))
             if a in self.frame_moves:
                 self._moved_unseen(st, *self.frame_moves[a])
+            if st.slot_by_reg and mn not in _CALLS:
+                # A slot whose text names a register this instruction reassigns now reads
+                # the new register, not the value stored: `stur x6; mov x6, x1; ldur x3`
+                # read the new x6 (#173). A goto join and a loop drop such a slot already;
+                # here it is dropped on the straight-line write too, in program order. Not
+                # at a call: its clobbers are named across it (#64) and dropping the
+                # outgoing area would lose a call's arguments. A frame reload drops the
+                # other slots its register names but keeps the one it reads, whose drop
+                # would collide two reloads onto one name; a reload keying to no slot is
+                # skipped (#173 review).
+                written = _def_use(mn, op)[0]
+                if mn in _LOADS and _off_frame(_split_ops(op)):
+                    got = _frame_access(mn, op)
+                    if got is not None:
+                        st.stale_on_write(written, got[0])
+                else:
+                    st.stale_on_write(written)
             if st.spill:
                 # After the instruction's own statement, not before: the declaration belongs
                 # at the point the value was produced, and only later instructions read it.
@@ -5031,6 +5119,7 @@ class Lifter:
         if carry is not None:
             st.reg = dict(carry.reg)
             st.slot = dict(carry.slot)
+            st.slot_by_reg = {r: set(ks) for r, ks in carry.slot_by_reg.items()}
             st.elem.update(carry.elem)
             st.poolbase.update(carry.poolbase)
             st.pair.update(carry.pair)
@@ -5038,6 +5127,7 @@ class Lifter:
         else:
             st.reg = {}
             st.slot = {}
+            st.slot_by_reg = {}
             st.result = _T.ret_int
 
     def _cond(self, cond: str, st: State) -> str:
@@ -5378,9 +5468,11 @@ class Lifter:
                 elif tfalls:
                     st.reg, st.slot, st.elem, st.result = a.reg, a.slot, a.elem, a.result
                     st.lost, st.lost_slot = a.lost, a.lost_slot
+                    st.slot_by_reg = a.slot_by_reg
                 elif efalls:
                     st.reg, st.slot, st.elem, st.result = b.reg, b.slot, b.elem, b.result
                     st.lost, st.lost_slot = b.lost, b.lost_slot
+                    st.slot_by_reg = b.slot_by_reg
                 else:
                     falls = False
                 alive = tfalls or efalls
