@@ -13,6 +13,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A frame slot reads its register afresh once a register its text names is reassigned.**
+  A slot that spills a stable register keeps that register's name as its text, so a reload
+  read the register's new value where the machine holds the one stored: `stur x6; mov x6,
+  x1; ldur x3` printed `x20.field_0x8 = x6`, the reassigned x6, not the stored one. It is
+  the stable-register twin of #140, which covered only a value a join lost; the hazard is
+  any slot whose text names a register written between the store and the read. A slot now
+  goes stale on the straight-line write that reassigns a register it names, the tight
+  per-write form of the `_stale_slots` pass a goto join and a loop already run, keyed off
+  the register by a reverse index so a write costs a lookup, not a scan. Not at a call,
+  whose clobbers are named across it (#64) and whose outgoing arguments a drop would lose;
+  a reload off the frame drops the other slots its register names but keeps the one it
+  reads back, whose drop would collide two reloads. Exports change 184 files on the clean
+  fixture, a stale register or expression becoming the register the reload reads, and none
+  on obf. A targeted spill, reassign and reload differential against a real CPU (unicorn)
+  corrects 1,654 lifted values and adds no new mismatch; 407 stale reads of shapes this
+  does not reach remain, as on main. Closes #173.
+
 - **Tier 3 honours traps in its CFG.** A `brk`, `hlt`, `udf` or `bkpt` ends its block
   with no edge past it, the rule tier 2 took in #57; `_lift_function` and `entry_arity`
   no longer build the graph with `traps=()`. Dart emits a trap after a call that cannot
