@@ -5380,16 +5380,17 @@ class Lifter:
                 label(s[1])
                 if not alive:
                     self._reenter(s[1], st)
-                    # A trap ends a block with no successor, so a block reached here out
-                    # of normal flow (a goto, not fall-through) that ends in a trap hands
-                    # its state to no later line. That state can spell a value with a temp
-                    # no `var` on the way to this block declared, the live path's own
-                    # declaration dropped or never printed, so the block reads a name
-                    # nothing binds: nextInt's divide-by-zero throw read t0 and t1,
-                    # declared nowhere. A register's temp name holds only until it is
-                    # reassigned, so the bare register is the same value; read the
-                    # undeclared temps as their registers, and keep the declared (#179).
-                    if self.blocks[s[1]].term in TRAPS:
+                    # A block with no successor (a trap, a return, or an indirect jump
+                    # out of the function), reached out of normal flow (a goto, not a
+                    # fall-through), hands its state to no later line. That state can
+                    # spell a value with a temp no `var` on the way here declared (the
+                    # live path's declaration dropped or never printed), so the block
+                    # reads a name nothing binds: nextInt's throw read t0 and t1, and a
+                    # loop that collapsed the receiver's name left toUpperCase reading an
+                    # undeclared t1 at `return t1`. A register's temp name holds only
+                    # until it is reassigned, so the bare register is the same value;
+                    # drop the undeclared temps, keep the declared (#179, #129).
+                    if not self.blocks[s[1]].succ:
                         bound = _declared_temps(out)
                         bound |= {int(n[1:]) for n in self.pins}
                         bound |= {int(n[1:]) for n in self.phi_names}

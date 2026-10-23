@@ -9092,6 +9092,36 @@ def test_the_dead_trap_forget_drops_only_undeclared_temps():
     assert st.reg["x1"].text == "t3"        # the declared temp stays
 
 
+def test_a_return_block_reads_no_undeclared_temp():
+    # A no-successor block is not only a trap: a `return` block has none either. A loop that
+    # collapses a register's carried name (the receiver x0, which the loop never writes)
+    # drops the name's declaration but left a goto-target `return` reading it, so the
+    # _OneByteString toUpperCase/toLowerCase ended `return t1;` with t1 declared nowhere.
+    # The no-successor forget now covers return blocks, so they read the bare register
+    # (`return x0`, the unchanged receiver) (#129). _lift picks the first same-named range
+    # (a stub), so lift every match to reach the bodies that carry the loop.
+    _needs_capstone()
+    from jadart.disasm import (load_instructions, disassemble_function,
+                               function_name_by_pc, build_pool_map, annotate)
+    from jadart.branches import row_kinds
+    from jadart.expr import lift_function
+    image, fr, _ = load_instructions(CLEAN)
+    pm, p2n = build_pool_map(fr), function_name_by_pc(image, fr)
+    seen = 0
+    for ref, nr, ow, kt in fr.functions:
+        if fr.strings.get(nr) not in ("toUpperCase", "toLowerCase"):
+            continue
+        dis = disassemble_function(image, ref)
+        body = "\n".join(lift_function(
+            annotate(dis, p2n, pm, kinds=row_kinds(image, dis)), pm))
+        declared = set(re.findall(r"\bvar (t\d+)", body))
+        used = set(re.findall(r"\bt(\d+)\b", body))
+        undeclared = {"t" + n for n in used} - declared
+        assert not undeclared, f"{fr.strings.get(nr)} @0x{ref:x}: undeclared {sorted(undeclared)}"
+        seen += 1
+    assert seen >= 2, f"expected the cased-string helpers, lifted {seen}"
+
+
 def test_a_goto_out_of_the_function_leaves_the_labels_after_it():
     """`render` printed `goto sub_0x..` for a branch out of the function by rebinding the
     name of its own label printer, so every `L_0x..:` after it in the same body printed
