@@ -13523,6 +13523,22 @@ def test_a_value_a_join_lost_is_not_read_back_from_a_slot_as_the_register():
     assert "x20.field_0x28 = x9;" in out and "x20.field_0x28 = x6;" not in out, out
 
 
+def test_a_register_expression_is_named_before_a_load_reassigns_it():
+    # `add x3, x2, #0xad` leaves x3 holding the expression `x2 + 173`. `ldur x2, ...` then
+    # reassigns x2, so printing x3 at the later store read the reloaded x2, not the value
+    # x3 held (#187): `x20.field_0x8 = x2 + 173;` reads the reassigned x2. It is the
+    # register-level twin of the frame-slot staleness #173 fixed; a load now writes
+    # such a live expression out first, so the store reads what x3 held. Only a load (an
+    # unrelated clobber), only a compound expression (a bare-register copy stays bare for
+    # the argument / phi / read-afresh rules), only the register map (a slot is #173's).
+    body = _lift_asm([("add", "x3, x2, #0xad"), ("ldur", "x2, [x29, #-8]"),
+                      ("stur", "x3, [x20, #7]"), ("ret", "")])
+    m = re.search(r"var (t\d+) = x2 \+ 173;", body)
+    assert m, f"the expression was not named before the reload:\n{body}"
+    assert f"x20.field_0x8 = {m.group(1)};" in body, body    # the store reads the name
+    assert "field_0x8 = x2 + 173;" not in body, body          # not the reloaded x2
+
+
 def test_a_frame_slot_reads_the_register_afresh_when_it_is_reassigned():
     # A frame slot that stores a stable register keeps the register's bare name as its
     # text. When the register is reassigned on a straight-line path, that name means a

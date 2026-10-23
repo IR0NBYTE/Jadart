@@ -3808,6 +3808,40 @@ class Lifter:
                 del st.elem[key]
         return out
 
+    def _name_stale_reg(self, st: State, name: str, live) -> list:
+        """Name-first a register-held EXPRESSION that mentions `name`, before a load
+        reassigns `name` (#187). The register analog of `_pin` before a base moves, but
+        narrowed: register map only (a slot is `stale_on_write`'s job, #173), and only a
+        compound expression (a bare-register copy stays bare for the argument / phi /
+        read-afresh rules that want the register name). The expression must still be
+        VALID: every register it names holds its own bare value, so the text means what it
+        says. A register reassigned by a move or a computed result (which #187 does not
+        track) left a non-bare value in the map; an expression naming it was already stale
+        before this load, and freezing it into a temp would preserve the wrong value and
+        defeat the slot reload that still read it right (#173). `live` leaves out a
+        register nothing reads again, so a dropped value is not written out dead."""
+        pat = _USE_RE.get(name)
+        if pat is None:
+            pat = _USE_RE[name] = re.compile(rf"\b{re.escape(name)}\b")
+        if self._flags is not None and any(pat.search(v.text)
+                                           for v in self._flags[2].values()):
+            self._flags = None
+        out = []
+        for key, v in sorted(st.reg.items()):
+            if key == name or name not in v.text or not pat.search(v.text):
+                continue
+            if _REG_RE.fullmatch(v.text) or not live & _reg_mask((key,)):
+                continue                      # a bare-register copy, or a dead register
+            if any(st.get(q).text != q for q in _slot_regs(v.text)):
+                continue                      # already names a reassigned register: stale
+            tmp = f"t{st.tmpc[0]}"
+            st.tmpc[0] += 1
+            out.append(f"var {tmp} = {v.text};")
+            st.reg[key] = V(tmp, P_ATOM)
+            st.elem.pop(key, None)
+            st.poolbase.pop(key, None)
+        return out
+
     def _pin_mem(self, st: State, loc: str) -> list:
         """Give a name to every LIVE tracked value that reads `loc`, before `loc` changes.
 
@@ -5060,6 +5094,18 @@ class Lifter:
             last = (k == len(insns) - 1)
             if last and (mn == "b" or cond_of(mn) or mn in _CONDB):
                 break                                          # branch is structural
+            # Name-first (#187): a LOAD reassigns a register to an unrelated value, so a
+            # computed expression that still names that register goes stale. Write such a
+            # value out first, so a later read gets what it held, not the reloaded
+            # register: `add x3,x2,#173; ldur x2,[..]; stur x3,[..]` printed `= x2 + 173`,
+            # reading the reloaded x2. Only a LOAD, only an expression (a bare-register
+            # copy stays bare for arg/phi/afresh rules), only st.reg (a slot is #173's,
+            # via stale_on_write below). The pin goes before the load's effect.
+            if mn in _LOADS:
+                wq = set(_def_use(mn, op)[0]) - (_SPECIAL - {_lr()})
+                plive = self._live_after & ~_reg_mask(wq)
+                for q in sorted(wq):
+                    lines.extend(self._name_stale_reg(st, q, plive))
             lines.extend(self._step(st, a, mn, op, note))
             if a in self.frame_moves:
                 self._moved_unseen(st, *self.frame_moves[a])

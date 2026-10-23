@@ -13,6 +13,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A register expression is named before a load reassigns a register it names.** The
+  register map holds expressions, not results, and substitutes them into their uses later,
+  which is sound only while the registers inside them still hold what they held. A load that
+  reassigns one of those registers broke that: `add x3, x2, #0xad; ldur x2, [..]; stur x3,
+  [..]` printed `x20.field_0x8 = x2 + 173;`, reading the reloaded x2, where the machine
+  stored the entry x2 plus 173. This is the register-map twin of the frame-slot staleness
+  #173 fixed, and the register half of #187; `_pin` already wrote such a value out before a
+  base moves and before a raw line, and a load now does the same through `_name_stale_reg`.
+  Only a load (an unrelated clobber), only a compound expression (a bare-register copy stays
+  bare for the argument, phi and read-afresh rules), only the register map (a slot stays
+  #173's), and only an expression every register of which still holds its bare self: one
+  already stale from an untracked move or computed result is left alone, or naming it would
+  freeze the wrong value and defeat the slot reload (#173) that still read it right. A
+  differential against a real CPU (unicorn) that resolves each named value and reads the
+  store in program order (the fp-slot oracle alone cannot, since a named store reads a temp
+  it treats as undecidable) finds main reads the reloaded register and this reads the value
+  the register held: 0 regressions over 66,000 generated runs where the same generator finds
+  6 without the bare-self guard, and 90 fixes with 0 wrong on the functions the fixtures
+  change. The clean export changes about 13,000 lines, but the change is some 320 named
+  expressions in 224 functions; the rest is the temp renumbering each new name ripples
+  through its function. 7 lines change on obf. Part of #187: a register reassigned by a move
+  or a computed result, and the loop-invariant case #129 leaves, are still read stale.
+
 - **A return reached out of flow reads no undeclared temp.** The no-successor forget #179
   added for trap blocks now covers every block the walk reaches out of normal flow that
   has no successor, a return or an indirect jump out of the function as much as a trap. A
