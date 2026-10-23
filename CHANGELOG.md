@@ -13,6 +13,27 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A register expression is named before a move or a computed result reassigns a register
+  it names.** The load pass below is the same hazard for the two other ways a register is
+  reassigned: `add x3, x2, #0xad; add x2, x4, #1; stur x3, [..]` and the `mov x2, x4` form
+  both printed `x20.field_0x8 = x2 + 173;`, reading the reassigned x2 where the machine
+  stored the entry x2 plus 173. `_lift_block` now writes such a live expression out before
+  any reassigning instruction, not only a load. What it leaves untouched is the still-open
+  self-referential case, a store that reads a register set from its own earlier value and is
+  right on main only by that stale read: a register live into a join (the phi machinery
+  renames the arm write, keeping its pre-branch meaning, so a pin only adds a redundant phi
+  temp); a write whose own result already names the register it sets, because a source holds
+  a value that does (`sub x4, x7, x4`, right only by `x4 + 214 - x4` cancelling); a value a
+  later self-referential store in the block reads; and a conditional select, which reads the
+  flags to render. A differential against a real CPU (unicorn) that resolves each named
+  value and reads the store in program order finds 0 regressions: over 69,116 straight-line
+  runs, and a further 64,000 from a generator emphasising shifted operands, multiply-
+  accumulate and self-referential writes, with about 2,031 fixes. The clean export changes
+  about 9,000 lines, 265 of them named expressions and the rest the temp renumbering each
+  ripples through its function; obf is unchanged and the raw-instruction line count does not
+  move. Part of #187: a register reassigned self-referentially and the loop-invariant case
+  #129 leaves are still read stale.
+
 - **A register expression is named before a load reassigns a register it names.** The
   register map holds expressions, not results, and substitutes them into their uses later,
   which is sound only while the registers inside them still hold what they held. A load that
@@ -33,8 +54,8 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   6 without the bare-self guard, and 90 fixes with 0 wrong on the functions the fixtures
   change. The clean export changes about 13,000 lines, but the change is some 320 named
   expressions in 224 functions; the rest is the temp renumbering each new name ripples
-  through its function. 7 lines change on obf. Part of #187: a register reassigned by a move
-  or a computed result, and the loop-invariant case #129 leaves, are still read stale.
+  through its function. 7 lines change on obf. Part of #187; the move and computed-result
+  cases are the entry above, and the loop-invariant case #129 leaves is still read stale.
 
 - **A return reached out of flow reads no undeclared temp.** The no-successor forget #179
   added for trap blocks now covers every block the walk reaches out of normal flow that

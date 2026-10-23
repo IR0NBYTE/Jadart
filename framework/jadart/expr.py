@@ -3808,18 +3808,41 @@ class Lifter:
                 del st.elem[key]
         return out
 
-    def _name_stale_reg(self, st: State, name: str, live) -> list:
-        """Name-first a register-held EXPRESSION that mentions `name`, before a load
-        reassigns `name` (#187). The register analog of `_pin` before a base moves, but
+    def _feeds_selfref(self, key: str, text: str, start: int) -> bool:
+        """True if a later instruction in this block reads `key` and renders a
+        self-referential result: its destination is one of its own source registers, or is
+        a register `text` already names. Freezing `key` would then change how that
+        self-referential store spells (or remove the self-reference), and such a store is
+        right on main only by the stale read it keeps, so #187 leaves the pin out (the
+        still-open self-referential case). A call ends the straight-line reasoning."""
+        for (_a, mn, op, _n) in self._insns[start:]:
+            if mn in _CALLS:
+                break
+            defs, uses = _def_use(mn, op)
+            if key not in uses:
+                continue
+            for d in defs:
+                if d in uses or _use_re(d).search(text):
+                    return True
+        return False
+
+    def _name_stale_reg(self, st: State, name: str, live, guard_feed=False) -> list:
+        """Name-first a register-held EXPRESSION that mentions `name`, before `name` is
+        reassigned (#187). The register analog of `_pin` before a base moves, but
         narrowed: register map only (a slot is `stale_on_write`'s job, #173), and only a
         compound expression (a bare-register copy stays bare for the argument / phi /
         read-afresh rules that want the register name). The expression must still be
         VALID: every register it names holds its own bare value, so the text means what it
-        says. A register reassigned by a move or a computed result (which #187 does not
-        track) left a non-bare value in the map; an expression naming it was already stale
-        before this load, and freezing it into a temp would preserve the wrong value and
-        defeat the slot reload that still read it right (#173). `live` leaves out a
-        register nothing reads again, so a dropped value is not written out dead."""
+        says. An expression already stale from an earlier untracked reassignment (a named
+        register no longer holding its bare value) is left alone; freezing it into a temp
+        would preserve the wrong value and defeat the slot reload that still read it right
+        (#173). `live` leaves out a register nothing reads again, so a dropped value is
+        not written out dead. The caller leaves out a reassignment of a register live out
+        of the block: one carried into a join is the phi machinery's to name (it renames
+        arm write so the register keeps its pre-branch meaning), so a value naming it does
+        not go stale there, and a pin would only force a redundant phi temp. `guard_feed`
+        (set for a move or a computed result, not a load) also leaves out a value a later
+        self-referential store in the block reads (`_feeds_selfref`)."""
         pat = _USE_RE.get(name)
         if pat is None:
             pat = _USE_RE[name] = re.compile(rf"\b{re.escape(name)}\b")
@@ -3834,6 +3857,8 @@ class Lifter:
                 continue                      # a bare-register copy, or a dead register
             if any(st.get(q).text != q for q in _slot_regs(v.text)):
                 continue                      # already names a reassigned register: stale
+            if guard_feed and self._feeds_selfref(key, v.text, self._at + 1):
+                continue                      # feeds a later self-referential store
             tmp = f"t{st.tmpc[0]}"
             st.tmpc[0] += 1
             out.append(f"var {tmp} = {v.text};")
@@ -5086,6 +5111,11 @@ class Lifter:
                     us = self._ret_use(insns[k][0], us)
                 m = us | more.get(k, 0) | (m & ~de)
         self._insns = insns
+        # Registers live into a JOIN this block feeds (a successor more than one block
+        # reaches). A move or a computed result that reassigns one of these is the phi
+        # machinery's to name, not #187's (see the hook below).
+        join_live = _or_all(self._livein.get(s, 0) for s in blk.succ
+                            if len(self._preds.get(s, ())) > 1)
         if addr in self.frame_joins:
             _forget_frame(st)       # paths meet here from frames apart (_frame_plan)
         for k, (a, mn, op, note) in enumerate(insns):
@@ -5094,18 +5124,41 @@ class Lifter:
             last = (k == len(insns) - 1)
             if last and (mn == "b" or cond_of(mn) or mn in _CONDB):
                 break                                          # branch is structural
-            # Name-first (#187): a LOAD reassigns a register to an unrelated value, so a
-            # computed expression that still names that register goes stale. Write such a
-            # value out first, so a later read gets what it held, not the reloaded
-            # register: `add x3,x2,#173; ldur x2,[..]; stur x3,[..]` printed `= x2 + 173`,
-            # reading the reloaded x2. Only a LOAD, only an expression (a bare-register
-            # copy stays bare for arg/phi/afresh rules), only st.reg (a slot is #173's,
-            # via stale_on_write below). The pin goes before the load's effect.
-            if mn in _LOADS:
-                wq = set(_def_use(mn, op)[0]) - (_SPECIAL - {_lr()})
+            # Name-first (#187): a reassignment of a register (a load's unrelated value, a
+            # move, or a computed result) leaves a computed expression that still names it
+            # stale. Write such a value out first, so a later read gets what it held, not
+            # the reassigned register: `add x3,x2,#173; <x2 reassigned>; stur x3,[..]`
+            # printed `= x2 + 173`, reading the reassigned x2. Only an expression (a
+            # bare-register copy stays bare for arg/phi/afresh rules), only st.reg (a slot
+            # is #173's, via stale_on_write below). The pin goes before the write.
+            if mn not in _CALLS and mn not in _CSEL:
+                # Not a conditional select either (`csel`, `cset`, ..): it reads the flags
+                # to render, and pinning before it would clear a comparison that names the
+                # register it sets, leaving the select itself with no flags and raw.
+                defs, uses = _def_use(mn, op)
+                wq = set(defs) - (_SPECIAL - {_lr()})
                 plive = self._live_after & ~_reg_mask(wq)
+                # A load reassigns to an unrelated value, pinned wherever the stale
+                # expression is still live. A move or a computed result is pinned too, but
+                # not where it would disturb a self-referential store, which is right on
+                # main only by a stale read it keeps (the still-open #187 case). Two such
+                # cases are caught here, a third in `_name_stale_reg` via `guard_feed`.
+                # One: a register live into a join is the phi's to name (it renames the
+                # arm write, so the register keeps its pre-branch meaning), and a pin only
+                # forces a redundant phi temp. Two: a write whose own result already names
+                # the register it sets, because a source holds a value that does (`sub x4,
+                # x7, x4`, or `eor x2, x6, x1` with x6 as `x2 << 4`); it names the
+                # register and is right only by that stale read cancelling the one in the
+                # expressions naming it (`x4 + 214 - x4`), which a pin breaks. A load's
+                # result is a fresh value, not a text of its operands, so none applies.
+                carried = 0 if mn in _LOADS else join_live
                 for q in sorted(wq):
-                    lines.extend(self._name_stale_reg(st, q, plive))
+                    if _reg_mask((q,)) & carried:
+                        continue
+                    if mn not in _LOADS and any(_use_re(q).search(st.get(s).text)
+                                                for s in uses):
+                        continue
+                    lines.extend(self._name_stale_reg(st, q, plive, mn not in _LOADS))
             lines.extend(self._step(st, a, mn, op, note))
             if a in self.frame_moves:
                 self._moved_unseen(st, *self.frame_moves[a])

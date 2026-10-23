@@ -13539,6 +13539,33 @@ def test_a_register_expression_is_named_before_a_load_reassigns_it():
     assert "field_0x8 = x2 + 173;" not in body, body          # not the reloaded x2
 
 
+def test_a_register_expression_is_named_before_a_move_or_compute_reassigns_it():
+    # The load case above generalises (#187): a MOVE or a COMPUTED RESULT reassigns a
+    # register the same way a load does, so an expression still naming it goes stale.
+    # `add x3, x2, #0xad` leaves x3 as `x2 + 173`; whether x2 is then overwritten by a
+    # computed result, a move or a shift, the later store must read what x3 held, not the
+    # reassigned x2. On the pre-generalisation renderer each of these printed the stale
+    # `x2 + 173`.
+    for reassign in [("add", "x2, x4, #1"), ("mov", "x2, x4"), ("lsl", "x2, x4, #3")]:
+        body = _lift_asm([("add", "x3, x2, #0xad"), reassign,
+                          ("stur", "x3, [x20, #7]"), ("ret", "")])
+        m = re.search(r"var (t\d+) = x2 \+ 173;", body)
+        assert m, f"{reassign} did not name the expression first:\n{body}"
+        assert f"x20.field_0x8 = {m.group(1)};" in body, body   # the store reads the name
+        assert "field_0x8 = x2 + 173;" not in body, body        # not the reassigned x2
+
+    # A write whose own result still names the register it sets is left alone: a source
+    # holds a value naming it, so the new value self-references the soon-stale register.
+    # `add x7, x4, #0xd6; sub x4, x7, x4` prints `x4 + 214 - x4`, right only because that
+    # stale x4 cancels the other; pinning x7 into a temp would leave `t0 - x4`, reading
+    # reassigned x4 on one side only and printing the wrong value. The guard keeps the
+    # cancelling spelling, matching the pre-generalisation renderer exactly.
+    body = _lift_asm([("add", "x7, x4, #0xd6"), ("sub", "x4, x7, x4"),
+                      ("stur", "x4, [x20, #7]"), ("ret", "")])
+    assert "x20.field_0x8 = x4 + 214 - x4;" in body, body
+    assert re.search(r"var t\d+ = x4 \+ 214;", body) is None, body
+
+
 def test_a_frame_slot_reads_the_register_afresh_when_it_is_reassigned():
     # A frame slot that stores a stable register keeps the register's bare name as its
     # text. When the register is reassigned on a straight-line path, that name means a
