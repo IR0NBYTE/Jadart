@@ -13,6 +13,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A return reached out of flow reads no undeclared temp.** The no-successor forget #179
+  added for trap blocks now covers every block the walk reaches out of normal flow that
+  has no successor, a return or an indirect jump out of the function as much as a trap. A
+  loop that collapses a register's carried name (the receiver, which the loop never
+  writes) drops the name's declaration but left a goto-target `return` reading it, so
+  `_OneByteString.toUpperCase` and `toLowerCase` ended `return t1;` with t1 declared
+  nowhere; they now read the bare register, `return x0`, the unchanged receiver. Two lines
+  change on the clean fixture, none on obf. Part of #129 (the loop-latch and
+  register-text-staleness halves remain, the latter tracked as #187).
+
 - **A trap block reads no undeclared temp, and tier 3 prints no trap mnemonic raw.**
   Tier 3 renders a block the machine reaches out of normal flow (a goto, not fall-through)
   that ends in a trap as its one predecessor left it. A trap ends a block with no
