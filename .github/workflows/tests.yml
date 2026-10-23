@@ -19,12 +19,17 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         # 3.9 is the floor the package claims; the newest is what most people will have.
-        python: ["3.9", "3.11", "3.13"]
+        # ubuntu-latest moved to 26.04, which no longer ships 3.9, so the floor runs on
+        # 22.04 (which still has it) while the others track the latest image.
+        include:
+          - {python: "3.9", os: ubuntu-22.04}
+          - {python: "3.11", os: ubuntu-latest}
+          - {python: "3.13", os: ubuntu-latest}
     steps:
       - uses: actions/checkout@v7
 
