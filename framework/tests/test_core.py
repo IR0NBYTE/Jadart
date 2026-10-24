@@ -13566,6 +13566,63 @@ def test_a_register_expression_is_named_before_a_move_or_compute_reassigns_it():
     assert re.search(r"var t\d+ = x4 \+ 214;", body) is None, body
 
 
+def test_a_self_referential_write_keeps_the_spelling_that_cancels():
+    # The open half of #187, and a guard on the obvious fix for it. A register reassigned
+    # from its own earlier value (`op d, .., d`, which includes a plain `add d, d, #k`)
+    # leaves every value naming d reading the reassigned register, and a store of such a
+    # value is right for every input only because those references cancel one another.
+    # Naming one of them first, which is what the #187 pass does for a load, a move and an
+    # ordinary computed result, freezes one side at the value d held and leaves the
+    # partner reading the register the machine moved past: that turns a spelling right
+    # for every input into one wrong for every input, the worst failure this lifter has.
+    #
+    # Each case was scored against a real CPU (unicorn) over 200 wide-range register
+    # environments: the spelling asserted here is correct in all 200, and the named-first
+    # spelling named in each comment is correct in none. They are kept as a set because
+    # the partner a reference cancels against can be any value still naming the register,
+    # so no local "does this value meet the register" test decides it. Keep these exact
+    # spellings, or show against the CPU that the replacement is right for every input.
+
+    # partner is the write's own result: 214 whatever x4 now holds. Naming x7 first gives
+    # `t0 - x4`, which reads the reassigned x4 on one side only.
+    body = _lift_asm([("add", "x7, x4, #0xd6"), ("sub", "x4, x7, x4"),
+                      ("stur", "x4, [x20, #7]"), ("stur", "x7, [x20, #15]"), ("ret", "")])
+    assert "x20.field_0x8 = x4 + 214 - x4;" in body, body
+    assert re.search(r"var t\d+ = x4 \+ 214;", body) is None, body
+
+    # partner is a source of the write, which the write's own spelling needs: 114 for
+    # every input. Naming x3 first gives `x4 + 214 - t0`.
+    body = _lift_asm([("add", "x7, x4, #0xd6"), ("add", "x3, x4, #100"),
+                      ("sub", "x4, x7, x4"), ("sub", "x6, x7, x3"),
+                      ("stur", "x6, [x20, #7]"), ("ret", "")])
+    assert "x20.field_0x8 = x4 + 214 - (x4 + 100);" in body, body
+    assert re.search(r"var t\d+ = x4 \+ 100;", body) is None, body
+
+    # partner is a bare copy, which stays bare for the argument, phi and read-afresh rules
+    # and so is never named first: all ones for every input. Naming x6 first gives
+    # `t0 | x4`.
+    body = _lift_asm([("mvn", "x6, x4"), ("mov", "x3, x4"), ("lsr", "x4, x3, #4"),
+                      ("orr", "x1, x6, x3"), ("stur", "x1, [x20, #7]"), ("ret", "")])
+    assert "x20.field_0x8 = ~x4 | x4;" in body, body
+    assert re.search(r"var t\d+ = ~x4;", body) is None, body
+
+    # the partner is met across a FURTHER self-referential write, which leaves x4 as `~x4`
+    # and so does not end the chain: right for every input because all three read the one
+    # reassigned x4. Naming x1 at the move gives `t0 + ~x4 * ~x4`.
+    body = _lift_asm([("mvn", "x1, x4"), ("mov", "x4, x4"), ("mvn", "x4, x4"),
+                      ("madd", "x5, x4, x4, x1"), ("stur", "x5, [x20, #7]"), ("ret", "")])
+    assert "x20.field_0x8 = ~x4 + ~x4 * ~x4;" in body, body
+    assert re.search(r"var t\d+ = ~x4;", body) is None, body
+
+    # two values cancel EACH OTHER and neither is the register: x5 ^ x6 for every input.
+    # Naming either one alone leaves the other reading the reassigned x2.
+    body = _lift_asm([("eor", "x4, x2, x6"), ("eor", "x3, x2, x5"),
+                      ("eor", "x2, x4, x2"), ("eor", "x7, x3, x4"),
+                      ("stur", "x7, [x20, #7]"), ("ret", "")])
+    assert "x20.field_0x8 = x2 ^ x5 ^ (x2 ^ x6);" in body, body
+    assert re.search(r"var t\d+ = x2 \^ x5;", body) is None, body
+
+
 def test_a_frame_slot_reads_the_register_afresh_when_it_is_reassigned():
     # A frame slot that stores a stable register keeps the register's bare name as its
     # text. When the register is reassigned on a straight-line path, that name means a
