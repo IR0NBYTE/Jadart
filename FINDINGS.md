@@ -607,3 +607,61 @@ entry on both sides, so a raw `adcs` whose carry comes from outside the run is a
 rather than tested. Frame slots are off x29 only, at four displacements. And a store whose
 text rests on a declined register is skipped rather than judged, which is the right call
 for an oracle and leaves the ambiguity itself to the issue above.
+
+## What a dropped frame slot is worth remembering, and the four ways it stops being true
+
+`_reload` spelled the load's own register when a slot was gone, which is right only for the
+spill-and-reload round trip. Spelling the value the slot HELD is right far more often, and
+it took three attempts to say exactly when, so the conditions are worth stating in one
+place. A record is valid at a reload on a path iff, on THAT path, between the drop that
+made it and the reload:
+
+1. nothing FILLED the slot,
+2. the key still names the same address,
+3. no write touched memory the text reads, and
+4. the printed body assigned none of the registers the text names.
+
+Each of those cost an attempt to learn. (1) fails if the kill is keyed off the slot leaving
+the map, because a store to a key that is already absent removes nothing: the first version
+routed every removal site through one door and still printed the pre-refill value. (2)
+fails on a frame move, and only on an FP move, because every record is FP-keyed. (3) is a
+predicate and not a counter: generations do not compose at a join, where taking the maximum
+makes a record the other arm invalidated read as fresh. (4) has to be asked over the whole
+function and not over the walk so far, because a loop body's write happens before a reload
+inside the same loop on every trip after the first, and a loop RENAMES a carried register
+rather than writing it.
+
+The scope follows from "on that path": the record lives on the `State`, so it forks with
+the arms and `_merge` intersects it. Keeping it on the Lifter instead leaked it across
+paths 2,023 times on the clean build (#199). But `_arrive` and `_reenter` do not invalidate
+anything, they replace the state with another block's, so there the record travels WITH the
+slot map from the same predecessor; forgetting it there costs correct output.
+
+A region-level drop is the interesting case. `_exit_slots` subtracts statically what a loop
+may have stored, and the drop it ends with has `stale_on_write`'s shape for
+`stale_on_write`'s reason, so it can record too. Not unconditionally: a region holding a
+CALL stands for a printed statement whose result no reader can take off the entry state.
+The gate is per REGISTER rather than per region, because the region reaches back past the
+loop header on purpose, so a call before the loop would otherwise turn off recording for
+keys its clobbers never touch: 260 of 991 loop exits on the clean build, against 95 where
+a whole-region gate was on at all.
+
+**Result: 6,623 wrong reads in 1,967 of 8,194 clean functions down to 2,129 in 545**, for
+one net line of output. Nineteen shapes scored against a real CPU over 40 environments each
+either agree in 40 of 40 or decline. The remainder are slots lost to `_forget_frame` and
+`_merge`, which record nothing at all, and are #198.
+
+### What the gates could not see, which is the part to fix next
+
+None of this was reachable by any automated check. `irfuzz` generates no x29-relative frame
+slot. `tools/pbfuzz.py` scores any store resting on a register the run writes as
+undecidable, so it is silent on the whole class in both directions, and it returns 0 while
+scoring nothing. The first attempt shipped on four green CI jobs, a clean suite and five
+CPU-verified shapes, and still carried 2,023 confident wrong values.
+
+What found the defects instead was a census of what each drop loses plus a direct
+comparison of candidate spellings against the CPU, and that census was wrong three times
+before it was right: once path-insensitive, once counting every walk instead of the last,
+once blind to the loop body being a `State` copy. Each wrong number was plausible enough to
+act on. A harness for this class has to fork its bookkeeping where the lifter forks its
+state, score the final walk only, and refuse to score a spelling that rests on a decline.

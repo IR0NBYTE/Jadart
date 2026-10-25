@@ -11,6 +11,48 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Fixed
+
+- **A reload of a dropped frame slot reads the value it held, not the load's own
+  register.** `stale_on_write` drops a slot whose text names a register that is then
+  reassigned (#173), and `_reload` fell back to spelling the LOAD'S OWN destination. That
+  is right only where the slot held that very register, whose entry value the printed body
+  still reads, so the reload round-trips; where it held anything else the fallback named a
+  different value. `stur x6, [x29, #-8]; mov x6, x2; ldur x3, [x29, #-8]; stur x3, [x20, #7]`
+  printed `x20.field_0x8 = x3;` for the x6 the machine stores, and now prints `= x6;`.
+
+  Sound because the drop is about the MAP, not the output: the instruction that reassigned
+  the register was FOLDED, so it printed no assignment and the printed body still reads
+  that register as it did at the spill. The conditions that makes true are written at
+  `State.dropped` and carried with it: nothing filled the slot, the key still names the
+  same address, no write touched memory the text reads, and the printed body assigned none
+  of the registers the text names. The record lives on the `State` so it forks with the
+  arms and `_merge` intersects it, and it is killed by a FILL rather than by the slot
+  leaving the map, because a store to a key already absent removes nothing.
+
+  Across the 3.12.2 clean build the fallback misnamed **6,623 reads in 1,967 of 8,194
+  functions**, now 2,129 in 545. The rest are slots lost to `_forget_frame` and `_merge`,
+  which record nothing, and are #198. Nineteen shapes were scored against a real CPU over
+  40 random register environments each: every one either agrees in 40 of 40 or declines,
+  and none states a value. The four cases of
+  `test_a_reload_of_a_dropped_slot_reads_the_value_it_held` carry the 0-of-60 against
+  60-of-60 numbers, and it ends by putting the bug back.
+
+  This is the second attempt. The first (#197) remembered the same thing on the Lifter and
+  invalidated it nowhere, which printed 2,023 stale spellings on the clean build and was
+  reverted in #200; #199 records the repros. What is different here is the kill condition,
+  the scope, and that a region-level drop (`_stale_slots` at a loop exit) records only for
+  keys whose text names no register a call in the region may have left holding something
+  else.
+
+  **A changed answer.** 180 files of the clean export differ. The size does not: 144,727
+  lines to 144,728, with 3 fewer declarations. The obf export does not change, though that
+  covers only 8,249 of its lifted lines and is not the evidence it looks like; measured
+  over all 8,188 obf ranges the lifted output differs by about 8,000 lines with no
+  staleness and no ordering residual. Both acceptance gates read as before (Tier A 11/11
+  and 9/9, Tier B 3/3), `cfgcheck` is clean on both fixtures, and the export is
+  byte-identical across two hash seeds.
+
 ### Added
 
 - **`tools/pbfuzz.py`, a differential oracle for the printed body where a register write

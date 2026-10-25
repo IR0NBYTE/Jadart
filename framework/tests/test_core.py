@@ -13402,7 +13402,12 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     reg = (("stur", "x5, [x29, #-0x20]"),)
     assert "x2.field_0x10 = x5;" in counted(("add", "x7, x7, #1"), before=reg)
     out = counted(("add", "x5, x5, #1"), before=reg)
-    assert "x2.field_0x10 = x6;" in out, out
+    # The loop reassigns x5, so the slot goes and the reload spells the x5 it held
+    # (#196): the loop carries its own name, so nothing printed assigns x5. The #140 case
+    # above keeps its decline, because a record does not survive a loop boundary and the
+    # region kill that replaces it cannot cover a text naming a register the region
+    # reloaded (#199).
+    assert "x2.field_0x10 = x5;" in out, out
 
     # A loop's own stack check: its slow path, laid out after the `ret`, is a block
     # nothing reaches that jumps into the body, which could be a handler the graph has
@@ -13723,14 +13728,19 @@ def test_a_self_referential_write_keeps_the_spelling_that_cancels():
     assert re.search(r"var t\d+ = x2 \^ x5;", body) is None, body
 
 
-def test_a_frame_slot_reads_the_register_afresh_when_it_is_reassigned():
-    # A frame slot that stores a stable register keeps the register's bare name as its
-    # text. When the register is reassigned on a straight-line path, that name means a
-    # different value, and a reload read the reassigned one where the machine holds the
-    # stored one (#173). This is the stable-register twin of #140, which covered only a
-    # value a join lost; the hazard is any slot whose text names a register that is then
-    # written between the store and the read. The slot is now dropped where a register it
-    # names is reassigned, so the reload reads the register afresh.
+def test_a_reload_of_a_dropped_slot_reads_the_value_it_held():
+    # A frame slot whose text names a register that is then reassigned is DROPPED, so the
+    # text cannot read the new register (#173). What the reload then PRINTS is this test.
+    #
+    # It used to print the load's own destination, which names a different value: over 60
+    # random register environments each case below stores what the slot held in 60 of 60
+    # and the destination register's entry value in 0 of 60, and across the 3.12.2 clean
+    # build the fallback misnamed 6,623 reads in 1,967 of 8,194 functions (#196).
+    #
+    # Sound because the drop is about the MAP, not the output: the instruction that
+    # reassigned the register was folded, so it printed no assignment and the printed body
+    # still reads that register as it did at the spill. `State.dropped` carries the
+    # conditions that have to hold with it, and #199 is what happens without them.
     from jadart.expr import lift_function
 
     def lift(rows):
@@ -13738,35 +13748,55 @@ def test_a_frame_slot_reads_the_register_afresh_when_it_is_reassigned():
         ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
         return [ln.strip() for ln in lift_function(ann)]
 
-    # the issue's case: x6 stored, reassigned by a mov, then reloaded. The reload must
-    # not share the reassigned x6; it reads its own register.
+    # the issue's case: x6 stored, reassigned by a mov, then reloaded into x3. The
+    # machine stores the x6 that was spilled, which is what the body's `x6` still reads.
     out = lift([("stur", "x6, [x29, #-8]"), ("mov", "x6, x2"),
                 ("ldur", "x3, [x29, #-8]"), ("stur", "x3, [x20, #7]")])
-    assert "x20.field_0x8 = x3;" in out, out
-    assert "x20.field_0x8 = x6;" not in out, out
+    assert "x20.field_0x8 = x6;" in out, out
+    assert "x20.field_0x8 = x3;" not in out, out
 
-    # a register reassigned by a load has the same hazard
+    # a register reassigned by a load reads the same way: the load prints nothing either
     out = lift([("stur", "x6, [x29, #-8]"), ("ldr", "x6, [x7, #0x10]"),
                 ("ldur", "x3, [x29, #-8]"), ("stur", "x3, [x20, #7]")])
-    assert "x20.field_0x8 = x3;" in out, out
-    assert "x20.field_0x8 = x6;" not in out, out
+    assert "x20.field_0x8 = x6;" in out, out
+    assert "x20.field_0x8 = x3;" not in out, out
 
-    # a slot whose text is an expression naming a register is dropped when that register
-    # moves: x7.field_0x11 stops describing the slot once x7 is written.
+    # an EXPRESSION the slot held reads the same way. The text reads memory, so it is
+    # spelled only while nothing has written memory since the drop (`State.stale_mem`);
+    # nothing has here.
     out = lift([("ldr", "x5, [x7, #0x10]"), ("stur", "x5, [x29, #-8]"),
                 ("mov", "x7, x2"), ("ldur", "x3, [x29, #-8]"),
                 ("stur", "x3, [x20, #7]")])
+    assert "x20.field_0x8 = x7.field_0x11;" in out, out
+    assert "x20.field_0x8 = x3;" not in out, out
+
+    # Put the bug back. With the record forgotten the reload falls back to its own
+    # register and the wrong value returns, so a pass above is not the shape being
+    # uninteresting.
+    from jadart import expr
+    real = expr.Lifter._reload
+
+    def no_memory(self, st, key, mn, reg):
+        st.dropped.clear()
+        return real(self, st, key, mn, reg)
+
+    expr.Lifter._reload = no_memory
+    try:
+        out = lift([("stur", "x6, [x29, #-8]"), ("mov", "x6, x2"),
+                    ("ldur", "x3, [x29, #-8]"), ("stur", "x3, [x20, #7]")])
+    finally:
+        expr.Lifter._reload = real
     assert "x20.field_0x8 = x3;" in out, out
-    assert "x20.field_0x8 = x7.field_0x11;" not in out, out
 
     # a register reassigned by a reload off the frame drops the OTHER slots it names, not
     # just the straight-line writes: the slot it reads back is kept (dropping it would
-    # collide two reloads), the rest go. Here x6 reloads from [-0x10] and the [-8] slot
-    # that names x6 is dropped, so its reload reads x3 afresh, not stale x6 (#173).
+    # collide two reloads), the rest go (#173). Here x6 reloads from [-0x10], so the [-8]
+    # slot that names x6 is dropped and its reload spells the x6 it held. The kept slot is
+    # never recorded, because `stale_on_write` records at the drop and not before it.
     out = lift([("stur", "x6, [x29, #-8]"), ("ldur", "x6, [x29, #-0x10]"),
                 ("ldur", "x3, [x29, #-8]"), ("stur", "x3, [x20, #7]")])
-    assert "x20.field_0x8 = x3;" in out, out
-    assert "x20.field_0x8 = x6;" not in out, out
+    assert "x20.field_0x8 = x6;" in out, out
+    assert "x20.field_0x8 = x3;" not in out, out
 
     # a slot whose register is never reassigned still reads it: the drop is tight, not a
     # blanket stale of every slot that names a register the block writes. The restore form
