@@ -13566,32 +13566,134 @@ def test_a_register_expression_is_named_before_a_move_or_compute_reassigns_it():
     assert re.search(r"var t\d+ = x4 \+ 214;", body) is None, body
 
 
-def test_a_self_referential_write_keeps_the_spelling_that_cancels():
-    # The open half of #187, and a guard on the obvious fix for it. A register reassigned
-    # from its own earlier value (`op d, .., d`, which includes a plain `add d, d, #k`)
-    # leaves every value naming d reading the reassigned register, and a store of such a
-    # value is right for every input only because those references cancel one another.
-    # Naming one of them first, which is what the #187 pass does for a load, a move and an
-    # ordinary computed result, freezes one side at the value d held and leaves the
-    # partner reading the register the machine moved past: that turns a spelling right
-    # for every input into one wrong for every input, the worst failure this lifter has.
-    #
-    # Each case was scored against a real CPU (unicorn) over 200 wide-range register
-    # environments: the spelling asserted here is correct in all 200, and the named-first
-    # spelling named in each comment is correct in none. They are kept as a set because
-    # the partner a reference cancels against can be any value still naming the register,
-    # so no local "does this value meet the register" test decides it. Keep these exact
-    # spellings, or show against the CPU that the replacement is right for every input.
+def test_pbfuzz_says_what_it_assembles():
+    """Every encoder the printed-body oracle uses, decoded back by capstone.
 
-    # partner is the write's own result: 214 whatever x4 now holds. Naming x7 first gives
-    # `t0 - x4`, which reads the reassigned x4 on one side only.
+    The same contract irfuzz's own `verify_encodings` has, and for the same reason: a
+    harness that fuzzes a different instruction than the one it names reports a clean
+    pass and proves nothing."""
+    if not _capstone_available():
+        _skip("  SKIP test_pbfuzz_says_what_it_assembles")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pbfuzz
+    bad = pbfuzz.verify_encodings()
+    assert not bad, "\n".join(f"wanted {w!r}, capstone read {g!r}" for w, g in bad)
+
+
+def test_a_self_referential_write_is_right_under_printed_body_semantics():
+    """The open half of #187, measured against a real CPU, and the answer is that there
+    is nothing to fix.
+
+    A register in the output starts at the value the function came in with and means
+    whatever the printed body last assigned it. `expr._verbatim` states it ("a register
+    the lifter holds as an expression was never assigned in the printed body"), the
+    `_bump` invariant test states the consequence ("from that line on, the token `x3` in
+    the output means what the statement put there"), and `tools/irfuzz.py` implements it.
+    A self-referential write prints no assignment, so `add x4, x4, #1` leaves `x4` still
+    meaning the argument and `x4 + 1` is exactly what the machine stored.
+
+    So the pin #187 would have generalised here is not a missing guard, and the two
+    spellings below are not right by luck. Only a PRINTED register write makes a spelling
+    stale, which is `_pin`'s job: the last case puts that bug back and the oracle catches
+    it, so a pass here is not the harness scoring nothing.
+    """
+    if not _unicorn_available() or not _capstone_available():
+        _skip("  SKIP test_a_self_referential_write_is_right_under_printed_body_semantics")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pbfuzz
+    from jadart import expr
+    P = pbfuzz
+
+    def ldur(t, n, i):
+        return (f"ldur x{t}, [x{n}, #{i:#x}]", P.enc_ldur(t, n, i))
+
+    def stur(t, n, i):
+        return (f"stur x{t}, [x{n}, #{i:#x}]", P.enc_stur(t, n, i))
+
+    def alu(mn, d, n, m):
+        tmpl, enc = next(x for x in P.ALU if x[0].startswith(mn + " "))
+        return (tmpl.format(d=f"x{d}", n=f"x{n}", m=f"x{m}"), enc(d, n, m))
+
+    def addi(d, n, i):
+        return (f"add x{d}, x{n}, #{i:#x}", P.IMM[0][1](d, n, i))
+
+    def ldr_post(t, n, i):
+        return (f"ldr x{t}, [x{n}], #{i:#x}", P.enc_ldr_post(t, n, i))
+
+    ret = ("ret", P.RET_WORD)
+    oracle = P.Oracle()
+    # The value registers are preloaded, so each holds a field expression and a bare
+    # register anywhere is unambiguously the lifter declining (FINDINGS.md: a lost value
+    # "rests on the bare register meaning nothing to the reader"). That is what makes a
+    # self-referential spelling scoreable rather than skipped.
+    pre = [ldur(d, P.SEED_BASE, 8 * k) for k, d in enumerate((3, 4, 5, 7))]
+    cases = {
+        # the simplest self-reference there is
+        "add x4, x4, #1": pre + [addi(4, 4, 1), stur(4, P.OBS, 7), ret],
+        # the spelling the #187 guard keeps, whose two references cancel
+        "sub x4, x7, x4 after add x7, x4, #0xd6": pre + [
+            addi(7, 4, 0xD6), alu("sub", 4, 7, 4), stur(4, P.OBS, 7), ret],
+        # a self-referential write whose partner is a term that reads zero
+        "sub x4, x4, x3 after add x4, x3, x4": pre + [
+            alu("add", 4, 3, 4), alu("sub", 3, 5, 5), alu("sub", 4, 4, 3),
+            stur(4, P.OBS, 7), ret],
+    }
+    for what, rows in cases.items():
+        clean, wrong, _undec, lines = oracle.score(rows, trials=40, seed=7,
+                                                   bind_values=False)
+        assert wrong == 0 and clean >= 30, (
+            f"{what} disagreed with the CPU in {wrong} of {clean + wrong} "
+            "environments:\n  " + "\n  ".join(l.strip() for l in lines))
+
+    # Put the bug back. A value spelled off x9 is stale once `_bump` PRINTS `x9 = x9 + 8`,
+    # and that is the one case in this family that is a real defect. With both guards
+    # disabled the oracle must call it wrong, or a pass above proves nothing.
+    stale = [addi(3, 9, 0xAD), ldr_post(4, 9, 8), stur(3, P.OBS, 7), ret]
+    clean, wrong, _u, lines = oracle.score(stale, trials=40, seed=7, bind_values=True)
+    assert wrong == 0 and clean >= 30, "\n  ".join(l.strip() for l in lines)
+    real_pin, real_name = expr.Lifter._pin, expr.Lifter._name_stale_reg
+    expr.Lifter._pin = lambda self, st, name, live=None: []
+    expr.Lifter._name_stale_reg = lambda self, st, name, live, guard_feed=False: []
+    try:
+        clean, wrong, _u, lines = oracle.score(stale, trials=40, seed=7,
+                                               bind_values=True)
+    finally:
+        expr.Lifter._pin, expr.Lifter._name_stale_reg = real_pin, real_name
+    assert wrong >= 30 and clean == 0, (
+        "with both pins disabled the oracle still agreed with the CPU, so it is not "
+        "measuring the staleness it claims to:\n  "
+        + "\n  ".join(l.strip() for l in lines))
+
+
+def test_a_self_referential_write_keeps_the_spelling_that_cancels():
+    # A register reassigned from its own earlier value (`op d, .., d`, which includes a
+    # plain `add d, d, #k`) leaves every value naming d spelled in terms of d, and this
+    # pins the spellings the lifter prints for the shapes that produces.
+    #
+    # It is a spelling pin, NOT a correctness guard, and the distinction was measured:
+    # see test_a_self_referential_write_is_right_under_printed_body_semantics. A
+    # self-referential write prints no assignment, so d still means the value the function
+    # came in with and both the spelling asserted here and the named-first alternative
+    # agree with the CPU. An earlier version of this comment claimed the named-first
+    # spelling was "correct in none" of 200 environments; that was scored by reading a
+    # bare register as the machine's CURRENT value, which is not what the output means
+    # (tools/irfuzz.py and the `_bump` invariant test both take the printed body's), so it
+    # did not support the claim and is withdrawn.
+    #
+    # What the pin is worth is the temp it does not mint: naming one side of
+    # `x4 + 214 - x4` costs a declaration and reads no better. Change these spellings if
+    # something is gained, and show with tools/pbfuzz.py that the replacement still
+    # agrees with the CPU.
+
+    # partner is the write's own result: 214 for every input. Naming x7 first would
+    # spell the same value as `t0 - x4`, for the cost of the declaration.
     body = _lift_asm([("add", "x7, x4, #0xd6"), ("sub", "x4, x7, x4"),
                       ("stur", "x4, [x20, #7]"), ("stur", "x7, [x20, #15]"), ("ret", "")])
     assert "x20.field_0x8 = x4 + 214 - x4;" in body, body
     assert re.search(r"var t\d+ = x4 \+ 214;", body) is None, body
 
     # partner is a source of the write, which the write's own spelling needs: 114 for
-    # every input. Naming x3 first gives `x4 + 214 - t0`.
+    # every input. Naming x3 first would spell it `x4 + 214 - t0`.
     body = _lift_asm([("add", "x7, x4, #0xd6"), ("add", "x3, x4, #100"),
                       ("sub", "x4, x7, x4"), ("sub", "x6, x7, x3"),
                       ("stur", "x6, [x20, #7]"), ("ret", "")])
@@ -13599,23 +13701,21 @@ def test_a_self_referential_write_keeps_the_spelling_that_cancels():
     assert re.search(r"var t\d+ = x4 \+ 100;", body) is None, body
 
     # partner is a bare copy, which stays bare for the argument, phi and read-afresh rules
-    # and so is never named first: all ones for every input. Naming x6 first gives
-    # `t0 | x4`.
+    # and so is never named first: all ones for every input.
     body = _lift_asm([("mvn", "x6, x4"), ("mov", "x3, x4"), ("lsr", "x4, x3, #4"),
                       ("orr", "x1, x6, x3"), ("stur", "x1, [x20, #7]"), ("ret", "")])
     assert "x20.field_0x8 = ~x4 | x4;" in body, body
     assert re.search(r"var t\d+ = ~x4;", body) is None, body
 
     # the partner is met across a FURTHER self-referential write, which leaves x4 as `~x4`
-    # and so does not end the chain: right for every input because all three read the one
-    # reassigned x4. Naming x1 at the move gives `t0 + ~x4 * ~x4`.
+    # and so does not end the chain. Naming x1 at the move would spell it
+    # `t0 + ~x4 * ~x4`.
     body = _lift_asm([("mvn", "x1, x4"), ("mov", "x4, x4"), ("mvn", "x4, x4"),
                       ("madd", "x5, x4, x4, x1"), ("stur", "x5, [x20, #7]"), ("ret", "")])
     assert "x20.field_0x8 = ~x4 + ~x4 * ~x4;" in body, body
     assert re.search(r"var t\d+ = ~x4;", body) is None, body
 
     # two values cancel EACH OTHER and neither is the register: x5 ^ x6 for every input.
-    # Naming either one alone leaves the other reading the reassigned x2.
     body = _lift_asm([("eor", "x4, x2, x6"), ("eor", "x3, x2, x5"),
                       ("eor", "x2, x4, x2"), ("eor", "x7, x3, x4"),
                       ("stur", "x7, [x20, #7]"), ("ret", "")])

@@ -11,6 +11,44 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Added
+
+- **`tools/pbfuzz.py`, a differential oracle for the printed body where a register write
+  is printed.** The existing oracles could not reach that case: `irfuzz._exec_one` raises
+  on a line printed raw, so the case is dropped, and `irfuzz._mem_expr` maps
+  `x20.field_0xN` to a fixed slot key, so a `_bump` that advances the base still reads the
+  old slot. Those two are how the printed body assigns a register, and a printed register
+  write is the precondition for the staleness #187 was opened for, so that class had never
+  been measured. The new oracle generates straight-line runs mixing self-referential
+  writes, write-back bases, raw lines and spill/reload round trips through an x29 frame
+  slot, then interprets the printed body against a real CPU: a raw line is executed on the
+  CPU against the body's own state with its `// x1 holds x1 + 8` note bound first, and
+  memory is a real array, so a moved base reads where it now points. A store is scored
+  only where every register in its text is an argument the run never writes or one the
+  printed body has already assigned, because a bare register can be the lifter declining
+  and FINDINGS.md records that the two are not distinguishable from the output. Clean:
+  8,000 runs, 7,998 scored, 0 disagreements over seeds 1 to 16 and 12 environments each.
+  Teeth over seeds 1 to 8 of the same set: `_pin` returning nothing makes 653 of 3,998
+  scored runs disagree, where main has 0 of 4,000. Needs unicorn, as `irfuzz` does, and is
+  not part of `check.sh`.
+
+### Changed
+
+- **The self-referential half of #187 is measured, and it is not a defect.** A register
+  in the output means the value the function came in with until a printed statement
+  assigns it, which is what `_verbatim`, `_phi_name`, the `_bump` invariant test and
+  `tools/irfuzz.py` all take it to mean. A self-referential write prints no assignment, so
+  `add x4, x4, #1` followed by a store prints `x4 + 1`, which is what the machine stored.
+  The guard that keeps `x4 + 214 - x4` from being named apart is therefore a spelling
+  choice, worth the declaration it does not mint, not a correctness guard. No output byte
+  changes: this replaces a claim, not the renderer.
+  `test_a_self_referential_write_keeps_the_spelling_that_cancels` said each named-first
+  spelling was "correct in none" of 200 environments; that was scored by reading a bare
+  register as the machine's current value rather than the printed body's, so it did not
+  support the claim and is withdrawn. The assertions stand as spelling pins and
+  `test_a_self_referential_write_is_right_under_printed_body_semantics` carries the
+  measurement.
+
 ### Fixed
 
 - **A register expression is named before a move or a computed result reassigns a register

@@ -521,3 +521,89 @@ precision rounds differently, so `fadd s0, s1, s2` rendered as `d1 + d2` would b
 value rather than a wide one. It is moot on real code: across the corpus binary and three
 shipped apps the only s-register instruction the compiler emits is `fcvt`, and there is no
 scalar single-precision arithmetic anywhere in them.
+
+## The printed body had no oracle where a register write is printed
+
+Every oracle in `tools/irfuzz.py` scores the text the lifter prints, and two things it
+prints were outside all of them.
+
+A line printed RAW: `_exec_one` raises `_Undecidable` on one, so the case is dropped
+before it is compared. A MOVING base: `_mem_expr` maps `x20.field_0xN` to a fixed slot
+key, so a `_bump` that advances the base still reads the old slot. Those two are exactly
+the ways the printed body ASSIGNS A REGISTER, and a printed register write is the
+precondition for the staleness #187 is about. Without one, a folded expression still reads
+the registers the function came in with and is right. So the class #187 was opened for had
+never been measured, in either direction.
+
+`tools/pbfuzz.py` measures it. It generates straight-line runs that mix self-referential
+writes, write-back bases, raw lines and spill/reload round trips through an x29 frame slot
+(the path the issue asks for: "the repo's tools/irfuzz.py memory and corpus oracles use
+x20 for every object base, never x29"), then interprets the printed body against a real
+CPU. A raw line is executed on the CPU against the body's own state, with its `// x1 holds
+x1 + 8` note bound first because `_verbatim` prints that note instead of an assignment on
+purpose (#120); memory is a real byte array, so `.field_0xN` is a load from where the base
+now points.
+
+### What a bare register means, and what is therefore not scored
+
+Registers in the output start at the values the function came in with and mean whatever
+the printed body last assigned them. `_verbatim` states it ("a register the lifter holds
+as an expression was never assigned in the printed body"), `_phi_name` states the
+consequence, and the `_bump` invariant test states it as a rule: "from that line on, the
+token `x3` in the output means what the statement put there". For x1-x7 that entry value
+is an argument, which is the only reading under which the output means anything.
+
+A bare register can also be the lifter DECLINING, and this file already records that a
+lost value "rests on the bare register meaning nothing to the reader". The two are not
+distinguishable from the output, so a printed store is scored only where every register in
+its text is either one the run never writes, so it is an argument, or one the printed body
+has already assigned, so it is a claim. Anything else is counted undecidable. A harness
+that reads a decline as a wrong answer reports defects that are its own, and four separate
+versions of this one did before the rule was added.
+
+### Result
+
+**Clean: 8,000 generated runs, 7,998 scored, 0 disagreements** (seeds 1 to 16, 500 runs
+each, 12 register environments per run). Teeth proved by putting the bug back: over seeds
+1 to 8 of the same set, `_pin` returning nothing makes 653 of 3,998 scored runs disagree
+with the CPU, where main has 0 of 4,000. `_name_stale_reg` returning nothing changes
+nothing on these shapes, so the two guards are redundant here and `_pin` is the one
+carrying the property.
+
+**The self-referential half of #187 is not a defect.** A self-referential write prints no
+assignment, so the register still means the value it came in with and `add x4, x4, #1`
+followed by a store prints `x4 + 1`, which is what the machine stored. The guard that
+keeps `x4 + 214 - x4` from being named apart is therefore a spelling choice, worth the
+temp it does not mint, and not a correctness guard;
+`test_a_self_referential_write_is_right_under_printed_body_semantics` pins that with the
+measurement. Two attempts at generalising the pin were abandoned after scoring regressions
+that only existed under the other reading, where a bare register is taken to be the
+machine's current value. That reading is not the one the output carries.
+
+### What it found instead
+
+With the value registers read as arguments (the default mode), 67 of 6,508 scored runs
+disagree over seeds 1 to 16. Suppressing only the frame reload in the generator, over
+seeds 1 to 8, takes the count from 36 to 0 of 3,375 scored runs, so they are one
+mechanism. `_reload` falls back to the register's own name when a slot is unknown,
+and that name is not free: after `adcs x1, x1, x2` has printed, or where x1 is an
+argument, `x1` already means something. Three instructions are enough:
+
+```
+adcs x1, x1, x2        adcs x1, x1, x2
+ldur x1, [x29, #-8]    x20.field_0x8 = x1;
+stur x1, [x20, #7]
+```
+
+The load prints nothing and the store reads the `adcs` result, so the output is identical
+to the same program with the load deleted, and wrong in all 60 environments. It is the
+class recorded above as "a join left a register bare after the body had already assigned
+it", reached through a raw line rather than a phi, and it is filed separately.
+
+### What is still not covered
+
+Straight-line runs only: joins, loops and gotos are `--cfgmem`'s. The flags are cleared at
+entry on both sides, so a raw `adcs` whose carry comes from outside the run is agreed
+rather than tested. Frame slots are off x29 only, at four displacements. And a store whose
+text rests on a declined register is skipped rather than judged, which is the right call
+for an oracle and leaves the ambiguity itself to the issue above.
