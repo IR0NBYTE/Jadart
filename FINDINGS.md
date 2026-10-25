@@ -598,7 +598,43 @@ stur x1, [x20, #7]
 The load prints nothing and the store reads the `adcs` result, so the output is identical
 to the same program with the load deleted, and wrong in all 60 environments. It is the
 class recorded above as "a join left a register bare after the body had already assigned
-it", reached through a raw line rather than a phi, and it is filed separately.
+it", reached through a raw line rather than a phi (#196).
+
+Chasing it down the census below showed the bigger half of the same mechanism, and the
+fallback is now fixed: a reload of a dropped slot spells the value the slot held.
+
+### Where a frame slot's value goes, and which losses misname it
+
+A reload reaches the fallback because the slot is gone, so the question is what removes
+it. Counted over the 3.12.2 clean build, by cause, for FP-relative slots:
+
+| cause | removals |
+| --- | --- |
+| `_forget_frame`, the wholesale frame wipe | 9,382 |
+| `stale_on_write`, a register the text names is reassigned (#173) | 5,647 |
+| `_merge`, a join keeps only the slots both arms agree on | 5,619 |
+| `_overwrite` | 295 |
+| `_pin_mem` | 80 |
+
+46,531 frame reloads, 18,846 resolve to a slot, 27,685 take the fallback, 18,809 of those
+with the register live afterwards. Split by what the slot had held, the fallback is not
+uniformly wrong, and that is the part worth stating: a spill reloaded back into its OWN
+register reads correctly as that register, because the slot held that register's entry
+value and the printed body still reads it (1,665 of them). Where the slot held a
+DIFFERENT register (6,937) or an expression (493) the fallback names another value
+outright. **6,623 wrong reads in 1,967 of 8,194 functions**, now 74 in 38.
+
+What the fix is not is a value written out. Two attempts did that, naming the slot before
+the drop, and both cost about 1,500 declarations and broke the spellings an argument and
+a phi want: `benchCheckSecret(x1)` became `benchCheckSecret(t1)`. No name is needed. The
+drop is about the MAP, and the instruction that triggered it was FOLDED, so it printed no
+assignment and the printed body still reads the register as it did at the spill. The text
+can simply be spelled again, which costs 3 lines across the build. Only a register the
+printed body has WRITTEN reads as something else, and that case never arrives here
+because `_verbatim` pins the slot before printing its line.
+
+The `_forget_frame` and `_merge` losses are untouched, and are what the remaining 74 and
+most of the 12,528 surviving declines are.
 
 ### What is still not covered
 
