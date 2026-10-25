@@ -35,6 +35,14 @@ argument and means the entry value, or one the printed body has already assigned
 is a claim. Anything else is counted undecidable, never as a defect: a harness that reads
 a decline as a wrong answer reports defects that are its own.
 
+WHAT IT CANNOT SEE. It lifts ONE BLOCK through `_lift_block`, so a decision
+`lift_function` makes over the whole body is invisible: the `keep`, `carry` and
+`join_phi` passes, and anything else that re-walks. And a store resting on a bare
+register is counted undecidable, so a defect spelled AS a decline is not reported as
+one. #196 was both at once, and this tool was silent on it in either direction; the
+drop census in that issue and a direct comparison against the CPU are what found and
+settled it. Silence here is not a pass.
+
 Usage:
   python framework/tools/pbfuzz.py --cases 400 --trials 12 --seed 1
   python framework/tools/pbfuzz.py --no-args      # destinations preloaded, declines kept

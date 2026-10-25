@@ -2631,6 +2631,13 @@ class Lifter:
         self.results: set = set()
         #: Names _verbatim gave, which _drop_unread leaves out where nothing reads them.
         self.raw_names: set = set()
+        #: {slot key: the value `stale_on_write` dropped}, so a later reload can still
+        #: spell it instead of falling back to the load's own register (#196).
+        self._dropped_slots: dict = {}
+        #: Registers the printed body has ASSIGNED. A dropped slot's text may only be
+        #: spelled again while every register in it still reads as the value it had,
+        #: which is true exactly while nothing printed has written to it.
+        self._printed_regs: set = set()
         #: entry block, and the memoised dominator tree / per-join kill sets `_join_kill`
         #: needs. Built on first use, because most functions never reach a goto join.
         self.entry = entry if entry is not None else (min(blocks) if blocks else 0)
@@ -3417,6 +3424,7 @@ class Lifter:
                 if r in use_regs and v.text != r]
         for r in sorted(defs):
             st.set(r, V(r, P_ATOM))
+            self._printed_regs.add(r)
         line = f"{mn} {shown}".rstrip()
         return out + [f"{line}   // {', '.join(held)}" if held else line]
 
@@ -3619,6 +3627,23 @@ class Lifter:
         signed = mn in _SIGNED_LOADS
         if got.text and kind == "x" and (width < 4 or width < 8 and signed):
             got = _extended(got, 8 * width, signed)
+        if not got.text:
+            # The fallback spells the LOAD'S OWN register, which is right only where the
+            # slot held that very register: then the printed body still reads its entry
+            # value and the reload round-trips. Where the slot held anything else the
+            # fallback names a different value, and across the 3.12.2 clean build that is
+            # 6,623 such reads in 1,967 of 8,194 functions (#196).
+            #
+            # `stale_on_write` dropped the slot because a register its text names was
+            # reassigned, but only in the MAP: a folded instruction prints no assignment,
+            # so the printed body still reads that register as it did at the spill, and
+            # the text can simply be spelled again. Only a register the printed body has
+            # WRITTEN reads as something else, and then the text is not spelled.
+            lost = self._dropped_slots.get(key)
+            if (lost is not None
+                    and not any(r in self._printed_regs
+                                for r in _slot_regs(lost.text))):
+                return lost
         return got if got.text else V(canon(reg), P_ATOM)
 
     def _overwrite(self, st: State, at, base: str, lo: int, width: int, second):
@@ -3764,6 +3789,7 @@ class Lifter:
         out = self._pin(st, base)
         out.append(self._assign(V(base, P_ATOM), step))
         st.set(base, V(base, P_ATOM))
+        self._printed_regs.add(base)
         return out
 
     def _pin(self, st: State, name: str, live=None) -> list:
@@ -5173,6 +5199,13 @@ class Lifter:
                 # would collide two reloads onto one name; a reload keying to no slot is
                 # skipped (#173 review).
                 written = _def_use(mn, op)[0]
+                # What the drop is about to lose, so a later reload of the slot can still
+                # spell the value instead of the load's own register (#196, _reload).
+                for r in written:
+                    for k in st.slot_by_reg.get(canon(r), ()):
+                        v = st.slot.get(k)
+                        if v is not None and canon(r) in _slot_regs(v.text):
+                            self._dropped_slots[k] = v
                 if mn in _LOADS and _off_frame(_split_ops(op)):
                     got = _frame_access(mn, op)
                     if got is not None:
