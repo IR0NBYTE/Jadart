@@ -609,6 +609,10 @@ _RECEIVER = "this"
 #: `field_0x` would stop seeing it, so exactly the fields we understand best would be
 #: the ones left stale across a call. A name is only ever attached to the receiver alias,
 #: which bounds the widening to that one base rather than every dotted expression.
+#: A text spelled off the frame itself, `(FP - 64).field_0x1`. It reads memory the
+#: lifter tracks as slots rather than as fields, so a frame store writes it without
+#: anything marking a value that reads it stale; such a text is never recorded (#199).
+_FRAME_TEXT_RE = re.compile(r"\((?:FP|SP)\s*[-+]")
 _READS_MEMORY = re.compile(
     r"\.field_0x[0-9a-fA-F]+|\.tags\b|\[|\b" + _RECEIVER + r"\.[A-Za-z_$]")
 
@@ -674,11 +678,22 @@ def _slot_regs(text: str) -> frozenset:
 
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
-                 "src", "views", "lost", "lost_slot", "slot_by_reg")
+                 "src", "views", "lost", "lost_slot", "slot_by_reg", "dropped")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
         self.slot: dict = {}         # "(base,disp)" stack slot -> V
+        #: {slot key: (value, memory still fresh)} for the slots `stale_on_write` dropped,
+        #: so `_reload` can spell the value rather than the load's own register (#196).
+        #:
+        #: THE INVARIANT. A record is valid at a reload on a path iff, on THAT path,
+        #: between the drop that made it and the reload: nothing FILLED the slot, the key
+        #: still names the same address, no write touched memory the text reads, and the
+        #: printed body assigned none of the registers the text names. It lives on the
+        #: State so it forks with the arms and is intersected by `_merge`; it is killed by
+        #: a fill (`note_slot`) rather than by the slot leaving the map, because a store
+        #: to a key that is already absent removes nothing and would be missed (#199).
+        self.dropped: dict = {}
         self.elem: dict = {}         # reg -> (base V, index V, scale) for element addrs
         # Temps waiting to be written out. set() can decide a value needs a name, but it is
         # the block walker that owns the line list, so the declaration is parked here and
@@ -738,6 +753,7 @@ class State:
         s.lost = set(self.lost)
         s.lost_slot = dict(self.lost_slot)
         s.slot_by_reg = {r: set(ks) for r, ks in self.slot_by_reg.items()}
+        s.dropped = dict(self.dropped)
         s.tmpc = self.tmpc
         s.src = self.src
         return s
@@ -786,6 +802,10 @@ class State:
         with (#173). Called wherever an FP-relative slot is filed with a value; the
         caller gates on that, as the outgoing area off SP is a call's arguments, read
         before any reassign and cleared by `_drop_outgoing` (#140)."""
+        # A FILL supersedes any record, and is the only event that can: a store to a
+        # key already absent from the map removes nothing, so keying the kill off removals
+        # misses it (#199).
+        self.dropped.pop(key, None)
         for r in _slot_regs(v.text):
             self.slot_by_reg.setdefault(r, set()).add(key)
 
@@ -802,6 +822,36 @@ class State:
                     for r in _slot_regs(v.text):
                         idx.setdefault(r, set()).add(key)
         self.slot_by_reg = idx
+
+    def forget_slot(self, key: str):
+        """Remove slot `key` and forget what it held.
+
+        Every way a slot leaves the map except `stale_on_write` means its value is no
+        longer the one the machine has there, so the record goes with it (#199)."""
+        self.slot.pop(key, None)
+        self.dropped.pop(key, None)
+
+    def record_drop(self, key: str, v: V):
+        """Remember `v` for a slot dropped because a register its text names was
+        reassigned, which is the one drop whose value stays worth spelling: the
+        instruction was FOLDED, so it printed no assignment and the text still reads what
+        it read at the spill (#196).
+
+        A text spelled off the frame itself is refused. `(FP - 64).field_0x1` reads memory
+        the lifter does not model as a slot, so nothing marks it stale when a frame store
+        writes it (#199)."""
+        if not _FRAME_TEXT_RE.search(v.text):
+            self.dropped[key] = (v, True)
+
+    def stale_mem(self):
+        """A write to memory has happened, so no record that READS memory is fresh.
+
+        A flag and not a counter: `_merge` has to combine two arms, and the obvious
+        arithmetic is unsound. With generations, an arm that wrote memory raises the
+        merged counter, and a record the other arm kept then compares equal to it and
+        reads as fresh. "Has memory been written since" is a predicate, so it ANDs."""
+        if self.dropped:
+            self.dropped = {k: (v, False) for k, (v, _f) in self.dropped.items()}
 
     def stale_on_write(self, written, keep=()):
         """Drop the slots whose text names a register in `written`, reassigned here on a
@@ -821,6 +871,7 @@ class State:
                 if k in keep:
                     survivors.add(k)
                 else:
+                    self.record_drop(k, v)
                     del self.slot[k]
             if survivors:
                 self.slot_by_reg[reg] = survivors
@@ -937,7 +988,7 @@ def _drop_outgoing(st: State):
     would let one call's arguments be read back as the next call's."""
     sp = next((r for r, v in _T.roles.items() if v == "SP"), "x15")
     for key in [k for k in st.slot if k.startswith(sp)]:
-        del st.slot[key]
+        st.forget_slot(key)
 
 
 def _forget_frame(st: State):
@@ -947,6 +998,7 @@ def _forget_frame(st: State):
     sp = next((r for r, v in _T.roles.items() if v == "SP"), "x15")
     lost = any(k.startswith(sp) for k in st.slot)
     st.slot.clear()
+    st.dropped.clear()          # the frame is not trustworthy, so neither is a record
     if lost:
         st.slot[_LOST] = V("", P_ATOM)
 
@@ -975,6 +1027,12 @@ def _merge(dst: State, a: State, b: State):
             dropped.add(r)
     dst.reg = agreed
     dst.slot = {k: a.slot[k] for k in a.slot if k in b.slot and b.slot[k] == a.slot[k]}
+    # ...and the same rule for the records, with the freshness ANDed: a record only one
+    # path justifies would be spelled on the path that never made it, and one arm having
+    # written memory makes it unfresh for both (#199).
+    dst.dropped = {k: (va, fa and b.dropped[k][1])
+                   for k, (va, fa) in a.dropped.items()
+                   if k in b.dropped and b.dropped[k][0] == va and k not in dst.slot}
     # A slot's lost tie survives only where both arms agree on it and the register is not
     # itself dropped. A slot either arm held as a lost value whose tie does not survive is
     # unstable on that path, so it goes rather than lingering untied (#140).
@@ -2631,6 +2689,18 @@ class Lifter:
         self.results: set = set()
         #: Names _verbatim gave, which _drop_unread leaves out where nothing reads them.
         self.raw_names: set = set()
+        #: Registers the printed body has assigned SO FAR in this walk.
+        self._printed_regs: set = set()
+        #: Registers the printed body assigns ANYWHERE in the function, handed in by the
+        #: walk before this one. The growing set above answers "assigned before the walk
+        #: reached here", which is the wrong question: a loop body's write happens
+        #: before a reload inside the same loop on every trip after the first, and
+        #: `_render_loop` RENAMES a carried register rather than writing it, so the
+        #: growing set never sees that at all (#199).
+        self.printed_prior: frozenset = frozenset()
+        #: The registers each spelled record named, so `_lift_function` can tell whether
+        #: the prior above would change an answer and pay for the extra walk only then.
+        self.spelled_regs: set = set()
         #: entry block, and the memoised dominator tree / per-join kill sets `_join_kill`
         #: needs. Built on first use, because most functions never reach a goto join.
         self.entry = entry if entry is not None else (min(blocks) if blocks else 0)
@@ -3417,6 +3487,7 @@ class Lifter:
                 if r in use_regs and v.text != r]
         for r in sorted(defs):
             st.set(r, V(r, P_ATOM))
+            self._printed_regs.add(r)
         line = f"{mn} {shown}".rstrip()
         return out + [f"{line}   // {', '.join(held)}" if held else line]
 
@@ -3589,9 +3660,10 @@ class Lifter:
                 return []
         elif self._through_frame(at, mn, op):
             _forget_frame(st)       # and it may write the heap all the same
+        st.stale_mem()
         out = self._pin_call(st, _def_use(mn, op)[0])
         for k in [k for k, v in st.slot.items() if _READS_MEMORY.search(v.text)]:
-            del st.slot[k]
+            st.forget_slot(k)
         return out
 
     def _reload(self, st: State, key: str, mn: str, reg: str) -> V:
@@ -3619,6 +3691,20 @@ class Lifter:
         signed = mn in _SIGNED_LOADS
         if got.text and kind == "x" and (width < 4 or width < 8 and signed):
             got = _extended(got, 8 * width, signed)
+        if not got.text:
+            # The fallback spells the LOAD'S OWN register, right only where the slot held
+            # that very register, whose entry value the printed body still reads so the
+            # reload round-trips. Where it held anything else the fallback names a
+            # different value, 6,623 reads in 1,967 of 8,194 functions (#196). Spell what
+            # the slot held instead, under `State.dropped`'s invariant.
+            held = st.dropped.get(key)
+            if held is not None:
+                v, fresh = held
+                if ((fresh or not _READS_MEMORY.search(v.text))
+                        and not any(r in self._printed_regs or r in self.printed_prior
+                                    for r in _slot_regs(v.text))):
+                    self.spelled_regs.update(_slot_regs(v.text))
+                    return v
         return got if got.text else V(canon(reg), P_ATOM)
 
     def _overwrite(self, st: State, at, base: str, lo: int, width: int, second):
@@ -3649,7 +3735,7 @@ class Lifter:
         for off in range(lo - 15 if wide else lo - 7, hi):
             key = f"{base}{off:+d}"
             if key in st.slot and (off >= lo - 7 or key in wide):
-                del st.slot[key]
+                st.forget_slot(key)
                 gone = gone or key not in own
         if gone and base == sp:
             st.slot[_LOST] = V("", P_ATOM)
@@ -3677,7 +3763,7 @@ class Lifter:
             else:
                 gone = self._covered(st, sp, lo - at, lo - at + slack + n)
         for k in gone:
-            del st.slot[k]
+            st.forget_slot(k)
         if base == fp and any(k != _LOST for k in gone):
             st.slot[_LOST] = V("", P_ATOM)
 
@@ -3707,9 +3793,17 @@ class Lifter:
             return
         if _T.roles.get(base) == "FP":
             # SP's slots too: _frame_meets compares them with FP's only while FP stays
-            # where it is (#162).
+            # where it is (#162). The records go with them, through `_forget_frame`: their
+            # keys are displacements from the base that just moved, so each now names a
+            # different address and there is nothing to rename it to (#199).
             _forget_frame(st)
             return
+        # An SP move leaves the records alone, because every one of them is FP-keyed.
+        # `record_drop` is reached only from `stale_on_write`, whose candidates come from
+        # `slot_by_reg`, which `note_slot` and `reindex_slots` fill for FP slots only; and
+        # the loop-exit recorder runs after `_exit_slots` deleted the SP keys. Measured
+        # over the 3.12.2 clean build, all 3,640 recorded keys are FP's, and clearing
+        # here threw away 2,553 of them on SP moves alone (#199 review).
         if delta % 8 == 0:
             # SP moved by a push or a pop of a known amount: a slot keyed off it is still
             # there, now at a different displacement. Rename them by the move rather than
@@ -3764,6 +3858,7 @@ class Lifter:
         out = self._pin(st, base)
         out.append(self._assign(V(base, P_ATOM), step))
         st.set(base, V(base, P_ATOM))
+        self._printed_regs.add(base)
         return out
 
     def _pin(self, st: State, name: str, live=None) -> list:
@@ -3891,6 +3986,7 @@ class Lifter:
         """
         if not loc:
             return []
+        st.stale_mem()
         # `loc` ends in hex digits, so a bare substring match would let `field_0x8` fire
         # inside `field_0x80`, a different field, and a value that is not stale at all.
         pat = re.compile(re.escape(loc) + r"(?![0-9a-fA-F])")
@@ -3935,7 +4031,7 @@ class Lifter:
         # Dropping is honest (the reload renders as the bare destination register) and does
         # not spend a declaration on a spill nothing reloads.
         for key in [k for k, v in st.slot.items() if reads(v.text)]:
-            del st.slot[key]
+            st.forget_slot(key)
         for key, (b, i, _s, _f) in list(st.elem.items()):
             if reads(b.text) or reads(i.text):
                 del st.elem[key]
@@ -4293,6 +4389,7 @@ class Lifter:
                 pair = (second, disp + _access_width(mn, ops[1]), g(second))
             if frame and index is not None:
                 st.slot.clear()              # an offset _fold_frame_offsets left
+                st.dropped.clear()
                 return self._verbatim(st, mn, op, op)
             if frame:                                        # spill to a stack slot
                 self._frame_moved(st, base, delta)
@@ -4852,6 +4949,14 @@ class Lifter:
         if isinstance(st.src, frozenset) and preds[0] in st.src and left is not None:
             got = left.copy()
             stale = _mentions(self._broke.get(preds[0], ()))
+            # The record comes from the same predecessor the slot map does, and takes the
+            # same text test: these two do not invalidate anything, they describe another
+            # path, so forgetting here would throw away a record still true on it. Whether
+            # the arriving path has PRINTED to a register the text names is asked at the
+            # reload instead, by `_printed_regs` and `printed_prior`, which are
+            # function-wide.
+            got.dropped = {k: (v, f) for k, (v, f) in got.dropped.items()
+                           if not stale(v.text)}
             for r, v in sorted(got.reg.items()):
                 if stale(v.text):
                     got.reg[r] = st.get(r)
@@ -5221,6 +5326,7 @@ class Lifter:
         if carry is not None:
             st.reg = dict(carry.reg)
             st.slot = dict(carry.slot)
+            st.dropped = dict(carry.dropped)     # with the slot map, from its source
             st.slot_by_reg = {r: set(ks) for r, ks in carry.slot_by_reg.items()}
             st.elem.update(carry.elem)
             st.poolbase.update(carry.poolbase)
@@ -5229,6 +5335,7 @@ class Lifter:
         else:
             st.reg = {}
             st.slot = {}
+            st.dropped = {}
             st.slot_by_reg = {}
             st.result = _T.ret_int
 
@@ -5529,6 +5636,7 @@ class Lifter:
                     _forget_temps(st, lambda k: self._anchor.get(k) not in doms)
                     if mem:
                         st.slot.clear()
+                        st.dropped.clear()
                     else:
                         self._stale_slots(st, kill)
                     if heap:
@@ -5608,6 +5716,7 @@ class Lifter:
                         st.forget(r)
                     if mem:
                         st.slot.clear()
+                        st.dropped.clear()
                     else:
                         self._stale_slots(st, kill)
                     if heap:
@@ -5701,6 +5810,11 @@ class Lifter:
             names[r] = f"t{st.tmpc[0]}"
             st.tmpc[0] += 1
         loop_st = st.copy()
+        # A record does not cross into the loop. The body's own fills happen in this copy
+        # and are never reconciled back, so a record carried in would survive a store the
+        # body makes on every trip (#199). What the loop itself drops is re-recorded on
+        # the way out, by `_stale_slots` through `_exit_slots`.
+        loop_st.dropped.clear()
         for r in sorted(carried):
             loop_st._stale_lost(r)      # its lost value is gone, carried as a name (#140)
             loop_st.reg[r] = V(names[r], P_ATOM)
@@ -5825,6 +5939,10 @@ class Lifter:
         # Which return register the function last wrote is a fact about the BODY, and the
         # body is what just ran.
         st.result = loop_st.result
+        # ...and no record survives the loop either: `_exit_slots` subtracts statically
+        # from the pre-loop state, so a key the loop FILLED is simply absent here and no
+        # removal fires for it (#199).
+        st.dropped.clear()
         self._exit_slots(st, header)
         return out
 
@@ -5846,6 +5964,29 @@ class Lifter:
                 nodes.add(n)
                 stack.extend(self._preds.get(n, ()))
         return nodes
+
+    def _call_written(self, nodes) -> frozenset:
+        """The registers a call inside `nodes` may leave holding something the reader
+        cannot read off the entry state: what the calling blocks write, plus the call's
+        own clobbers.
+
+        A region-level drop is recordable for a key whose text names none of these. Asking
+        instead whether the region calls AT ALL is too coarse, because the region reaches
+        back past the loop header on purpose (`_exit_slots`: the pre-loop blocks stand for
+        the ones between the store and the loop), so a call before the loop turned the
+        record off for keys its clobbers never touch: 260 of 991 loop exits on the 3.12.2
+        clean build, against 95 where the gate was on at all (#199 review).
+
+        A tail call through `br` is not counted, the convention `_exit_slots` uses for
+        its own memory question: a `br` block does not fall through, so it cannot reach
+        the latch and the region's text cannot be read after it."""
+        out: set = set()
+        for b in nodes:
+            if b not in self.blocks:
+                continue
+            if any(mn in _CALLS for (_a, mn, _o, _n) in self.blocks[b].insns):
+                out |= self._written({b}) | _CALL_CLOBBERS
+        return frozenset(out)
 
     def _quiet(self, b) -> bool:
         """True for a stack check's slow path, `bl` to the stub and `b` back: the stub
@@ -5910,7 +6051,8 @@ class Lifter:
         ended = self._ended_blocks()
         near = {b for b in self._loop_nodes(header)
                 if b not in ended and not self._quiet(b)}
-        self._stale_slots(st, self._written(near) - _SPECIAL)
+        self._stale_slots(st, self._written(near) - _SPECIAL,
+                          unsafe=self._call_written(near))
 
     def _wide_slots(self) -> set:
         """The frame slots a store of a q register fills anywhere in the function, which
@@ -6101,7 +6243,7 @@ class Lifter:
                     return True
         return False
 
-    def _stale_slots(self, st: State, written) -> None:
+    def _stale_slots(self, st: State, written, unsafe=None) -> None:
         """Drop the slots whose TEXT names a register the region overwrote.
 
         Keeping a slot across a region that did not store to the frame is only sound for
@@ -6113,6 +6255,12 @@ class Lifter:
             return
         for k in [k for k, v in st.slot.items()
                   if any(canon(m) in written for m in _REG_RE.findall(v.text))]:
+            # Recordable where the text names no register a call in the region may have
+            # left holding something else: then the drop has `stale_on_write`'s reason and
+            # the value stays worth spelling (#196). `unsafe` is None where the caller
+            # does not vouch for the region at all (#199).
+            if unsafe is not None and not (set(_slot_regs(st.slot[k].text)) & unsafe):
+                st.record_drop(k, st.slot[k])
             del st.slot[k]
 
     def _loop_nodes(self, header) -> frozenset:
@@ -6708,7 +6856,12 @@ def _forget_temps(st: State, gone) -> None:
         if late(v.text):
             st.forget(r)
     for k in [k for k, v in st.slot.items() if late(v.text)]:
-        del st.slot[k]
+        st.forget_slot(k)
+    # ...and a record naming a name declared only on another path goes too: the text
+    # would read a `tN` whose declaration does not dominate the reload (#199).
+    for k, (v, _f) in list(st.dropped.items()):
+        if late(v.text):
+            st.dropped.pop(k, None)
     for k, (b, i, _s, _f) in list(st.elem.items()):
         if late(b.text) or late(i.text):
             del st.elem[k]
@@ -7104,7 +7257,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     meets, moves, joins, cross = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
 
-    def walk(keep, carry=None, join_phi=None):
+    def walk(keep, carry=None, join_phi=None, printed_prior=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields)
@@ -7127,6 +7280,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.keep = keep
         lifter.carry_more = carry or {}
         lifter.join_phi = join_phi or {}
+        lifter.printed_prior = printed_prior or frozenset()
         lines, _falls = lifter.walk(stmts, State(), indent, depth)
         return lifter, lines
 
@@ -7147,6 +7301,12 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     # ...and which registers a loop has to carry out past a printed write (#123). One the
     # body never prints a write to reads as its value from before, which is a decline.
     printed = _printed_writes(lines)
+    # ...and whether a slot value `_reload` spelled names a register the printed body
+    # assigns somewhere the growing set could not have seen yet (#199). Only then is the
+    # extra walk worth it, so this reuses the set the carry already needs. One walk is
+    # enough: both walks print the same raw lines and the same write-backs, since those
+    # come from the instructions, and every statement a later walk adds assigns a `tN`.
+    printed_prior = frozenset(lifter.spelled_regs & printed) or None
     carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
              if r & printed}
     # ...and which registers a goto-reached join needs a phi for (#123). Only ones a loop
@@ -7155,9 +7315,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     carried_regs = frozenset().union(*carry.values()) if carry else frozenset()
     join_phi = {j: frozenset(rs & carried_regs)
                 for j, rs in lifter._join_phi_set.items() if rs & carried_regs}
-    if keep is not None or carry or join_phi:
+    if keep is not None or carry or join_phi or printed_prior:
         lifter = lines = None               # not held while the second walk runs
-        lifter, lines = walk(keep, carry, join_phi)
+        lifter, lines = walk(keep, carry, join_phi, printed_prior)
         # A name the code after the loop does not print, its only reader a call that
         # prints `(...)`, says nothing, and the walk goes back to the bare register.
         unread = {h: frozenset(names[n] for n in _never_read(lines, names))
@@ -7166,7 +7326,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
             carry = {h: r - unread.get(h, frozenset()) for h, r in carry.items()}
             carry = {h: r for h, r in carry.items() if r}
             lifter = lines = None
-            lifter, lines = walk(keep, carry, join_phi)
+            lifter, lines = walk(keep, carry, join_phi, printed_prior)
         # A goto-join phi nothing reads says nothing, and minting its name shifted every
         # later temp for a line then dropped. The walk runs once more without the joins
         # whose names went unread, so those numbers go back and only a join a reader
@@ -7179,7 +7339,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                             for j, rs in join_phi.items()}
                 join_phi = {j: rs for j, rs in join_phi.items() if rs}
                 lifter = lines = None
-                lifter, lines = walk(keep, carry, join_phi)
+                lifter, lines = walk(keep, carry, join_phi, printed_prior)
     # A goto-join phi is declared once, above the body, since no single edge into the
     # join dominates it; `_drop_dead_phis` drops the ones nothing read.
     if lifter._join_name:
