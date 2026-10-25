@@ -11,36 +11,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
-### Fixed
-
-- **A reload of a dropped frame slot reads the value the slot held, not the load's own
-  register.** `stale_on_write` drops a slot whose text names a register that is then
-  reassigned (#173), and `_reload` fell back to spelling the LOAD'S DESTINATION. That is
-  right only where the slot held that very register, whose entry value the printed body
-  still reads; where it held anything else the fallback named a different value.
-  `stur x6, [x29, #-8]; mov x6, x2; ldur x3, [x29, #-8]; stur x3, [x20, #7]` printed
-  `x20.field_0x8 = x3;` for the x6 the machine stores, and now prints `= x6;`.
-
-  The drop is about the MAP, not the output: the instruction that reassigned the register
-  was folded, so it printed no assignment and the printed body still reads that register
-  as it did at the spill, which is why the text can simply be spelled again. A register
-  the printed body has WRITTEN reads as something else, and such a text is not spelled;
-  that case does not arise through a raw line, since `_verbatim` pins the slot before
-  printing it.
-
-  Across the 3.12.2 clean build the fallback misnamed **6,623 reads in 1,967 of 8,194
-  functions**, now 74 in 38 (the rest are slots lost to `_forget_frame` and `_merge`,
-  which #196 still covers). Five shapes were scored against a real CPU over 60 random
-  register environments each: the old spelling is correct in 0 of 60 and the new one in
-  60 of 60, and the four tests that pinned the old behaviour are updated with those
-  numbers. Found with the drop census in #196.
-
-  **A changed answer.** 187 files of the clean export differ, the obf export does not
-  change at all, and the size is the same: 144,727 lines to 144,730, with 8 more
-  declarations. Both acceptance gates read as before (Tier A 11/11 and 9/9, Tier B 3/3),
-  `cfgcheck` is clean on both fixtures, the export is byte-identical across two hash
-  seeds, and irfuzz `--mem`, `--cfgmem` and `--cfg` are unchanged at 0 mismatches.
-
 ### Added
 
 - **`tools/pbfuzz.py`, a differential oracle for the printed body where a register write
