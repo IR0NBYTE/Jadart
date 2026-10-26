@@ -603,6 +603,8 @@ def main() -> int:
               f"{t['same_reg']} times correctly, {t['diff_reg']} where the slot held "
               f"another register and {t['expr']} where it held an expression; "
               f"{t['name']} out-of-scope names and {t['never']} genuine declines")
+        print(f"  of {t['lifted']} ranges lifted, {t['oos_fns']} read a name whose "
+              f"declaration has closed, {t['oos']} reads in all")
         print(f"WRONG READS: {t['wrong']}   STALE RECORDS: {t['stale']}")
         return 1 if t["stale"] else 0
     if a.cases < 1 or a.trials < 1:
@@ -630,7 +632,7 @@ def _census_hooks(expr):
     """Install the hooks, returning (restore, totals, per-walk cell)."""
     hist, alive, walk = {}, [], {"cur": None}
     tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "name": 0,
-           "expr": 0, "never": 0, "ranges": 0}
+           "expr": 0, "never": 0, "ranges": 0, "oos": 0, "oos_fns": 0, "lifted": 0}
     saved = {n: getattr(expr.State, n)
              for n in ("note_slot", "record_drop", "forget_slot", "copy",
                        "stale_on_write")}
@@ -755,6 +757,10 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
       same_reg  the fallback spelled the register the slot held; correct, the spill and
                 reload round-trip
       never     the slot never held anything on this path; a genuine decline
+      oos       reads of a minted name whose declaration has closed, by the lifter's own
+                `expr._out_of_scope`. Measured HERE and nowhere else: four separate
+                scripts of mine drifted from that function's rules and each one reported a
+                number I then had to withdraw (#198)
       spelled   records `_reload` spelled instead of falling back
       stale     records spelled although this path superseded them; must be 0 (#199)
 
@@ -780,16 +786,28 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
             del alive[:]
             walk["cur"] = None
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+            lines = None
             try:
                 # `arch=` is not optional: without it an arm32 range lifts through
                 # arm64's register roles and prints confident nonsense, which
                 # `test_every_lift_call_site_passes_the_target` exists to stop.
-                expr.lift_function(ann, pool_map, arch=getattr(image, "arch", None),
-                                   cut_end=cut_end(cr, dis))
+                lines = expr.lift_function(ann, pool_map,
+                                           arch=getattr(image, "arch", None),
+                                           cut_end=cut_end(cr, dis))
             except RecursionError:
                 continue
+            # Counted for every range that LIFTED, before the slot census's own guards:
+            # those drop a range that built no Lifter, and letting them drop it here too
+            # silently shrank this population by 27 ranges (#198).
+            if lines is not None:
+                hits: list = []
+                expr._out_of_scope([l.rstrip() for l in lines], hits)
+                if hits:
+                    tot["oos"] += len(hits)
+                    tot["oos_fns"] += 1
+                tot["lifted"] += 1
             w = walk["cur"]
-            if w is None:
+            if w is None or lines is None:
                 continue
             tot["ranges"] += 1
             for k in ("spelled", "stale", "same_reg", "diff_reg", "name", "expr",

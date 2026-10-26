@@ -12557,11 +12557,15 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                  ("sub", "x9, x9, #1"), ("b", "#0x4"), ("ret", "")] + out
                 + [("stur", "x8, [x2, #103]"), ("ret", "")])
     assert "x2.field_0x60 = x7;" in body and "x2.field_0x68 = x8;" in body, body
-    # A join in the loop that names it starts from the register, not that value.
+    # A join in the loop that names it starts from the register, not that value. The
+    # declaration is at the TOP here, not inside the loop: the goto target reads it after
+    # the loop closes, and a declaration inside the loop does not dominate that read
+    # (#198). The assignment stays where the value is, so this is the same program.
     body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("cbz", "x3, #0x10"),
                  ("add", "x7, x6, x1"), ("cmp", "x9, #1"), ("b.eq", "#0x24"),
                  ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8")] + out[1:] + out)
-    assert "var t1 = x7;" in body and "x2.field_0x60 = t1;" in body, body
+    assert body[0] == "var t1;" and "t1 = x7;" in body, body
+    assert "x2.field_0x60 = t1;" in body, body
     # A goto out of two loops reads what the outer one wrote, and where a printed line
     # writes it, the outer loop carries it: on its first trip x8 is still x5 + x1.
     body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("add", "x10, x9, #3"),
@@ -13726,6 +13730,83 @@ def test_a_self_referential_write_keeps_the_spelling_that_cancels():
                       ("stur", "x7, [x20, #7]"), ("ret", "")])
     assert "x20.field_0x8 = x2 ^ x5 ^ (x2 ^ x6);" in body, body
     assert re.search(r"var t\d+ = x2 \^ x5;", body) is None, body
+
+
+def test_a_block_holding_a_nested_one_is_not_empty():
+    """`_drop_dead_phis` keeps a dead phi WHOLE rather than leave a block holding nothing
+    else. The lines it counts are a block's DIRECT ones, so a parent whose body is one
+    dead declaration plus an `if` looked bare and the dead phi survived (#198).
+
+    Invisible while a live declaration sat beside the dead one, which is why it went
+    unnoticed until hoisting moved the live one away: 16 dead lines came back in 5
+    functions, 4 of them naming a bare machine register. Both shapes are checked, since
+    the one that held before is what made the other one hard to see.
+
+    `_drop_unread_slots` has the same guard for the same reason and does NOT need the same
+    change: its `elif` appends a block-opening line to the parent's body, so such a parent
+    already fails the all-dropped test. That shape is load-bearing, and tidying it into
+    this function's form would reintroduce the bug there."""
+    from jadart.expr import _drop_dead_phis
+
+    # The parent holds the dead declaration and an `if`, and the arm holds the dead
+    # assignment and a statement, so neither would be left with nothing: it all goes.
+    dead_alone = ["  var t13;", "  if (c) {", "    t13 = 1;", "    f(x);", "  }"]
+    out = _drop_dead_phis(dead_alone, {"t13"})
+    assert out == ["  if (c) {", "    f(x);", "  }"], out
+
+    # The same body with a live declaration beside it: unchanged by this fix, which is
+    # why the parent case went unnoticed until hoisting moved the live one away.
+    beside_live = ["  var t14;", "  var t13;", "  if (c) {", "    t13 = 1;",
+                   "    f(x);", "  }", "  g(t14);"]
+    out = _drop_dead_phis(beside_live, {"t13", "t14"})
+    assert "  var t13;" not in out and "  var t14;" in out, out
+
+    # And the guard still fires where it must: an arm whose ONLY line is the dead phi
+    # stays, because the arm is the walk's to render.
+    arm_would_empty = ["  var t13;", "  if (c) {", "    t13 = 1;", "  }"]
+    assert _drop_dead_phis(arm_would_empty, {"t13"}) == arm_would_empty
+
+
+def test_a_name_is_not_read_after_its_declaration_closed():
+    """The lifter printed `var t1 = x7;` inside a `while` and read `t1` at a goto target
+    after the loop closed: a reference to something no longer declared, which a Dart
+    parser rejects and an agent resolves to nothing. 1,488 such reads in 517 of 8,194
+    ranges on the clean build, now 171 in 122 (#198).
+
+    Counted by `expr._out_of_scope` and nowhere else. Four separate scripts of mine
+    drifted from its rules and each reported a number I had to withdraw, so the only
+    supported way to measure this is the function the lifter itself uses, through the
+    `hits` list it fills on the same walk. Counting occurrences of the returned SET
+    afterwards is a different and wrong number, because a name can be in scope on one
+    line and out on another."""
+    if not _capstone_available():
+        _skip("  SKIP test_a_name_is_not_read_after_its_declaration_closed")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pbfuzz
+    from jadart import expr
+
+    # the shape, as the lifter prints it: a declaration that has closed, and one that has not
+    closed = ["  while (true) {", "    var t1 = x7;", "  }", "  x2.field_0x8 = t1;"]
+    hits = []
+    assert expr._out_of_scope(closed, hits) == {"t1"} and len(hits) == 1, hits
+    hoisted = ["  var t1;", "  while (true) {", "    t1 = x7;", "  }",
+               "  x2.field_0x8 = t1;"]
+    assert expr._out_of_scope(hoisted) == set()
+    # a use in the note a raw line carries is not a read: `_inline_single_use` refuses to
+    # fold into one for the same reason, and hoisting on a comment moved a name for nobody
+    noted = ["  while (true) {", "    var t1 = x7;", "  }",
+             "  fmov x3, d0   // d0 holds t1"]
+    assert expr._out_of_scope(noted) == set()
+    # an inner declaration shadowing an outer one leaves the outer in scope
+    shadowed = ["  var t1 = 1;", "  if (c) {", "    var t1 = 2;", "  }",
+                "  x2.field_0x8 = t1;"]
+    assert expr._out_of_scope(shadowed) == set()
+
+    got = pbfuzz.census(CLEAN)
+    assert got["lifted"] > 8000, f"only {got['lifted']} ranges lifted"
+    assert got["oos"] <= 171, (
+        f"{got['oos']} reads of a name whose declaration has closed, in "
+        f"{got['oos_fns']} ranges, up from 171 in 122; see #198")
 
 
 def test_no_frame_slot_record_outlives_the_path_that_made_it():

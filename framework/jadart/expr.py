@@ -2698,6 +2698,15 @@ class Lifter:
         #: `_render_loop` RENAMES a carried register rather than writing it, so the
         #: growing set never sees that at all (#199).
         self.printed_prior: frozenset = frozenset()
+        #: Phi names whose declaration this walk lifts to the top of the body, because the
+        #: walk before it found them read outside the scope `_phi` declared them in (#198).
+        self.hoist: frozenset = frozenset()
+        #: The ones it actually hoisted, for `_lift_function` to declare.
+        self.hoisted: set = set()
+        #: The names `_phi` MINTED. `phi_names` is wider: `_render_loop` and `_join_write`
+        #: add to it, and only `_phi` reads `self.hoist`, so deciding off `phi_names` put
+        #: names in the set that nothing could act on (#198 review).
+        self.phi_minted: set = set()
         #: The registers each spelled record named, so `_lift_function` can tell whether
         #: the prior above would change an answer and pay for the extra walk only then.
         self.spelled_regs: set = set()
@@ -5496,8 +5505,18 @@ class Lifter:
             gone = [lost(k, v, r, pre) for k, (_lines, v) in enumerate(arms)]
             sets = [changed(v) or entered[id(lines)] or r in printed[id(lines)] or gone[k]
                     for k, (lines, v) in enumerate(arms)]
-            decls.append(f"{pad}var {name};" if all(sets)
-                         else f"{pad}var {name} = {pre.text};")
+            if name in self.hoist:
+                # Declared at the top instead, because a reader outside this `if`'s scope
+                # needs it. The INITIALISER stays here: it is the value from before this
+                # `if`, and evaluating it at the top of the body would read a different
+                # state. So the declaration splits into a bare one up there and an
+                # assignment down here (#198).
+                self.hoisted.add(name)
+                if not all(sets):
+                    decls.append(f"{pad}{name} = {pre.text};")
+            else:
+                decls.append(f"{pad}var {name};" if all(sets)
+                             else f"{pad}var {name} = {pre.text};")
             for (lines, v), assign, g in zip(arms, sets, gone):
                 if assign:
                     lines.append(pad2 + self._assign(V(name, P_ATOM),
@@ -5670,6 +5689,7 @@ class Lifter:
                                              self._livein.get(joins[i], 0), pad, indent,
                                              (then, els))
                     self.phi_names.update(named.values())
+                    self.phi_minted.update(named.values())
                     out.extend(decls)
                     # Declared above the `if`, at the end of the block that decides it,
                     # and set on every path through it. Where a goto enters an arm, that
@@ -6965,6 +6985,8 @@ def _printed_writes(lines: list) -> set:
 
 
 _LABEL_LINE_RE = re.compile(r"\s*L_0x[0-9a-f]+:$")
+#: A declaration of a minted name, with or without an initialiser.
+_PHI_DECL_RE = re.compile(r"\s*var (t\d+)\s*(?:=|;)")
 
 
 _SET_RE = re.compile(r"\s*(?:var\s+)?(t\d+)\s*(?:;|=(?!=))")
@@ -7052,6 +7074,68 @@ def _unread(lines: list, names: set) -> set:
 _CALL_IN_LINE = re.compile(r"[\w\])]\(|\(dynamic call\)")
 
 
+def _out_of_scope(lines: list, hits=None) -> set:
+    """The minted names `lines` READ outside the scope their declaration is in.
+
+    `_phi` declares its name at the level of the `if` it belongs to, which dominates the
+    arms but not necessarily the reader: where that `if` is itself nested in an arm, the
+    arm closes and the name is gone while a later line still reads it. Over the 3.12.2
+    clean build that is 1,554 reads in 544 of 8,194 functions, each one a reference to
+    something no longer declared (#198).
+
+    Three things it deliberately does not count.
+
+    A use inside the `   //` note a raw line carries is not a read: `_inline_single_use`
+    refuses to fold into one for the same reason, and hoisting a declaration on the
+    strength of a comment moved one name on the clean build for no reader at all.
+
+    And `var t1;` at the top with the arms assigning it is the `_join_name` shape, which
+    is already correct; only a declaration that has closed is reported.
+
+    `hits`, a list if given, collects one (line index, name) per offending READ. The
+    lifter wants the set; a census wants the count, and counting occurrences of the set
+    afterwards is NOT the same thing, because a name can be in scope on one line and out
+    on another. Both come from this one walk so neither can drift from the other, which
+    four separate scripts of mine did, each reporting a number I had to withdraw (#198).
+
+    Linear in the lines, not in lines times live names: the live set is a count per name,
+    decremented when its scope pops, because both the line count and the nesting come
+    from the input (CLAUDE.md puts resource exhaustion on hostile input first).
+    """
+    live: dict = {}
+    scopes: list = [[]]
+    bad = set()
+
+    def pop():
+        for n in scopes.pop():
+            if live.get(n):
+                live[n] -= 1
+                if not live[n]:
+                    del live[n]
+
+    for i, ln in enumerate(lines):
+        cut = ln.find("   //")
+        t = (ln[:cut] if cut >= 0 else ln).strip()
+        if t.startswith("}"):
+            if len(scopes) > 1:
+                pop()
+            if t.endswith("{"):                       # `} else {`
+                scopes.append([])
+            continue
+        m = _PHI_DECL_RE.match(t)
+        if m:
+            scopes[-1].append(m.group(1))
+            live[m.group(1)] = live.get(m.group(1), 0) + 1
+        for name in _TMP_RE.findall(t):
+            if not (m and name == m.group(1)) and name not in live:
+                bad.add(name)
+                if hits is not None:
+                    hits.append((i, name))
+        if t.endswith("{"):
+            scopes.append([])
+    return bad
+
+
 def _drop_dead_phis(lines: list, names: set) -> list:
     """Drop the declaration and assignments of each phi name in `names` nothing reads.
 
@@ -7087,25 +7171,38 @@ def _drop_dead_phis(lines: list, names: set) -> list:
     by_name = {n: idxs for n, idxs in by_name.items()
                if not any(_CALL_IN_LINE.search(lines[i]) for i in idxs)}
     drop_line = {i: n for n, idxs in by_name.items() for i in idxs}
-    # Keep whole a phi any of whose lines is in a block that would otherwise empty.
+    # Keep whole a phi any of whose lines is in a block that would otherwise empty. A
+    # block holding a NESTED one would not empty, whatever happens to its own lines, and
+    # counting it as empty kept a dead phi alive for nothing: the lines it collects are a
+    # block's direct ones, so a parent whose body is one dead declaration plus an `if`
+    # looked bare. That is invisible while a live declaration sits beside the dead one and
+    # shows the moment anything moves the live one away (#198).
     keep, stack = set(), []
     for i, ln in enumerate(lines):
         s = ln.strip()
         opens, closes = s.endswith("{"), s.startswith("}")
         if closes and stack:
-            body = stack.pop()
-            if body and all(j in drop_line for j in body):
+            body, nested = stack.pop()
+            if body and not nested and all(j in drop_line for j in body):
                 keep.update(drop_line[j] for j in body)
         if not opens and not closes and stack:
-            stack[-1].append(i)
+            stack[-1][0].append(i)
         if opens:
-            stack.append([])
+            if stack:
+                stack[-1][1] = True
+            stack.append([[], False])
     drop = {i for i, n in drop_line.items() if n not in keep}
     return [ln for i, ln in enumerate(lines) if i not in drop]
 
 
 def _drop_unread_slots(lines: list, names: set) -> list:
     """`lines` without the declarations of the slot names nothing reads (#64; _unread).
+
+    The `elif` below is deliberate and load-bearing: it appends a block-OPENING line to
+    the parent's body, so a parent holding one unread declaration plus a nested `if` fails
+    the all-dropped test on that `if` line and the declaration is dropped. Writing it as
+    `_drop_dead_phis` does, skipping opens and closes, is what made that function call such
+    a parent empty and keep a dead phi alive (#198).
 
     Except where an arm of an `if` holds nothing else: dropping those left the arm empty,
     `if (c) {} else {}` 21 times over the two fixtures and three corpus builds, and the
@@ -7257,7 +7354,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     meets, moves, joins, cross = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
 
-    def walk(keep, carry=None, join_phi=None, printed_prior=None):
+    def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields)
@@ -7281,6 +7378,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.carry_more = carry or {}
         lifter.join_phi = join_phi or {}
         lifter.printed_prior = printed_prior or frozenset()
+        lifter.hoist = hoist or frozenset()
         lines, _falls = lifter.walk(stmts, State(), indent, depth)
         return lifter, lines
 
@@ -7307,6 +7405,27 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     # enough: both walks print the same raw lines and the same write-backs, since those
     # come from the instructions, and every statement a later walk adds assigns a `tN`.
     printed_prior = frozenset(lifter.spelled_regs & printed) or None
+    # ...and which phi names are read outside the scope `_phi` declared them in, which
+    # only the printed body can say (#198). Their declaration moves to the top, where it
+    # dominates every read, and the initialiser stays where the value was.
+    # ...and which phi names are read outside the scope `_phi` declared them in (#198).
+    # Decided on the lines as they will SHIP, after the passes that drop what nothing
+    # reads: deciding on the raw walk hoisted declarations whose only reader was a line
+    # about to be dropped, and left 11 functions with a top-of-body `var tN;` nothing
+    # reads. Only names `_phi` minted, because only `_phi` acts on the set.
+    def wants_hoist(lf, body):
+        """The names `_phi` minted that `body` reads out of scope, judged on the lines as
+        they will SHIP: deciding on the raw walk hoists for readers a later pass drops.
+        The view it judges has no top declarations yet, so every already-hoisted name
+        reads as undeclared in it and this always re-reports the whole current set. The
+        caller's loop therefore has to test for GROWTH rather than for emptiness."""
+        shipped_body = _inline_single_use(
+            _drop_dead_phis(_drop_unread_slots(_drop_unread(body, lf.raw_names),
+                                               lf.slot_names), lf.phi_names),
+            lf.results | lf.slot_names, lf.slot_names)
+        return frozenset(_out_of_scope(shipped_body) & lf.phi_minted)
+
+    hoist = wants_hoist(lifter, lines) or None
     carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
              if r & printed}
     # ...and which registers a goto-reached join needs a phi for (#123). Only ones a loop
@@ -7315,9 +7434,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     carried_regs = frozenset().union(*carry.values()) if carry else frozenset()
     join_phi = {j: frozenset(rs & carried_regs)
                 for j, rs in lifter._join_phi_set.items() if rs & carried_regs}
-    if keep is not None or carry or join_phi or printed_prior:
+    if keep is not None or carry or join_phi or printed_prior or hoist:
         lifter = lines = None               # not held while the second walk runs
-        lifter, lines = walk(keep, carry, join_phi, printed_prior)
+        lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
         # A name the code after the loop does not print, its only reader a call that
         # prints `(...)`, says nothing, and the walk goes back to the bare register.
         unread = {h: frozenset(names[n] for n in _never_read(lines, names))
@@ -7326,7 +7445,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
             carry = {h: r - unread.get(h, frozenset()) for h, r in carry.items()}
             carry = {h: r for h, r in carry.items() if r}
             lifter = lines = None
-            lifter, lines = walk(keep, carry, join_phi, printed_prior)
+            lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
         # A goto-join phi nothing reads says nothing, and minting its name shifted every
         # later temp for a line then dropped. The walk runs once more without the joins
         # whose names went unread, so those numbers go back and only a join a reader
@@ -7339,13 +7458,24 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                             for j, rs in join_phi.items()}
                 join_phi = {j: rs for j, rs in join_phi.items() if rs}
                 lifter = lines = None
-                lifter, lines = walk(keep, carry, join_phi, printed_prior)
+                lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
     # A goto-join phi is declared once, above the body, since no single edge into the
     # join dominates it; `_drop_dead_phis` drops the ones nothing read.
-    if lifter._join_name:
+    # Hoisting changes the lines, so a name that was in scope may now not be. Measured on
+    # both fixtures this settles in ONE more round: of the functions that reach here, all
+    # but about thirty want nothing further and none wants a third pass. Bounded anyway,
+    # because the bound is the only thing standing between a pathological body and a loop.
+    for _ in range(4):
+        more = wants_hoist(lifter, lines)
+        if not more or more <= (hoist or frozenset()):
+            break
+        hoist = frozenset((hoist or frozenset()) | more)
+        lifter = lines = None
+        lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
+    top = set(lifter._join_name.values()) | lifter.hoisted
+    if top:
         pad = indent * depth
-        decls = [f"{pad}var {n};" for n in sorted(set(lifter._join_name.values()),
-                                                  key=lambda n: int(n[1:]))]
+        decls = [f"{pad}var {n};" for n in sorted(top, key=lambda n: int(n[1:]))]
         lines = decls + lines
     lines = _drop_unread_slots(_drop_unread(lines, lifter.raw_names), lifter.slot_names)
     lines = _drop_dead_phis(lines, lifter.phi_names)
