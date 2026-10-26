@@ -27,14 +27,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   bookkeeping where the lifter forks `State`, and scores only the last walk of each range
   because `lift_function` walks up to three times. Five earlier measurements of this class
   were wrong for want of one of those, so the census carries them rather than a scratch
-  script. On `4623d71`: 8,606 records spelled, 0 stale, 3,427 reads where the fallback
-  spelled its own register although the slot held another one or an expression.
+  script. On `4623d71`: 8,606 records spelled, 0 stale, and 3,427 reads that name a
+  different value than the slot held, of which 2,608 are ACTIONABLE (the slot held a
+  register or an expression that was still available) and 819 are names out of their
+  declaration's scope, which cannot be spelled at all.
 
-  `test_no_frame_slot_record_outlives_the_path_that_made_it` asserts the stale count is
-  zero, which has no acceptable non-zero value, and that the wrong-read count has not
-  risen above the recorded 3,427, which #198 tracks down. It then puts #197's bug back,
-  both halves of it, and checks the census still reports it: a fill that no longer
-  supersedes gives 20, records shared across arms give 561.
+  That split is the point rather than bookkeeping. Naming a spill earlier moves reads from
+  the first number into the second without the reader gaining anything, so the test asserts
+  both: the stale count is zero, which has no acceptable non-zero value; the actionable
+  count has not risen above 2,608; and the total has not risen above 3,427. It then puts
+  #197's bug back, both halves of it, and checks the census still reports it: a fill that
+  no longer supersedes gives 20, records shared across arms give 561.
 
 ### Fixed
 

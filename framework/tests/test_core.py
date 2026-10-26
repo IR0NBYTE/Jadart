@@ -13760,9 +13760,19 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     assert got["stale"] == 0, (
         f"{got['stale']} frame-slot records were spelled after their own path had "
         f"superseded them; see #199 and State.dropped's invariant")
-    assert got["wrong"] <= 3427, (
-        f"{got['wrong']} reloads spell a register the slot did not hold, up from 3427; "
-        f"see #198. {got['diff_reg']} held another register, {got['expr']} an expression")
+    # Two numbers, because they can move in opposite directions. ACTIONABLE is where the
+    # slot held a spelling that was still available; it is what #198's frame-model work
+    # takes down. TOTAL adds the reads whose slot held a NAME out of its declaration's
+    # scope, which cannot be spelled at all and so are a forced decline. Naming a spill
+    # earlier moves reads from the first into the second without the reader gaining
+    # anything, so a change that improves one must not quietly worsen the other.
+    assert got["wrong"] <= 2608, (
+        f"{got['wrong']} reloads spell a register where the slot held a spelling that was "
+        f"available, up from 2608; see #198. {got['diff_reg']} held another register, "
+        f"{got['expr']} an expression")
+    assert got["wrong"] + got["name"] <= 3427, (
+        f"{got['wrong'] + got['name']} reloads in total name a different value than the "
+        f"slot held, up from 3427, of which {got['name']} are names out of scope")
 
     # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
     real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,

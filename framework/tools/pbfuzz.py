@@ -599,10 +599,10 @@ def main() -> int:
             return 0
         t = census(a.census, a.verbose)
         print(f"{t['ranges']} ranges: {t['spelled']} records spelled "
-              f"({t['stale']} stale), fallback took its own register "
+              f"({t['stale']} stale); the fallback took its own register "
               f"{t['same_reg']} times correctly, {t['diff_reg']} where the slot held "
-              f"another register and {t['expr']} where it held an expression, "
-              f"{t['never']} genuine declines")
+              f"another register and {t['expr']} where it held an expression; "
+              f"{t['name']} out-of-scope names and {t['never']} genuine declines")
         print(f"WRONG READS: {t['wrong']}   STALE RECORDS: {t['stale']}")
         return 1 if t["stale"] else 0
     if a.cases < 1 or a.trials < 1:
@@ -629,8 +629,8 @@ def main() -> int:
 def _census_hooks(expr):
     """Install the hooks, returning (restore, totals, per-walk cell)."""
     hist, alive, walk = {}, [], {"cur": None}
-    tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "expr": 0,
-           "never": 0, "ranges": 0}
+    tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "name": 0,
+           "expr": 0, "never": 0, "ranges": 0}
     saved = {n: getattr(expr.State, n)
              for n in ("note_slot", "record_drop", "forget_slot", "copy",
                        "stale_on_write")}
@@ -678,7 +678,7 @@ def _census_hooks(expr):
     def init(self, *a, **k):
         real_init(self, *a, **k)
         walk["cur"] = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0,
-                       "expr": 0, "never": 0, "worst": []}
+                       "name": 0, "expr": 0, "never": 0, "worst": []}
 
     def reload(self, st, key, mn, reg):
         before = st.dropped.get(key)
@@ -712,6 +712,12 @@ def _census_hooks(expr):
                 w["diff_reg"] += 1
                 if len(w["worst"]) < 3:
                     w["worst"].append(("diff", key, held, r))
+        elif expr._MINTED_RE.fullmatch(held):
+            # The slot held a NAME. A name cannot go stale, so the only reason the reload
+            # cannot spell it is that its declaration does not dominate the reload, which
+            # is a forced decline and not a fixable read: spelling it would be a reference
+            # out of scope. Counted apart from `diff_reg` for that reason (#198).
+            w["name"] += 1
         else:
             w["expr"] += 1
             if len(w["worst"]) < 3:
@@ -741,8 +747,11 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
 
     Returns counts over the LAST walk of each range:
       diff_reg  the fallback spelled its own register where the slot held a DIFFERENT
-                one; a wrong read
+                one; a wrong read, and the class #198's fix targets
       expr      the same, where the slot held an expression; also a wrong read
+      name      the slot held a minted NAME. A name cannot go stale, so the reload could
+                only fail to spell it because its declaration does not dominate; that is a
+                forced decline, not a fixable read, and is counted apart
       same_reg  the fallback spelled the register the slot held; correct, the spill and
                 reload round-trip
       never     the slot never held anything on this path; a genuine decline
@@ -783,12 +792,17 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
             if w is None:
                 continue
             tot["ranges"] += 1
-            for k in ("spelled", "stale", "same_reg", "diff_reg", "expr", "never"):
+            for k in ("spelled", "stale", "same_reg", "diff_reg", "name", "expr",
+                      "never"):
                 tot[k] += w[k]
             if verbose and w["worst"] and len(worst) < 8:
                 worst.append((cr.pc_offset, w["worst"][0]))
     finally:
         restore()
+    # The ACTIONABLE class: the slot held a spelling that was still available, and the
+    # reload named something else. `name` is excluded because a name out of its
+    # declaration's scope cannot be spelled at all, and `never` because the slot genuinely
+    # held nothing on that path.
     tot["wrong"] = tot["diff_reg"] + tot["expr"]
     if verbose:
         for at, item in worst:
