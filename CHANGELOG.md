@@ -11,6 +11,56 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Fixed
+
+- **A name is no longer read after its declaration has closed.** `_phi` declares its name
+  at the level of the `if` it belongs to, which dominates the arms but not the reader:
+  where that `if` is nested in an arm, the arm closes and the name is gone while a later
+  line still reads it. The lifter printed
+
+      while (true) {
+        var t1 = x7;
+        ...
+      }
+      L_0x24:
+      x2.field_0x60 = t1;
+
+  where `t1` is declared inside the loop and read at a goto target after it closes. A Dart
+  parser rejects that and an agent reading the output resolves it to nothing. **1,488 such
+  reads in 517 of 8,194 ranges** on the clean build and the same on obf, now 171 in 122.
+
+  The declaration moves to the top of the body, joining the goto-join phis already
+  declared there. The INITIALISER stays where it was, because it is the value from before
+  that `if`, so `var t1 = x7;` inside the loop becomes `var t1;` at the top and `t1 = x7;`
+  in place: the same assignment point and the same value. Definite assignment over a
+  line-level CFG of the printed body finds no path reaching a hoisted read without passing
+  its assignment, on either fixture.
+
+  `_drop_dead_phis` also stops calling a block empty when it holds a nested one, which the
+  hoist requires. That function keeps a dead phi whole rather than leave a block with
+  nothing else, and the lines it counts are a block's DIRECT ones, so a parent whose body
+  is one dead declaration plus an `if` looked bare. Invisible while a live declaration sat
+  beside the dead one; the moment hoisting moved the live one away, 16 dead lines came back
+  in 5 functions, 4 naming a bare machine register. The fix also drops **162 net lines in
+  50 functions** that were already dead on main, every one a phi name nothing reads and
+  none carrying a call, so lines naming a bare machine register go 33,836 to 33,797.
+
+  What is left is two different things. Seventeen reads are of phi names, twelve of them
+  minted by `_render_loop` and `_join_write`, which only `_phi` can act on today. The rest
+  are call results and slot names whose declaration has closed in the same way, a class
+  this does not reach because `_phi` is the only emission site consulting the decision.
+
+  **A changed answer.** 88 files of the clean export differ. Two output changes beyond the
+  declarations, both stated because an unstated one blocks: the 162 dead lines above, and
+  **58 fewer `var tN = <call>;` lines**, because `_inline_single_use` folds a call into the
+  next statement when that statement is its only reader and a hoisted `var tN;` was the
+  line between. Both acceptance gates read as before (Tier A 11/11 and 9/9, Tier B 3/3),
+  `cfgcheck` is clean on both fixtures, the export is byte-identical across two hash seeds,
+  `pbfuzz --census` is unchanged at 2,608 actionable reads and 0 stale records, and the CPU
+  oracles are unchanged at 0 mismatches. Lift 1.04x and export 1.02x against a baseline
+  recorded from main on the same machine. One pinned assertion moves, and it was pinning
+  the defect.
+
 ### Added
 
 - **`tools/pbfuzz.py --census`, a gate for #196's class that needs no emulator.** A reload
