@@ -588,12 +588,226 @@ def main() -> int:
                     help="preload the value registers from memory instead of reading "
                          "them as arguments, so every bare register is a decline")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--census", metavar="BINARY",
+                    help="classify every frame reload of a real image instead of "
+                         "fuzzing; needs capstone only, no emulator")
     a = ap.parse_args()
+    if a.census:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if _capstone() is None:
+            print("SKIP: the census needs capstone")
+            return 0
+        t = census(a.census, a.verbose)
+        print(f"{t['ranges']} ranges: {t['spelled']} records spelled "
+              f"({t['stale']} stale); the fallback took its own register "
+              f"{t['same_reg']} times correctly, {t['diff_reg']} where the slot held "
+              f"another register and {t['expr']} where it held an expression; "
+              f"{t['name']} out-of-scope names and {t['never']} genuine declines")
+        print(f"WRONG READS: {t['wrong']}   STALE RECORDS: {t['stale']}")
+        return 1 if t["stale"] else 0
     if a.cases < 1 or a.trials < 1:
         ap.error("--cases and --trials must be positive")
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     return run(a.cases, a.trials, a.seed, a.preload, a.verbose)
 
+
+
+# THE CENSUS: the one check for #196's class that needs no CPU.
+#
+# A reload that spells a register the slot did not hold, and a record spelled on a path
+# that superseded it, are both properties of the PRINTED BODY and the instruction list.
+# No emulator is involved, so unlike everything above this runs wherever capstone does,
+# which is every pull request. #197 shipped 2,023 stale spellings past four green CI jobs
+# and a clean suite because nothing looked; this is what looks.
+#
+# The bookkeeping has to fork where the lifter forks its state, or the numbers are wrong
+# in both directions. That cost five wrong measurements to learn, so it is spelled out:
+# a per-key history travels with `State.copy`, is intersected by `_merge`, and only the
+# LAST walk of each function is scored, because `lift_function` walks up to three times
+# and the earlier walks' lines are thrown away.
+
+def _census_hooks(expr):
+    """Install the hooks, returning (restore, totals, per-walk cell)."""
+    hist, alive, walk = {}, [], {"cur": None}
+    tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "name": 0,
+           "expr": 0, "never": 0, "ranges": 0}
+    saved = {n: getattr(expr.State, n)
+             for n in ("note_slot", "record_drop", "forget_slot", "copy",
+                       "stale_on_write")}
+    real_merge, real_reload = expr._merge, expr.Lifter._reload
+    real_init = expr.Lifter.__init__
+
+    def h(st):
+        alive.append(st)
+        return hist.setdefault(id(st), {})
+
+    def note_slot(self, key, v):
+        h(self)[key] = ("fill", v.text)
+        return saved["note_slot"](self, key, v)
+
+    def record_drop(self, key, v):
+        out = saved["record_drop"](self, key, v)
+        if key in self.dropped:
+            h(self)[key] = ("drop", v.text)
+        return out
+
+    def forget_slot(self, key):
+        h(self)[key] = ("forget", None)
+        return saved["forget_slot"](self, key)
+
+    def stale_on_write(self, written, keep=()):
+        before = {k: v.text for k, v in self.slot.items()}
+        out = saved["stale_on_write"](self, written, keep)
+        for k, t in before.items():
+            if k not in self.slot and h(self).get(k, (None,))[0] != "drop":
+                h(self)[k] = ("lost", t)
+        return out
+
+    def copy(self):
+        s = saved["copy"](self)
+        hist[id(s)] = dict(h(self))
+        alive.append(s)
+        return s
+
+    def merge(dst, a, b):
+        real_merge(dst, a, b)
+        ha, hb = h(a), h(b)
+        h(dst).clear()
+        h(dst).update({k: v for k, v in ha.items() if hb.get(k) == v})
+
+    def init(self, *a, **k):
+        real_init(self, *a, **k)
+        walk["cur"] = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0,
+                       "name": 0, "expr": 0, "never": 0, "worst": []}
+
+    def reload(self, st, key, mn, reg):
+        before = st.dropped.get(key)
+        out = real_reload(self, st, key, mn, reg)
+        w = walk["cur"]
+        if w is None:
+            return out
+        r = expr.canon(reg)
+        if before is not None and out is before[0]:
+            w["spelled"] += 1
+            ev = h(st).get(key)
+            # A record spelled where this path's last event was not the drop that made it,
+            # unless the event put the same TEXT back, which is harmless by value.
+            if ev != ("drop", before[0].text) and not (ev and ev[1] == before[0].text):
+                w["stale"] += 1
+                if len(w["worst"]) < 3:
+                    w["worst"].append(("stale", key, before[0].text, ev))
+            return out
+        if out.text != r or not (self._live_after & expr._reg_mask((r,))):
+            return out
+        # The fallback ran and the register is read again: classify by what the slot held,
+        # because the fallback is RIGHT only where that was this very register.
+        ev = h(st).get(key)
+        held = ev[1] if ev and ev[0] in ("drop", "lost", "fill") else None
+        if held is None:
+            w["never"] += 1
+        elif expr._REG_RE.fullmatch(held):
+            if held == r:
+                w["same_reg"] += 1
+            else:
+                w["diff_reg"] += 1
+                if len(w["worst"]) < 3:
+                    w["worst"].append(("diff", key, held, r))
+        elif expr._MINTED_RE.fullmatch(held):
+            # The slot held a NAME. A name cannot go stale, so the only reason the reload
+            # cannot spell it is that its declaration does not dominate the reload, which
+            # is a forced decline and not a fixable read: spelling it would be a reference
+            # out of scope. Counted apart from `diff_reg` for that reason (#198).
+            w["name"] += 1
+        else:
+            w["expr"] += 1
+            if len(w["worst"]) < 3:
+                w["worst"].append(("expr", key, held, r))
+        return out
+
+    expr.State.note_slot, expr.State.record_drop = note_slot, record_drop
+    expr.State.forget_slot, expr.State.copy = forget_slot, copy
+    expr.State.stale_on_write = stale_on_write
+    expr._merge, expr.Lifter._reload, expr.Lifter.__init__ = merge, reload, init
+
+    def restore():
+        for n, f in saved.items():
+            setattr(expr.State, n, f)
+        expr._merge, expr.Lifter._reload = real_merge, real_reload
+        expr.Lifter.__init__ = real_init
+
+    return restore, tot, walk, hist, alive
+
+
+def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
+    """Lift EVERY range of the image at `path` and classify what each frame reload prints.
+
+    Over `image.all_ranges`, not `fr.functions`: the latter is the attributed functions,
+    238 of 8,188 on the obfuscated fixture, so a census over it covers 3% of that image
+    and reads as "unaffected" (#198).
+
+    Returns counts over the LAST walk of each range:
+      diff_reg  the fallback spelled its own register where the slot held a DIFFERENT
+                one; a wrong read, and the class #198's fix targets
+      expr      the same, where the slot held an expression; also a wrong read
+      name      the slot held a minted NAME. A name cannot go stale, so the reload could
+                only fail to spell it because its declaration does not dominate; that is a
+                forced decline, not a fixable read, and is counted apart
+      same_reg  the fallback spelled the register the slot held; correct, the spill and
+                reload round-trip
+      never     the slot never held anything on this path; a genuine decline
+      spelled   records `_reload` spelled instead of falling back
+      stale     records spelled although this path superseded them; must be 0 (#199)
+
+    `limit` scores only the first N ranges, for a caller that wants the property rather
+    than the whole image.
+    """
+    from jadart import expr
+    from jadart.branches import row_kinds
+    from jadart.disasm import (load_instructions, disassemble_range, annotate,
+                               function_name_by_pc, build_pool_map, cut_end)
+    image, fr, _hdr = load_instructions(path)
+    pc_to_name = function_name_by_pc(image, fr)
+    pool_map = build_pool_map(fr, getattr(image, "arch", None))
+    restore, tot, walk, hist, alive = _census_hooks(expr)
+    worst = []
+    ranges = image.all_ranges[:limit] if limit else image.all_ranges
+    try:
+        for cr in ranges:
+            dis = disassemble_range(image, cr)
+            if not dis:
+                continue
+            hist.clear()
+            del alive[:]
+            walk["cur"] = None
+            ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+            try:
+                # `arch=` is not optional: without it an arm32 range lifts through
+                # arm64's register roles and prints confident nonsense, which
+                # `test_every_lift_call_site_passes_the_target` exists to stop.
+                expr.lift_function(ann, pool_map, arch=getattr(image, "arch", None),
+                                   cut_end=cut_end(cr, dis))
+            except RecursionError:
+                continue
+            w = walk["cur"]
+            if w is None:
+                continue
+            tot["ranges"] += 1
+            for k in ("spelled", "stale", "same_reg", "diff_reg", "name", "expr",
+                      "never"):
+                tot[k] += w[k]
+            if verbose and w["worst"] and len(worst) < 8:
+                worst.append((cr.pc_offset, w["worst"][0]))
+    finally:
+        restore()
+    # The ACTIONABLE class: the slot held a spelling that was still available, and the
+    # reload named something else. `name` is excluded because a name out of its
+    # declaration's scope cannot be spelled at all, and `never` because the slot genuinely
+    # held nothing on that path.
+    tot["wrong"] = tot["diff_reg"] + tot["expr"]
+    if verbose:
+        for at, item in worst:
+            print(f"    {at:#x}: {item}")
+    return tot
 
 if __name__ == "__main__":
     sys.exit(main())
