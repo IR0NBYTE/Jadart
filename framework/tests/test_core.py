@@ -13728,6 +13728,79 @@ def test_a_self_referential_write_keeps_the_spelling_that_cancels():
     assert re.search(r"var t\d+ = x2 \^ x5;", body) is None, body
 
 
+def test_no_frame_slot_record_outlives_the_path_that_made_it():
+    """The gate for #196's class, and the one check for it that needs no emulator.
+
+    A reload that spells a register the slot did not hold, and a record spelled on a path
+    that superseded it, are both properties of the printed body and the instruction list.
+    So this runs wherever capstone does, which is every pull request. It exists because
+    #197 shipped 2,023 stale spellings past four green CI jobs, a clean suite and five
+    CPU-verified shapes: nothing automated looked at this class, in either direction
+    (`irfuzz` generates no x29-relative frame slot, and `tools/pbfuzz.py`'s fuzzing half
+    scores any store resting on a written register as undecidable).
+
+    Two assertions, and they are different in kind. STALE must be zero: a record spelled
+    after its own path superseded it is `#199` and there is no acceptable number of them.
+    WRONG READS is the residual #198 tracks, recorded here so it can only go down; lower
+    the number when it does, and read FINDINGS.md before raising it.
+
+    The census forks its bookkeeping where the lifter forks `State` and scores only the
+    last walk of each range, because `lift_function` walks up to three times. Five earlier
+    measurements of this class were wrong for want of one of those, so the second half of
+    this test puts the bug back and checks the census still sees it."""
+    if not _capstone_available():
+        _skip("  SKIP test_no_frame_slot_record_outlives_the_path_that_made_it")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pbfuzz
+    from jadart import expr
+
+    got = pbfuzz.census(CLEAN)
+    assert got["ranges"] > 8000, f"only {got['ranges']} ranges, so this proved little"
+    assert got["spelled"] > 1000, f"only {got['spelled']} records spelled"
+    assert got["stale"] == 0, (
+        f"{got['stale']} frame-slot records were spelled after their own path had "
+        f"superseded them; see #199 and State.dropped's invariant")
+    assert got["wrong"] <= 3427, (
+        f"{got['wrong']} reloads spell a register the slot did not hold, up from 3427; "
+        f"see #198. {got['diff_reg']} held another register, {got['expr']} an expression")
+
+    # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
+    real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,
+                                        expr._merge)
+
+    def no_supersede(self, key, v):
+        kept = self.dropped.get(key)
+        out = real_note(self, key, v)
+        if kept is not None:
+            self.dropped[key] = kept          # a fill no longer kills the record
+        return out
+
+    def shared(self):
+        s = real_copy(self)
+        s.dropped = self.dropped              # the arms share one map
+        return s
+
+    def no_intersect(dst, a, b):
+        kept = dict(a.dropped)
+        real_merge(dst, a, b)
+        dst.dropped = kept                    # the join no longer intersects
+
+    for what, patch in (("a fill no longer supersedes", ("note_slot", no_supersede)),
+                        ("records leak across paths", ("copy", shared))):
+        name, fn = patch
+        setattr(expr.State, name, fn)
+        if name == "copy":
+            expr._merge = no_intersect
+        try:
+            bad = pbfuzz.census(CLEAN, limit=3000)
+        finally:
+            expr.State.note_slot, expr.State.copy = real_note, real_copy
+            expr._merge = real_merge
+        assert bad["stale"] > 0, (
+            f"with {what} the census still reported 0 stale records, so it is not "
+            f"measuring what it claims")
+
+
 def test_a_reload_of_a_dropped_slot_reads_the_value_it_held():
     # A frame slot whose text names a register that is then reassigned is DROPPED, so the
     # text cannot read the new register (#173). What the reload then PRINTS is this test.

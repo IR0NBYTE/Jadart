@@ -11,6 +11,31 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Added
+
+- **`tools/pbfuzz.py --census`, a gate for #196's class that needs no emulator.** A reload
+  that spells a register the slot did not hold, and a record spelled on a path that
+  superseded it, are both properties of the printed body and the instruction list, so this
+  runs wherever capstone does, which is every pull request. That matters because nothing
+  automated looked at this class before, in either direction: `irfuzz` generates no
+  x29-relative frame slot, and `pbfuzz`'s fuzzing half scores any store resting on a
+  written register as undecidable. #197 shipped 2,023 stale spellings past four green CI
+  jobs, a clean suite and five CPU-verified shapes.
+
+  It reads every range of a real image (`image.all_ranges`, 8,194 on the clean fixture and
+  8,188 on the obf one, not the 6,849 and 238 that `fr.functions` gives), forks its
+  bookkeeping where the lifter forks `State`, and scores only the last walk of each range
+  because `lift_function` walks up to three times. Five earlier measurements of this class
+  were wrong for want of one of those, so the census carries them rather than a scratch
+  script. On `4623d71`: 8,606 records spelled, 0 stale, 3,427 reads where the fallback
+  spelled its own register although the slot held another one or an expression.
+
+  `test_no_frame_slot_record_outlives_the_path_that_made_it` asserts the stale count is
+  zero, which has no acceptable non-zero value, and that the wrong-read count has not
+  risen above the recorded 3,427, which #198 tracks down. It then puts #197's bug back,
+  both halves of it, and checks the census still reports it: a fill that no longer
+  supersedes gives 20, records shared across arms give 561.
+
 ### Fixed
 
 - **A reload of a dropped frame slot reads the value it held, not the load's own
