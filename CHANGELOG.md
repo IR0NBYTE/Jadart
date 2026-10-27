@@ -13,6 +13,36 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A declined frame reload no longer reads as the value the function came in with.** A
+  reload the walk cannot answer printed NOTHING and kept the load's own register. The
+  printed body reads a register it never assigns as the incoming value, so
+
+      ldur x3, [x29, #-8]        // a slot the walk lost
+      stur x3, [x2, #7]
+
+  printed `x2.field_0x8 = x3;`, which says the destination still holds the x3 the
+  function was called with. It does not: the load happened. The reload now says the read
+  it is, under a fresh name, which is `_phi_name`'s rule at the other end, always a fresh
+  one and never the register:
+
+      var t0 = (FP - 8).field_0x1;
+      x2.field_0x8 = t0;
+
+  spelled the way the lifter already spells that address when it is held in a register.
+  **A changed answer, and a wide one.** On the clean build, over all 8,194 ranges:
+  **171,119 lines to 182,305**, and **lines carrying a bare machine register 38,140 to
+  26,614**, by `tools/quality.py`'s own count. Raw arm64 lines do not move, 1,553 either
+  way, and reads of a name out of its declaration's scope go 171 to 164 because the new
+  names are hoisted by the same rule as a phi name. Names nothing reads go 4,713 to
+  5,002: the drop pass takes 1,903 of the 2,192 the naming adds, and the 289 left are
+  the hoisted split, which its one-occurrence test does not match. Where the slot held
+  the load's own register the old output was right, and those are a named read now: still
+  right, and no longer spelled exactly like a reload that had given up. No record of what
+  a slot held closes this class, which is what the attempts on #198 kept finding: once a
+  path may have written the slot, neither the register nor a name for the register is
+  what the load reads. Naming the value at the spill measured four fewer reads for 1.7%
+  more output (#198).
+
 - **A name is no longer read after its declaration has closed.** `_phi` declares its name
   at the level of the `if` it belongs to, which dominates the arms but not the reader:
   where that `if` is nested in an arm, the arm closes and the name is gone while a later

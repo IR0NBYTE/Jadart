@@ -2629,6 +2629,9 @@ def _frame_accesses(insns, stop=False, meets=frozenset(), moves=frozenset()):
 # ── the lifter ──────────────────────────────────────────────────────────────
 
 class Lifter:
+    #: Whether the last `_reload` fell back to the load's own register; see `_reload`.
+    _reload_blind = False
+
     def __init__(self, blocks, pool_map=None, receiver=None, arity=None, dispatch=None,
                  selectors=None, entry=None, fields=None):
         self.blocks = blocks
@@ -2707,6 +2710,10 @@ class Lifter:
         #: add to it, and only `_phi` reads `self.hoist`, so deciding off `phi_names` put
         #: names in the set that nothing could act on (#198 review).
         self.phi_minted: set = set()
+        #: The names `_name_blind` minted. Hoisted by the same rule as a phi name and for
+        #: the same reason: the declaration sits where the load is, which can be inside a
+        #: block a later reader is outside of (#198).
+        self.blind_named: set = set()
         #: The registers each spelled record named, so `_lift_function` can tell whether
         #: the prior above would change an answer and pay for the extra walk only then.
         self.spelled_regs: set = set()
@@ -3713,8 +3720,67 @@ class Lifter:
                         and not any(r in self._printed_regs or r in self.printed_prior
                                     for r in _slot_regs(v.text))):
                     self.spelled_regs.update(_slot_regs(v.text))
+                    self._reload_blind = False
                     return v
+        # Whether the fallback ran, which the caller cannot tell from the value: a slot
+        # that held this very register reads back the same text as the fallback spells.
+        self._reload_blind = not got.text
         return got if got.text else V(canon(reg), P_ATOM)
+
+    def _frame_read(self, base: str, disp: int) -> V:
+        """A frame slot spelled as the read it is, `(FP - 8).field_0x1`.
+
+        Spelled the way the lifter already spells the SAME address when it is held in a
+        register: `sub x0, x29, #0x40; ldur x3, [x0, #8]` prints `(FP - 64).field_0x9`,
+        and `mov x0, x15; ldur x3, [x0, #0x10]` prints `SP.field_0x11`. So the negative
+        part of the displacement goes into the base expression and the field offset
+        carries the tag bias, which is what `record_drop` and `_FRAME_TEXT_RE` both
+        document.
+
+        Not `_byte_off`: the frame registers are untagged, and taking its answer here
+        would print `.tags`, the object header, for a read at the base itself, and a
+        negative field offset for the frame slots that matter, which are all below FP.
+        """
+        addr, off = V(_T.roles.get(base) or base, P_ATOM), disp
+        if disp < 0:
+            addr, off = _bin(addr, "-", _num(-disp), P_ADD), 0
+        return self._field(addr, off + 1)
+
+    def _name_blind(self, st: State, base: str, mn: str, blind: list) -> list:
+        """Name what a DECLINED frame reload read, rather than keep the load's register.
+
+        The fallback in `_reload` spells the load's own register, and the printed body
+        reads a register it never assigns as the value the function came in with, so the
+        output said the destination still held its entry argument. It does not: the load
+        happened. Every cause of a decline gives the same silent wrong read, and most of
+        them cannot be fixed by remembering a spelling, because once a path may have
+        written the slot neither the register nor a name for it is what the load reads
+        (#198). What the lifter does know is the read, so it says that and names it, which
+        is `_phi_name`'s rule at the other end: always a fresh one, never the register.
+
+        A register nothing reads again is left alone; naming it would print a line for a
+        value the reader never meets.
+        """
+        out = []
+        for reg, op, disp in blind:
+            if not (self._live_after & _reg_mask((reg,))):
+                continue
+            v = self._frame_read(base, disp)
+            width, signed = _access_width(mn, op), mn in _SIGNED_LOADS
+            if _reg_file(op) == "x" and (width < 4 or width < 8 and signed):
+                v = _extended(v, 8 * width, signed)
+            tmp = f"t{st.tmpc[0]}"
+            st.tmpc[0] += 1
+            self.blind_named.add(tmp)
+            if tmp in self.hoist:
+                # Declared at the top instead, as `_phi` does: the read stays here, where
+                # the memory holds what it holds, and only the declaration moves.
+                self.hoisted.add(tmp)
+                out.append(f"{tmp} = {v.text};")
+            else:
+                out.append(f"var {tmp} = {v.text};")
+            st.set(reg, V(tmp, P_ATOM))
+        return out
 
     def _overwrite(self, st: State, at, base: str, lo: int, width: int, second):
         """Forget the slots off `base` that the store at `at` of `width` bytes to `lo`,
@@ -4592,13 +4658,18 @@ class Lifter:
                     self._last_mem = None
                     self._frame_moved(st, base, delta)
                     return []
-                st.set(dst, self._reload(st, f"{base}{disp:+d}", mn, ops[0]))
+                got = self._reload(st, f"{base}{disp:+d}", mn, ops[0])
+                blind = [(canon(ops[0]), ops[0], disp)] if self._reload_blind else []
+                st.set(dst, got)
                 if second:
-                    st.set(second[0],
-                           self._reload(st, f"{base}{second[1]:+d}", mn, ops[1]))
+                    g2 = self._reload(st, f"{base}{second[1]:+d}", mn, ops[1])
+                    if self._reload_blind:
+                        blind.append((canon(ops[1]), ops[1], second[1]))
+                    st.set(second[0], g2)
+                out = self._name_blind(st, base, mn, blind)
                 self._last_mem = ("load", base, disp, dst)
                 self._frame_moved(st, base, delta)
-                return []
+                return out
             if index is not None or base in st.elem:          # element load
                 st.set(dst, self._elem_access(base, index, scale, st, disp))
                 return self._bump(st, base, delta)
@@ -7418,12 +7489,17 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         they will SHIP: deciding on the raw walk hoists for readers a later pass drops.
         The view it judges has no top declarations yet, so every already-hoisted name
         reads as undeclared in it and this always re-reports the whole current set. The
-        caller's loop therefore has to test for GROWTH rather than for emptiness."""
+        caller's loop therefore has to test for GROWTH rather than for emptiness.
+
+        `_name_blind`'s names too, for the same reason and by the same split, so naming a
+        declined reload does not trade a wrong read for an out-of-scope one (#198)."""
         shipped_body = _inline_single_use(
-            _drop_dead_phis(_drop_unread_slots(_drop_unread(body, lf.raw_names),
-                                               lf.slot_names), lf.phi_names),
+            _drop_dead_phis(_drop_unread_slots(
+                _drop_unread(body, lf.raw_names | lf.blind_named), lf.slot_names),
+                lf.phi_names),
             lf.results | lf.slot_names, lf.slot_names)
-        return frozenset(_out_of_scope(shipped_body) & lf.phi_minted)
+        return frozenset(_out_of_scope(shipped_body)
+                         & (lf.phi_minted | lf.blind_named))
 
     hoist = wants_hoist(lifter, lines) or None
     carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
@@ -7477,7 +7553,13 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         pad = indent * depth
         decls = [f"{pad}var {n};" for n in sorted(top, key=lambda n: int(n[1:]))]
         lines = decls + lines
-    lines = _drop_unread_slots(_drop_unread(lines, lifter.raw_names), lifter.slot_names)
+    # `blind_named` too: a declined reload is named where liveness says the register is
+    # read again, and a later pass can take that reader away. Left in, 2,192 such reads
+    # shipped as a declaration nothing reads over the clean build; this drops 1,903 of
+    # them. The 289 left are the hoisted split, `var tN;` apart from `tN = ...;`, which
+    # the one-occurrence test here does not match (#198).
+    lines = _drop_unread_slots(
+        _drop_unread(lines, lifter.raw_names | lifter.blind_named), lifter.slot_names)
     lines = _drop_dead_phis(lines, lifter.phi_names)
     return _inline_single_use(lines, lifter.results | lifter.slot_names,
                               lifter.slot_names)
