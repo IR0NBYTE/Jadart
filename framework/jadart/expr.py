@@ -3759,14 +3759,25 @@ class Lifter:
         is `_phi_name`'s rule at the other end: always a fresh one, never the register.
 
         A register nothing reads again is left alone; naming it would print a line for a
-        value the reader never meets.
+        value the reader never meets. Liveness is asked with `_regs`, which is how the
+        liveness sets are keyed: `canon` leaves `q0`, `v0`, `h0` and `b0` alone where
+        `_regs` calls them all `d0`, so testing the state key minted an unknown bit that
+        is never live and 1,169 reads off FP that ARE read again were passed over.
+
+        And only where the text can say what was read. A field read is eight bytes, which
+        `_extended` narrows for the general file, as `_reload` does for a slot's value.
+        The other file has no such spelling, so a 16-byte `q` read, or a 4, 2 or 1-byte
+        one, declines rather than claim eight: a decline is recoverable and a width that
+        is not what the machine read is not.
         """
         out = []
         for reg, op, disp in blind:
-            if not (self._live_after & _reg_mask((reg,))):
+            if not (self._live_after & _reg_mask(tuple(_regs((op,))))):
+                continue
+            width, signed = _access_width(mn, op), mn in _SIGNED_LOADS
+            if _reg_file(op) != "x" and width != 8:
                 continue
             v = self._frame_read(base, disp)
-            width, signed = _access_width(mn, op), mn in _SIGNED_LOADS
             if _reg_file(op) == "x" and (width < 4 or width < 8 and signed):
                 v = _extended(v, 8 * width, signed)
             tmp = f"t{st.tmpc[0]}"
@@ -7554,12 +7565,17 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         decls = [f"{pad}var {n};" for n in sorted(top, key=lambda n: int(n[1:]))]
         lines = decls + lines
     # `blind_named` too: a declined reload is named where liveness says the register is
-    # read again, and a later pass can take that reader away. Left in, 2,192 such reads
-    # shipped as a declaration nothing reads over the clean build; this drops 1,903 of
-    # them. The 289 left are the hoisted split, `var tN;` apart from `tN = ...;`, which
-    # the one-occurrence test here does not match (#198).
+    # read again, and 2,192 such reads shipped as a declaration nothing reads over the
+    # clean build without this (#198).
     lines = _drop_unread_slots(
         _drop_unread(lines, lifter.raw_names | lifter.blind_named), lifter.slot_names)
     lines = _drop_dead_phis(lines, lifter.phi_names)
-    return _inline_single_use(lines, lifter.results | lifter.slot_names,
-                              lifter.slot_names)
+    lines = _inline_single_use(lines, lifter.results | lifter.slot_names,
+                               lifter.slot_names)
+    # And once more, for those names only. Each pass above can delete the last READER of
+    # a name, which leaves the declaration behind: 417 frame reads shipped unread for
+    # that reason, every one of them a line the first call would have taken had it run
+    # after. Restricted to `blind_named` on purpose. The other emitters' names have the
+    # same pass-order limit, 3,878 of them on the clean build, and taking those too is a
+    # far wider changed answer than this one concern.
+    return _drop_unread(lines, lifter.blind_named)

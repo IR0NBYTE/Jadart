@@ -28,20 +28,30 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
       var t0 = (FP - 8).field_0x1;
       x2.field_0x8 = t0;
 
-  spelled the way the lifter already spells that address when it is held in a register.
-  **A changed answer, and a wide one.** On the clean build, over all 8,194 ranges:
-  **171,119 lines to 182,305**, and **lines carrying a bare machine register 38,140 to
-  26,614**, by `tools/quality.py`'s own count. Raw arm64 lines do not move, 1,553 either
-  way, and reads of a name out of its declaration's scope go 171 to 164 because the new
-  names are hoisted by the same rule as a phi name. Names nothing reads go 4,713 to
-  5,002: the drop pass takes 1,903 of the 2,192 the naming adds, and the 289 left are
-  the hoisted split, which its one-occurrence test does not match. Where the slot held
-  the load's own register the old output was right, and those are a named read now: still
-  right, and no longer spelled exactly like a reload that had given up. No record of what
-  a slot held closes this class, which is what the attempts on #198 kept finding: once a
-  path may have written the slot, neither the register nor a name for the register is
-  what the load reads. Naming the value at the spill measured four fewer reads for 1.7%
-  more output (#198).
+  The address is the base expression and `.field_0x1` is the read at it, which is the
+  spelling the lifter already prints when that address is held in a register.
+  `docs/usage.md` now says so, and says that FP and SP mean those registers at that line.
+
+  **A changed answer, and a wide one.** `tools/quality.py` on the clean build: lines
+  173,025 to 185,979, **lines carrying a bare machine register 33,797 to 20,678**, 19.5%
+  of the output to 11.1%, byte-offset field lines 44,423 to 55,127, 25.7% to 29.6%, raw
+  arm64 lines 1,553 either way and every other symptom unchanged to the line. Over the
+  same ranges through `pbfuzz.census`, which lifts without a receiver, arity or field
+  names: 171,119 lines to 181,892 and reads of a name out of its declaration's scope 171
+  in 122 ranges to 164 in 115, on the obfuscated build too. Names nothing reads go 4,713
+  to 4,589, below where they started, because the pass that drops them runs once more for
+  these names after the passes that can delete a reader.
+
+  Where the slot held the load's own register the old output was right, 904 of that class
+  on the clean build, and those are a named read now: still right at that line, and no
+  longer spelled exactly like a reload that had given up.
+
+  **What it does not do.** A 16-byte `q` or `v` read declines rather than claim the eight
+  bytes a field spelling says, 1,169 of them off FP on the clean build that are read
+  again. And no record of what a slot held closes this class, which is what the attempts
+  on #198 kept finding: once a path may have written the slot, neither the register nor a
+  name for the register is what the load reads. Naming the value at the spill measured
+  four fewer reads for 1.7% more output (#198).
 
 - **A name is no longer read after its declaration has closed.** `_phi` declares its name
   at the level of the `if` it belongs to, which dominates the arms but not the reader:

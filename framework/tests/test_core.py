@@ -953,6 +953,7 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
             # on `named` below still checks.
             m = re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;", body)
             assert m and f"return {m.group(1)};" in body, (why, body)
+            assert body.count("var ") == 1, (why, body)
         else:
             assert "var " not in body, (why, body)
             assert "return " + ("x20.field_0xc;" if want is None else want[7:]) in body, (
@@ -11749,9 +11750,10 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
     # declaration the goto-entered arm needs must be BARE, with no initialiser.
     assert not any(re.fullmatch(r"var t\d+ = x0;", l) for l in body), body
     assert any(re.fullmatch(r"var t\d+;", l) for l in body), body
-    bare = next(re.fullmatch(r"var (t\d+);", l).group(1) for l in body
-                if re.fullmatch(r"var t\d+;", l))
-    assert body.index("L_0xae0b0:") < body.index(f"{bare} = x0;"), body
+    bare = [re.fullmatch(r"var (t\d+);", l).group(1) for l in body
+            if re.fullmatch(r"var t\d+;", l) and f"{l[4:-1]} = x0;" in body]
+    assert len(bare) == 1, (bare, body)
+    assert body.index("L_0xae0b0:") < body.index(f"{bare[0]} = x0;"), body
     # ...and a phi an entered arm sets is set on every path into the `if`'s join, though
     # not on every path through its head: `ui.dart`'s goto into the arm keeps reading it.
     cr = next(c for c in image.all_ranges if c.pc_offset == 0x18d4e4)
@@ -12823,7 +12825,8 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
     assert lift(reload, None)[:3] == [
         "foo(...);", "var t0 = (FP - 8).field_0x1;", "t0.field_0x8 = d0;"]
     # Where the callers say nothing, the callee's own code decides (code_d0).
-    assert lift(reload, None, own=True)[0] == "var t0 = foo(...);"
+    assert lift(reload, None, own=True)[:3] == [
+        "var t0 = foo(...);", "var t1 = (FP - 8).field_0x1;", "t1.field_0x8 = t0;"]
     assert lift(reload, None, own=False)[:3] == [
         "foo(...);", "var t0 = (FP - 8).field_0x1;", "t0.field_0x8 = d0;"]
     mixed = [("cbz", "x1, #0x10", ""), ("bl", "#0x100", "  ; -> foo"), ("b", "#0x14", ""),
@@ -13947,6 +13950,19 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
     # Only the half of a pair that is read again is named.
     assert lift([("ldp", "x3, x4, [x29, #-0x10]")] + keep)[:2] == [
         "var t0 = (FP - 16).field_0x1;", "x2.field_0x8 = t0;"]
+    # Liveness is keyed by `_regs` and not by `canon`, and the two disagree for the
+    # floating-point file. Asking the state key minted a bit that is never live, so every
+    # `q`, `v`, `h` and `b` reload was passed over however it was read: 1,169 of them off
+    # FP on the clean build, in 260 ranges.
+    from jadart.expr import _regs, canon
+    assert canon("q3") == "q3" and _regs(("q3",)) == {"d3"}
+    # A width the field spelling cannot say declines rather than claim eight bytes. The
+    # general file has `_extended` for that and the other one has nothing.
+    for r in ("q3", "v3", "s3", "h3", "b3"):
+        got = lift([("ldur", f"{r}, [x29, #-8]"), ("stur", f"{r}, [x2, #7]")] + keep)
+        assert not any("field_0x" in l and "var " in l for l in got), (r, got)
+    assert lift([("ldur", "d3, [x29, #-8]"), ("stur", "d3, [x2, #7]")] + keep)[:2] == [
+        "var t0 = (FP - 8).field_0x1;", "x2.field_0x8 = t0;"]
     # A guard: a register nothing reads again gets no line, because naming it would print
     # a value the reader never meets.
     assert lift([("ldur", "x3, [x29, #-8]"), ("mov", "x3, #1")] + keep)[0] == (
@@ -14426,6 +14442,8 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
         "(FP - 8).field_0x1")
     assert lift(frame(0x20, spill, ("mov", "x29, x15"), load, *keep))[:2] == gone_at(
         "(FP - 40).field_0x1")
+    # FP here is the pointer the `ldr` just put in it, not the frame the function was
+    # entered with, and the text means the register at that line; see docs/usage.md.
     assert lift(frame(0x20, spill, ("ldr", "x29, [x1]"), load, *keep))[:2] == gone_at(
         "(FP - 8).field_0x1")
     # FP moved by an amount known reads its slots where they now are.
