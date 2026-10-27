@@ -10904,7 +10904,9 @@ _GOTO_SHAPES = {
                   (0x54ffff61, "b.ne", "#4"), (0xd2800000, "mov", "x0, #0"),
                   (0xd65f03c0, "ret", ""), (0x94000037, "bl", "#0x100"),
                   (0xd65f03c0, "ret", "")],
-                 None, ["var t1 = t0;", "t0 += 1;", "goto L_0x24;"],
+                 # `t1` is read at the goto target, outside the block `_arrive` pins it
+                 # in, so its declaration is hoisted and the assignment stays here (#204).
+                 None, ["t1 = t0;", "t0 += 1;", "goto L_0x24;"],
                  "return sub_0x100(t1);", "return sub_0x100(t0);"),
     # The target reads x4 and x6, which hold t0 from BEFORE the write-back, and reloads
     # `t0 + 2` from a frame slot: each value is written out once, while it still means
@@ -10920,7 +10922,8 @@ _GOTO_SHAPES = {
                 (0x8b060080, "add", "x0, x4, x6"), (0x8b090000, "add", "x0, x0, x9"),
                 (0xd65f03c0, "ret", "")],
                {"x1": 3},
-               ["var t1 = t0;", "var t2 = t0 + 2;", "t0 += 1;", "goto L_0x34;"],
+               # Both are read at the goto target, so both declarations hoist (#204).
+               ["t1 = t0;", "t2 = t0 + 2;", "t0 += 1;", "goto L_0x34;"],
                "return t1 + t1 + t2;", "return t0 + t0 + (t0 + 2);"),
     # The inner loop's `break` writes t2 back, then the outer loop's goto leaves: the
     # shape parsePartialString has, where no write-back sits next to the goto at all.
@@ -10982,8 +10985,10 @@ def test_a_goto_target_reads_what_the_jump_left():
     finally:
         expr.Lifter.__init__ = init
     # A second walk is what keeps a value written out for nothing out of the output;
-    # one nothing past the jump can read is not written out to begin with.
-    assert [lifted[k][1] for k in ("renamed", "joined", "pinned")] == [1, 1, 2], lifted
+    # one nothing past the jump can read is not written out to begin with. `pinned` takes
+    # a third now: its two pins are read at the goto target, so the hoist wants them and
+    # the hoist decides on the lines as they will ship, which costs one more walk (#204).
+    assert [lifted[k][1] for k in ("renamed", "joined", "pinned")] == [1, 1, 3], lifted
 
     # And on a CPU: the value the printed program returns is the one the machine does.
     if not _unicorn_available() or not _capstone_available():
@@ -13924,9 +13929,9 @@ def test_a_name_is_not_read_after_its_declaration_closed():
 
     got = pbfuzz.census(CLEAN)
     assert got["lifted"] > 8000, f"only {got['lifted']} ranges lifted"
-    assert got["oos"] <= 164, (
+    assert got["oos"] <= 28, (
         f"{got['oos']} reads of a name whose declaration has closed, in "
-        f"{got['oos_fns']} ranges, up from 164 in 115; see #198 and #204")
+        f"{got['oos_fns']} ranges, up from 28 in 11; see #204")
 
 
 def test_a_declined_frame_reload_names_the_read_and_not_the_register():

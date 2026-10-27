@@ -2735,6 +2735,10 @@ class Lifter:
         #: the same reason: the declaration sits where the load is, which can be inside a
         #: block a later reader is outside of (#198).
         self.blind_named: set = set()
+        #: EVERY name `_mint` hands out. `wants_hoist` asks this, so a name is hoistable
+        #: whichever site minted it. Before, only `_phi`'s and `_name_blind`'s were
+        #: hoistable, and a name any other site minted was not (#204).
+        self.minted: set = set()
         #: The registers each spelled record named, so `_lift_function` can tell whether
         #: the prior above would change an answer and pay for the extra walk only then.
         self.spelled_regs: set = set()
@@ -2911,9 +2915,8 @@ class Lifter:
                 continue
             if not (self._live_after & _reg_mask((key,))):
                 continue
-            tmp = f"t{st.tmpc[0]}"
-            st.tmpc[0] += 1
-            out.append(f"var {tmp} = {v.text};")
+            tmp, decl = self._mint(st, v.text)
+            out.append(decl)
             st.reg[key] = V(tmp, P_ATOM)
         return out
 
@@ -3462,10 +3465,10 @@ class Lifter:
         out = []
         tmp = named.get(v.text)
         if tmp is None:
-            tmp = named[v.text] = f"t{st.tmpc[0]}"
-            st.tmpc[0] += 1
+            tmp, decl = self._mint(st, v.text)
+            named[v.text] = tmp
             self.slot_names.add(tmp)
-            out.append(f"var {tmp} = {v.text};")
+            out.append(decl)
         if st.reg.get(reg) == v:
             st.reg[reg] = V(tmp, P_ATOM)
         st.slot[key] = V(tmp, P_ATOM)
@@ -3597,11 +3600,10 @@ class Lifter:
             reg = (_T.ret_fp if fp and not self._live_after & _reg_mask((_T.ret_int,))
                    else _T.ret_int)
         if self._live_after & _reg_mask((reg,)):
-            name = f"t{st.tmpc[0]}"
-            st.tmpc[0] += 1
+            name, decl = self._mint(st, expr)
             self.results.add(name)
             st.set(reg, V(name, P_ATOM))
-            return [f"var {name} = {expr};"]
+            return [decl]
         st.set(reg, V(reg, P_ATOM))
         return [f"{expr};"]
 
@@ -3629,9 +3631,8 @@ class Lifter:
                 pat = re.compile(rf"\b{re.escape(dst)}\b")
                 for r, v in sorted(vals.items()):
                     if pat.search(v.text):
-                        name = f"t{st.tmpc[0]}"
-                        st.tmpc[0] += 1
-                        out.append(f"var {name} = {v.text};")
+                        name, decl = self._mint(st, v.text)
+                        out.append(decl)
                         vals[r] = V(name, P_ATOM)
             self._flags = (mn, op, vals, regs)
         elif mn in _FLAG_KILL:
@@ -3803,16 +3804,9 @@ class Lifter:
             v = self._frame_read(base, disp)
             if _reg_file(op) == "x" and (width < 4 or width < 8 and signed):
                 v = _extended(v, 8 * width, signed)
-            tmp = f"t{st.tmpc[0]}"
-            st.tmpc[0] += 1
+            tmp, decl = self._mint(st, v.text)
             self.blind_named.add(tmp)
-            if tmp in self.hoist:
-                # Declared at the top instead, as `_phi` does: the read stays here, where
-                # the memory holds what it holds, and only the declaration moves.
-                self.hoisted.add(tmp)
-                out.append(f"{tmp} = {v.text};")
-            else:
-                out.append(f"var {tmp} = {v.text};")
+            out.append(decl)
             st.set(reg, V(tmp, P_ATOM))
         return out
 
@@ -3970,6 +3964,34 @@ class Lifter:
         self._printed_regs.add(base)
         return out
 
+    def _mint(self, st: State, text: str, pad: str = "") -> tuple:
+        """Allocate a name for `text` and return it with the line that declares it.
+
+        One place for it, because thirteen sites allocated `t{tmpc}` themselves and then
+        each decided for itself whether the name could be hoisted. Only `_phi` and
+        `_name_blind` could, so a name any other site minted and a later line read outside
+        the block it was declared in was a read of something undeclared: 164 of them in
+        115 of 8,194 ranges, which is #204. Minting here puts every name in `self.minted`,
+        which is what `_lift_function.wants_hoist` asks.
+
+        Hoisted, the DECLARATION moves to the top of the body and the assignment stays
+        where the value is, because the text means what it means at this line and not at
+        the top. That split is `_phi`'s, and the reason it is not just a `var` at the top
+        is in its comment (#198).
+
+        Which pass may DROP the name is still the caller's to say, by adding it to
+        `results`, `slot_names`, `phi_names` or `raw_names`: those three passes keep
+        different things (a slot name's initialiser chain, a phi's block, a one-occurrence
+        test) and folding them together is not this change.
+        """
+        name = f"t{st.tmpc[0]}"
+        st.tmpc[0] += 1
+        self.minted.add(name)
+        if name in self.hoist:
+            self.hoisted.add(name)
+            return name, f"{pad}{name} = {text};"
+        return name, f"{pad}var {name} = {text};"
+
     def _pin(self, st: State, name: str, live=None) -> list:
         """Give a name to every tracked value that mentions `name`, before `name` changes.
 
@@ -4003,9 +4025,8 @@ class Lifter:
                     continue
                 if live is not None and holder is st.reg and not live & _reg_mask((key,)):
                     continue
-                tmp = f"t{st.tmpc[0]}"
-                st.tmpc[0] += 1
-                out.append(f"var {tmp} = {v.text};")
+                tmp, decl = self._mint(st, v.text)
+                out.append(decl)
                 holder[key] = V(tmp, P_ATOM)
         for key, (b, i, _s, _f) in list(st.elem.items()):
             if pat.search(b.text) or pat.search(i.text):
@@ -4063,9 +4084,8 @@ class Lifter:
                 continue                      # already names a reassigned register: stale
             if guard_feed and self._feeds_selfref(key, v.text, self._at + 1):
                 continue                      # feeds a later self-referential store
-            tmp = f"t{st.tmpc[0]}"
-            st.tmpc[0] += 1
-            out.append(f"var {tmp} = {v.text};")
+            tmp, decl = self._mint(st, v.text)
+            out.append(decl)
             st.reg[key] = V(tmp, P_ATOM)
             st.elem.pop(key, None)
             st.poolbase.pop(key, None)
@@ -4136,9 +4156,8 @@ class Lifter:
                 continue
             if not reads(v.text):
                 continue
-            tmp = f"t{st.tmpc[0]}"
-            st.tmpc[0] += 1
-            out.append(f"var {tmp} = {v.text};")
+            tmp, decl = self._mint(st, v.text)
+            out.append(decl)
             self.raw_names.add(tmp)
             st.reg[key] = V(tmp, P_ATOM)
         # A stack slot has no liveness to consult, it is read back by a later load or not
@@ -5122,9 +5141,9 @@ class Lifter:
                         else:
                             del held[k]
                         continue
-                    n = pinned[v.text] = f"t{st.tmpc[0]}"
-                    st.tmpc[0] += 1
-                    out.append(f"{pad}var {n} = {v.text};")
+                    n, decl = self._mint(st, v.text, pad)
+                    pinned[v.text] = n
+                    out.append(decl)
                     self.pins[n] = (addr, side, k)
                     # Set on the goto's path, and that is every path into its one-way
                     # target; see the join in `walk`.
@@ -5676,9 +5695,8 @@ class Lifter:
             if not any(_use_re(o).search(v.text) for o in earlier):
                 post.append(pad + self._assign(V(name, P_ATOM), v))
             else:
-                tmp = f"t{st.tmpc[0]}"
-                st.tmpc[0] += 1
-                pre.append(f"{pad}var {tmp} = {v.text};")
+                tmp, decl = self._mint(st, v.text, pad)
+                pre.append(decl)
                 post.append(f"{pad}{name} = {tmp};")
             earlier.append(name)
         return pre + post
@@ -7555,15 +7573,16 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         reads as undeclared in it and this always re-reports the whole current set. The
         caller's loop therefore has to test for GROWTH rather than for emptiness.
 
-        `_name_blind`'s names too, for the same reason and by the same split, so naming a
-        declined reload does not trade a wrong read for an out-of-scope one (#198)."""
+        EVERY name `_mint` handed out, not just the two kinds that used to be hoistable:
+        a name any other site minted and a later line read outside its block was a read of
+        something undeclared, 164 of them in 115 ranges (#204). `phi_minted` stays in the
+        union because `_phi` mints its own, outside `_mint`."""
         shipped_body = _inline_single_use(
             _drop_dead_phis(_drop_unread_slots(
                 _drop_unread(body, lf.raw_names | lf.blind_named), lf.slot_names),
                 lf.phi_names),
             lf.results | lf.slot_names, lf.slot_names)
-        return frozenset(_out_of_scope(shipped_body)
-                         & (lf.phi_minted | lf.blind_named))
+        return frozenset(_out_of_scope(shipped_body) & (lf.minted | lf.phi_minted))
 
     hoist = wants_hoist(lifter, lines) or None
     carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
