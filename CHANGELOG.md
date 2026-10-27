@@ -13,6 +13,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A name is hoistable whichever site minted it.** Thirteen places allocated
+  `t{tmpc}` themselves and then each decided for itself whether the name could be
+  hoisted into scope. Only two could, `_phi` and `_name_blind`, so a name any other site
+  minted and a later line read outside the block it was declared in was a read of
+  something undeclared. `_mint` hands out every name now and owns the hoist split, the
+  declaration going to the top of the body and the assignment staying where the value is,
+  and `_lift_function` asks one set rather than two. Over all 8,194 clean ranges and
+  8,188 obfuscated ones, **reads of a name whose declaration has closed go 164 in 115
+  ranges to 28 in 11**, the same on both. 36 fewer lines carry a bare machine register as
+  well, because a name in scope is a name the reader can be given. Output grows 167 lines
+  for the declarations that moved, and one synthetic shape takes a third walk because the
+  hoist decides on the lines as they will ship.
+
+  What is left is in one pathological function and `_concatAll`: names minted by `_phi`
+  and `_join_write`, which allocate outside `_mint` and declare elsewhere, plus the four
+  that are declared nowhere at all (#205). Raising the hoist's iteration bound from 4 to
+  12 changes none of them, so the residue is not a bound.
+
+
 - **Liveness is asked about one register however the operand spells it.** `d0`, `s0`,
   `v0`, `q0`, `h0`, `b0` and `v0.16b` are one machine register, and `_regs` builds every
   liveness set calling them all `d0`. The STATE is keyed by `canon`, which keeps the view
