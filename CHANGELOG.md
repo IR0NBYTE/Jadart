@@ -13,6 +13,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A raw line no longer crashes on a pinned name the hoist took.** `_verbatim` collects
+  the names `_pin` wrote out into `raw_names` by matching each line as a declaration, and
+  a name the hoist took is not one: it declares at the top of the body and assigns where
+  the value is, `tN = ...;`, which the pattern does not match because it requires `var`.
+  Matching unconditionally raised `AttributeError`, and an exception that escapes is exit
+  3, a bug in Jadart rather than bad input. Nothing on either fixture hoists a name `_pin`
+  writes out, so this shipped green with the hoist in; the first change that made
+  `_verbatim` fire more often found it (#212, found working on #176).
+
+
 - **A bare `q` or `v` register is counted.** `tools/quality.py`'s register pattern matched
   `w`, `x`, `d` and `s` only, so a line whose only register was `q0` or `v1` counted as
   carrying none, and `pbfuzz.census`'s `regline` inherited that because it uses that same

@@ -11872,6 +11872,34 @@ def test_a_bitfield_reads_as_wide_as_its_field():
                 x = rng.getrandbits(64)
                 assert dart(t, x) == arm(mn, x, lsb, width), (mn, lsb, width, t, hex(x))
 
+def test_a_raw_line_survives_a_pinned_name_the_hoist_took():
+    """`_verbatim` reads `_pin`'s lines as declarations, and a hoisted one is not.
+
+    A name the hoist took declares at the top of the body and ASSIGNS where the value is,
+    `tN = ...;`, which `_DECL_RE` does not match because it requires `var`. `_verbatim`
+    matched unconditionally to collect the names into `raw_names`, so such a line raised
+    AttributeError, and an exception that escapes is exit 3: a bug in Jadart rather than
+    bad input, which the threat model puts above a wrong answer.
+
+    Nothing on either fixture hoists a name `_pin` writes out, which is why #212 shipped
+    this green. The first change that makes `_verbatim` fire more often finds it, and one
+    did: see #176."""
+    from jadart.expr import Lifter, State, _DECL_RE
+
+    hoisted = "t7 = x1 + 8;"
+    assert _DECL_RE.match(hoisted) is None, "the premise: it is not a declaration"
+    lf = Lifter.__new__(Lifter)
+    lf.raw_names = set()
+    lf._printed_regs = set()
+    lf._live_after = 0
+    lf.alias = {}
+    lf._pin = lambda st, r, live=None: [hoisted, "var t8 = x2;"]
+    out = Lifter._verbatim(lf, State(), "adcs", "x1, x1, x3", "x1, x1, x3")
+    assert any(l.startswith("adcs") for l in out), out
+    # Only the declaration contributes a name; the assignment is already declared above.
+    assert lf.raw_names == {"t8"}, lf.raw_names
+
+
 def test_liveness_is_asked_about_one_register_however_the_operand_spells_it():
     """`_reg_mask` maps to the LIVENESS identity, so a state key asks the right question.
 
