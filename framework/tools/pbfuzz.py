@@ -633,7 +633,7 @@ def _census_hooks(expr):
     hist, alive, walk = {}, [], {"cur": None}
     tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "name": 0,
            "expr": 0, "never": 0, "ranges": 0, "oos": 0, "oos_fns": 0, "lifted": 0,
-           "regline": 0}
+           "regline": 0, "empty": 0}
     saved = {n: getattr(expr.State, n)
              for n in ("note_slot", "record_drop", "forget_slot", "copy",
                        "stale_on_write")}
@@ -766,6 +766,10 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
                 regex and not a copy of it. A frame reload that declines used to keep the
                 load's register and print nothing, so this is where #198's fix shows:
                 every decline it names is a line that stops reading a register (#198)
+      empty     blocks the rendering leaves holding nothing, `if (c) {` with `}` under
+                it. Must be 0. A pass that drops a declaration nothing reads can take
+                the only line an `if` arm has, which is why three of them carry a guard
+                against it; 112 of these shipped on the clean build while one did not
       spelled   records `_reload` spelled instead of falling back
       stale     records spelled although this path superseded them; must be 0 (#199)
 
@@ -816,6 +820,9 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
                     tot["oos_fns"] += 1
                 tot["lifted"] += 1
                 tot["regline"] += sum(1 for l in lines if _REG_RE.search(l))
+                flat = [l.strip() for l in lines]
+                tot["empty"] += sum(1 for a, b in zip(flat, flat[1:])
+                                    if a.endswith("{") and b.startswith("}"))
             w = walk["cur"]
             if w is None or lines is None:
                 continue

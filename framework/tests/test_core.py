@@ -13950,14 +13950,24 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
     # Only the half of a pair that is read again is named.
     assert lift([("ldp", "x3, x4, [x29, #-0x10]")] + keep)[:2] == [
         "var t0 = (FP - 16).field_0x1;", "x2.field_0x8 = t0;"]
+    # The pass that drops a name nothing reads keeps one that is all its block holds: an
+    # `if` arm is the walk's to render, and taking its only line prints `if (c) {` with
+    # `}` under it. 112 empty blocks in 47 ranges of the clean build shipped without this.
+    from jadart.expr import _drop_unread
+    sole = ["  if (c) {", "    var t0 = (FP - 8).field_0x1;", "  }", "  f(x1);"]
+    assert _drop_unread(sole, {"t0"}) == sole, _drop_unread(sole, {"t0"})
+    more = ["  if (c) {", "    var t0 = (FP - 8).field_0x1;", "    f(x1);", "  }"]
+    assert _drop_unread(more, {"t0"}) == [more[0], more[2], more[3]]
     # Liveness is keyed by `_regs` and not by `canon`, and the two disagree for the
     # floating-point file. Asking the state key minted a bit that is never live, so every
     # `q`, `v`, `h` and `b` reload was passed over however it was read: 1,169 of them off
     # FP on the clean build, in 260 ranges.
     from jadart.expr import _regs, canon
     assert canon("q3") == "q3" and _regs(("q3",)) == {"d3"}
-    # A width the field spelling cannot say declines rather than claim eight bytes. The
-    # general file has `_extended` for that and the other one has nothing.
+    # A width the field spelling cannot say declines rather than claim eight bytes: the
+    # general file has the `_extended` convention for that and the other one has none.
+    # Only `s3` is a regression case, since `canon` already called it `d3` and the old
+    # test matched; the rest are guards that hold either way.
     for r in ("q3", "v3", "s3", "h3", "b3"):
         got = lift([("ldur", f"{r}, [x29, #-8]"), ("stur", f"{r}, [x2, #7]")] + keep)
         assert not any("field_0x" in l and "var " in l for l in got), (r, got)
@@ -14037,6 +14047,13 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     assert got["regline"] <= 26614, (
         f"{got['regline']} lines carry a bare machine register, up from 26614; a reload "
         f"that declines must name the read and not keep the register (#198)")
+    # And no block is left holding nothing. A pass that drops a declaration nothing reads
+    # can take the only line an `if` arm has: `_drop_unread_slots`, `_drop_dead_phis` and
+    # `_drop_unread` each guard against it, and 112 empty blocks in 47 ranges shipped
+    # while the third one did not. There is no acceptable number of these.
+    assert got["empty"] == 0, (
+        f"{got['empty']} rendered blocks hold nothing, `if (c) {{` with `}}` under it; a "
+        f"pass dropped the only line an arm had (#198)")
 
     # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
     real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,

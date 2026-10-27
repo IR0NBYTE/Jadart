@@ -33,22 +33,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `docs/usage.md` now says so, and says that FP and SP mean those registers at that line.
 
   **A changed answer, and a wide one.** `tools/quality.py` on the clean build: lines
-  173,025 to 185,979, **lines carrying a bare machine register 33,797 to 20,678**, 19.5%
-  of the output to 11.1%, byte-offset field lines 44,423 to 55,127, 25.7% to 29.6%, raw
+  173,025 to 186,090, **lines carrying a bare machine register 33,797 to 20,678**, 19.5%
+  of the output to 11.1%, byte-offset field lines 44,423 to 55,238, 25.7% to 29.7%, raw
   arm64 lines 1,553 either way and every other symptom unchanged to the line. Over the
   same ranges through `pbfuzz.census`, which lifts without a receiver, arity or field
-  names: 171,119 lines to 181,892 and reads of a name out of its declaration's scope 171
-  in 122 ranges to 164 in 115, on the obfuscated build too. Names nothing reads go 4,713
-  to 4,589, below where they started, because the pass that drops them runs once more for
-  these names after the passes that can delete a reader.
+  names: 171,119 lines to 182,015 and reads of a name out of its declaration's scope 171
+  in 122 ranges to 164 in 115, on the obfuscated build too. Names nothing reads come out
+  at 4,713 against 4,712, level: the pass that drops them runs once more for these names,
+  after the passes that can delete a reader, and it now also keeps one that is all its
+  block holds, which the two beside it already did. An `if` arm is the walk's to render,
+  and taking its only line printed `if (c) {` with `}` under it, 112 times in 47 ranges.
+  `pbfuzz.census` counts those now and the gate holds them at zero.
 
   Where the slot held the load's own register the old output was right, 904 of that class
   on the clean build, and those are a named read now: still right at that line, and no
   longer spelled exactly like a reload that had given up.
 
-  **What it does not do.** A 16-byte `q` or `v` read declines rather than claim the eight
-  bytes a field spelling says, 1,169 of them off FP on the clean build that are read
-  again. And no record of what a slot held closes this class, which is what the attempts
+  **What it does not do.** A read through the floating-point file declines unless it is
+  exactly eight bytes, because that file has no convention for saying less where the
+  general one has `_extended`: a 16-byte `q` or `v`, and a 4, 2 or 1-byte `s`, `h` or `b`.
+  On the clean build that is 1,169 reads off the frame, all of them 16-byte, whose
+  register is read again, so those still print it.
+
+  And no record of what a slot held closes this class, which is what the attempts
   on #198 kept finding: once a path may have written the slot, neither the register nor a
   name for the register is what the load reads. Naming the value at the spill measured
   four fewer reads for 1.7% more output (#198).

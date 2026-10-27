@@ -3764,11 +3764,13 @@ class Lifter:
         `_regs` calls them all `d0`, so testing the state key minted an unknown bit that
         is never live and 1,169 reads off FP that ARE read again were passed over.
 
-        And only where the text can say what was read. A field read is eight bytes, which
-        `_extended` narrows for the general file, as `_reload` does for a slot's value.
-        The other file has no such spelling, so a 16-byte `q` read, or a 4, 2 or 1-byte
-        one, declines rather than claim eight: a decline is recoverable and a width that
-        is not what the machine read is not.
+        And only where the text can say what was read. A field read is eight bytes. The
+        general file has a convention for saying less, which `_reload` uses for a slot's
+        value too: `_extended` below for a byte or a halfword, and a w register left as it
+        is because a w value reads as its low 32 bits anyway. The other file has no such
+        convention, so a read through it declines unless it is exactly eight bytes: a
+        16-byte `q` or `v`, and a 4, 2 or 1-byte `s`, `h` or `b`. A decline is
+        recoverable; a width that is not what the machine read is not.
         """
         out = []
         for reg, op, disp in blind:
@@ -7096,13 +7098,32 @@ def _drop_unread(lines: list, names: set) -> list:
     for ln in lines:
         for m in _TMP_RE.finditer(ln):
             counts[m.group(0)] = counts.get(m.group(0), 0) + 1
-    out = []
-    for ln in lines:
+    drop = {}                              # {line index: the name it declares}
+    for i, ln in enumerate(lines):
         m = _DECL_RE.match(ln)
         if m and m.group(2) in names and counts[m.group(2)] == 1:
-            continue
-        out.append(ln)
-    return out
+            drop[i] = m.group(2)
+    if not drop:
+        return lines
+    # ...except where one is all its block holds. `_drop_unread_slots` and
+    # `_drop_dead_phis` both carry this guard and say why: an `if` arm is the walk's to
+    # render, and taking its only line prints `if (c) {` with `}` under it. Costing
+    # nothing while this ran over `_verbatim`'s names alone, which are pinned beside the
+    # line that needed them and so never stand alone in an arm, and costing 112 empty
+    # blocks in 47 ranges of the clean build once it also runs over `_name_blind`'s,
+    # where a declined reload can be the only thing an arm does (#198).
+    keep, inside = set(), []               # the lines of each block still open
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("}") and inside:
+            body = inside.pop()
+            if body and all(j in drop for j in body):
+                keep.update(drop[j] for j in body)
+        elif inside:
+            inside[-1].append(i)
+        if s.endswith("{"):
+            inside.append([])
+    return [ln for i, ln in enumerate(lines) if i not in drop or drop[i] in keep]
 
 
 def _one_term(text: str) -> bool:
