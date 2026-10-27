@@ -3522,7 +3522,14 @@ class Lifter:
         live = self._live_after & ~_reg_mask(defs)
         for r in sorted(defs):
             out += self._pin(st, r, live)
-        self.raw_names.update(_DECL_RE.match(ln).group(2) for ln in out)
+        # Not every line `_pin` returns declares. A name the hoist took declares at the
+        # top of the body and assigns here, `tN = ...;`, which `_DECL_RE` does not match
+        # because it requires `var`. Matching unconditionally raises AttributeError, and
+        # an exception that escapes is exit 3, a bug in Jadart rather than bad input.
+        # Reached only by a walk that hoists a name `_pin` writes out, which is why #212
+        # shipped it green: nothing on either fixture hoists one today, and the first
+        # change that makes `_verbatim` fire more often finds it (#212).
+        self.raw_names.update(m.group(2) for m in map(_DECL_RE.match, out) if m)
         held = [f"{r} holds {v.text}" for r, v in sorted(st.reg.items())
                 if r in use_regs and v.text != r]
         for r in sorted(defs):
