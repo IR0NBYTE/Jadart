@@ -13,6 +13,54 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A declined frame reload no longer reads as the value the function came in with.** A
+  reload the walk cannot answer printed NOTHING and kept the load's own register. The
+  printed body reads a register it never assigns as the incoming value, so
+
+      ldur x3, [x29, #-8]        // a slot the walk lost
+      stur x3, [x2, #7]
+
+  printed `x2.field_0x8 = x3;`, which says the destination still holds the x3 the
+  function was called with. It does not: the load happened. The reload now says the read
+  it is, under a fresh name, which is `_phi_name`'s rule at the other end, always a fresh
+  one and never the register:
+
+      var t0 = (FP - 8).field_0x1;
+      x2.field_0x8 = t0;
+
+  The address is the base expression and `.field_0x1` is the read at it, which is the
+  spelling the lifter already prints when that address is held in a register.
+  `docs/usage.md` now says so, and says that FP and SP mean those registers at that line.
+
+  **A changed answer, and a wide one.** `tools/quality.py` on the clean build: lines
+  173,025 to 186,090, **lines carrying a bare machine register 33,797 to 20,678**, 19.5%
+  of the output to 11.1%, byte-offset field lines 44,423 to 55,238, 25.7% to 29.7%, raw
+  arm64 lines 1,553 either way and every other symptom unchanged to the line. Over the
+  same ranges through `pbfuzz.census`, which lifts without a receiver, arity or field
+  names: 171,119 lines to 182,015 and reads of a name out of its declaration's scope 171
+  in 122 ranges to 164 in 115, on the obfuscated build too. Names nothing reads come out
+  at 4,713 against 4,712, level: the pass that drops them runs once more for these names,
+  after the passes that can delete a reader, and it now also keeps one that is all its
+  block holds, which the two beside it already did. An `if` arm is the walk's to render,
+  and taking its only line printed `if (c) {` with `}` under it, 112 times in 47 of those
+  ranges, where main has none.
+  `pbfuzz.census` counts those now and the gate holds them at zero.
+
+  Where the slot held the load's own register the old output was right, 904 of that class
+  on the clean build, and those are a named read now: still right at that line, and no
+  longer spelled exactly like a reload that had given up.
+
+  **What it does not do.** A read through the floating-point file declines unless it is
+  exactly eight bytes, because that file has no convention for saying less where the
+  general one has `_extended`: a 16-byte `q` or `v`, and a 4, 2 or 1-byte `s`, `h` or `b`.
+  On the clean build that is 1,169 reads off the frame, all of them 16-byte, whose
+  register is read again, so those still print it.
+
+  And no record of what a slot held closes this class, which is what the attempts
+  on #198 kept finding: once a path may have written the slot, neither the register nor a
+  name for the register is what the load reads. Naming the value at the spill measured
+  four fewer reads for 1.7% more output (#198).
+
 - **A name is no longer read after its declaration has closed.** `_phi` declares its name
   at the level of the `if` it belongs to, which dominates the arms but not the reader:
   where that `if` is nested in an arm, the arm closes and the name is gone while a later

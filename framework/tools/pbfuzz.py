@@ -632,7 +632,8 @@ def _census_hooks(expr):
     """Install the hooks, returning (restore, totals, per-walk cell)."""
     hist, alive, walk = {}, [], {"cur": None}
     tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "name": 0,
-           "expr": 0, "never": 0, "ranges": 0, "oos": 0, "oos_fns": 0, "lifted": 0}
+           "expr": 0, "never": 0, "ranges": 0, "oos": 0, "oos_fns": 0, "lifted": 0,
+           "regline": 0, "empty": 0}
     saved = {n: getattr(expr.State, n)
              for n in ("note_slot", "record_drop", "forget_slot", "copy",
                        "stale_on_write")}
@@ -761,12 +762,24 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
                 `expr._out_of_scope`. Measured HERE and nowhere else: four separate
                 scripts of mine drifted from that function's rules and each one reported a
                 number I then had to withdraw (#198)
+      regline   lines carrying a bare machine register, by `tools/quality.py`'s own
+                regex and not a copy of it. A frame reload that declines used to keep the
+                load's register and print nothing, so this is where #198's fix shows:
+                every decline it names is a line that stops reading a register (#198)
+      empty     blocks the rendering leaves holding nothing, `if (c) {` with `}` under
+                it. Must be 0. A pass that drops a declaration nothing reads can take
+                the only line an `if` arm has, which is why three of them carry a guard
+                against it; 112 of these shipped on the clean build while one did not
       spelled   records `_reload` spelled instead of falling back
       stale     records spelled although this path superseded them; must be 0 (#199)
 
     `limit` scores only the first N ranges, for a caller that wants the property rather
     than the whole image.
     """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    # The regex, not a copy of it: a second implementation of a rule measured in two
+    # places is how four numbers in #198 came to be wrong.
+    from quality import _REG_RE
     from jadart import expr
     from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
@@ -806,6 +819,10 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
                     tot["oos"] += len(hits)
                     tot["oos_fns"] += 1
                 tot["lifted"] += 1
+                tot["regline"] += sum(1 for l in lines if _REG_RE.search(l))
+                flat = [l.strip() for l in lines]
+                tot["empty"] += sum(1 for a, b in zip(flat, flat[1:])
+                                    if a.endswith("{") and b.startswith("}"))
             w = walk["cur"]
             if w is None or lines is None:
                 continue

@@ -86,6 +86,16 @@ handled by one rule with neither special-cased.
 | 3.3 | virtual and interface calls attributed to a receiver plus a stable selector offset, `x1.sel_0xb34(...)`. About 74% of dispatch sites recover both | the rest print `(dynamic call)` |
 | 3.4 | that offset resolved to a **source selector name**: `x2.toString()`, `x2.addListener(...)`. 133 selectors on the clean corpus, naming 23.5% of the dispatch sites that have a recovered offset | names need two agreeing classes, an untied vote AND an offset no other function is known to be placed at, so the rest keep `sel_0x<off>` |
 
+**Reading a frame slot.** A load from the frame that the lifter cannot answer prints the
+read it is, under a name: `var t0 = (FP - 8).field_0x1;`. The address is the base
+expression, and `.field_0x1` is the read at it, because a field offset carries the
+heap-object tag bias. That is the same spelling you get when the address is held in a
+register first, `sub x0, x29, #0x40; ldur x3, [x0, #8]` printing `(FP - 64).field_0x9`,
+and it is not the untagged spelling used for the thread, where `THR.field_0x68` is offset
+0x68 exactly. `FP` and `SP` mean those registers AT that line: where the frame moves
+within a function, two reads of different addresses can print the same text. The name is
+what carries the value; the text says where it came from.
+
 Two things sit outside the tier ladder and matter a lot in practice.
 
 **Full-image disassembly coverage.** Fixing the instruction-table walk to size a
