@@ -42,7 +42,8 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   at 4,713 against 4,712, level: the pass that drops them runs once more for these names,
   after the passes that can delete a reader, and it now also keeps one that is all its
   block holds, which the two beside it already did. An `if` arm is the walk's to render,
-  and taking its only line printed `if (c) {` with `}` under it, 112 times in 47 ranges.
+  and taking its only line printed `if (c) {` with `}` under it, 112 times in 47 of those
+  ranges, where main has none.
   `pbfuzz.census` counts those now and the gate holds them at zero.
 
   Where the slot held the load's own register the old output was right, 904 of that class

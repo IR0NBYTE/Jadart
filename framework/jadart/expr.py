@@ -7112,6 +7112,11 @@ def _drop_unread(lines: list, names: set) -> list:
     # line that needed them and so never stand alone in an arm, and costing 112 empty
     # blocks in 47 ranges of the clean build once it also runs over `_name_blind`'s,
     # where a declined reload can be the only thing an arm does (#198).
+    #
+    # Without `_drop_unread_slots`'s closure over what a kept initialiser reads, which it
+    # needs because `_unread` is transitive and can mark a name whose only reader is
+    # another name that also goes. The test here is `counts == 1`, so a name that goes
+    # appears nowhere else in the body at all and no kept line can name it.
     keep, inside = set(), []               # the lines of each block still open
     for i, ln in enumerate(lines):
         s = ln.strip()
