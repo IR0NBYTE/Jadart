@@ -13,6 +13,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A bare `q` or `v` register is counted.** `tools/quality.py`'s register pattern matched
+  `w`, `x`, `d` and `s` only, so a line whose only register was `q0` or `v1` counted as
+  carrying none, and `pbfuzz.census`'s `regline` inherited that because it uses that same
+  pattern rather than a copy. The 1,169 declined 16-byte frame reads that still print
+  their register were invisible to every number in the repo. 55 lines on the clean build
+  and 55 on the obfuscated one are counted now; no output changes, the lifted lines are
+  identical (#209).
+
+
 - **A name is hoistable whichever site minted it.** Thirteen places allocated
   `t{tmpc}` themselves and then each decided for itself whether the name could be
   hoisted into scope. Only two could, `_phi` and `_name_blind`, so a name any other site
