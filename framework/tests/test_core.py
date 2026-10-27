@@ -11867,6 +11867,35 @@ def test_a_bitfield_reads_as_wide_as_its_field():
                 x = rng.getrandbits(64)
                 assert dart(t, x) == arm(mn, x, lsb, width), (mn, lsb, width, t, hex(x))
 
+def test_liveness_is_asked_about_one_register_however_the_operand_spells_it():
+    """`_reg_mask` maps to the LIVENESS identity, so a state key asks the right question.
+
+    d0, s0, v0, q0, h0, b0 and v0.16b are one machine register, and `_regs` builds every
+    liveness set calling them all `d0`. The STATE is keyed by `canon` instead, which keeps
+    the view spellings apart on purpose, so a value written under one is not read back
+    under another; that is what the test below this one is about (#114).
+
+    So the two are different names for one register, and a caller holding a state key asks
+    about liveness with the wrong one. The bit table cannot say so: an unknown name MINTS
+    a bit, which no liveness set holds, so the answer is a confident "not live". 1,169
+    frame reloads off FP, every one of them read again, were passed over for exactly that
+    (#198 review). Mapping inside `_reg_mask` makes all fifteen callers right at once.
+
+    `canon` first, because `_fp_n` does not match `s`: that is what makes `s3` right too.
+    """
+    from jadart.expr import _fp_n, _reg_mask, _regs, canon
+
+    d = _reg_mask(("d3",))
+    for r in ("d3", "s3", "v3", "q3", "h3", "b3", "v3.16b", "v3.d[0]"):
+        assert _reg_mask((r,)) == d, r
+        # ...and the liveness SETS agree with the mask, since both go through `_regs`.
+        assert _reg_mask(tuple(_regs((r,)))) == d, r
+    assert _reg_mask(("w3",)) == _reg_mask(("x3",)) != d
+    # The state does NOT fold them, and must not: `_other_views` is what needs them apart.
+    assert canon("q3") == "q3" and canon("v3.16b") == "v3.16b"
+    assert canon("s3") == "d3" and _fp_n("s3") is None
+
+
 def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
     # d0, v0.16b and q0 are one register, and tier 3 tracked a double under the spelling
     # it was written with: `eor v0.16b, v0.16b, v0.16b` (how the VM loads 0.0), `movi`,

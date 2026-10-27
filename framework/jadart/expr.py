@@ -1350,8 +1350,29 @@ _BIT_REG: list = []
 
 
 def _reg_mask(regs) -> int:
+    """These registers as a bitmask, under the LIVENESS identity.
+
+    Every liveness set is built by `_regs`, which calls d0, s0, v0, q0, h0, b0 and v0.16b
+    all `d0`: they are one machine register and a write under any spelling reaches the
+    others. The STATE is keyed by `canon` instead, which keeps those spellings apart on
+    purpose, so a value written under one is not read back under another (#114,
+    `_other_views`).
+
+    The two are therefore different names for one register, and a caller holding a state
+    key asks about liveness with the wrong one. The lookup cannot say so: an unknown name
+    MINTS a bit, and no liveness set holds it, so the answer is a confident "not live".
+    That is how 1,169 frame reloads off FP came to be passed over, every one of them read
+    again (#198 review). Mapping here, with the identity the sets were built with, makes
+    every caller right rather than leaving fifteen of them to remember which name to use.
+    """
     m = 0
     for r in regs:
+        # What `_regs` does, in the same order: `canon` first, which already folds w into
+        # x and s into d, then the view spellings `canon` keeps apart on purpose.
+        r = canon(r)
+        n = _fp_n(r)
+        if n is not None:
+            r = "d" + n
         b = _REG_BIT.get(r)
         if b is None:
             b = _REG_BIT[r] = 1 << len(_BIT_REG)
@@ -4071,6 +4092,11 @@ class Lifter:
         reads again is never printed, so writing it out would only add a dead declaration:
         `balance -= amount` mentions the field in both the loaded register and the computed
         one, and pinning unconditionally puts two of them in front of every such line.
+
+        Liveness can still be right and the READER unable to use the name: `ldr q0` leaves
+        d0 holding the low half of a 16-byte read, which the field spelling cannot say, so
+        the `ret` that reads d0 declines and the name goes unread. The names are recorded
+        in `raw_names` for that, so `_drop_unread` takes the ones nothing reads.
         """
         if not loc:
             return []
@@ -4113,6 +4139,7 @@ class Lifter:
             tmp = f"t{st.tmpc[0]}"
             st.tmpc[0] += 1
             out.append(f"var {tmp} = {v.text};")
+            self.raw_names.add(tmp)
             st.reg[key] = V(tmp, P_ATOM)
         # A stack slot has no liveness to consult, it is read back by a later load or not
         # at all, so a slot that reads the written location is dropped rather than named.

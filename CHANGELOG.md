@@ -13,6 +13,27 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Liveness is asked about one register however the operand spells it.** `d0`, `s0`,
+  `v0`, `q0`, `h0`, `b0` and `v0.16b` are one machine register, and `_regs` builds every
+  liveness set calling them all `d0`. The STATE is keyed by `canon`, which keeps the view
+  spellings apart on purpose so a value written under one is not read back under another
+  (#114). The two are therefore different names for one register, and a caller holding a
+  state key was asking about liveness with the wrong one. The bit table could not say so:
+  an unknown name MINTED a bit, no liveness set held it, and the answer came back a
+  confident "not live". That is how 1,169 frame reloads off the frame pointer, every one
+  of them read again, came to be passed over (found reviewing #206). `_reg_mask` now maps
+  through the identity the sets were built with, which makes all fifteen callers right
+  rather than leaving each to remember which name to use.
+
+  No output changes from that on its own: byte-identical over all 8,194 clean and 8,188
+  obfuscated ranges. What it exposes is that `_pin_mem` can be right to name a value while
+  the reader cannot use the name: `ldr q0` leaves `d0` holding the low half of a 16-byte
+  read, which a field spelling cannot say, so the `ret` reading `d0` declines and the name
+  goes unread. Its names are recorded in `raw_names` now, so the pass that drops what
+  nothing reads takes them. **63 declarations nothing reads leave the output**, on each
+  fixture.
+
+
 - **A declined frame reload no longer reads as the value the function came in with.** A
   reload the walk cannot answer printed NOTHING and kept the load's own register. The
   printed body reads a register it never assigns as the incoming value, so
