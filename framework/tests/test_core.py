@@ -14078,8 +14078,8 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # body never assigns reads as the value the function came in with, so every line this
     # removes is a line that stopped claiming one. Counted with `tools/quality.py`'s own
     # regex, not a copy of it.
-    assert got["regline"] <= 26614, (
-        f"{got['regline']} lines carry a bare machine register, up from 26614; a reload "
+    assert got["regline"] <= 26633, (
+        f"{got['regline']} lines carry a bare machine register, up from 26633; a reload "
         f"that declines must name the read and not keep the register (#198)")
     # And no block is left holding nothing. A pass that drops a declaration nothing reads
     # can take the only line an `if` arm has: `_drop_unread_slots`, `_drop_dead_phis` and

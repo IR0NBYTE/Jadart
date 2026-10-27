@@ -36,7 +36,11 @@ DEFAULT_LIB = os.path.join(ROOT, "flubench/artifacts/clean/lib/arm64-v8a/libapp.
 
 #: Same spelling the lifter uses for a register token, so "a bare register survived" here
 #: and "this is a register operand" there cannot drift apart.
-_REG_RE = re.compile(r"\b([wx](?:3[01]|[12]\d|\d)|[ds](?:3[01]|[12]\d|\d))\b")
+#: A bare machine register, under every spelling the lifter can print. `q`, `v`, `h` and
+#: `b` were missing, so a line whose only register was `q0` counted as carrying none and
+#: no number in the repo could see it: 1,169 declined 16-byte frame reads print one and
+#: `regline` read as unaffected (#209).
+_REG_RE = re.compile(r"\b([wx](?:3[01]|[12]\d|\d)|[dsqvhb](?:3[01]|[12]\d|\d))\b")
 _GOTO_RE = re.compile(r"\bgoto L_0x")
 _FIELD_RE = re.compile(r"\.(?:field_0x[0-9a-fA-F]+|tags)\b")
 _ELLIPSIS_RE = re.compile(r"\(\.\.\.\)")
