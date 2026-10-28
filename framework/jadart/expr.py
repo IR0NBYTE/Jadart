@@ -2882,6 +2882,38 @@ class Lifter:
         for r in sorted(r for r in touched if r in _CALL_CLOBBERS
                         or (_fp_n(r) is not None and f"d{_fp_n(r)}" in _CALL_CLOBBERS)):
             st.forget(r)
+        # ...and the call DEFINES each one it destroyed that is read again, with a name
+        # for a value nobody knows. `forget` leaves the register holding its own bare
+        # name, and the printed body never assigns that, so it reads as the value the
+        # function came in with: `f(this); x1.field_0x8 = x2;` says the entry x2 where the
+        # machine has whatever `f` left. A fresh name says the one true thing instead,
+        # that the value is not known, and it cannot be confused with an argument.
+        #
+        # This is what every decompiler does rather than reuse the register's name.
+        # Ghidra emits an INDIRECT at the call, "a placeholder for possible indirect
+        # effects... used for SSA construction", whose output carries nothing through from
+        # before it; GCC's RTL SSA makes a clobber a definition in its own right, marking
+        # the register as holding an unknown value. It is also `_phi_name`'s own rule,
+        # "always a FRESH one, never the register", at a third site (#176, #198, #206).
+        #
+        # Only the ones liveness says are read again, which is what keeps it to a handful
+        # per call site rather than forty.
+        # Not the return registers: the call's own result is `_result`'s to name, and
+        # minting here would hand out a name it overwrites one line later.
+        rets = {_T.ret_int, _T.ret_fp} - {None}
+        out = []
+        for r in sorted(_CALL_CLOBBERS - rets):
+            if not (self._live_after & _reg_mask((r,))):
+                continue
+            name, decl = self._mint(st)
+            if decl:
+                out.append(decl)
+            # So the pass that drops what nothing reads can take it: liveness says the
+            # register is read again, and a later pass can still take that reader away.
+            self.raw_names.add(name)
+            st.reg[r] = V(name, P_ATOM)
+            st.lost.discard(r)
+        return out
 
     def _pin_call(self, st: State, dying=None) -> list:
         """Name every live value that READS MEMORY, before a call that may rewrite it.
@@ -3971,8 +4003,11 @@ class Lifter:
         self._printed_regs.add(base)
         return out
 
-    def _mint(self, st: State, text: str, pad: str = "") -> tuple:
+    def _mint(self, st: State, text=None, pad: str = "") -> tuple:
         """Allocate a name for `text` and return it with the line that declares it.
+
+        `text` of None is a name for a value the lifter does NOT know, declared and never
+        assigned: what a call leaves in a register it clobbered. See `_clobber_call`.
 
         One place for it, because thirteen sites allocated `t{tmpc}` themselves and then
         each decided for itself whether the name could be hoisted. Only `_phi` and
@@ -3996,7 +4031,10 @@ class Lifter:
         self.minted.add(name)
         if name in self.hoist:
             self.hoisted.add(name)
-            return name, f"{pad}{name} = {text};"
+            # Already declared at the top, so an initialiser-less one needs no line at all.
+            return name, ("" if text is None else f"{pad}{name} = {text};")
+        if text is None:
+            return name, f"{pad}var {name};"
         return name, f"{pad}var {name} = {text};"
 
     def _pin(self, st: State, name: str, live=None) -> list:
@@ -4428,18 +4466,18 @@ class Lifter:
                     # All but LR, which the `bl` itself writes (#162).
                     st.forget(_lr())
                     return []
-                self._clobber_call(st)
+                pre = self._clobber_call(st)
                 if kind == "throw":
-                    return [f"throw {exc.text};"]
+                    return pre + [f"throw {exc.text};"]
                 if kind == "rethrow":
-                    return ["rethrow;"]
+                    return pre + ["rethrow;"]
                 if kind == "throw_err":
-                    return [f"throw {label}();"]
+                    return pre + [f"throw {label}();"]
                 if kind == "alloc":
-                    return self._result(st, f"new {label}()", _T.ret_int)
+                    return pre + self._result(st, f"new {label}()", _T.ret_int)
                 terse = label.replace("stub ", "").replace("_iso_stub_", "")
                 # terse, without the stub prefix; a stub's result is an object
-                return self._result(st, f"{terse}(...)", _T.ret_int)
+                return pre + self._result(st, f"{terse}(...)", _T.ret_int)
             call = name or self._sub(target or 0)
             args = self._call_args(name, target, st, pushed)
             # after the arguments are read, not before: they live in the very registers the
@@ -4448,7 +4486,7 @@ class Lifter:
             # reason, one step further: it renames what SURVIVES the call, and doing it
             # earlier would rename the arguments too.
             pins = self._pin_call(st)
-            self._clobber_call(st)
+            pins += self._clobber_call(st)
             # The receiver is NOT dropped from `pushed`, unlike the dispatch case. A `blr`
             # prints its receiver as the base of the call (`x.foo(...)`) so listing it
             # again would show it twice; a direct call has no base, so argument zero is
@@ -4473,7 +4511,8 @@ class Lifter:
                     named = None
                 base = _wrap(self._leaf(recv, st), P_POST) if recv else None
                 pins = self._pin_call(st)   # after the receiver is read, and before it dies
-                self._clobber_call(st)   # after the receiver is read; it is x0 as often as not
+                # after the receiver is read; it is x0 as often as not
+                pins += self._clobber_call(st)
                 if named and base and named.startswith(("get:", "set:")):
                     prop = named.split(":", 1)[1]       # an accessor, not a call, in source
                     return pins + (self._result(st, f"{base}.{prop}")
@@ -4492,7 +4531,7 @@ class Lifter:
             # `tgt_val` was read off the state before this point, so the callee register is
             # still spelled as the thing being called and not as its post-call garbage.
             pins = self._pin_call(st)
-            self._clobber_call(st)
+            pins += self._clobber_call(st)
             if tgt_val and tgt_val.prec >= P_POST and "DISPATCH" not in tgt_val.text:
                 return pins + self._result(st, f"{_wrap(tgt_val, P_POST)}({shown})")
             return pins + self._result(st, f"(dynamic call)({shown})")
@@ -6925,6 +6964,10 @@ def detect_dispatch(dis) -> dict:
 # ── public entry point ──────────────────────────────────────────────────────
 
 _DECL_RE = re.compile(r"^(\s*)var (t\d+) = (.+);$")
+#: A declaration with NO initialiser, `var t5;`, which is what names a value the lifter
+#: does not know: what a call left in a register it clobbered (`_clobber_call`). It has no
+#: initialiser to evaluate, so one nothing reads can always go (#176).
+_BARE_DECL_RE = re.compile(r"^(\s*)var (t\d+);$")
 _TMP_RE = re.compile(r"\bt\d+\b")
 
 
@@ -7152,7 +7195,7 @@ def _drop_unread(lines: list, names: set) -> list:
             counts[m.group(0)] = counts.get(m.group(0), 0) + 1
     drop = {}                              # {line index: the name it declares}
     for i, ln in enumerate(lines):
-        m = _DECL_RE.match(ln)
+        m = _DECL_RE.match(ln) or _BARE_DECL_RE.match(ln)
         if m and m.group(2) in names and counts[m.group(2)] == 1:
             drop[i] = m.group(2)
     if not drop:

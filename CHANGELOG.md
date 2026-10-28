@@ -13,6 +13,42 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call defines what it clobbers.** `State.forget` left a register holding its OWN bare
+  name, and the printed body never assigns that, so it read as the value the function came
+  in with. After a call that is whatever the callee left: `f(this); x1.field_0x8 = x2;`
+  claimed the entry x2. The register's name was already taken, so reusing it as the
+  definition was the bug. The call now DEFINES each volatile register it destroyed that
+  liveness says is read again, with a fresh name and no initialiser, `var tN;`: a value the
+  lifter does not know, which cannot be confused with an argument. Not the return
+  registers, which `_result` names.
+
+  **A changed answer, on every call site with a live volatile register.** Over all 8,194
+  clean ranges and 8,188 obfuscated ones: lines 182,119 to 183,876 on the clean build and
+  182,128 to 183,885 on the obfuscated one; lines carrying a bare machine register 26,633
+  to 26,257 and 26,620 to 26,244; reads of a name whose declaration has closed unchanged
+  at 28 in 11 on both, and blocks the rendering leaves empty still 0. The whole-image lift
+  costs about 4% more, 16.68s to 17.47s, best of three in each of two runs alternating
+  between the checkouts, and peak RSS does not move. All nine CPU oracle tests pass with
+  the same scored population as main, to the expression: the generated bodies hold no
+  calls, which is on `irfuzz`'s own list of what it cannot check, so this shape is one no
+  oracle sees either way.
+
+  This is what the field does rather than reuse the register's name. Ghidra emits an
+  INDIRECT at a call, a placeholder for possible indirect effects used for SSA
+  construction, whose output carries nothing through from before it; GCC's RTL SSA makes a
+  clobber a definition in its own right, marking the register as holding an unknown value.
+  It is also `_phi_name`'s own rule, always a fresh one and never the register.
+
+  Printing the instruction raw instead was tried four ways first and each had a blocker,
+  the decisive one being that `irfuzz._exec_one` scores a raw line as undecidable, so every
+  converted line stopped being checked and the oracle lost the power to see a defect class.
+  Defining the register keeps every line a statement, which is why this is the design.
+  What it does not reach: a register clobbered inside a loop and read after it still prints
+  the bare register, because the loop carries nothing for it. 74 of the new declarations
+  per fixture, in 30 ranges, are read by nothing, which is `_drop_unread`'s pass order and
+  not this change: its last call says why it stays restricted to `blind_named` (#176).
+
+
 - **A raw line no longer crashes on a pinned name the hoist took.** `_verbatim` collects
   the names `_pin` wrote out into `raw_names` by matching each line as a declaration, and
   a name the hoist took is not one: it declares at the top of the body and assigns where

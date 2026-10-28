@@ -327,12 +327,32 @@ def _reads_frame(lines, store):
     keeping the load's own register, which the printed body reads as the value the
     function came in with (#198). Matched by shape: the number depends on how many names
     are minted before it, and that moves whenever another emitter mints one first.
+
+    The store's own BASE is matched the same way, because a call DEFINES each volatile
+    register it destroyed that liveness says is read again, so a store after one is based
+    on the name the call declared and not on a bare register (#176). What these cases are
+    about is the value the reload gives, never the base.
     """
+    base, _, fld = store.partition(".")
+    want = re.compile(r"(?:%s|t\d+)\.%s = (t\d+);" % (re.escape(base), re.escape(fld)))
     for a, b in zip(lines, lines[1:]):
         m = re.fullmatch(r"\s*var (t\d+) = \(?(?:FP|SP)[^;]*;", a)
-        if m and b.strip() == f"{store} = {m.group(1)};":
+        n = want.fullmatch(b.strip())
+        if m and n and n.group(1) == m.group(1):
             return True
     return False
+
+
+def _stores(line, rhs):
+    """Whether `line` stores `rhs` into field 0x8 of x2, however x2 is spelled.
+
+    A call DEFINES each volatile register it destroyed that liveness says is read again,
+    so the base of a store that comes after one is the name the call declared for x2 and
+    not a bare x2, which would read as the value the function came in with (#176). The
+    cases that use this are about the value stored, never about the base.
+    """
+    return bool(re.fullmatch(r"\s*(?:x2|t\d+)\.field_0x8 = %s;" % re.escape(rhs),
+                             line))
 
 
 def _needs_capstone():
@@ -775,7 +795,9 @@ def test_a_call_does_not_leave_the_values_it_destroyed_behind_it():
     # an integer register: 5 cannot still be in x9 once the callee has run.
     body = _lift_asm([("mov", "x9, #5"), ("bl", "#0x40"), ("mov", "x0, x9"), ("ret", "")])
     assert "return 5;" not in body, body
-    assert re.search(r"return x9;", body), body
+    # Not `x9` either: the call DEFINES what it clobbered, so what it left in x9 has a
+    # name of its own rather than the register's, which read as the entry x9 (#176).
+    assert re.search(r"return t\d+;", body), body
 
     # a float register, which had no invalidation at all: `_result` only ever names the
     # INTEGER return register, so d0 kept its pre-call value across every call.
@@ -953,7 +975,12 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
             # on `named` below still checks.
             m = re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;", body)
             assert m and f"return {m.group(1)};" in body, (why, body)
-            assert body.count("var ") == 1, (why, body)
+            # Two names now. The call declares what it left in x6, which the loop reads
+            # again, where a bare x6 read as the value the function came in with (#176).
+            # The spill is still not named, which is what this case is for, so that is
+            # what the second assertion says; the numbers move with whoever mints first.
+            assert "x20.field_0xc" not in body, (why, body)
+            assert body.count("var ") == 2 and re.search(r"var t\d+;", body), (why, body)
         else:
             assert "var " not in body, (why, body)
             assert "return " + ("x20.field_0xc;" if want is None else want[7:]) in body, (
@@ -1021,7 +1048,11 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
                       ("b", "#0x30"), ("nop", ""), ("ldur", "w5, [x23, #0xb]"),
                       ("stur", "x5, [x29, #-0x18]"), ("str", "x6, [x24, #7]"),
                       ("bl", "#0x100"), ("ldur", "x0, [x29, #-0x18]"), ("ret", "")])
-    assert "var t0 = x20.field_0xc;" in body and "var t1 = t0.field_0xc;" in body, body
+    # The two calls declare what they left in the registers the arms read, so the second
+    # spill's name takes the number after those (#176); that it reads the first is the
+    # point, so match the shape rather than the number.
+    assert "var t0 = x20.field_0xc;" in body, body
+    assert re.search(r"var t\d+ = t0\.field_0xc;", body), body
     # A name whose one printed use is the statement right after the store says no more
     # than the field did, and folds back into it like a call's result does.
     body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
@@ -1032,8 +1063,12 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
     # The guard still folds the field back into the condition. The one name is the
     # reload after the loop, which says the read it is rather than keeping x0 (#198).
     assert "if (x20.field_0xc != 0) {" in body, body
-    assert body.count("var ") == 1 and re.search(
-        r"var (t\d+) = \(FP - 16\)\.field_0x1;\n\s*return \1;", body), body
+    # Two now: the call in the loop declares what it left in x6, which the loop reads
+    # again (#176). The spill is still not named, which is what this case is for; the
+    # field itself is in the body, folded back into the condition above.
+    assert not re.search(r"var t\d+ = x20\.field_0xc;", body), body
+    assert body.count("var ") == 2 and re.search(r"var t\d+;", body), body
+    assert re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;\n\s*return \1;", body), body
     assert named([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
                   ("cbz", "x4, #0x10"), ("bl", "#0x200"), ("mov", "x6, #0"),
                   ("bl", "#0x100"), ("stur", "x6, [x29, #-0xc]"),
@@ -1047,8 +1082,11 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
         # The fold is not named. The one name is the reload `_then_forget` puts after the
         # loop, which says the read it is rather than keeping x0 (#198).
         assert want in body, (want, body)
-        assert body.count("var ") == 1 and re.search(
-            r"var (t\d+) = \(FP - 16\)\.field_0x1;\n\s*return \1;", body), (want, body)
+        # Two names: the loop's call declares what it left in x6, which the loop reads
+        # again (#176). The fold is still not named, which is what this case is for.
+        assert body.count("var ") == 2 and re.search(r"var t\d+;", body), (want, body)
+        assert re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;\n\s*return \1;",
+                         body), (want, body)
         assert named(_then_forget(rows)), want              # named, then found unread
     # ...and a value that reads no memory cannot be changed by the callee.
     body = _lift_asm([("add", "x4, x19, #1"), ("stur", "x4, [x29, #-0x10]"),
@@ -11718,7 +11756,17 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
                   ("add", "x10, x11, #1"), ("b", "#0x18"), ("add", "x10, x11, #2")],
                  [("stur", "x19, [x1, #0x17]"), ("stur", "x10, [x1, #0x1f]"),
                   ("ret", "")])
-    assert body[-3:-1] == ["x1.field_0x18 = t0;", "x1.field_0x20 = t1;"], body
+    # x1 is the call's to clobber like any other volatile register, so the base is the
+    # name the call declares for it rather than a bare x1 that read as the entry value
+    # (#176). The point is the two names made above the branches, the result and the phi,
+    # which the join still reads; their numbers move with the declarations minted first.
+    joined = "\n".join(body)
+    res = re.search(r"var (t\d+) = sub_0x900\(\.\.\.\);", joined)
+    phi = re.search(r"\b(t\d+) = t\d+ \+ 1;", joined)
+    assert res and phi, body
+    base = re.fullmatch(r"(t\d+)\.field_0x18 = %s;" % res.group(1), body[-3])
+    assert base, body
+    assert body[-2] == f"{base.group(1)}.field_0x20 = {phi.group(1)};", body
     body = ahead([("mov", "x8, #0"), ("add", "x8, x8, #1"), ("cmp", "x8, x13"),
                   ("b.lt", "#0x4")], [("stur", "x8, [x1, #7]"), ("ret", "")])
     assert body[-2] == "x1.field_0x8 = t0;", body
@@ -11802,9 +11850,14 @@ def test_a_raw_line_says_what_the_registers_it_reads_hold():
         "br x16   // x16 holds THR.field_0x258"]
     # A call's result only the note mentions is still a call in the code, not folded
     # into the note.
-    assert lift([("bl", "#0x100"), ("add", "x17, x0, #27"), ("mov", "x0, #0"),
-                 ("ldar", "w1, [x17]"), ("str", "x1, [x2, #7]"), ("ret", "")])[:2] == [
-        "var t0 = sub_0x100(...);", "ldar w1, [x17]   // x17 holds t0 + 27"]
+    # The call declares x2 as well, which the store after the raw line reads, so the
+    # result takes the number after that declaration (#176). The note still reads the
+    # result's name and the call is still a line of its own, which is the point.
+    got = lift([("bl", "#0x100"), ("add", "x17, x0, #27"), ("mov", "x0, #0"),
+                ("ldar", "w1, [x17]"), ("str", "x1, [x2, #7]"), ("ret", "")])
+    res = re.fullmatch(r"var (t\d+) = sub_0x100\(\.\.\.\);", got[1])
+    assert re.fullmatch(r"var t\d+;", got[0]) and res, got
+    assert got[2] == f"ldar w1, [x17]   // x17 holds {res.group(1)} + 27", got
     # A register that holds itself, or the receiver it was on entry, says nothing, nor
     # one a loop's name for it collapsed back to.
     body = lift([("add", "x17, x14, #7"), ("swp", "x11, x7, [x17]"),
@@ -11978,7 +12031,10 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
     # and so does a call, which clobbers the register whatever it is called
     called = copy[:1] + [(4, "bl", "#0x100", ""), (8, "str", "q0, [x2, #0x10]", ""),
                          (12, "ret", "", "")]
-    assert "x2.field_0x11 = q0;" in [ln.strip() for ln in lift_function(called)]
+    # The base is the name the call declares for x2, which it clobbers like any other
+    # volatile register (#176); `= q0` is the point, that the copy ended at the call.
+    got = [ln.strip() for ln in lift_function(called)]
+    assert any(re.fullmatch(r"t\d+\.field_0x11 = q0;", ln) for ln in got), got
     # and so does a loop that writes d0, whose state after it forgets d0
     looped = copy[:1] + [(4, "fmov", "d0, #1.0", ""), (8, "subs", "x3, x3, #1", ""),
                          (12, "b.ne", "#0x4", ""), (16, "str", "q0, [x2, #0x10]", ""),
@@ -12003,7 +12059,10 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
          (12, "eor", "v0.16b, v0.16b, v0.16b", ""), (16, "stur", "d0, [x29, #-8]", ""),
          (20, "bl", "#0x100", ""), (24, "ldur", "d1, [x29, #-8]", ""),
          (28, "stur", "d1, [x2, #7]", ""), (32, "ret", "", "")])]
-    assert "t0 = 0.0;" in joined and "x2.field_0x8 = t0;" in joined, joined
+    # The base is the name the call declares for x2 (#176); the 0.0 reaching the store
+    # through the spill is the point.
+    assert "t0 = 0.0;" in joined, joined
+    assert any(_stores(ln, "t0") for ln in joined), joined
 
     # The clean fixture's lerp clamps to [0.0, 1.0]: `eor v4.16b` zeroes d4, which held a
     # product a moment before, and main compared that product.
@@ -12136,12 +12195,22 @@ def test_a_frame_slot_past_the_displacement_is_its_own_slot():
     # The raw store may have written any slot, so the load that follows reads a slot the
     # walk no longer knows. It now says the read instead of keeping x0, which read as the
     # value the function came in with (#198).
-    assert lift([("stur", "x2, [x29, #-0x160]"), ("mov", "x17, #-0x158"),
-                 ("bl", "#0x100"), ("str", "x1, [x29, x17]"), ("mov", "x17, #-0x160"),
-                 ("ldr", "x0, [x29, x17]")])[1:] == [
-        "str x1, [x29, x17]", "var t0 = (FP - 0x160).field_0x1;", "return t0;"]
-    assert lift([("mov", "x17, #5"), ("bl", "#0x100"), ("mov", "x0, x17")])[1:] == [
-        "return x17;"]
+    # The call declares x1 and x17 too, so the note says each holds a name for a value
+    # nobody knows rather than nothing at all (#176). Still not the `mov`'s offset, which
+    # is the point: nothing in the body names 0x158.
+    got = lift([("stur", "x2, [x29, #-0x160]"), ("mov", "x17, #-0x158"),
+                ("bl", "#0x100"), ("str", "x1, [x29, x17]"), ("mov", "x17, #-0x160"),
+                ("ldr", "x0, [x29, x17]")])
+    assert re.fullmatch(r"str x1, \[x29, x17\]   // x1 holds t\d+, x17 holds t\d+",
+                        got[3]), got
+    assert "0x158" not in "\n".join(got), got
+    m = re.fullmatch(r"var (t\d+) = \(FP - 0x160\)\.field_0x1;", got[4])
+    assert m and got[5] == f"return {m.group(1)};", got
+    # ...and the 5 is gone with it: the call declares what it left in x17, where a bare
+    # x17 read as the value the function came in with (#176).
+    got = lift([("mov", "x17, #5"), ("bl", "#0x100"), ("mov", "x0, x17")])
+    m = re.fullmatch(r"var (t\d+);", got[0])
+    assert m and got[-1] == f"return {m.group(1)};", got
     # An offset changed since its `mov` is not the `mov`'s: this x17 is -0x158 again.
     # x17 changed since its `mov`, so the store went to a slot the walk cannot place and
     # the reload after it names the read instead of keeping x0 (#198).
@@ -12227,8 +12296,12 @@ def test_a_value_read_only_as_a_call_argument_is_live_up_to_the_call():
     # x2 spelled as itself, as on entry. The name takes x2 in that arm, after the inner
     # `if`, and not from before the outer one, where it held something else. Either
     # arm of the inner `if` may be the one that loads it.
-    want = ["var t1;", "if (x3 != 0) {", "var t0 = sub_0x500(...);", "t1 = t0;",
-            "} else {", "t1 = x2;", "}", "return sub_0x200(x6, t1);"]
+    # The first argument is no longer the entry x6: x6 is the call's to clobber, so the
+    # arm that calls leaves the name the call declares for it and the join takes a phi
+    # over the two. Main passed x6 where the callee may have left anything (#176).
+    want = ["var t2;", "var t3 = x6;", "if (x3 != 0) {", "var t0;",
+            "var t1 = sub_0x500(...);", "t2 = t1;", "t3 = t0;", "} else {", "t2 = x2;",
+            "}", "return sub_0x200(t3, t2);"]
     for then, other in ((("ldur", "x2, [x5, #7]"), ("ldur", "x2, [x5, #0xf]")),
                         (("add", "x7, x7, #1"), ("ldur", "x2, [x5, #0xf]")),
                         (("ldur", "x2, [x5, #7]"), ("add", "x7, x7, #1"))):
@@ -12356,9 +12429,14 @@ def test_a_loop_carries_a_register_it_reads_only_as_a_call_argument():
             ("cbnz", "x0, #0x4"), ("ret", "")]
     body = [ln.strip() for ln in lift_function(
         [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)], arity=lambda pc: 2)]
-    assert body[:4] == ["var t0 = 0;", "var t1 = x6;", "while (true) {",
-                        "var t2 = sub_0x200(t1, t0);"], body
-    assert "t0 = t2;" in body, body
+    # The call declares what it left in x1, which the loop carries, so its own result
+    # takes the number after that. The latch said `t1 = x6;` on main, the entry x6 on
+    # every trip, where the callee may have left anything in x1 (#176).
+    assert body[:3] == ["var t0 = 0;", "var t1 = x6;", "while (true) {"], body
+    clob = re.fullmatch(r"var (t\d+);", body[3])
+    res = re.fullmatch(r"var (t\d+) = sub_0x200\(t1, t0\);", body[4])
+    assert clob and res, body
+    assert f"t0 = {res.group(1)};" in body and f"t1 = {clob.group(1)};" in body, body
 
 
 def test_a_function_that_reads_its_arguments_off_the_stack_has_no_register_arity():
@@ -12548,7 +12626,11 @@ def test_a_phi_name_nothing_reads_is_dropped():
     # nothing reads them: the dead carries go, the call and the loop stay.
     out = lift(regs + [("str", "x9, [x15]"), "top", ("bl", "#0x200"),
                        ("stur", "x10, [x29, #-0x10]"), ("cbnz", "x20, @top")], **one)
-    assert "var t6 = sub_0x200(...);" in out
+    # The call's own number moves: it declares each clobbered register it left live
+    # first, and those declarations are what the dead carries read (#176). The six that
+    # are left over once the carries go are `_drop_unread`'s pass order, which its last
+    # call already names and does not fix outside `blind_named`.
+    assert any(re.fullmatch(r"var t\d+ = sub_0x200\(\.\.\.\);", ln) for ln in out), out
     assert not any(ln.startswith("var t0") or ln == "t0 = x1;" for ln in out), out
     assert not any(re.search(r"\{\s*\}", ln) for ln in out)
     # a loop whose carry is read keeps it
@@ -12593,13 +12675,23 @@ def test_a_call_whose_double_result_is_read_names_it():
                  ("mov", "x0, x22", "")]) == [
         "if (foo(...) > 0.0) {", "bar(...);", "}", "return NULL;"]
     # Where x0 is read after it, the result is x0's, as before.
-    assert lift([("bl", "#0x100", "  ; -> foo"), ("stur", "x0, [x2, #7]", "")])[:2] == [
-        "var t0 = foo(...);", "x2.field_0x8 = t0;"]
+    # The store's base is the name the call declares for x2, which it clobbers like any
+    # other volatile register (#176); the result being x0's is what this line is for.
+    got = lift([("bl", "#0x100", "  ; -> foo"), ("stur", "x0, [x2, #7]", "")])
+    base = re.fullmatch(r"var (t\d+);", got[0])
+    res = re.fullmatch(r"var (t\d+) = foo\(\.\.\.\);", got[1])
+    assert base and res, got
+    assert got[2] == f"{base.group(1)}.field_0x8 = {res.group(1)};", got
     # A stub's result is an object; the double an allocation is for stays d0.
-    assert lift([("fmov", "d0, #1.0", ""),
-                 ("bl", "#0x300", "  ; -> stub _iso_stub_AllocateDoubleStub"),
-                 ("stur", "d0, [x0, #7]", ""), ("mov", "x0, x2", "")]) == [
-        "new double().field_0x8 = d0;", "return x2;"]
+    # The stub call declares what it left in x2, which the `ret` reads, where a bare x2
+    # read as the value the function came in with (#176). The allocation and its d0 are
+    # the point.
+    got = lift([("fmov", "d0, #1.0", ""),
+                ("bl", "#0x300", "  ; -> stub _iso_stub_AllocateDoubleStub"),
+                ("stur", "d0, [x0, #7]", ""), ("mov", "x0, x2", "")])
+    m = re.fullmatch(r"var (t\d+);", got[0])
+    assert m and got[1:] == ["new double().field_0x8 = d0;",
+                             f"return {m.group(1)};"], got
 
 
 def test_a_loop_names_what_it_computed_over_a_raw_write_it_printed():
@@ -12691,7 +12783,13 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                  ("umulh", "x7, x10, x3"), ("bl", "#0x100"), ("cbz", "x0, #0x24"),
                  ("sub", "x9, x9, #1"), ("b", "#0x4"), ("ret", "")] + out
                 + [("stur", "x8, [x2, #103]"), ("ret", "")])
-    assert "x2.field_0x60 = x7;" in body and "x2.field_0x68 = x8;" in body, body
+    # x7 is the call's. The call declares what it left there, the loop carries that name
+    # out, and the store says it where main said a bare x7 that read as the entry value
+    # (#176). The carry still starts from the x7 the loop was entered with. x8 the callee
+    # preserves, so the goto's target still reads it bare and carries nothing for x7.
+    m = re.search(r"x2\.field_0x60 = (t\d+);", "\n".join(body))
+    assert m and f"var {m.group(1)} = x7;" in body, body
+    assert "x2.field_0x68 = x8;" in body, body
     # A join in the loop that names it starts from the register, not that value. The
     # declaration is at the TOP here, not inside the loop: the goto target reads it after
     # the loop closes, and a declaration inside the loop does not dominate that read
@@ -12914,7 +13012,8 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
     # Nor is the restore, around a stub that gives every register back, a write: the d0
     # this `ret` hands back is the call's. The `ret` itself prints `d0`, because the
     # slot the save filled is dropped as x15 moves (#147).
-    assert lift(saved, "d0")[0] == "var t0 = foo(...);"
+    assert re.fullmatch(r"var t\d+ = foo\(\.\.\.\);", lift(saved, "d0")[0]), lift(
+        saved, "d0")
     assert _read_after_call([(0, "str", "q0, [x15, #-0x10]!"),
                              (4, "fmov", "x0, d0")]) is None
     # A call's argument pushed is a read: `_adjustRect`'s callers pass on its Rect.
@@ -12927,7 +13026,10 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
             ("stur", "d0, [x2, #7]", ""), ("ret", "", ""), ("bl", "#0x300", ""),
             ("b", "#0xc", "")]
     body = lift(loop, None)
-    assert "t4 = d0;" in body and "t0 = t4 + t4;" in body, body
+    # The phi's number moves with the names the stub's call site declares; `= d0;` is the
+    # point, that this d0 is the loop's and not a result the call left (#176).
+    m = re.search(r"\b(t\d+) = d0;", "\n".join(body))
+    assert m and f"t0 = {m.group(1)} + {m.group(1)};" in body, body
 
 
 def test_a_function_that_hands_back_its_double_argument_returns_d0():
@@ -14273,8 +14375,15 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     throw = "  ; -> stub _iso_stub_ThrowStub"
     # LR after a call, after a stub that gives every register back, and after an atomic
     # that loads into it.
-    assert lift([("stur", "x30, [x29, #-8]"), ("bl", "#0x200"), ("mov", "x6, x30"),
-                 ("stur", "x6, [x2, #7]")])[1] == "x2.field_0x8 = x30;"
+    # LR is the call's to clobber like any other register, so the store now says the name
+    # the call declares for what it left there, where a bare x30 read as the LR the
+    # function was entered with (#176). Either way it is not the slot the `stur` filled,
+    # which is what this case is about, so that is what the assertion says.
+    got = lift([("stur", "x30, [x29, #-8]"), ("bl", "#0x200"), ("mov", "x6, x30"),
+                ("stur", "x6, [x2, #7]")])
+    m = re.search(r"t\d+\.field_0x8 = (t\d+);", "\n".join(got))
+    assert m and f"var {m.group(1)};" in got, got
+    assert "FP - 8" not in "\n".join(got), got
     check = "  ; -> stub _iso_stub_StackOverflowSharedWithFPURegsStub"
     assert lift([("bl", "#0x200", check), ("mov", "x6, x30"),
                  ("stur", "x6, [x2, #7]")])[0] == "x2.field_0x8 = x30;"
@@ -14381,24 +14490,30 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     saves = [("str", "x3, [x15, #-8]!"), ("bl", "#0x500"), ("ldr", "x3, [x15], #8")]
     for after in ((), (("mov", "x9, #0"),), (("sub", "x15, x15, #0x10"),)):
         # The throw ends its block or not, and what follows it moves SP or not.
-        assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
-                          ("mov", "x15, x29"), ("bl", "#0x600", throw), *after, "J",
-                          *saves, load, *keep))[-2] == "x2.field_0x8 = x0;", after
-    assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
-                      ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
-                      ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"), ("b", "@K"),
-                      "T", ("bl", "#0x600", throw), "P", *saves, ("b", "@K"),
-                      "K", load, *keep))[-2] == "x2.field_0x8 = x0;"
+        # The call in `saves` declares what it left in x2 (#176), so the base is that
+        # name; the slot reading x0 is what these cases are about.
+        assert _stores(lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
+                                  ("mov", "x15, x29"), ("bl", "#0x600", throw), *after,
+                                  "J", *saves, load, *keep))[-2], "x0"), after
+    assert _stores(lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
+                              ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
+                              ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"),
+                              ("b", "@K"), "T", ("bl", "#0x600", throw), "P", *saves,
+                              ("b", "@K"), "K", load, *keep))[-2], "x0")
 
     # A write-back store through FP is filed where FP is left, by the walk and by what
     # names a slot across a call alike, pre-index and post-index. SP's slots go when FP
     # moves, and SP loaded, through itself too, is not known.
     field = [("ldur", "x0, [x1, #7]")]
-    named = ["var t0 = x1.field_0x8;", "var t1 = sub_0x100(...);", "x2.field_0x8 = t0;"]
-    assert lift(field + [("str", "x0, [x29, #-8]!"), ("bl", "#0x100"),
-                         ("ldr", "x3, [x29]")] + keep)[:3] == named
-    assert lift(field + [("str", "x0, [x29], #8"), ("bl", "#0x100"),
-                         ("ldur", "x3, [x29, #-8]")] + keep)[:3] == named
+    # The call declares what it left in x2 between the name and the store, so the store's
+    # base is that name and the result's number moves past it (#176).
+    named = ["var t0 = x1.field_0x8;", "var t1;", "var t2 = sub_0x100(...);"]
+    for rows in (field + [("str", "x0, [x29, #-8]!"), ("bl", "#0x100"),
+                          ("ldr", "x3, [x29]")] + keep,
+                 field + [("str", "x0, [x29], #8"), ("bl", "#0x100"),
+                          ("ldur", "x3, [x29, #-8]")] + keep):
+        got = lift(rows)
+        assert got[:3] == named and _stores(got[3], "t0"), got
     got = lift(frame(0x20, ("str", "x0, [x29, #-0x10]!"), ("str", "x1, [x15, #0x10]"),
                       ("ldr", "x3, [x29], #0x10"), *keep))
     assert lost(got), got
@@ -14415,7 +14530,11 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     # a trip stores to, through SP or FP over it; a slot SP overwrites under a reload.
     out = lift([("mov", "x6, #0"), "top", ("stur", "x30, [x2, #7]"), ("bl", "#0x100"),
                 ("cbnz", "x4, @top"), ("stur", "x30, [x2, #15]")])
-    assert "var t1 = LR;" in out and "t1 = x30;" in out, out
+    # The latch says the name the call declares for what it left in LR, where it said a
+    # bare x30 that read as the LR the function was entered with (#176).
+    assert "var t1 = LR;" in out, out
+    m = re.search(r"\bt1 = (t\d+);", "\n".join(out))
+    assert m and f"var {m.group(1)};" in out, out
     got = lift([("stur", "x0, [x29, #-8]"), "top", load, *keep,
                  ("sturb", "w1, [x29, #-5]"), ("cbnz", "x4, @top")])
     assert lost(got), got
@@ -14428,9 +14547,11 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     assert lift(loop(("bl", "#0x100")) + [("mov", "x6, x30"),
                                           ("stur", "x6, [x2, #7]")])[-2] == (
         "x2.field_0x8 = x30;")                          # LR after a loop that calls
-    assert "var t6 = sub_0x200(...);" in lift(
+    # The call's own number moves: it declares each clobbered register it left live
+    # first (#176), so match the shape rather than the number.
+    assert any(re.fullmatch(r"var t\d+ = sub_0x200\(\.\.\.\);", ln) for ln in lift(
         frame(0x10, *regs, ("str", "x9, [x15]"), "top", ("bl", "#0x200"),
-              ("stur", "x10, [x29, #-0x10]"), ("cbnz", "x20, @top")), **one)
+              ("stur", "x10, [x29, #-0x10]"), ("cbnz", "x20, @top")), **one))
     assert lift(frame(0x10, ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"),
                       "top", ("cbz", "x9, @out"), ("bl", "#0x200"),
                       ("str", "x7, [x15, #8]"), ("ldur", "x6, [x29, #-8]"),
@@ -14441,13 +14562,15 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     got = lift(frame(0x10, ("stur", "x0, [x29, #-0x14]"), ("str", "x1, [x15]"),
                       ("ldur", "x3, [x29, #-0x14]"), *keep))
     assert lost(got), got
-    assert "var t6 = sub_0x200(...);" in lift(
+    assert any(re.fullmatch(r"var t\d+ = sub_0x200\(\.\.\.\);", ln) for ln in lift(
         regs + [("str", "x9, [x15]"), "top", ("bl", "#0x200"),
-                ("cbnz", "x20, @top")], **one)
+                ("cbnz", "x20, @top")], **one))
     # A block the entry does not reach, that loses SP, says nothing of one it does.
-    assert lift(frame(0x20, ("stur", "x0, [x29, #-8]"), "J", *saves, load, *keep,
-                      ("ret", ""), ("mov", "x15, x0"), ("b", "@J")))[1] == (
-        "x2.field_0x8 = x0;")
+    # Not by index: the call in `saves` declares what it left in x2 ahead of the store
+    # (#176). The slot still reads x0, which is what this case is about.
+    assert any(_stores(ln, "x0") for ln in lift(
+        frame(0x20, ("stur", "x0, [x29, #-8]"), "J", *saves, load, *keep,
+              ("ret", ""), ("mov", "x15, x0"), ("b", "@J"))))
 
     # The frame an FFI call builds for C ends where it began: what its calls push
     # meets no slot. Where SP is not known at a push, the push may meet any.
@@ -14557,18 +14680,21 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
         # Not by index: the FFI epilogue's `ldr x29, [x15], #8` is a declined reload of
         # its own and is named, which the leaf one's `ldp` is not because neither
         # register it loads is read again.
-        assert got[0] == "var t0 = x1.field_0x8;" and "x2.field_0x8 = t0;" in got, got
+        # The store's base is the name the call declares for x2, which it clobbers like
+        # any other volatile register (#176); the slot read is what this case is about.
+        assert got[0] == "var t0 = x1.field_0x8;", got
+        assert any(re.fullmatch(r"t\d+\.field_0x8 = t0;", ln) for ln in got), got
         got = lift(frame(0x20, spill, *enter, ("ldur", "x3, [x29, #%#x]" % up), *keep,
                          *leave))
         assert got[0] == held, got                        # FP-8 through the moved FP
         got = lift(frame(0x20, spill, *enter, ("stur", "x5, [x29, #%#x]" % up), *leave,
                          load, *keep))
-        assert got[-2] == "x2.field_0x8 = x5;", got
+        assert _stores(got[-2], "x5"), got
     # A cell the push starts an FFI call's frame with and a leaf call's store into its
     # own frame use at different times, and cost no slot (`__constructor`).
     got = lift(frame(0x20, *field, *ffi, *out, *leaf, ("str", "x10, [x29, #8]"), *back,
                      load, *keep))
-    assert got[-2] == "x2.field_0x8 = t0;", got         # and this
+    assert _stores(got[-2], "t0"), got                 # and this
     # Where paths meet with FP in different places, the slots go.
     got = lift(frame(0x20, spill, ("cbz", "x4, @J"), *ffi[:2], "J", load, *keep))
     assert lost(got), got
@@ -14598,8 +14724,10 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     assert lost(got), got
     assert lift(frame(0x20, spill, sub, ("ldur", "x16, [x1, #7]"), ("str", "x4, [x16]"),
                       load, *keep))[1] == held            # guard: passes on main
-    assert lift(frame(0x20, spill, ("sub", "x9, x29, #8"), ("bl", "#0x400"),
-                      ("str", "x4, [x9]"), load, *keep))[2] == held     # and this
+    # Not by index: the call declares what it left in x9 and in x2, so the raw store and
+    # the slot read both move down the body (#176). The slot still reads x0.
+    assert _stores(lift(frame(0x20, spill, ("sub", "x9, x29, #8"), ("bl", "#0x400"),
+                              ("str", "x4, [x9]"), load, *keep))[-2], "x0")  # and this
     got = lift(frame(0x20, spill, ("sub", "x19, x29, #8"), ("bl", "#0x400"),
                      ("str", "x4, [x19]"), load, *keep))
     assert lost(got), got
