@@ -775,7 +775,9 @@ def test_a_call_does_not_leave_the_values_it_destroyed_behind_it():
     # an integer register: 5 cannot still be in x9 once the callee has run.
     body = _lift_asm([("mov", "x9, #5"), ("bl", "#0x40"), ("mov", "x0, x9"), ("ret", "")])
     assert "return 5;" not in body, body
-    assert re.search(r"return x9;", body), body
+    # Not `x9` either: the call DEFINES what it clobbered, so what it left in x9 has a
+    # name of its own rather than the register's, which read as the entry x9 (#176).
+    assert re.search(r"return t\d+;", body), body
 
     # a float register, which had no invalidation at all: `_result` only ever names the
     # INTEGER return register, so d0 kept its pre-call value across every call.
@@ -12914,7 +12916,8 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
     # Nor is the restore, around a stub that gives every register back, a write: the d0
     # this `ret` hands back is the call's. The `ret` itself prints `d0`, because the
     # slot the save filled is dropped as x15 moves (#147).
-    assert lift(saved, "d0")[0] == "var t0 = foo(...);"
+    assert re.fullmatch(r"var t\d+ = foo\(\.\.\.\);", lift(saved, "d0")[0]), lift(
+        saved, "d0")
     assert _read_after_call([(0, "str", "q0, [x15, #-0x10]!"),
                              (4, "fmov", "x0, d0")]) is None
     # A call's argument pushed is a read: `_adjustRect`'s callers pass on its Rect.
