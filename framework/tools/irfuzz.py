@@ -1547,7 +1547,14 @@ class _Unsound(Exception):
     Distinct from _Undecidable on purpose. "I cannot decide this trial" is a refusal and
     costs nothing; "the text declares a variable and reads it on a path that never assigns
     it" is a defect in the rendering and has to be counted as one, or the oracle passes on
-    exactly the mistake it was added to catch."""
+    exactly the mistake it was added to catch.
+
+    One shape is that on purpose and is NOT a defect: a call declares each volatile
+    register it destroyed that is read again and never assigns it, because what the callee
+    left there is not a value the lifter knows (#176). Nothing here can see one today,
+    since the generated bodies hold no calls and calls are on the list above of what this
+    cannot check. A fuzzer that ever emits a `bl` has to exempt those names, or it will
+    report a rendering the lifter means."""
 
 
 _ASSIGN = re.compile(r"^(?:var )?([A-Za-z_]\w*) ([-+*&|^]|~/|<<|>>)?= (.+);$")
