@@ -14218,6 +14218,20 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     assert got["empty"] == 0, (
         f"{got['empty']} rendered blocks hold nothing, `if (c) {{` with `}}` under it; a "
         f"pass dropped the only line an arm had (#198)")
+    # And the rest of the rendered text's own invariants (#210). These exist because a
+    # per-symptom COUNT cannot see a shape: #206 verified its counts over two review
+    # rounds and still nearly shipped 112 empty blocks. Four are exact, because there is
+    # no acceptable number of them.
+    for k, why in (("unbalanced", "functions whose braces do not balance"),
+                   ("twice", "names the body declares twice"),
+                   ("above", "names read on a line above their declaration")):
+        assert got[k] == 0, f"{got[k]} {why} (#210)"
+    # A bound, not a zero: `_drop_unread`'s guard trades an empty block for a block whose
+    # only line is a declaration nothing reads, which is the honest side of that trade and
+    # the same one `_drop_unread_slots` already makes.
+    assert got["sole"] <= 1398, (
+        f"{got['sole']} blocks hold nothing but a declaration nothing reads, up from "
+        f"1398; see the guard in `_drop_unread` (#210)")
 
     # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
     real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,

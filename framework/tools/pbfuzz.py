@@ -633,7 +633,8 @@ def _census_hooks(expr):
     hist, alive, walk = {}, [], {"cur": None}
     tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "name": 0,
            "expr": 0, "never": 0, "ranges": 0, "oos": 0, "oos_fns": 0, "lifted": 0,
-           "regline": 0, "empty": 0}
+           "regline": 0, "empty": 0, "unbalanced": 0, "twice": 0, "above": 0,
+           "sole": 0}
     saved = {n: getattr(expr.State, n)
              for n in ("note_slot", "record_drop", "forget_slot", "copy",
                        "stale_on_write")}
@@ -741,6 +742,60 @@ def _census_hooks(expr):
     return restore, tot, walk, hist, alive
 
 
+_DECLARES = re.compile(r"(?:var )?(t\d+)\s*(?:=[^=]|;)")
+_NAME = re.compile(r"\bt\d+\b")
+
+
+def _shape(flat: list) -> dict:
+    """The rendered text's own invariants, for one function's stripped lines.
+
+    Counted here rather than in a script because a script is what #206 did not have: two
+    review rounds verified its per-symptom counts and missed 112 empty blocks, because a
+    count says how much and not what shape (#210).
+    """
+    out = {"unbalanced": 0, "twice": 0, "above": 0, "sole": 0}
+    depth, bad = 0, False
+    declared, first = {}, {}
+    body: list = []
+    for i, ln in enumerate(flat):
+        if ln.startswith("}"):
+            depth -= 1
+            if depth < 0:
+                bad = True
+            if body:
+                body.pop()
+        elif body:
+            body[-1].append(i)
+        if ln.endswith("{"):
+            depth += 1
+            body.append([])
+        m = _DECLARES.match(ln)
+        if m:
+            # `var` only for the count: a hoisted name is `var tN;` at the top and
+            # `tN = ...;` where the value is, and reading the second as a declaration made
+            # this say 17,882 names were declared twice.
+            if ln.startswith("var "):
+                declared[m.group(1)] = declared.get(m.group(1), 0) + 1
+            first.setdefault(m.group(1), i)
+        rest = ln[m.end(1):] if m else ln
+        for n in _NAME.findall(rest):
+            # A name declared LATER in the text than it is read. One declared nowhere at
+            # all is #205's and `oos`'s, not this counter's.
+            if n in first and first[n] > i:
+                out["above"] += 1
+    out["unbalanced"] = 1 if (bad or depth != 0) else 0
+    out["twice"] = sum(n - 1 for n in declared.values() if n > 1)
+    read = set()
+    for i, ln in enumerate(flat):
+        m = _DECLARES.match(ln)
+        read.update(_NAME.findall(ln[m.end(1):] if m else ln))
+    for a, b, c in zip(flat, flat[1:], flat[2:]):
+        m = _DECLARES.match(b)
+        if a.endswith("{") and c.startswith("}") and m and m.group(1) not in read:
+            out["sole"] += 1
+    return out
+
+
 def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
     """Lift EVERY range of the image at `path` and classify what each frame reload prints.
 
@@ -770,6 +825,26 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
                 it. Must be 0. A pass that drops a declaration nothing reads can take
                 the only line an `if` arm has, which is why three of them carry a guard
                 against it; 112 of these shipped on the clean build while one did not
+
+    The five below are the rest of what #210 asks for: the invariants of the rendered
+    TEXT, which the per-symptom counts cannot see. #206 nearly shipped 112 empty blocks
+    past two review rounds that checked the counts and not the shape, so these exist to
+    make the shape a number as well.
+
+      unbalanced  functions whose braces do not balance under the scanner the drop passes
+                  use, so a `{` or `}` inside a raw line cannot mislead them. Must be 0
+      twice       a name the body declares twice. Must be 0
+      above       a name read on a line ABOVE its declaration, which makes the hoist
+                  textually sound and not only sound by scope. Must be 0
+      sole        blocks whose only statement is a declaration nothing reads. The guard in
+                  `_drop_unread` trades an empty block for one of these on purpose, so it
+                  is a bound and not a zero
+
+    A sixth was measured and NOT kept: a declaration whose text repeats one already used
+    in the same function, which is the readability half of #207. It comes out at 12,192 on
+    the clean build and cannot tell the defect (two reads of different addresses printing
+    the same text once the frame register has moved) from reading one field twice, which
+    is correct and common. A number that cannot say which it is counting is not a gate.
       spelled   records `_reload` spelled instead of falling back
       stale     records spelled although this path superseded them; must be 0 (#199)
 
@@ -823,6 +898,8 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
                 flat = [l.strip() for l in lines]
                 tot["empty"] += sum(1 for a, b in zip(flat, flat[1:])
                                     if a.endswith("{") and b.startswith("}"))
+                for k, n in _shape(flat).items():
+                    tot[k] += n
             w = walk["cur"]
             if w is None or lines is None:
                 continue
