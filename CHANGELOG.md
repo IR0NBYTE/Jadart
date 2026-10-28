@@ -13,6 +13,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The rendered output's shape is gated, not only its per-symptom counts.** A count says
+  how much and not what shape, and that is how #206 came within one review round of
+  shipping 112 blocks rendered as `if (c) {` with `}` under it: two rounds verified its
+  numbers and its composition, and neither looked at the text around the lines it changed.
+  `cfgcheck` could not see it either, since it checks CFG edges and not rendered arms.
+  `pbfuzz.census` now counts five invariants of the text itself and
+  `test_no_frame_slot_record_outlives_the_path_that_made_it` holds four of them at exactly
+  zero: blocks that hold nothing, functions whose braces do not balance under the scanner
+  the drop passes use, a name the body declares twice, and a name read on a line above its
+  declaration. The fifth, blocks whose only line is a declaration nothing reads, is a
+  bound at 1,398, because `_drop_unread`'s guard trades an empty block for one of those on
+  purpose. All five read the same on both fixtures. A sixth was measured and left out: a
+  declaration whose text repeats one already used in the same function comes to 12,192 and
+  cannot tell #207's defect from reading one field twice, and a number that cannot say
+  which it is counting is not a gate (#210).
+
+
 - **A call defines what it clobbers.** `State.forget` left a register holding its OWN bare
   name, and the printed body never assigns that, so it read as the value the function came
   in with. After a call that is whatever the callee left: `f(this); x1.field_0x8 = x2;`
