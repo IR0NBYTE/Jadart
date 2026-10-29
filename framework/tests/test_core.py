@@ -12842,6 +12842,46 @@ def test_a_loop_names_what_it_computed_over_a_raw_write_it_printed():
     assert "x2.field_0x60 = x7;" in body, body
 
 
+def test_a_goto_backwards_out_of_a_loop_leaves_it():
+    """Whether a goto leaves the loop is asked of the natural body, not of every ancestor
+    of the header (#129).
+
+    `_loop_nodes` closes BACKWARD over every predecessor, so it returns every ancestor of
+    the header: on the clean fixture that put blocks which run before the loop into all
+    6,131 of its loops, 70,789 such blocks. A goto back to one of those then read as
+    staying inside the loop, so `_carry_out` wrote nothing back and the target read the
+    loop's names holding what the PREVIOUS trip left, which is the hazard #123 is about
+    at the other kind of edge. 46 gotos on each fixture answered this wrongly.
+
+    `_loop_nodes` stays as it is where it is asked what the loop may WRITE, which wants an
+    over-approximation, and where the blocks before the loop stand in for the ones between
+    a store and the loop (#140). Replacing it there is a separate question, and the one
+    the issue's own history records a revert for.
+    """
+    from jadart.cfg import build_cfg
+    from jadart.expr import Lifter
+
+    # Three blocks: the entry, a one-block loop at 0x8, and the return. The entry is a
+    # predecessor of the header, so the ancestors closure holds it and the natural body
+    # does not.
+    rows = [("mov", "x5, #1"), ("add", "x5, x5, #1"),
+            ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"), ("ret", "")]
+    blocks, entry = build_cfg(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)], traps=())
+    lf = Lifter(blocks, entry=entry)
+    assert lf._loop_nodes(8) == frozenset({0, 8}), sorted(lf._loop_nodes(8))
+    assert lf._back_loop(8) == frozenset({8}), sorted(lf._back_loop(8))
+    # Walking that loop, a goto to the entry block leaves it: control is not at the
+    # header again until it comes back round the way in.
+    lf._carrying = [(8, {}, set())]
+    assert lf._leaves_loop(entry) is True
+    # ...and one to the header's own block does not.
+    assert lf._leaves_loop(8) is False
+    # Outside a loop the question does not arise.
+    lf._carrying = []
+    assert lf._leaves_loop(entry) is False
+
+
 def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
     # A goto out of a loop handed its target the state the walk had at the jump, the
     # first trip's, where a register the loop writes later still held its value from

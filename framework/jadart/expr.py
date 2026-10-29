@@ -2841,6 +2841,8 @@ class Lifter:
         #: Per header and per block, what nested loops ask again for each loop around
         #: them; see _loop_nodes, _written, _accesses and _reload_step (#162).
         self._loops: dict = {}
+        #: loop header -> its natural body; see _back_loop.
+        self._backloops: dict = {}
         self._defs: dict = {}
         self._frame_list: dict = {}
         self._reload_ops: dict = {}
@@ -5411,7 +5413,14 @@ class Lifter:
         """True when a goto to `addr` jumps out of the loop currently being walked."""
         if not self._carrying:
             return False
-        return addr not in self._loop_nodes(self._carrying[-1][0])
+        # `_back_loop`, the natural body, and not `_loop_nodes`: the latter closes
+        # backward over every predecessor, so it holds the blocks BEFORE the loop too,
+        # all 6,131 loops on the clean fixture and 70,789 such blocks, and a goto back to
+        # one of those then read as staying inside the loop and wrote nothing back (#129).
+        # `_loop_nodes` is right where it is asked what the loop may WRITE, which is an
+        # over-approximation, and where the blocks before the loop stand for the ones
+        # between a store and the loop (#140); this question is not that one.
+        return addr not in self._back_loop(self._carrying[-1][0])
 
     def _dominators(self, addr) -> frozenset:
         """The blocks every path from the entry to `addr` passes through before it."""
@@ -6305,7 +6314,7 @@ class Lifter:
         self._exit_slots(st, header)
         return out
 
-    def _back_loop(self, header) -> set:
+    def _back_loop(self, header) -> frozenset:
         """The natural loop at `header`: the predecessors it dominates are its latches,
         and the body is what reaches one without passing it. `_loop_nodes` takes the
         edge in from before the loop for a latch too, and with it every block before the
@@ -6314,6 +6323,9 @@ class Lifter:
         if self._idom is None:
             self._idom = _idoms(self.blocks, self.entry, lambda n: (
                 self.blocks[n].succ if n in self.blocks else ()))[0]
+        got = self._backloops.get(header)
+        if got is not None:
+            return got
         latches = [p for p in self._preds.get(header, ())
                    if p not in self._idom or header in self._dominators(p)]
         nodes, stack = {header}, latches
@@ -6322,7 +6334,10 @@ class Lifter:
             if n not in nodes and n in self.blocks:
                 nodes.add(n)
                 stack.extend(self._preds.get(n, ()))
-        return nodes
+        # Remembered, as `_loop_nodes` is: `_leaves_loop` asks this once per goto inside
+        # a loop now, not once per loop (#129).
+        got = self._backloops[header] = frozenset(nodes)
+        return got
 
     def _call_written(self, nodes) -> frozenset:
         """The registers a call inside `nodes` may leave holding something the reader
