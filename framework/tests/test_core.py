@@ -13061,7 +13061,11 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
         rows[head // 4 + 1] = ("b.eq", f"#{len(rows) * 4:#x}")
         return lift(rows + [("stur", f"{reg}, [x2, #95]"), ("ret", "")])[-2]
     assert reload([("ldur", "x6, [x29, #-8]")]) == "x2.field_0x60 = 5;"
-    assert reload([("ldur", "x2, [x29, #-8]"), ("mov", "x6, x2")]) == "x2.field_0x60 = 5;"
+    # The base is a name here: this trip's `ldur x2` is the loop's own write, so after
+    # the loop the machine holds the slot's value and not the x2 the function came in
+    # with (#208). The VALUE, the 5 the slot holds, is what this asserts.
+    assert reload([("ldur", "x2, [x29, #-8]"), ("mov", "x6, x2")]).endswith(
+        ".field_0x60 = 5;")
     # A store beside the slot leaves it; and a double, reloaded after a call takes d6.
     for beside in (("stur", "x0, [x29, #-0x10]"), ("stp", "q0, q1, [x29, #-0x30]"),
                    ("sturb", "w0, [x29, #-9]"), ("sturh", "w0, [x29, #-0xa]"),
@@ -13084,11 +13088,16 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                       ([("ldur", "x6, [x29, #-0x10]")], ("nop", "")),
                       ([("ldur", "x6, [x29, #-8]"), ("mov", "x6, x2")], None),
                       ([("ldur", "w6, [x29, #-8]")], None),
-                      ([("ldur", "x2, [x29, #-8]"), ("mov", "w6, w2")], None),
                       ([("ldrsw", "x6, [x29, #-8]")], None),
                       ([("add", "x29, x29, #0x10"), ("ldur", "x6, [x29, #-8]")], None),
                       ([("nop", "")], None)):
         assert reload(mid, call or ("bl", "#0x100")) == "x2.field_0x60 = x6;", mid
+    # The same, for a trip that loads x2 itself. The store's base is a NAME there, because
+    # after the loop the machine holds what the trip loaded and x2's own spelling says the
+    # value the function came in with (#208). The reload is what this asserts, and it
+    # still declines.
+    assert reload([("ldur", "x2, [x29, #-8]"), ("mov", "w6, w2")],
+                  ("bl", "#0x100")).endswith(".field_0x60 = x6;")
     for mid in ([("ldr", "q6, [x29, #-0x20]")], [("ldur", "q6, [x29, #-0x20]")],
                 [("ldp", "q6, q7, [x29, #-0x40]")], [("ldr", "d6, [x29, #-0x20]")]):
         assert reload(mid, ("nop", ""), double, "d6") == "x2.field_0x60 = d6;", mid
@@ -14678,6 +14687,55 @@ def test_a_reload_of_a_dropped_slot_reads_the_value_it_held():
     out = lift([("stur", "x6, [x29, #-8]"), ("ldur", "x6, [x29, #-8]"),
                 ("stur", "x6, [x20, #7]")])
     assert "x20.field_0x8 = x6;" in out, out
+
+
+def test_a_store_through_a_base_the_loop_wrote_names_it_unknown():
+    """A store whose base register the LOOP'S OWN code writes goes through a name (#208).
+
+    After the loop the machine holds what the last trip put in that register, while the
+    register's own name says the value the function came in with, so the store writes a
+    field of the wrong object. Same rule as #206's at the other map and #216's at the
+    other end: a fallback must not borrow a name that already means something. 39 stores
+    on each fixture.
+
+    Two things are deliberately NOT this, and the cases below hold them:
+
+    * a register only a CALL inside the loop clobbered. That is #216's class, which names
+      it where a straight-line read follows the call. Treating it here renames the base of
+      every store after a loop that calls, which is most of them, and three loop tests say
+      so; that half wants its own measurement.
+    * a register written BEFORE the loop. `_loop_nodes` returns every ancestor of the
+      header, so the pre-loop blocks are in it (#228), and a register written there holds
+      what that block put in it, which its own name says correctly. The marking asks
+      `_loop_region` instead, the blocks the header dominates.
+    """
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    # The loop loads x2 every trip, and the store after it is based on x2.
+    got = lift([("mov", "x9, #3"), ("ldur", "x2, [x1, #7]"), ("sub", "x9, x9, #1"),
+                ("cbnz", "x9, #0x4"), ("stur", "x5, [x2, #0xb]"), ("ret", "")])
+    assert "var t1;" in got, got
+    assert "t1.field_0xc = x5;" in got, got
+    # A loop that only CALLS keeps the bare base: that is #216's class, not this one.
+    called = lift([("mov", "x9, #3"), ("bl", "#0x100"), ("sub", "x9, x9, #1"),
+                   ("cbnz", "x9, #0x4"), ("stur", "x5, [x2, #0xb]"), ("ret", "")])
+    assert "x2.field_0xc = x5;" in called, called
+    # A write BEFORE the loop keeps it too: x2 holds what that line put there.
+    before = lift([("ldur", "x2, [x1, #7]"), ("mov", "x9, #3"), ("add", "x8, x8, #1"),
+                   ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"),
+                   ("stur", "x5, [x2, #0xb]"), ("ret", "")])
+    assert any(ln.endswith(".field_0xc = x5;") and not ln.startswith("var") for ln in
+               before), before
+    assert not any(ln == "var t1;" for ln in before), before
+    # A register the loop carries is named by the carry, not by this: it has a value.
+    walked = lift([("mov", "x9, #3"), ("ldur", "x2, [x2, #7]"), ("sub", "x9, x9, #1"),
+                   ("cbnz", "x9, #0x4"), ("stur", "x5, [x2, #0xb]"), ("ret", "")])
+    assert "var t0 = x2;" in walked, walked
+    assert "t0.field_0xc = x5;" in walked, walked
 
 
 def test_a_store_through_a_base_the_join_lost_names_it_unknown():
