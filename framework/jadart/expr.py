@@ -4693,6 +4693,33 @@ class Lifter:
             if mn == "stp" and len(ops) >= 3:
                 second = canon(ops[1])
                 pair = (second, disp + _access_width(mn, ops[1]), g(second))
+            # A base a JOIN lost is not the register's own name, whatever the map says.
+            # The two arms disagreed about it, so `x2.field_0x10 = ...` claims the object
+            # the function came in with while the machine has one of two others. That is
+            # #206's rule at the other map, and #216's at the other end of the same
+            # argument: a fallback must not borrow a name that already means something.
+            # Named with no initialiser, `var tN;`, which says the lifter does not know
+            # what this points at, so the store writes a field of something unknown
+            # rather than of the wrong object. 17 stores in 11 ranges of the clean
+            # fixture (#208).
+            #
+            # `lost` and not every register the walk drops to its bare name: a loop exit
+            # drops the ones the loop writes, which takes this to 147 stores, and naming
+            # those costs 152 more blocks holding nothing but a declaration nothing reads
+            # and contradicts the thirteen loop-reload expectations in
+            # `test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed`. Measured
+            # and written up on the issue rather than shipped.
+            #
+            # Only an ordinary object register: SP, FP, THR and PP are roles whose value
+            # is the same all the way through, and the frame path below has its own rules.
+            basedecl = []
+            if (base in st.lost and _T.roles.get(base) is None
+                    and base not in self.alias):
+                tmp, decl = self._mint(st)
+                if decl:
+                    basedecl.append(decl)
+                self.raw_names.add(tmp)
+                st.set(base, V(tmp, P_ATOM))
             if frame and index is not None:
                 st.slot.clear()              # an offset _fold_frame_offsets left
                 st.dropped.clear()
@@ -4752,7 +4779,7 @@ class Lifter:
                     w2, off2 = _access_width(mn, ops[1]), self._byte_off(base, pair[1])
                     tgts.append((self._field(g(base), off2, w2), pair[2],
                                  self._covers(g(base), off2, w2)))
-            out = []
+            out = list(basedecl)
             for tgt, v, also in tgts:
                 # The value being stored was read off the map before this, so `+=` still
                 # renders: the rhs keeps the field's own spelling even when a register

@@ -14617,6 +14617,49 @@ def test_a_reload_of_a_dropped_slot_reads_the_value_it_held():
     assert "x20.field_0x8 = x6;" in out, out
 
 
+def test_a_store_through_a_base_the_join_lost_names_it_unknown():
+    """A store whose BASE register a join lost is written through a name, not through the
+    register (#208, from #198).
+
+    The two arms left different values in it, so the register's own name says the object
+    the function came in with while the machine has one of the two others, and the store
+    writes a field of the wrong object. That is #206's rule at the other map: a fallback
+    must not borrow a name that already means something, and #216's at the other end of
+    the same argument. The name has no initialiser, `var tN;`, which says the lifter does
+    not know what this points at.
+
+    `lost` and not every register the walk drops to its bare name. A loop exit drops the
+    ones the loop writes, which takes the class from 17 stores to 147, and naming those
+    costs 152 more blocks holding nothing but a declaration nothing reads, and contradicts
+    the loop-reload expectations two tests below this one. Measured and left on the issue.
+    """
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    # One arm loads x2 from itself, the other copies x4 into it, and the store after the
+    # join uses x2 as its base.
+    got = lift([("cbz", "x3, #0x10"), ("ldur", "x2, [x2, #7]"), ("b", "#0x14"),
+                ("nop", ""), ("mov", "x2, x4"),
+                ("stur", "x1, [x2, #0xb]"), ("ret", "")])
+    assert got[0] == "var t0;", got
+    assert got[1] == "t0.field_0xc = x1;", got
+    # Where the arms AGREE the register is not lost and keeps its own name, which is the
+    # value the function came in with and reads right.
+    agree = lift([("cbz", "x3, #0x10"), ("mov", "x5, #1"), ("b", "#0x14"),
+                  ("nop", ""), ("mov", "x5, #2"),
+                  ("stur", "x1, [x2, #0xb]"), ("ret", "")])
+    assert "x2.field_0xc = x1;" in agree, agree
+    # And a role register is not renamed: THR, SP, FP and PP hold the same thing all the
+    # way through, so their own spelling is right wherever it appears.
+    thr = lift([("cbz", "x3, #0x10"), ("ldur", "x2, [x2, #7]"), ("b", "#0x14"),
+                ("nop", ""), ("mov", "x2, x4"),
+                ("stur", "x1, [x26, #0xb]"), ("ret", "")])
+    assert "THR.field_0xb = x1;" in thr, thr
+
+
 def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     # What the review of #154 left (#162). A call writes LR, and LR read the same after
     # it. A store replaced only the slots it filled, so one it covered part of kept its
