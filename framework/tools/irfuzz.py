@@ -1136,10 +1136,11 @@ def run_mem(count: int, trials: int, seed: int, verbose: bool) -> int:
             continue
 
         bad_case = False
+        trial_rng = random.Random(seed * 1_000_003 + _case)      # see run_cfgmem (#230)
         for _ in range(trials):
-            env = {f"x{i}": rng.getrandbits(64) for i in range(31)}
+            env = {f"x{i}": trial_rng.getrandbits(64) for i in range(31)}
             env["xzr"] = 0
-            slots = {d: rng.getrandbits(64) for d in _MEM_DISPS}
+            slots = {d: trial_rng.getrandbits(64) for d in _MEM_DISPS}
             mu = Uc(ARCH, MODE)
             mu.mem_map(BASE, 0x2000)
             mu.mem_map(SCRATCH, 0x1000)
@@ -2181,8 +2182,26 @@ def _run_printed(lines: list, env: dict):
                 pc += 1
 
 
+def cfgmem_program(seed: int, index: int, seed_outs: bool = True,
+                   nested: bool = False) -> list:
+    """The words `run_cfgmem` generates as case `index` of its `seed`.
+
+    A corpus that holds still is one a gate can name a single case out of, which is the
+    other half of #230. The shape `_writes_heap` exists for turns up in about one
+    generated graph in seven thousand: switching the heap meet off disagreed at seed 1
+    and at seed 12 and nowhere else in twelve runs of 1,200 graphs, so a gate that asserts
+    on a count and a seed is asserting on that draw. Naming the case asserts on the shape.
+    """
+    rng = random.Random(seed)
+    gen = _gen_nested if nested else _gen_function
+    for _ in range(index + 1):
+        words = gen(rng, mem=True, seed_outs=seed_outs)
+    return words
+
+
 def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
-               seed_outs: bool = False, nested: bool = False) -> int:
+               seed_outs: bool = False, nested: bool = False,
+               progs: list = None) -> int:
     uc_mod = _unicorn()
     if uc_mod is None:
         print("SKIP: unicorn is not installed")
@@ -2205,9 +2224,14 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
     failures = checked = memchecked = skipped = 0
     joins = loops = withgoto = scored = 0
 
+    # `progs`: run THESE programs instead of drawing any, for a gate that names the
+    # case it is about rather than the seed it was found at (`cfgmem_program`).
+    if progs:
+        count = len(progs)
     for _case in range(count):
-        words = (_gen_nested if nested else _gen_function)(rng, mem=True,
-                                                           seed_outs=seed_outs)
+        words = progs[_case] if progs else (
+            _gen_nested if nested else _gen_function)(rng, mem=True,
+                                                      seed_outs=seed_outs)
         code = b"".join(struct.pack("<I", w) for w in words)
         ann = [(i.address, i.mnemonic, i.op_str, "") for i in md.disasm(code, BASE)]
         if len(ann) != len(words):
@@ -2254,8 +2278,16 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
 
         end = BASE + len(code)
         bad_case = False
+        # The trials draw from a generator of their own, as `run_cfg`'s do: how many of
+        # them a case runs is decided by the LIFTER, so drawing them from the generator
+        # that makes the programs let an ablation inside the lifter change which programs
+        # come after this one. The gates here are the proof that an oracle sees a defect
+        # class, and one of them hangs on a single case in four hundred, so a corpus that
+        # moves under the change reads as a blind gate: #228 lost three generator
+        # rewrites and a sample raised to 2,400 cases to it (#230).
+        trial_rng = random.Random(seed * 1_000_003 + _case)
         for _ in range(trials):
-            seeded = {f"x{i}": rng.getrandbits(64) for i in range(31)}
+            seeded = {f"x{i}": trial_rng.getrandbits(64) for i in range(31)}
             # x0-x7 are the registers the generator WRITES, so a bare one in the printed
             # text is the lifter declining rather than a reference to the incoming value.
             # This holds under `--seed-outputs` too, and binding them there was tried and
@@ -2270,7 +2302,7 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
             env = {k: v for k, v in seeded.items()
                    if not (k[1:].isdigit() and int(k[1:]) <= _FUZZ_CTR)}
             env["xzr"] = 0
-            slots = {d: rng.getrandbits(64) for d in _MEM_DISPS}
+            slots = {d: trial_rng.getrandbits(64) for d in _MEM_DISPS}
             mu = Uc(ARCH, MODE)
             mu.mem_map(BASE, 0x2000)
             mu.mem_map(SCRATCH, 0x1000)
