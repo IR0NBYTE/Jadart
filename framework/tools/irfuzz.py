@@ -1011,6 +1011,10 @@ def _mem_key(disp: int) -> str:
     return f"m_{disp + 1:x}"
 
 
+#: Deliberately not the `field16_0x8` spelling a 16-byte access uses (expr._field): the
+#: generated programs use x0..x7 and never make one, and a pattern that matched it here
+#: would model sixteen bytes as eight. Unmatched means undecidable, which is the safe
+#: answer rather than a wrong one (#209).
 _MEM_FIELD_RE = re.compile(r"\bx20\.field_0x([0-9a-f]+)\b")
 _MEM_DECL_RE = re.compile(r"^var (t\d+) = (.+);$")
 _MEM_STORE_RE = re.compile(r"^(x20\.field_0x[0-9a-f]+) ([-+*&|^]?)= (.+);$")

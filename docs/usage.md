@@ -92,7 +92,12 @@ expression, and `.field_0x1` is the read at it, because a field offset carries t
 heap-object tag bias. That is the same spelling you get when the address is held in a
 register first, `sub x0, x29, #0x40; ldur x3, [x0, #8]` printing `(FP - 64).field_0x9`,
 and it is not the untagged spelling used for the thread, where `THR.field_0x68` is offset
-0x68 exactly. An address written off `FP` is in the coordinates of the frame the function
+0x68 exactly. A field read is eight bytes, the word this machine spills and loads; an
+access of SIXTEEN says so, `(FP - 32).field16_0x1`, because a 16-byte copy would
+otherwise read character for character as an 8-byte one. A narrower access in the general
+file is the eight-byte read masked or extended, and in the floating-point file it declines
+rather than claim a width it cannot spell. An address written off `FP` is in the
+coordinates of the frame the function
 was ENTERED with, whatever FP and SP do inside it, so one address has one spelling. A read
 still written off `SP` is one whose place in that frame the analysis could not fix: `SP`
 there means SP at that line, and two such reads of different addresses can print the same
