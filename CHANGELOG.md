@@ -13,6 +13,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A goto backwards out of a loop leaves it.** `_loop_nodes` closes backward over every
+  predecessor of the loop header, so it returns every ANCESTOR of the header: on the clean
+  fixture that put blocks which run before the loop into all 6,131 of its loops, 70,789
+  such blocks. Asked whether a goto leaves the loop, it answered no for a jump back to one
+  of those, so the loop's carried names were not written back and the target read them
+  holding what the previous trip left, which is the hazard #123 is about at the other kind
+  of edge. 46 gotos on each fixture answered this wrongly, and the question now goes to
+  `_back_loop`, the natural body, which was written for this issue and already had the
+  dominance test. Six of 8,194 ranges change, 31 lines more on each fixture, 8 more
+  carrying a bare register; the reads at those targets now name the value the goto left
+  rather than one the loop had moved on from. `_loop_nodes` is unchanged where it is asked
+  what the loop may WRITE, which wants an over-approximation, and where the blocks before
+  the loop stand in for the ones between a store and the loop (#140); replacing it there
+  was attempted again today and still fails `--cfgmem`, with the reason recorded on the
+  issue. Every census counter holds, `undecl` 0 and `oos` 5, and 80 `--cfgmem` runs over
+  40 seeds in both modes are clean, seed 9 among them, which is the seed that caught the
+  previous attempt (#129).
+
 - **Every name the body reads is bound somewhere in it.** `parsePartialNumber` read four
   names that no line declared or assigned anywhere in its 181 lines, six reads in all, so
   the output was not valid Dart and a reader had nothing to go on, which is worse than a
