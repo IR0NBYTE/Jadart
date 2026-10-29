@@ -330,11 +330,14 @@ def _reads_frame(lines, store):
 
     The store's own BASE is matched the same way, because a call DEFINES each volatile
     register it destroyed that liveness says is read again, so a store after one is based
-    on the name the call declared and not on a bare register (#176). What these cases are
-    about is the value the reload gives, never the base.
+    on the name the call declared and not on a bare register (#176). It can be a FIELD
+    expression as well, because a register the loop never wrote keeps the value a line
+    before the loop loaded into it (#228) where main forgot it and printed the bare
+    register. What these cases are about is the value the reload gives, never the base.
     """
     base, _, fld = store.partition(".")
-    want = re.compile(r"(?:%s|t\d+)\.%s = (t\d+);" % (re.escape(base), re.escape(fld)))
+    want = re.compile(r"(?:%s(?:\.field\d*_0x[0-9a-fA-F]+)*|t\d+)\.%s = (t\d+);"
+                      % (re.escape(base), re.escape(fld)))
     for a, b in zip(lines, lines[1:]):
         m = re.fullmatch(r"\s*var (t\d+) = \(?(?:FP|SP)[^;]*;", a)
         n = want.fullmatch(b.strip())
@@ -11066,8 +11069,10 @@ _GOTO_SHAPES = {
                    (0x54ffff81, "b.ne", "#0x20"), (0x91000463, "add", "x3, x3, #1"),
                    (0xf100107f, "cmp", "x3, #4"), (0x54fffee1, "b.ne", "#0x18"),
                    (0x17fffff2, "b", "#8")],
-                  {"x1": 2, "x2": 1}, ["t2 += 1;", "break;"], "return t2 + 100;",
-                  "return t2 + 1 + 100;"),
+                  # t1, not t2: the loop no longer carries a register it does not
+                  # write, so one name fewer is minted before this one (#228).
+                  {"x1": 2, "x2": 1}, ["t1 += 1;", "break;"], "return t1 + 100;",
+                  "return t1 + 1 + 100;"),
     # The same, but the break leaves before the increment and writes nothing back, so
     # x6, the copy of t2 the state past the loop has lost, still reads as t2.
     "via_break_kept": ([(0xd2800003, "mov", "x3, #0"), (0x14000005, "b", "#0x18"),
@@ -11079,7 +11084,7 @@ _GOTO_SHAPES = {
                         (0xf1000cbf, "cmp", "x5, #3"), (0x54ffff61, "b.ne", "#0x20"),
                         (0x91000463, "add", "x3, x3, #1"), (0xf100107f, "cmp", "x3, #4"),
                         (0x54fffec1, "b.ne", "#0x18"), (0x17fffff1, "b", "#8")],
-                       {"x1": 2, "x2": 1}, ["} else {", "break;"], "return t2 + 100;",
+                       {"x1": 2, "x2": 1}, ["} else {", "break;"], "return t1 + 100;",
                        "return x6 + 100;"),
 }
 
@@ -11833,7 +11838,10 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
     body = lift([("add", "x8, x4, #49"), ("cbz", "x11, #0x18"), ("add", "x17, x14, #31"),
                  ("cbnz", "x0, #0x1c"), ("sub", "x10, x8, x1"), ("tbz", "x9, #63, #0x8"),
                  ("add", "x17, x14, #31"), ("swp", "x8, x4, [x17]"), ("ret", "")])
-    assert body[-2] == "swp x8, x4, [x17]", body
+    # The note says what the register the line STORES holds, which is the value the
+    # block before the loop put there: the loop does not write x8, so it is not
+    # forgotten at the exit any more and the note has something to say (#228).
+    assert body[-2] == "swp x8, x4, [x17]   // x8 holds x4 + 49", body
     # What a block that dominates the join names is set on every path, so it is kept:
     # a call's result, a phi bound above an `if` and a loop's name, each made before the
     # branches start.
@@ -11950,13 +11958,21 @@ def test_a_raw_line_says_what_the_registers_it_reads_hold():
     res = re.fullmatch(r"var (t\d+) = sub_0x100\(\.\.\.\);", got[1])
     assert re.fullmatch(r"var t\d+;", got[0]) and res, got
     assert got[2] == f"ldar w1, [x17]   // x17 holds {res.group(1)} + 27", got
-    # A register that holds itself, or the receiver it was on entry, says nothing, nor
-    # one a loop's name for it collapsed back to.
+    # A register that holds itself, or the receiver it was on entry, says nothing.
+    # The note reads the loop's NAME for a register the loop writes...
+    body = lift([("add", "x17, x14, #7"), ("cbnz", "x3, #0x1c"), ("stlr", "x7, [x17]"),
+                 ("add", "x17, x17, #1"), ("tbz", "x9, #63, #0x8"),
+                 ("stur", "x7, [x2, #71]"), ("ret", ""), ("ret", "")])
+    assert "var t0 = x14 + 7;" in body, body
+    assert "stlr x7, [x17]   // x17 holds t0" in body, body
+    # ...and the value itself where there is no name, which is what one the loop does not
+    # write now has: main carried it because the block before the loop wrote it (#228).
     body = lift([("add", "x17, x14, #7"), ("swp", "x11, x7, [x17]"),
                  ("cbnz", "x3, #0x18"), ("stlr", "x7, [x17]"), ("b.eq", "#0x1c"),
                  ("tbz", "x9, #63, #0xc"), ("b", "#0x1c"), ("stur", "x7, [x2, #71]"),
                  ("ret", "")])
-    assert "stlr x7, [x17]   // x17 holds t0" in body, body
+    assert "stlr x7, [x17]   // x17 holds x14 + 7" in body, body
+    assert not any(ln.startswith("var t") for ln in body), body
     assert lift([("adcs", "x1, x1, x3"), ("adcs", "x1, x1, x3"), ("str", "x1, [x2, #7]"),
                  ("ret", "")])[:2] == ["adcs x1, x1, x3", "adcs x1, x1, x3"]
     assert lift([("ldar", "w0, [x1]"), ("ret", "")], receiver={"x1": "this"})[0] == (
@@ -12969,11 +12985,15 @@ def test_a_loop_names_what_it_computed_over_a_raw_write_it_printed():
     body = lift([("ldur", "w2, [x7, #0x13]"), ("bl", "#0x40")])
     assert not any(ln.endswith("= x5 + x1;") for ln in body), body
     # The name starts from the value before the loop: a break that comes before the
-    # body writes the register reads that, and an unset name read it as nothing.
+    # body writes the register reads that, and an unset name read it as nothing. The
+    # loop has to WRITE x7 for any of this to be about it, which it does here with the
+    # raw `umulh`: where only the block BEFORE the loop wrote it, the register is not
+    # forgotten at the exit and the value is printed where it is read, with no name
+    # minted at all (#228).
     from jadart.expr import lift_function
-    rows = [("add", "x7, x5, x1"), ("mov", "x9, #2"), ("sub", "x9, x9, #1"),
-            ("tbz", "x9, #63, #0x8"), ("stur", "x7, [x2, #95]"), ("umulh", "x7, x10, x3"),
-            ("stur", "x7, [x2, #103]"), ("ret", "")]
+    rows = [("add", "x7, x5, x1"), ("mov", "x9, #2"), ("cbz", "x3, #0x18"),
+            ("umulh", "x7, x10, x3"), ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8"),
+            ("stur", "x7, [x2, #95]"), ("ret", "")]
     body = [ln.strip() for ln in lift_function(
         [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
     assert "var t0 = x5 + x1;" in body and "x2.field_0x60 = t0;" in body, body
@@ -13123,7 +13143,10 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                  ("cmp", "x10, #1"), ("b.eq", "#0x28"), ("umulh", "x7, x6, x1"),
                  ("sub", "x10, x10, #1"), ("tbz", "x10, #63, #0xc"),
                  ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8")] + out)
-    assert "var t0 = x5 + x1;" in body and "x2.field_0x60 = t5;" in body, body
+    # By shape, not by number, as the cases above it are: the number depends on how many
+    # names are minted before it, and one fewer is now (#228).
+    m = re.search(r"x2\.field_0x60 = (t\d+);", "\n".join(body))
+    assert "var t0 = x5 + x1;" in body and m and f"var {m.group(1)};" == body[0], body
     # Not a loop the machine runs twice: the way back is past a trap, and the stack
     # check's slow path strip_boilerplate cut off is not part of the loop.
     for mid in (("brk", "#0"), ("nop", "")):
@@ -14828,6 +14851,63 @@ def test_a_store_through_a_base_the_loop_wrote_names_it_unknown():
                    ("cbnz", "x9, #0x4"), ("stur", "x5, [x2, #0xb]"), ("ret", "")])
     assert "var t0 = x2;" in walked, walked
     assert "t0.field_0xc = x5;" in walked, walked
+
+
+def test_a_register_the_loop_never_wrote_still_holds_its_value_after_it():
+    """The loop's blocks are its OWN, the natural body read off the back edges (#228).
+
+    `_loop_nodes` closes backward over the header's predecessors without stopping at the
+    header, so it returns every ANCESTOR of it: on the clean fixture, 20,211 blocks across
+    the 833 loops it is asked about where the body is 8,975, and 9,781 of the extra ones
+    run BEFORE the loop. Three questions are asked of that set, and a block that ran
+    before the loop answers none of them.
+
+    #129 called this conservative. It is not. What the loop WRITES decides what is
+    forgotten after it, and a forgotten register prints as its own bare name, which reads
+    as the value the function came in with: the third case below holds a register the loop
+    never touched, and main prints the entry value where the machine has what the line
+    before the loop computed. That is #206's class, reached by counting a pre-loop write
+    as the loop's.
+
+    Taking the body instead needs the two things a trip can make stale written out above
+    the loop, which the inflation was doing by accident (`_pin_loop`): a value whose text
+    names a register the loop writes, and one that reads memory a trip stores to. Without
+    them `--cfgmem` disagrees at seed 9.
+
+    The body is also what the field means by a loop: LLVM's is the maximal strongly
+    connected set whose every entering edge reaches the header, and Ghidra's `LoopBody`
+    marks the same one off the back edges, by Tarjan's method.
+    """
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    # Written before the loop and read INSIDE it: not loop-carried, because no trip
+    # assigns it. Main hoisted the value into a carried name and read that.
+    inside = lift([("add", "x3, x1, #8"), ("mov", "x9, #3"), ("stur", "x3, [x2, #7]"),
+                   ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"), ("ret", "")])
+    assert "x2.field_0x8 = x1 + 8;" in inside, inside
+    assert not any(ln.startswith("var t0 = x1 + 8;") for ln in inside), inside
+    # Read AFTER the loop, which the loop leaves alone: it still holds what that line put
+    # there. Main forgot it and printed `x3`, the entry value.
+    after = lift([("add", "x3, x1, #8"), ("mov", "x9, #3"), ("add", "x8, x8, #1"),
+                  ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"),
+                  ("stur", "x3, [x2, #7]"), ("ret", "")])
+    assert "x2.field_0x8 = x1 + 8;" in after, after
+    # A value naming a register the loop DOES write is written out above the loop, where
+    # it still means what it says.
+    stale = lift([("add", "x3, x9, #0x22"), ("mov", "x11, #3"), ("add", "x9, x9, #1"),
+                  ("sub", "x11, x11, #1"), ("cbnz", "x11, #0x8"),
+                  ("stur", "x3, [x2, #7]"), ("ret", "")])
+    assert "var t0 = x9 + 34;" in stale and "x2.field_0x8 = t0;" in stale, stale
+    # So is one that reads memory a trip stores to: the load already happened.
+    mem = lift([("ldur", "x3, [x1, #7]"), ("mov", "x11, #3"), ("stur", "x5, [x1, #7]"),
+                ("sub", "x11, x11, #1"), ("cbnz", "x11, #0x8"),
+                ("stur", "x3, [x2, #0xf]"), ("ret", "")])
+    assert "var t0 = x1.field_0x8;" in mem, mem
+    assert "x1.field_0x8 = x5;" in mem and "x2.field_0x10 = t0;" in mem, mem
 
 
 def test_a_store_through_a_base_the_join_lost_names_it_unknown():

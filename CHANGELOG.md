@@ -13,6 +13,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop asked what every ANCESTOR of its header writes, and forgot the answer.**
+  `_loop_nodes` closes backward over the header's predecessors without stopping at the
+  header, so it returns every ancestor of it: on the clean fixture, 20,211 blocks across
+  the 833 loops it is asked about where the natural body is 8,975, and 9,781 of the extra
+  ones run BEFORE the loop. #129 called the inflation conservative. It is not: what the
+  loop WRITES decides what is forgotten after it, a forgotten register prints as its own
+  bare name, and a bare name reads as the value the function came in with, so a register
+  the loop never touched came out holding the entry value where the machine has what the
+  line before the loop computed. That is #206's class, reached by counting a pre-loop
+  write as the loop's. The three questions asked of that set, what the loop writes, what
+  it carries, and whether a break leaves it, now ask the natural body off the back edges,
+  which is also what the field means by a loop: LLVM's is the maximal strongly connected
+  set whose every entering edge reaches the header, and Ghidra's `LoopBody` marks the same
+  one by Tarjan's method. 723 statements that ended in a bare register are gone, 8,872
+  lines change on each fixture and the image is 394 shorter, `regline` falls 26,432 to
+  26,365 and quality's bare-register lines 20,540 to 20,460, `sole` 1,398 to 1,397, and
+  every census counter that must be zero is. The two things a trip can make stale are now
+  written out above the loop, which the inflation was doing by accident through the
+  carried name: a value whose text names a register the loop writes, and one that reads
+  memory a trip stores to. That is `_pin` and `_pin_mem`'s argument at the region, asked
+  over `_trip_body` so that a stack check's slow path, which gives back every register it
+  is handed, pins nothing (#228).
+
 - **The memory oracle drew its corpus from the lifter it was testing.** `--cfgmem` took
   the programs it generates and the per-trial register seeds from one `random.Random`, and
   how many trials a case runs is decided by the lifter, which breaks out of them on a
