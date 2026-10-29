@@ -97,6 +97,18 @@ def _canon_uncached(reg: str) -> str:
         return "x" + reg[1:]
     if reg[0] == "s" and reg[1:].isdigit():
         return "d" + reg[1:]                 # s0 is the low half of d0, as w0 is of x0
+    # The low doubleword lane IS what dN names, so `mov x0, v0.d[0]` reads d0. Keyed
+    # apart, the read found nothing under its own spelling and fell back to the bare
+    # operand, which the printed body never assigns and so reads as the value the
+    # function came in with: 31 lines on each fixture read the double a call had just
+    # returned as the entry v0 (#209). Folded here rather than at the read, so an insert
+    # into the lane lands on dN too, which is what it overwrites (#134): `mov v0.d[0],
+    # x3` used to write a key nothing reads and leave dN reading as the entry value with
+    # no printed assignment at all. `ins` and `fmov` of a lane print raw instead, and a
+    # raw line is itself a printed assignment, so those were already consistent. Neither
+    # fixture holds a lane write; all 62 lane operands in them are reads.
+    if reg[0] == "v" and reg.endswith(".d[0]") and reg[1:-5].isdigit():
+        return "d" + reg[1:-5]
     return reg
 
 

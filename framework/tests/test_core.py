@@ -11982,6 +11982,58 @@ def test_liveness_is_asked_about_one_register_however_the_operand_spells_it():
     assert canon("s3") == "d3" and _fp_n("s3") is None
 
 
+def test_the_low_doubleword_lane_of_a_v_register_reads_what_dn_holds():
+    """`v0.d[0]` is the low 64 bits of the register `d0` names, so a read of it reads d0.
+
+    Keyed apart, the read found nothing under its own spelling and fell back to the bare
+    operand. The printed body never assigns that, so under the printed-body rule it read
+    as the value the function came in with: 31 lines on each fixture read the double a
+    call had just returned as the entry v0. Every lane operand in both fixtures is this
+    spelling and all 62 of them are reads, so folding it is the whole of that class
+    (#209). Folded in `canon`, the one place, so a write to the lane lands on d0 too,
+    which is what it overwrites (#134).
+    """
+    from jadart.expr import canon, lift_function
+
+    assert canon("v0.d[0]") == "d0" and canon("v12.d[0]") == "d12"
+    # Not the upper lane, which d0 does not name (#134), and not a whole-register view,
+    # which is wider than d0 and is kept apart on purpose (#114).
+    assert canon("v0.d[1]") == "v0.d[1]" and canon("v0.16b") == "v0.16b"
+    assert canon("q0") == "q0" and canon("vx.d[0]") == "vx.d[0]"
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    # A double read from memory, then its bits read through the lane: the read says what
+    # was loaded, where it printed the register the body never assigns.
+    out = lift([("ldur", "d0, [x1, #0x17]"), ("mov", "x0, v0.d[0]"),
+                ("stur", "x0, [x2, #7]"), ("ret", "")])
+    assert out[0] == "x2.field_0x8 = x1.field_0x18;", out
+    # The shape the fixtures have, the isInfinite test on a double a call returned: the
+    # lane carries the call's result and not the register it came back in.
+    out = lift([("bl", "#0x100"), ("mov", "x0, v0.d[0]"),
+                ("and", "x0, x0, #0x7fffffffffffffff"),
+                ("stur", "x0, [x2, #7]"), ("ret", "")])
+    assert "t0.field_0x8 = t1 & 0x7fffffffffffffff;" in out, out
+    # An expression, not only a name: the lane reads whatever d0 holds.
+    out = lift([("fadd", "d0, d0, d1"), ("mov", "x0, v0.d[0]"),
+                ("stur", "x0, [x2, #7]"), ("ret", "")])
+    assert out[0] == "x2.field_0x8 = d0 + d1;", out
+    # The write side, which neither fixture holds: an insert into the lane overwrites the
+    # whole of d0, and it used to land on a key nothing reads, leaving d0 reading as the
+    # entry value with no printed assignment anywhere.
+    out = lift([("ldur", "d0, [x1, #0x17]"), ("mov", "v0.d[0], x3"),
+                ("stur", "d0, [x2, #7]"), ("ret", "")])
+    assert out[0] == "x2.field_0x8 = x3;", out
+    # `ins` and `fmov` of a lane print the instruction instead, and a raw line is itself a
+    # printed assignment, so d0 after one is read as that line left it (#187).
+    for mn in ("ins", "fmov"):
+        out = lift([("ldur", "d0, [x1, #0x17]"), (mn, "v0.d[0], x3"),
+                    ("stur", "d0, [x2, #7]"), ("ret", "")])
+        assert out[:2] == [f"{mn} v0.d[0], x3", "x2.field_0x8 = d0;"], (mn, out)
+
+
 def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
     # d0, v0.16b and q0 are one register, and tier 3 tracked a double under the spelling
     # it was written with: `eor v0.16b, v0.16b, v0.16b` (how the VM loads 0.0), `movi`,
