@@ -13,6 +13,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The low doubleword lane of a V register reads what dN holds.** `v0.d[0]` is the low 64
+  bits of the register `d0` names, and the two were keyed apart, so the read found nothing
+  under its own spelling and fell back to the bare operand. The printed body never assigns
+  that, so it read as the value the function came in with: the isInfinite test Dart emits
+  after a call that returns a double printed `if ((v0.d[0] & 0x7fffffffffffffff) !=
+  0x7ff0000000000000)`, naming the entry v0 where the machine reads the double the call
+  had just returned. 31 lines on each fixture, and every lane operand in both images is
+  this one spelling, all 62 of them reads. Folded in `canon`, the one place, so a write to
+  the lane lands on d0 too, which is what it overwrites (#134). `regline` 26,257 to 26,235
+  on the clean build and 26,244 to 26,222 on the obfuscated one, one line shorter on each,
+  and every other census counter unchanged. The same fold fixes the write side, which
+  neither fixture holds: `mov v0.d[0], x3`, capstone's spelling for an insert into the low
+  lane, wrote a key nothing reads and left d0 reading as the entry value with no printed
+  assignment at all; `ins` and `fmov` of a lane print the instruction instead, and a raw
+  line is itself a printed assignment (#187), so those were already consistent. A changed
+  answer: those 31 lines per fixture.
+  The 24 lines per fixture that still carry a bare q or v register are the other half of
+  #209, a 16-byte value with no spelling, and are untouched (#209).
+
 - **A frame read off SP says where it is in the frame the function was entered with.**
   `SP` in a read's text means SP AT that line, and the pushes and pops that move it print
   nothing, so `var t1 = SP.field_0x1; var t2 = SP.field_0x1;` stood for two addresses
