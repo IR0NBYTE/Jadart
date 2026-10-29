@@ -13,6 +13,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A store through a base the loop wrote names it unknown.** After the loop the machine
+  holds what the last trip put in that register, while the register's own name says the
+  value the function came in with, so the store wrote a field of the wrong object. It now
+  goes through a name with no initialiser, which is #206's rule at the other map and
+  #216's at the other end of the same argument. 39 stores on each fixture, 274 lines
+  changed, and every census counter holds, `sole` at 1,398 and `wrong` at 2,579 among
+  them. Two cases are deliberately not this and the test holds them: a register only a
+  CALL inside the loop clobbered, which is #216's class and whose inclusion renames the
+  base of every store after a loop that calls, and a register written BEFORE the loop,
+  which holds what that line put there. The second needs the marking to ask the blocks the
+  header dominates rather than `_loop_nodes`, which returns every ancestor of the header
+  and so counts pre-loop writes as the loop's; that set is added for this one reader
+  rather than changing what `written` and `carried` are computed over, which is #228
+  (#208).
+
 - **An access narrower than a word says how many bytes it moved.** A byte-offset spelling
   said nothing about the width, so `strb w0` printed the same text as `str x0` and a
   reader could not tell a byte store from a word store: the store side overstated and the

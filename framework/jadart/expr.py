@@ -697,7 +697,8 @@ def _slot_regs(text: str) -> frozenset:
 
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
-                 "src", "views", "lost", "lost_slot", "slot_by_reg", "dropped")
+                 "src", "views", "lost", "lost_slot", "slot_by_reg", "dropped",
+                 "opaque")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
@@ -747,6 +748,12 @@ class State:
         # store one, as the register will mean something else when the slot is read back
         # (#140). Cleared when the register is set to a real value.
         self.lost: set = set()
+        # Registers the MACHINE has moved on from where the walk has not: the ones a loop
+        # exit drops because the loop writes them. `lost` is the join's own set and the
+        # narrower question a slot asks (#140); this is kept apart and read in one place,
+        # a store's BASE, where a bare name claims the object the function came in with
+        # (#208).
+        self.opaque: set = set()
         # frame slot key -> the lost register whose value it holds, so the slot can be
         # dropped when that register is reassigned and its spelling means something else
         # (#140). Only lost values are tracked; a stable value in a slot stays.
@@ -770,6 +777,7 @@ class State:
         s.pair = dict(self.pair)
         s.views = {n: set(v) for n, v in self.views.items()}
         s.lost = set(self.lost)
+        s.opaque = set(self.opaque)
         s.lost_slot = dict(self.lost_slot)
         s.slot_by_reg = {r: set(ks) for r, ks in self.slot_by_reg.items()}
         s.dropped = dict(self.dropped)
@@ -951,6 +959,7 @@ class State:
         self._other_views(reg)
         self._stale_lost(reg)
         self.lost.discard(reg)
+        self.opaque.discard(reg)
         if reg in (_T.ret_int, _T.ret_fp):
             self.result = reg
 
@@ -1070,6 +1079,7 @@ def _merge(dst: State, a: State, b: State):
     if a.result == b.result:
         dst.result = a.result
     dst.lost = dropped | (a.lost & b.lost)
+    dst.opaque = a.opaque | b.opaque
 
 
 # ── boilerplate stripping (frame + thread stack-overflow check) ─────────────
@@ -2843,6 +2853,8 @@ class Lifter:
         self._loops: dict = {}
         #: loop header -> its natural body; see _back_loop.
         self._backloops: dict = {}
+        #: loop header -> the blocks it can reach while it runs; see _loop_region.
+        self._regions: dict = {}
         self._defs: dict = {}
         self._frame_list: dict = {}
         self._reload_ops: dict = {}
@@ -4730,7 +4742,7 @@ class Lifter:
             # Only an ordinary object register: SP, FP, THR and PP are roles whose value
             # is the same all the way through, and the frame path below has its own rules.
             basedecl = []
-            if (base in st.lost and _T.roles.get(base) is None
+            if ((base in st.lost or base in st.opaque) and _T.roles.get(base) is None
                     and base not in self.alias):
                 tmp, decl = self._mint(st)
                 if decl:
@@ -6332,8 +6344,22 @@ class Lifter:
         # 5, write 7 to it in the body, and the code after the loop printed 5. The loop
         # body is where the value now comes from, so the name is what the reader gets.
         written = self._written(self._loop_nodes(header)) - (_SPECIAL - {_lr()})
+        # What the loop's OWN instructions write, a call's clobbers left out. After the
+        # loop the machine holds what the last trip put in one of these, while the
+        # register's own name says the value the function came in with, so a store
+        # through one as its base writes a field of the wrong object (#208).
+        #
+        # Not the registers only a CALL inside the loop clobbered. Those are #216's
+        # class, which names them where a straight-line read follows the call, and
+        # treating them here as well renames the base of every store after a loop that
+        # calls, which is most of them: the shapes in three loop tests are exactly that,
+        # and those tests are about the value rather than the base. That half wants its
+        # own measurement.
+        own = self._own_written(self._loop_region(header)) - (_SPECIAL - {_lr()})
         for r in sorted(written | carried):
             st.forget(r)
+            if r in own:
+                st.opaque.add(r)
         # Forgotten, a register prints as itself, which reads as the last value a printed
         # line put in it. Where a break holds something else in it and the code after the
         # loop reads it, that is the wrong value: `umulh x7, ...` printed, `add x7, x5,
@@ -6368,8 +6394,10 @@ class Lifter:
         # phi collapsed keeps its entry value, which the loop did not change.
         for r in sorted(names):
             st.reg[r] = V(names[r], P_ATOM)
+            st.opaque.discard(r)      # it holds the carried name, not an unknown (#208)
         for r in sorted(carried - set(names)):
             st.reg[r] = init[r]
+            st.opaque.discard(r)      # its phi collapsed: it holds its entry value
         # Which return register the function last wrote is a fact about the BODY, and the
         # body is what just ran.
         st.result = loop_st.result
@@ -6718,6 +6746,51 @@ class Lifter:
                     stack.append(p)
         got = self._loops[header] = frozenset(nodes)
         return got
+
+    def _loop_region(self, header) -> frozenset:
+        """The blocks the loop at `header` can reach while it runs: the ones the header
+        DOMINATES, so control cannot be in them without having entered the loop.
+
+        Asked by ONE caller, the opaque marking at the loop exit, and deliberately not by
+        the three that ask `_loop_nodes` what the loop may write. `_loop_nodes` returns
+        every ANCESTOR of the header, blocks that run BEFORE the loop among them, and a
+        register written there is not one the loop assigned: a store based on it after the
+        loop reads the value the pre-loop block put there, which its own name says
+        correctly. Tightening what `written` and `carried` are computed over is a separate
+        question with its own measurement (#228); this adds a set rather than changing
+        one (#208).
+        """
+        got = self._regions.get(header)
+        if got is not None:
+            return got
+        if self._idom is None:
+            self._idom = _idoms(self.blocks, self.entry, lambda n: (
+                self.blocks[n].succ if n in self.blocks else ()))[0]
+        nodes, stack = set(), [header]
+        while stack:
+            n = stack.pop()
+            if n in nodes or n not in self.blocks:
+                continue
+            if n != header and header not in self._dominators(n):
+                continue
+            nodes.add(n)
+            stack.extend(self.blocks[n].succ)
+        got = self._regions[header] = frozenset(nodes)
+        return got
+
+    def _own_written(self, nodes) -> set:
+        """What the instructions in `nodes` write, NOT counting a call's clobbers.
+
+        `_written` folds `_def_use`, which gives a call every volatile register, so it
+        cannot tell "the loop assigned this" from "a callee may have changed it". A store
+        base wants the first (#208).
+        """
+        w = set()
+        for b in nodes:
+            for (_a, mn, op, _n) in self.blocks[b].insns:
+                if mn not in _CALLS:
+                    w |= _def_use(mn, op)[0]
+        return w
 
     def _written(self, nodes) -> set:
         w = set()
