@@ -9,7 +9,136 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
-## Unreleased
+## 1.3.0 - 2026-10-29
+
+Upgrading from 1.2.0. The command set, the options and `--json`'s `format_version` are
+unchanged, and the JSON shape only gains fields, but some values a script may hold on to
+are different now:
+
+- Every name and every literal prints ESCAPED. A function, class, field or library name,
+  an ELF symbol, a `--sigs` name and a string literal spell a C1 control, a format or bidi
+  character, a zero width space and a character past the BMP as `\xNN`, `\uNNNN` or
+  `\UNNNNNNNN`, and a `"` inside a quoted literal as `\"`. `strings -g`, `libraries -g`
+  and `xrefs string` read a pattern as typed or as printed, so either spelling matches.
+- A name longer than 200 characters as printed ends in `\... (N chars)`, N its real
+  length, everywhere it prints, `jadart.program()` included. `symbols -j` cuts `name`,
+  `owner` and `library` and says so in a `cut` dict, `qualified` stays whole, and
+  `strings.txt` still prints each string once and whole. A name past 200 characters is not
+  signable.
+- `constants` quotes a list's string elements, where it printed them bare and
+  comma-joined, and a slot reaching a list it has already printed says `same as 0x...`,
+  `same_as` in `--json`.
+- `export` writes nothing over anything. A library or asset whose path another took
+  already, which obfuscation and a case-insensitive filesystem make ordinary, gets a `~N`
+  before its extension: on a Mac the obfuscated fixture's export listed 307 libraries and
+  held 208, and holds 307 now. A failure names the side it came from, the archive or the
+  output directory.
+- Three exits moved off 3, which means a bug in jadart. `signatures -o` into a missing
+  directory, a directory it may not write or a path under a file raises `InputError`,
+  exit 2, naming the path; an `export` path collision is resolved rather than fatal; and
+  a function nested too deeply to structure prints its instructions under a comment where
+  `export -t 2`, `decompile` and `lift` raised RecursionError.
+- Three inputs are refused where they were parsed, each an exit 2. A features string past
+  4096 bytes, a stripped binary whose snapshot magic is at three or more file offsets,
+  since a library holds two, and an ELF or Mach-O whose name and table reads come to more
+  than the file holds, a `ContainerError`.
+- `xrefs` reports the matching entries no code loads directly again, as a count in the
+  text output and under `"unloaded"` in `-j`, where 1.2.0 dropped them without a word. A
+  pattern only such entries match lists them, says so and exits 0 as 1.1.0 did, and its
+  `-j` is `"ok": true` with `"count": 0` where 1.2.0 gave `"ok": false`. `--class` is
+  unchanged and reports no `"unloaded"`.
+- A branch into the part of a function the 4,000-instruction cut left out prints a
+  `goto` to that address with a comment saying it is past the cut, where it printed
+  `goto sub_0x..`, which names another function.
+- The decompiled body reads differently nearly everywhere, which is most of this release.
+  New spellings a script may meet: `.field1_0x8` and `.field2_0x8` for a one or two byte
+  access and `.field16_0x8` for a sixteen byte one, `(FP - 32).field_0x1` for a frame read
+  the walk cannot answer, `tN` names for a loop-carried or join value, `// xN holds ...`
+  on a raw line, `.toSigned(n)` for a bit field, and `(...)` where a call's arguments are
+  not reconstructed. Tier 2 and tier 3 text is a reading of the code, not a stable format.
+
+### Added
+
+- **`tools/pbfuzz.py --census`, a gate for #196's class that needs no emulator.** A reload
+  that spells a register the slot did not hold, and a record spelled on a path that
+  superseded it, are both properties of the printed body and the instruction list, so this
+  runs wherever capstone does, which is every pull request. That matters because nothing
+  automated looked at this class before, in either direction: `irfuzz` generates no
+  x29-relative frame slot, and `pbfuzz`'s fuzzing half scores any store resting on a
+  written register as undecidable. #197 shipped 2,023 stale spellings past four green CI
+  jobs, a clean suite and five CPU-verified shapes.
+
+  It reads every range of a real image (`image.all_ranges`, 8,194 on the clean fixture and
+  8,188 on the obf one, not the 6,849 and 238 that `fr.functions` gives), forks its
+  bookkeeping where the lifter forks `State`, and scores only the last walk of each range
+  because `lift_function` walks up to three times. Five earlier measurements of this class
+  were wrong for want of one of those, so the census carries them rather than a scratch
+  script. On `4623d71`: 8,606 records spelled, 0 stale, and 3,427 reads that name a
+  different value than the slot held, of which 2,608 are ACTIONABLE (the slot held a
+  register or an expression that was still available) and 819 are names out of their
+  declaration's scope, which cannot be spelled at all.
+
+  That split is the point rather than bookkeeping. Naming a spill earlier moves reads from
+  the first number into the second without the reader gaining anything, so the test
+  asserts
+  both: the stale count is zero, which has no acceptable non-zero value; the actionable
+  count has not risen above 2,608; and the total has not risen above 3,427. It then puts
+  #197's bug back, both halves of it, and checks the census still reports it: a fill that
+  no longer supersedes gives 20, records shared across arms give 561.
+
+- **`tools/pbfuzz.py`, a differential oracle for the printed body where a register write
+  is printed.** The existing oracles could not reach that case: `irfuzz._exec_one` raises
+  on a line printed raw, so the case is dropped, and `irfuzz._mem_expr` maps
+  `x20.field_0xN` to a fixed slot key, so a `_bump` that advances the base still reads the
+  old slot. Those two are how the printed body assigns a register, and a printed register
+  write is the precondition for the staleness #187 was opened for, so that class had never
+  been measured. The new oracle generates straight-line runs mixing self-referential
+  writes, write-back bases, raw lines and spill/reload round trips through an x29 frame
+  slot, then interprets the printed body against a real CPU: a raw line is executed on the
+  CPU against the body's own state with its `// x1 holds x1 + 8` note bound first, and
+  memory is a real array, so a moved base reads where it now points. A store is scored
+  only where every register in its text is an argument the run never writes or one the
+  printed body has already assigned, because a bare register can be the lifter declining
+  and FINDINGS.md records that the two are not distinguishable from the output. Clean:
+  8,000 runs, 7,998 scored, 0 disagreements over seeds 1 to 16 and 12 environments each.
+  Teeth over seeds 1 to 8 of the same set: `_pin` returning nothing makes 653 of 3,998
+  scored runs disagree, where main has 0 of 4,000. Needs unicorn, as `irfuzz` does, and is
+  not part of `check.sh`.
+
+
+### Changed
+
+- **The self-referential half of #187 is measured, and it is not a defect.** A register
+  in the output means the value the function came in with until a printed statement
+  assigns it, which is what `_verbatim`, `_phi_name`, the `_bump` invariant test and
+  `tools/irfuzz.py` all take it to mean. A self-referential write prints no assignment, so
+  `add x4, x4, #1` followed by a store prints `x4 + 1`, which is what the machine stored.
+  The guard that keeps `x4 + 214 - x4` from being named apart is therefore a spelling
+  choice, worth the declaration it does not mint, not a correctness guard. No output byte
+  changes: this replaces a claim, not the renderer.
+  `test_a_self_referential_write_keeps_the_spelling_that_cancels` said each named-first
+  spelling was "correct in none" of 200 environments; that was scored by reading a bare
+  register as the machine's current value rather than the printed body's, so it did not
+  support the claim and is withdrawn. The assertions stand as spelling pins and
+  `test_a_self_referential_write_is_right_under_printed_body_semantics` carries the
+  measurement.
+
+- **Declarations nothing reads, bound by a phi, are dropped.** `_phi` and `_render_loop`
+  bind a name at a join or a loop header whenever the paths disagree about a register,
+  before the body is printed and so before it is known whether the result is read. Where
+  nothing reads it, the declaration and the writes to it on each arm say nothing, and a
+  loop that carried six argument registers for a call that then declined to `(...)` left
+  a dozen such lines. They are now dropped, together, declaration and every assignment;
+  a phi stays whole where dropping it would leave an if-arm or a loop body holding
+  nothing else (the one line that says the arm ran, as a dead slot name is kept), and
+  where an assignment makes a call, the call being a side effect. Dropping a dead name
+  can leave the value it was copied from read once, which then folds into its use, so a
+  few lines read tighter too (`var t = this.field_0xc; ... t.field_0xc` becomes
+  `this.field_0xc.field_0xc`). Tier 3 exports lose dead lines in 340 functions on the
+  clean fixture, 223 on 2.19.6, 334 on 3.4.4 and 343 on 3.10.9, and none on obf; every
+  change is a line removal or that fold, no live value moves, and no block is left
+  empty. Closes #169.
+
 
 ### Fixed
 
@@ -225,7 +354,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   cannot tell #207's defect from reading one field twice, and a number that cannot say
   which it is counting is not a gate (#210).
 
-
 - **A call defines what it clobbers.** `State.forget` left a register holding its OWN bare
   name, and the printed body never assigns that, so it read as the value the function came
   in with. After a call that is whatever the callee left: `f(this); x1.field_0x8 = x2;`
@@ -261,7 +389,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   per fixture, in 30 ranges, are read by nothing, which is `_drop_unread`'s pass order and
   not this change: its last call says why it stays restricted to `blind_named` (#176).
 
-
 - **A raw line no longer crashes on a pinned name the hoist took.** `_verbatim` collects
   the names `_pin` wrote out into `raw_names` by matching each line as a declaration, and
   a name the hoist took is not one: it declares at the top of the body and assigns where
@@ -271,7 +398,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   writes out, so this shipped green with the hoist in; the first change that made
   `_verbatim` fire more often found it (#212, found working on #176).
 
-
 - **A bare `q` or `v` register is counted.** `tools/quality.py`'s register pattern matched
   `w`, `x`, `d` and `s` only, so a line whose only register was `q0` or `v1` counted as
   carrying none, and `pbfuzz.census`'s `regline` inherited that because it uses that same
@@ -279,7 +405,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   their register were invisible to every number in the repo. 55 lines on the clean build
   and 55 on the obfuscated one are counted now; no output changes, the lifted lines are
   identical (#209).
-
 
 - **A name is hoistable whichever site minted it.** Thirteen places allocated
   `t{tmpc}` themselves and then each decided for itself whether the name could be
@@ -298,7 +423,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   and `_join_write`, which allocate outside `_mint` and declare elsewhere, plus the four
   that are declared nowhere at all (#205). Raising the hoist's iteration bound from 4 to
   12 changes none of them, so the residue is not a bound.
-
 
 - **Liveness is asked about one register however the operand spells it.** `d0`, `s0`,
   `v0`, `q0`, `h0`, `b0` and `v0.16b` are one machine register, and `_regs` builds every
@@ -319,7 +443,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   goes unread. Its names are recorded in `raw_names` now, so the pass that drops what
   nothing reads takes them. **63 declarations nothing reads leave the output**, on each
   fixture.
-
 
 - **A declined frame reload no longer reads as the value the function came in with.** A
   reload the walk cannot answer printed NOTHING and kept the load's own register. The
@@ -417,36 +540,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   recorded from main on the same machine. One pinned assertion moves, and it was pinning
   the defect.
 
-### Added
-
-- **`tools/pbfuzz.py --census`, a gate for #196's class that needs no emulator.** A reload
-  that spells a register the slot did not hold, and a record spelled on a path that
-  superseded it, are both properties of the printed body and the instruction list, so this
-  runs wherever capstone does, which is every pull request. That matters because nothing
-  automated looked at this class before, in either direction: `irfuzz` generates no
-  x29-relative frame slot, and `pbfuzz`'s fuzzing half scores any store resting on a
-  written register as undecidable. #197 shipped 2,023 stale spellings past four green CI
-  jobs, a clean suite and five CPU-verified shapes.
-
-  It reads every range of a real image (`image.all_ranges`, 8,194 on the clean fixture and
-  8,188 on the obf one, not the 6,849 and 238 that `fr.functions` gives), forks its
-  bookkeeping where the lifter forks `State`, and scores only the last walk of each range
-  because `lift_function` walks up to three times. Five earlier measurements of this class
-  were wrong for want of one of those, so the census carries them rather than a scratch
-  script. On `4623d71`: 8,606 records spelled, 0 stale, and 3,427 reads that name a
-  different value than the slot held, of which 2,608 are ACTIONABLE (the slot held a
-  register or an expression that was still available) and 819 are names out of their
-  declaration's scope, which cannot be spelled at all.
-
-  That split is the point rather than bookkeeping. Naming a spill earlier moves reads from
-  the first number into the second without the reader gaining anything, so the test asserts
-  both: the stale count is zero, which has no acceptable non-zero value; the actionable
-  count has not risen above 2,608; and the total has not risen above 3,427. It then puts
-  #197's bug back, both halves of it, and checks the census still reports it: a fill that
-  no longer supersedes gives 20, records shared across arms give 561.
-
-### Fixed
-
 - **A reload of a dropped frame slot reads the value it held, not the load's own
   register.** `stale_on_write` drops a slot whose text names a register that is then
   reassigned (#173), and `_reload` fell back to spelling the LOAD'S OWN destination. That
@@ -486,46 +579,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   staleness and no ordering residual. Both acceptance gates read as before (Tier A 11/11
   and 9/9, Tier B 3/3), `cfgcheck` is clean on both fixtures, and the export is
   byte-identical across two hash seeds.
-
-### Added
-
-- **`tools/pbfuzz.py`, a differential oracle for the printed body where a register write
-  is printed.** The existing oracles could not reach that case: `irfuzz._exec_one` raises
-  on a line printed raw, so the case is dropped, and `irfuzz._mem_expr` maps
-  `x20.field_0xN` to a fixed slot key, so a `_bump` that advances the base still reads the
-  old slot. Those two are how the printed body assigns a register, and a printed register
-  write is the precondition for the staleness #187 was opened for, so that class had never
-  been measured. The new oracle generates straight-line runs mixing self-referential
-  writes, write-back bases, raw lines and spill/reload round trips through an x29 frame
-  slot, then interprets the printed body against a real CPU: a raw line is executed on the
-  CPU against the body's own state with its `// x1 holds x1 + 8` note bound first, and
-  memory is a real array, so a moved base reads where it now points. A store is scored
-  only where every register in its text is an argument the run never writes or one the
-  printed body has already assigned, because a bare register can be the lifter declining
-  and FINDINGS.md records that the two are not distinguishable from the output. Clean:
-  8,000 runs, 7,998 scored, 0 disagreements over seeds 1 to 16 and 12 environments each.
-  Teeth over seeds 1 to 8 of the same set: `_pin` returning nothing makes 653 of 3,998
-  scored runs disagree, where main has 0 of 4,000. Needs unicorn, as `irfuzz` does, and is
-  not part of `check.sh`.
-
-### Changed
-
-- **The self-referential half of #187 is measured, and it is not a defect.** A register
-  in the output means the value the function came in with until a printed statement
-  assigns it, which is what `_verbatim`, `_phi_name`, the `_bump` invariant test and
-  `tools/irfuzz.py` all take it to mean. A self-referential write prints no assignment, so
-  `add x4, x4, #1` followed by a store prints `x4 + 1`, which is what the machine stored.
-  The guard that keeps `x4 + 214 - x4` from being named apart is therefore a spelling
-  choice, worth the declaration it does not mint, not a correctness guard. No output byte
-  changes: this replaces a claim, not the renderer.
-  `test_a_self_referential_write_keeps_the_spelling_that_cancels` said each named-first
-  spelling was "correct in none" of 200 environments; that was scored by reading a bare
-  register as the machine's current value rather than the printed body's, so it did not
-  support the claim and is withdrawn. The assertions stand as spelling pins and
-  `test_a_self_referential_write_is_right_under_printed_body_semantics` carries the
-  measurement.
-
-### Fixed
 
 - **A register expression is named before a move or a computed result reassigns a register
   it names.** The load pass below is the same hazard for the two other ways a register is
@@ -696,6 +749,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   is a save, and the call reads no stack arguments. Tier 3 exports change in 30 functions
   on the clean fixture, 1455 on 2.19.6, 36 on 3.4.4 and 31 on 3.10.9, and none on obf:
   dropped argument lists now read in full, and saved registers decline. Closes #147.
+
 - **A value a join lost is no longer read back from a frame slot as the register.** A
   register the two arms of an `if` disagree about is dropped to its bare name, which
   reads like the entry value and like a raw line's result. A frame slot that spilled one
@@ -709,26 +763,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   374 on 2.19.6, 525 on 3.4.4 and 536 on 3.10.9, and none on obf: each a reload that read
   a stale register now reading the loaded value under its own name, which cannot be a
   wrong value, only a decline. Closes #140.
-
-### Changed
-
-- **Declarations nothing reads, bound by a phi, are dropped.** `_phi` and `_render_loop`
-  bind a name at a join or a loop header whenever the paths disagree about a register,
-  before the body is printed and so before it is known whether the result is read. Where
-  nothing reads it, the declaration and the writes to it on each arm say nothing, and a
-  loop that carried six argument registers for a call that then declined to `(...)` left
-  a dozen such lines. They are now dropped, together, declaration and every assignment;
-  a phi stays whole where dropping it would leave an if-arm or a loop body holding
-  nothing else (the one line that says the arm ran, as a dead slot name is kept), and
-  where an assignment makes a call, the call being a side effect. Dropping a dead name
-  can leave the value it was copied from read once, which then folds into its use, so a
-  few lines read tighter too (`var t = this.field_0xc; ... t.field_0xc` becomes
-  `this.field_0xc.field_0xc`). Tier 3 exports lose dead lines in 340 functions on the
-  clean fixture, 223 on 2.19.6, 334 on 3.4.4 and 343 on 3.10.9, and none on obf; every
-  change is a line removal or that fold, no live value moves, and no block is left
-  empty. Closes #169.
-
-### Fixed
 
 - **A write to a V register's upper lane no longer forgets the double in its low lane.**
   d0, v0.16b and q0 are one register, and #114 forgot the double tracked under dN on any
@@ -809,6 +843,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   cost test compares two sizes rather than a time in seconds, and nested loops cost about
   half what they did, 0.58 s for 300 deep against 1.02 s, as each block's frame accesses,
   writes and reload steps are worked out once for all the loops around it. Closes #162.
+
 - **A slot the loop does not store to survives it.** A loop's exit forgot every frame slot
   where a block of `_loop_nodes` stored to the frame, and those take in the blocks before
   the loop too (#129), which store to it as a rule. So a value saved before the loop read
@@ -827,6 +862,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   printed `(x1, t2, x3)`. Tier 3 exports change in 183 functions on the clean fixture, 76
   on 2.19.6, 160 on 3.4.4 and 190 on 3.10.9, and in none on obf, where a bare register
   after a loop now reads as what its slot holds. Closes #157.
+
 - **A goto out of a loop hands on what the last trip left.** A goto out of a loop handed
   its target the state the walk had at the jump, which is the first trip's: a register the
   loop writes further down still held its value from before the loop, so the target of a
@@ -843,6 +879,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   exports change in `_removeDotSegments` and `_normalizeRelativePath` on the clean fixture
   and 3.10.9, and in `_removeDotSegments` on 3.4.4, where a flag the loop sets printed as
   the `false` it starts as; none on 2.19.6 or obf. Closes #154.
+
 - **A call to a function with register and stack arguments prints both.** A Dart function
   that takes register arguments gets its first six integer and object arguments in x1, x2,
   x3, x5, x6 and x7, its first six unboxed doubles in V0 to V5, and the rest on the stack,
@@ -872,6 +909,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   3.4.4 and 31 on 3.10.9, and in none on 2.19.6 or obf. 19 or 20 calls a build print both
   parts, each with as many pushed values as its callee reads, and 8 to 12 print `...`
   where they printed one part. Closes #148.
+
 - **A function that hands back its double argument returns d0.** One that never writes d0
   had no rule of its own code to decide which register its `ret` hands back, so
   `Curve.transform`, which returns its argument where it is 0.0 or 1.0, printed
@@ -889,6 +927,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   obf's `Curve.transform`, which its export does not print, lifts to `return d0;` too.
   obf's table names one offset, not that one, so its `_Linear.transformInternal` still
   prints `return x0;` (#159). Closes #127.
+
 - **A call's double read past the next instruction is named.** A call's d0 result got a
   name only where the very next of x0 and d0 an instruction touched was a read of d0.
   After a reload of x0, an inline box or a join it printed as `d0`, the d0 the function
@@ -902,6 +941,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   slow path's save of q0 laid out after a throw no longer reads as the throw's caller
   reading its result. Tier 3 exports change in 29 functions on the clean fixture, 17 on
   2.19.6, 26 on 3.4.4 and 31 on 3.10.9. Closes #152, part of #127.
+
 - **A loop names what it computed over a raw write it printed.** A register a loop writes
   is forgotten at its exits, and prints after the loop as itself, which reads as the last
   value a printed line put in it. Where that was a raw line in the loop, `umulh x7, ...`,
@@ -914,6 +954,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   the loop around it (#129). Tier 3 exports change in one function on each corpus build
   and the clean fixture: `_append` in serialization.dart on clean, 3.4.4 and 3.10.9, and
   `_synchronizeModifiers` on 2.19.6. Part of #123.
+
 - **A call whose double result is read next names it.** A double comes back in d0, and a
   call's d0 result was never named: it read as d0, which is also how the d0 the function
   was handed reads, so `ratioOfTones` compared two calls' results as `d0 > d0`. Where the
@@ -924,6 +965,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   to a `return NULL;`, where every join on the way took a phi for it that nothing read.
   Tier 3 exports change in 149 functions on the clean fixture, 107 on 2.19.6, 135 on 3.4.4
   and 146 on 3.10.9. Part of #134 and #127.
+
 - **A call to a function that reads its arguments off the stack prints what it pushed.**
   `entry_arity` counts the registers a function reads on entry and declines where it reads
   stack arguments off FP, but a frameless function reads them off SP, `ldr x0, [x15]`, and
@@ -941,6 +983,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   on the clean fixture, 35 on 3.4.4 and 37 on 3.10.9, and in 1,324 on 2.19.6, which pushes
   its arguments that way: 2,691 of the lines it gains are a call printing `...` where it
   printed part of its arguments. Closes #144.
+
 - **A loop carries a register it reads only as a call argument.** A loop decides what it
   carries from the registers its body reads before writing, and a call read none, so a
   value passed to a call and set again later in the loop printed as its value from before
@@ -951,6 +994,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   often as not. Tier 3 exports change in 12 functions on the clean fixture, 7 on 3.4.4 and
   14 on 3.10.9; 2.19.6, which passes no arguments in registers, does not change. Closes
   #142.
+
 - **A stub that returns a value is a call to the return rule.** The walk suppresses
   `InitLate*`, `Await`, `InitAsync` and `CloneContext` as it does the stubs that give
   every register back, and the rule that decides whether a `ret` hands back x0 or d0 took
@@ -960,6 +1004,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   return rule now, as `export` does: the bench `lift` digest changes, and `quality.py`'s
   count of bare-register lines on the clean fixture goes from 37,248 to 37,233. Part of
   #127.
+
 - **A dispatch offset other selectors share is not named.** The dispatch table is packed
   by row displacement, so selectors whose classes never meet can take the same offset, and
   a call site's immediate does not say which one it calls; the vote gave the offset to the
@@ -975,6 +1020,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   that returns a double. 133 of the 168 names stay on the clean build, naming 607 of its
   2,580 recovered dispatch sites (974 before), and about 51% of the sites on the 2.19.6,
   3.4.4 and 3.10.9 builds (about 65% before). Closes #128.
+
 - **A value read only as a call's argument is live up to the call.** `bl` reads no
   register to the machine, so tier 3 took a value read only as a call's argument, or as
   what a `throw` throws, as dead. A raw line overwriting a register it was spelled with
@@ -987,6 +1033,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `if`, and the phi took the value from before the `if`. Such an arm now assigns the
   register itself. Tier 3 exports change in 161 functions on the clean fixture, 117 on
   2.19.6, 243 on 3.4.4 and 257 on 3.10.9, most of them one of those three. Closes #122.
+
 - **A register list load writes every register in it.** `ld1 {v0.16b, v1.16b}` writes
   d0 and d1, and tier 3 took only the first register of a list as written and the rest
   as read: a store of d1 after the load printed the field d1 held before, and the raw
@@ -994,6 +1041,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   lane of each, `ld2 {v4.s, v5.s}[1]`, reads them too, since it keeps the other lanes.
   None of the five fixtures has a register list, so exports do not change. Part of
   #134.
+
 - **A frame slot past the displacement is its own slot.** A slot further from FP than the
   9-bit displacement reaches is addressed through a register, `mov x17, #-0x158; str d0,
   [x29, x17]`, and tier 3 read every such access as `[x29]`, so all of them were one slot
@@ -1007,6 +1055,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `ColorScheme`'s `copyWith`, `fromSeed`, `hashCode` and `lerp` and `ThemeData`'s
   `copyWith`, `lerp` and constructor among them. obf does not change, as its export lifts
   none of the functions with such an access. Closes #137.
+
 - **A negative number and a 32-bit shift read as Dart reads them.** Tier 3 gave a
   negative literal the precedence of a name, so `neg` of it printed `--128`, which is
   Dart's decrement, a field read off it `-128.field_0x8`, which Dart reads as
@@ -1018,6 +1067,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   compressed Smi untagged with `asr w` comes out negative where it is. Tier 3 exports
   change by 42 lines on the clean fixture, 114 on 2.19.6, 52 on 3.4.4 and 40 on 3.10.9;
   obf does not change. Closes #130.
+
 - **A goto into a loop's head reads no name and no value the goto skipped.** A loop
   head a goto also reaches was left out of the goto join's rules, because the loop binds
   its own names there, and the way in the walk did not take brought a state it never
@@ -1030,6 +1080,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   sees the read and a raw one says what the register held. Tier 3 exports change in 11
   functions on the clean fixture (50 lines), 9 on 2.19.6, 11 on 3.4.4 and 13 on 3.10.9,
   each a value the ways in disagree on that now prints as its register. Closes #125.
+
 - **A field saved in a frame slot across a call keeps the value it had when it was
   saved.** Tier 3 tracks what a slot `[x29, #d]` holds as the text stored there, so a
   field spilled before a call and reloaded after it printed as a fresh read of the field,
@@ -1059,6 +1110,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   holds: with the spill named, `StadiumBorder.lerpFrom` returned the field where the
   machine returns the object it allocates. Part of #64; the trap rule is not in this
   change.
+
 - **A loop that keeps a counter in a frame slot no longer reads the slot's first value on
   every trip.** The walk of a loop starts from the state before it, so a slot the body
   stores a new value to printed its pre-loop text at the top of the loop: a counter kept
@@ -1067,6 +1119,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   and the reload prints its register. One it only writes back with the value it already
   held keeps it, and a store on a path that throws does not count, since tier 3's graph
   still runs on past a trap and past a throw stub with nothing after it. Closes #109.
+
 - **A write to any spelling of a SIMD register reaches the double in it.** `d0`, `v0.16b`
   and `q0` are one register, and tier 3 tracked a double under the spelling it was
   written with, so a write under another left `d0` describing the value before it. `eor
@@ -1086,6 +1139,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   print 118, 590, 286 and 117 values right that main printed wrong, and 19 that main
   named right go bare, all in one function, the `pow` cases of `_findResultByJ`.
   `st1 {v0.16b}` now reads d0 too. Closes #114.
+
 - **A `ret` hands back x0 unless something proves a double.** Tier 3 printed whichever of
   x0 and d0 a path wrote last, so a function that allocates an object and then fills its
   double fields printed its last field value as what it returns: `Rect.topRight` on the
@@ -1109,6 +1163,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   object and return another temp, goes from 147 to 117 on 3.4.4, and every `ret` of those
   117 returns x0: the object they fill is not what they return. Tiers 1 and 2 are byte for
   byte as before. Closes #115.
+
 - **A goto's target reads what the goto left.** A block only a goto reaches is lifted
   from the state its one predecessor left, and that state was taken before the printed
   program writes loop names back on the way there: in the goto's own write-back, and in
@@ -1138,6 +1193,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   graphs (#125), came from the last block printed, not the return. Its trials draw from
   a generator of their own per graph, so what one graph scores no longer moves the
   graphs after it. Closes #106.
+
 - **A bit field reads as wide as it is.** `sbfx` carries the top bit of its field up,
   and tier 3 printed it as `(x >> lsb) & mask`, which clears it, so a negative field read
   as a large positive one. `sbfiz` and `ubfiz` printed `x << lsb` and kept every bit
@@ -1151,6 +1207,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   had, `x >> 1` and the value itself (see `tools/irfuzz.py`); the hash is tagged in the
   open now, `<< 1`. Tier 3 exports change by 6 lines on the clean fixture and 4 on each
   of the 2.19.6, 3.4.4 and 3.10.9 corpus builds. Closes #124.
+
 - **A raw line says what the registers it reads hold.** A raw line reads the machine
   registers it names, and tier 3 holds most registers as expressions it prints only where
   something reads them, so a register a raw line read could hold a value the printed
@@ -1164,6 +1221,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   mentions is no longer folded into the next line (`var t3 = lerpDouble(...)`). A
   flag-setting instruction also no longer names the old value of a destination it does
   not read, as `subs x1, x0, x2` named x1 (#116). Closes #120.
+
 - **A name is read only on paths that set it.** Tier 3 read a name on paths that never
   set it, in three ways. A goto join kept every register no block between wrote, and
   naming a value writes none, so a call's result or a phi named on one path into the
@@ -1181,6 +1239,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   the clean fixture (2,499 lines in 65 files), 300 on 3.4.4, 298 on 3.10.9, 287 on
   2.19.6 and 82 on obf, and the clean export grows from 141,867 to 142,084 lines.
   Closes #121.
+
 - **A raw line no longer changes what an earlier value reads as.** An instruction tier 3
   prints as it is assigns the registers it writes, so a value the lifter still held that
   was spelled with one of them read as the new value after it: `add x5, x1, #1; subs x1,
@@ -1192,6 +1251,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   second register and a compare-and-swap its first, and `st1 {v0.16b}, [x1], x2` moves
   its base; `br` reads its target. A name only another raw line would read is left out.
   A value read only as a call's argument is not counted as read yet (#122). Closes #118.
+
 - **A branch reads the operands its flags were set from.** `subs x1, x1, #8` sets the
   flags from the x1 it is overwriting, and tier 3 rendered the branch after it with the
   x1 that was left: a copy loop in the clean fixture (0x2d32c8) printed `if (x1 == 8)`
@@ -1205,6 +1265,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   Tier 3 exports change by 1,923 lines in 7 files on the clean fixture, 1,803 in 7 on
   3.4.4 and 1,870 in 7 on 3.10.9, much of it later temps renumbered, and by 8 and 12
   lines on obf and 2.19.6. Closes #116.
+
 - **cfgcheck knows which arm of an `if` is taken.** It compared the set of places an
   `if`'s arms go with the set the block's CFG records, never which arm was which, so an
   `if` rendered the other way round, each arm running exactly when it should not, passed:
@@ -1213,6 +1274,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   emits (two successors, a branch out, a conditional return, a branch at the cut). Every
   corpus build and the fixtures still read 0, and so do 150,000 random functions. Closes
   #110.
+
 - **cfgcheck holds an arm that leaves to the way its block leaves.** It read every branch
   out of the function or past the instruction cut as one and the same, so a rendering
   that called a branch into the part past the cut a branch out of the function, which is
@@ -1225,6 +1287,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   the body is the last block's only. Its reports name the ways out, as `exit 0x...`, `cut
   0x...`, `exit return` or `exit indirect`. Every corpus build, arm64 and arm32, and
   120,000 random functions still read 0. Closes #107.
+
 - **`export` writes no asset over another, and blames a failure on the side it came
   from.** An APK's or IPA's assets went where their names said, as libraries did before
   #96: on the Brod & Co. apk with two members added, `Logo.txt` and `logo.txt` left one
@@ -1248,6 +1311,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `ContainerError` about an archive that is fine; it is an `InputError` naming the output
   directory now, and a failure reading the archive is still its `ContainerError`. The
   four Flutter apks on hand export byte for byte as before. Closes #104.
+
 - **A snapshot's features string is read only as long as a real one can be.** It names
   the build's VM flags and target, in under 160 bytes in every AOT build measured, and it
   was read to its NUL however far away that was, kept whole, and printed whole by `info
@@ -1258,6 +1322,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   that runs past 4096 bytes raised `TruncatedSnapshot` before and is that `InputError`
   too, and one that ends inside the bound with no NUL is still reported truncated. The 92
   headers of 46 real libapp.so hold 118 to 156 bytes and read as before. Closes #101.
+
 - **`export` no longer writes one library over another.** A library goes where its url
   says, and nothing checked that two did not land in one place. Obfuscation names
   libraries by short tokens, and `Ahd` and `ahd` are one file on macOS and Windows: the
@@ -1286,6 +1351,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   disk) is an `InputError` (exit 2) naming it, where those were exit 3 too; assets are
   #104. On the fixtures, four corpus builds and the CTF apps, every file main wrote has
   the same contents. Closes #96.
+
 - **A branch out of the function from inside a loop or an `if` reads as one.** cfgcheck
   read a branch out of the function, or past the instruction cut, as nothing at all, so
   an arm that leaves claimed whatever followed it and the check reported an edge the
@@ -1298,6 +1364,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   so they said nothing of what the registers held where control left; the innermost
   loop's are written back now, as for a `break`. No corpus build or fixture has that
   shape, and their tier 3 exports are unchanged. Closes #86.
+
 - **`signatures -o` into a path it cannot write exits 2.** A missing directory, a
   directory, a path under a file, a directory it may not write or a name too long raised
   the `OSError` from opening the file, and the CLI reported it as a bug in Jadart, with
@@ -1310,6 +1377,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   own descriptor, which reaches it behind a symlink or a hard link too, and removed while
   the path still names it. A broken pipe on `-o /dev/stdout` is that same exit 2, where
   it was 0. Closes #97.
+
 - **A stripped binary is read for two snapshots at most.** With no `_kDart*SnapshotData`
   symbols, the snapshots are found by scanning for their magic, and each hit was parsed
   out of a copy of the rest of the file and listed: an ELF of 201 byte snapshot headers
@@ -1323,6 +1391,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   parse was refused before too, with that hit's parse error; it is the count that is
   reported now. Each of 46 real libapp.so has the magic exactly twice, and with its
   section headers removed still reads to the two headers its symbols name. Closes #99.
+
 - **A container's tables cannot cost more than the file.** An ELF or Mach-O gives the
   offset of each symbol's name, of each symbol table and of a segment's sections, and
   their counts, and nothing stopped them from overlapping, so a crafted file made every
@@ -1351,6 +1420,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `_kDart` blobs as before. Remembering the offsets read costs a large symbol table a
   little: libwireshark's 524K symbols open in 0.54s and 438 MB, from 0.47s and 389 MB.
   Closes #95.
+
 - **A long name is cut wherever it prints.** One string names every function that
   shares it, a class name comes back in each of its members and a library url in each
   of its classes, and nothing cut a name, so a long one cost the output its length at
@@ -1380,6 +1450,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   2.19.6, 3.12.2 and two arm32 corpus builds. The `symbols` table and the IDA, Ghidra
   and radare2 scripts cut a qualified name at 200 already; the cut gains its backslash
   there, on 5 names of the clean fixture and 8 of the 2.19.6 build. Closes #94.
+
 - **A crafted pool cannot make the const lists cost a product.** Nothing bounds how
   many pool slots name one object, or how many refs share one RO data string, and the
   const list paths paid for each again: an Array was resolved once per slot naming it,
@@ -1403,10 +1474,12 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   same on both fixtures, the two CTF apps in ctfbench and the 3.12.2 and two arm32
   corpus builds: none names an Array from two slots or holds a list string over 25
   characters. Closes #91.
+
 - **A string in a const list label is cut at 200 like any literal.** `const[N]{...}`
   printed its string elements whole, where the same string in its own slot is cut, so
   one long string cost its length at every slot and use site naming the list. Closes
   #92.
+
 - **`constants` quotes a list's string elements.** `constants` and `export`'s
   `constants.txt` printed them bare, joined by `, `, so a crafted list could not be read
   back: `["a, b"]` read as two elements, `"0x10"` as the int 0x10, and `""` as a gap.
@@ -1414,6 +1487,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   escaped, and whole. Of the 39 lists in the fixtures, the two CTF apps in ctfbench and
   the 3.12.2 and two arm32 corpus builds, the 18 that hold a string change by their
   quotes alone and the rest not at all; none of them was ambiguous before. Closes #88.
+
 - **A quote in a string literal does not end it.** A literal printed between double quotes
   kept a `"` in it raw, so on its line the literal ended early and what followed read as
   code: a string `a" ; isAdmin = true; x = "b` lifted to three statements, and the clean
@@ -1426,6 +1500,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   escape alone, and 192 are long literals whose cut moved. Nothing else does. The arm64
   disasm samples the tests pin move by 6 and 2 lines, all such notes, and are
   regenerated. Closes #83.
+
 - **A function nested too deeply to structure prints its rows.** `structure` and the
   renderers recurse once for each level of nesting, so a range of 500 conditionals
   nested in each other, which only a crafted binary holds, ran out of Python's stack:
@@ -1434,6 +1509,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `// nested too deeply to structure`, and the rest of the output goes on; cfgcheck
   counts it apart. Nothing in the fixtures or the corpus nests that deep, and their
   output is unchanged. Closes #81.
+
 - **A function cut short says where it goes on.** The instruction cut stops a long
   function after 4,000 instructions. A conditional there whose target is earlier had its
   not-taken arm recorded nowhere, so `mov; cmp; b.gt #0x0` printed as a loop with no way
@@ -1446,6 +1522,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   fixtures is cut, so their output is unchanged; on the corpus, `export -t 2` adds one
   such line, to `ColorScheme.fromSeed` in five arm32 builds, and changes no other. Closes
   #70.
+
 - **A branch's condition reads the compare arm32 puts further back.** The condition was
   read from the instruction right before the branch, and on arm32 that is often not the
   compare: 8,606 of arm32-2.19.6's tier 2 conditions printed as `? op ?`. It now reads a
@@ -1460,6 +1537,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   the clean fixture 31 at tier 2 and 57 at tier 3 where 105 and 131 did. Only condition
   lines change, 8,558 on arm32-2.19.6, 291 and 245 on the clean fixture at tiers 2 and 3;
   the obfuscated fixture's export is unchanged. Part of #70.
+
 - **Tier 2 prints the code no edge reaches.** It placed only the blocks the entry reaches,
   so a block that only an exception edge, a jump through a register or a second entry
   leads to was in no statement, and nothing in the output said so: in 1.2.0, 8,580 of the
@@ -1475,6 +1553,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   gains lines: 7,305 with 221 notes on the clean fixture, 2,964 with 70 on the obfuscated
   one, 2,001 with 56 on arm32-2.19.6. Tier 3 is unchanged, since `strip_boilerplate`
   leaves the stack check's slow path unreached on purpose. Closes #67.
+
 - **Literals, two header fields and container listings print escaped too.** #74 escaped
   names; string literals went through `printable()`, which escaped C0 controls, DEL,
   surrogates and NEL/LS/PS and let C1 controls and format characters through, so a literal
@@ -1495,6 +1574,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   U+FE0F shows those as escapes. A signature library hashes pool labels, so one built
   before this may miss a function whose first instructions load such a string; on both
   fixtures the libraries come out identical. Closes #78.
+
 - **Names from the binary print escaped, and read back that way.** Function, class,
   field and library names come out of the same strings as literals, so a crafted snapshot
   can put an escape sequence, a carriage return, a bidi override or a zero width space in
@@ -1510,6 +1590,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   needs no escape and costs an `isprintable()` and a regex search, and the output of
   `functions`, `classes`, `libraries`, `selectors`, `strings`, `symbols` and `export -t 2`
   on both fixtures and arm32-2.19.6 is byte-identical to before. Closes #74.
+
 - **The fence check reads `.MD` and `.markdown` files, and a heading after a quote in a
   list.** `--tracked` asked git for `*.md`, which it matches case sensitively, so
   `Guide.MD` and `notes.markdown`, which GitHub renders, were never checked; it asks for
@@ -1517,6 +1598,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   under HTML was not read as the heading line it is, which holds what the HTML above it
   left open; it is refused now, as `- # x` was. The docs in the repository still pass.
   Part of #48.
+
 - **The fence check reads HTML anywhere in a line, and an element left open to the end.**
   It checked HTML only on a line opening with `<`, so `# <br> <table><tr><td>` put the
   rest of the page inside a heading and `* [<b>]` left a bold element open over it. No
@@ -1535,6 +1617,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   Three code spans in EVAL.md and FINDINGS.md that went on to a second line now fit on
   one, the issue template's title says `VERSION` where it said `<version>`, and the docs
   pass. Closes #48.
+
 - **A signature library survives a crafted reference, and its lines are read to a bound.**
   `save()` wrote each name raw after a tab, so a name holding a line break split its entry
   and `load()` refused the library it had just written, and a name ending in `\r` came
@@ -1546,6 +1629,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   read until memory ran out; a line longer than 1 MiB is now refused with its path and
   number, an input error, in 0.15 s for that command. A library built from the clean
   fixture is byte-identical to before. Closes #49.
+
 - **`xrefs` says which matching entries no code loads, instead of dropping them.** #22
   listed only the pool entries with a direct load, so `xrefs FILE string e` counted 1,113
   of the 1,444 entries 1.1.0 reported, with nothing said about the 331 left out, and
@@ -1558,6 +1642,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `"count": 0`, where 1.2.0 gave `"ok": false`. With `--class` nothing changes, and no
   `"unloaded"` is reported. A miss on an explicit `string` or `pool` kind no longer says
   it looked for a function, which only the 1.1.0 form does. Closes #62.
+
 - **The call graph counts arm32's register calls.** An indirect call site was counted on
   `mn == "blr"`, arm64's name, so arm32's `blx rN` never counted: `functions -j` gave
   `"indirect": 0` for every function of all 13 arm32 corpus builds, and the graph's opaque
@@ -1568,6 +1653,7 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   opaque, since only arm64's dispatch is attributed to a selector; the 200 functions
   `functions -j` lists there by default carry 308 of them. Both arm64 fixtures are
   unchanged, at 5,370 indirect sites on the clean one. Closes #54.
+
 - **A conditional branch at the 4,000-instruction cut keeps its taken edge.** When the
   last instruction decoded was a conditional branch whose target lay past the cut,
   `build_cfg` recorded the target neither as a successor nor as the block's exit, so tier
@@ -1578,12 +1664,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   one edge violation of that build; it now also checks every branch target capstone reads
   against the graph, which flags that range and nothing else on main's graph across both
   fixtures and the 13 arm32 builds, and 0 now. Closes #58.
+
 - **Tier 2 prints every label a goto names again.** Since 1.2.0 a branch out of the
   function printed `goto sub_0x...` by rebinding the name of `render`'s own label printer,
   so every `L_0x...:` after it in the same body printed nothing while the goto naming it
   stayed: 17 such gotos in the clean fixture's `export -t 2` and 4 on arm32-2.19.6, none
   now. On top of the trap fix below, which already removed one of the 17, the only lines
   that change are the 16 and the 4 labels put back. Closes #66.
+
 - **Tier 2 stops at a trap.** `build_cfg` ended a block only at a branch or a return, so a
   `brk` (arm64) or `bkpt` (arm32) inside a range had an edge to the instruction after it,
   and tier 2 printed the code there as what runs next: 939 `brk` on the clean fixture and
