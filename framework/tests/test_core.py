@@ -15050,6 +15050,45 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
         "x2.field_0x8 = d1 + d2;")                        # guard: passes on main
 
 
+def test_a_break_out_of_two_loops_writes_both_loops_names_back():
+    """A break that leaves more than one loop makes every loop it leaves carry the
+    register, not just the innermost (#176, from #123).
+
+    The shape is #176's own: two loops, and two conditional exits out of the inner one
+    that the structurer turns into breaks out of both. x7 is written before the loops by
+    an instruction the lifter models and does not print, and again inside the inner loop
+    by a raw line. On the path that breaks before the raw line the machine holds the
+    first value, and the store after both loops printed a bare `x7`, which under the
+    printed body rule reads as the value the function came in with.
+
+    The hazard WAS recorded, against the inner loop, and the inner loop named it; the
+    outer loop had still forgotten the register, so the code after both read it bare, the
+    name had no reader, and `_lift_function` dropped the carry and walked again without
+    it. Recording the hazard against every loop the break leaves is what makes the second
+    walk's fix stick.
+    """
+    from jadart.expr import lift_function
+
+    rows = [("add", "x7, x5, x1"), ("mov", "x9, #2"), ("mov", "x10, #3"),
+            ("cbz", "x3, #0x34"), ("umulh", "x7, x6, x1"), ("cbz", "x4, #0x34"),
+            ("sub", "x10, x10, #1"), ("cbnz", "x10, #0xc"),
+            ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"), ("ret", ""), ("ret", ""),
+            ("ret", ""), ("stur", "x7, [x2, #95]"), ("ret", "")]
+    got = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    # The unprinted write is named before the loops, and the store reads that name and
+    # not the register. Which name it is depends on the numbering, so the test reads the
+    # store line and checks what it names.
+    store = next(ln for ln in got if ln.startswith("x2.field_0x60 = "))
+    named = store[len("x2.field_0x60 = "):-1]
+    assert re.fullmatch(r"t\d+", named), store
+    assert f"var {named} = x5 + x1;" in got, got
+    # The inner loop assigns it from x7 on each way out, after the raw line that wrote
+    # x7, and the outer loop carries it on to the store.
+    assert sum(1 for ln in got if re.fullmatch(r"t\d+ = x7;", ln)) >= 2, got
+    assert f"{named} = t" in "\n".join(got), got
+
+
 def test_a_goto_out_of_nested_loops_names_what_the_join_reads():
     # A goto out of an inner loop to a block the outer loop also leaves to is a join the
     # structured walk never met: `_join_kill` dropped the register to its bare name, which
