@@ -13,6 +13,20 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A break out of two loops makes both of them carry the register.** `_render_loop`
+  records an exit hazard for a register a break leaves holding something other than its
+  own name, and `_lift_function` walks again with that register carried so the break names
+  what it holds. Recorded against the innermost loop only, a break that leaves TWO loops
+  named the register at the inner one and the outer one had still forgotten it, so the
+  code after both read it bare, the name had no reader, and the walk dropped the carry and
+  ran again without it: the second walk's fix came undone by the third. The hazard now
+  goes to every loop the break leaves, which are the frames still on `_carrying` when the
+  inner loop's own has been popped. On #176's own shape the store after both loops read a
+  bare `x7` whose last write on one way in was an instruction the lifter models and does
+  not print, so it read as the value the function came in with; it now reads a name bound
+  to that write before the loops and assigned from x7 on each way out. No line of either
+  fixture changes, the shape is not in them, and the test is the issue's listing (#176).
+
 - **A goto backwards out of a loop leaves it.** `_loop_nodes` closes backward over every
   predecessor of the loop header, so it returns every ANCESTOR of the header: on the clean
   fixture that put blocks which run before the loop into all 6,131 of its loops, 70,789

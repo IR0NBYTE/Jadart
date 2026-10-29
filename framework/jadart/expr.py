@@ -6296,6 +6296,17 @@ class Lifter:
                     v = left.get(r)
                     if v.text != r or (r in marks and v is marks[r]):
                         self.exit_hazards.setdefault(header, set()).add(r)
+                        # A break that leaves MORE THAN ONE loop leaves this register in
+                        # the same state at each of them, so each has to carry it. Named
+                        # at the inner loop alone, the name was written back there and the
+                        # outer loop had still forgotten the register, so the code after
+                        # both read it bare; the name then had no reader and the walk gave
+                        # it up, which is how the second walk's fix came undone. The
+                        # enclosing loops are the frames still on `_carrying`: this runs
+                        # after the body walk has popped this loop's own (#176).
+                        for out_h, _names, _copied in self._carrying:
+                            if s not in self._loop_nodes(out_h):
+                                self.exit_hazards.setdefault(out_h, set()).add(r)
         # ...except the ones that got a name, whose value after the loop is that variable.
         # That is the second half of naming it: forgetting it here would put the machine
         # register back into every line that reads the result of the loop. A register whose
