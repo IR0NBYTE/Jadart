@@ -609,6 +609,11 @@ _INT_LITERAL = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)\Z")
 _FIELD_LHS = re.compile(
     r"\.(?:field_0x[0-9a-fA-F]+|tags|[A-Za-z_$][A-Za-z0-9_$]*(?:@\d+)?)\Z")
 
+#: A selector that says its access is WIDER than one word, `.field16_0x8`; see
+#: Lifter._field. `_FIELD_LHS` matches it as though it were a recovered field name, which
+#: is what the may-alias rule wants, and is wrong for anything that reads it as one word.
+_WIDE_FIELD = re.compile(r"\.field\d+_0x[0-9a-fA-F]+\Z")
+
 #: The name the receiver alias is bound to (program.receiver_for). A field name is only
 #: attached to a base spelled exactly this, so it is worth having one spelling of it.
 _RECEIVER = "this"
@@ -626,7 +631,7 @@ _RECEIVER = "this"
 #: anything marking a value that reads it stale; such a text is never recorded (#199).
 _FRAME_TEXT_RE = re.compile(r"\((?:FP|SP)\s*[-+]")
 _READS_MEMORY = re.compile(
-    r"\.field_0x[0-9a-fA-F]+|\.tags\b|\[|\b" + _RECEIVER + r"\.[A-Za-z_$]")
+    r"\.field(?:\d+)?_0x[0-9a-fA-F]+|\.tags\b|\[|\b" + _RECEIVER + r"\.[A-Za-z_$]")
 
 
 def _in_cond(v: V) -> str:
@@ -657,6 +662,8 @@ def _smi_note(lhs: V, rhs: V) -> str:
     would tell the reader nothing (zero, or a value that is not a plain literal)."""
     if not (_FIELD_LHS.search(lhs.text) and _INT_LITERAL.match(rhs.text)):
         return ""
+    if _WIDE_FIELD.search(lhs.text):
+        return ""            # a Smi is one word, and this write is wider than a field
     n = int(rhs.text, 0)
     if n == 0 or n % 2:
         return ""
@@ -3828,7 +3835,7 @@ class Lifter:
         self._reload_blind = not got.text
         return got if got.text else V(canon(reg), P_ATOM)
 
-    def _frame_read(self, base: str, disp: int, at=None) -> V:
+    def _frame_read(self, base: str, disp: int, at=None, width: int = 8) -> V:
         """A frame slot spelled as the read it is, `(FP - 8).field_0x1`.
 
         Spelled the way the lifter already spells the SAME address when it is held in a
@@ -3859,7 +3866,7 @@ class Lifter:
         addr, off = V(role, P_ATOM), disp
         if disp < 0:
             addr, off = _bin(addr, "-", _num(-disp), P_ADD), 0
-        return self._field(addr, off + 1)
+        return self._field(addr, off + 1, width)
 
     def _name_blind(self, st: State, base: str, mn: str, blind: list, at=None) -> list:
         """Name what a DECLINED frame reload read, rather than keep the load's register.
@@ -3892,9 +3899,13 @@ class Lifter:
             if not (self._live_after & _reg_mask(tuple(_regs((op,))))):
                 continue
             width, signed = _access_width(mn, op), mn in _SIGNED_LOADS
-            if _reg_file(op) != "x" and width != 8:
+            # Sixteen bytes has a spelling of its own now, so a `q` or `v` reload says
+            # the read instead of keeping the register (#209). Still not a 4, 2 or 1-byte
+            # read through that file: `_extended`'s mask is the general file's convention
+            # and a masked double is not what the machine loaded.
+            if _reg_file(op) != "x" and width not in (8, 16):
                 continue
-            v = self._frame_read(base, disp, at)
+            v = self._frame_read(base, disp, at, width)
             if _reg_file(op) == "x" and (width < 4 or width < 8 and signed):
                 v = _extended(v, 8 * width, signed)
             tmp, decl = self._mint(st, v.text)
@@ -4190,8 +4201,13 @@ class Lifter:
             st.poolbase.pop(key, None)
         return out
 
-    def _pin_mem(self, st: State, loc: str) -> list:
+    def _pin_mem(self, st: State, loc: str, also=()) -> list:
         """Give a name to every LIVE tracked value that reads `loc`, before `loc` changes.
+
+        `also` is the OTHER spellings of bytes this write covers, which a 16-byte access
+        needs because the spelling says the width: a write of `x2.field16_0x8` lands on
+        the bytes a live `x2.field_0x8` and `x2.field_0x10` read, and neither text
+        contains the other, so matching one text would miss them (#209).
 
         `_pin` is the same argument about a register: the map holds expressions, not
         results, and `x4.field_0x1` only means what it meant while x4 still points where it
@@ -4222,7 +4238,8 @@ class Lifter:
         st.stale_mem()
         # `loc` ends in hex digits, so a bare substring match would let `field_0x8` fire
         # inside `field_0x80`, a different field, and a value that is not stale at all.
-        pat = re.compile(re.escape(loc) + r"(?![0-9a-fA-F])")
+        pat = re.compile("(?:" + "|".join(re.escape(x) for x in (loc,) + tuple(also))
+                         + r")(?![0-9a-fA-F])")
         alias = None
         sel = _FIELD_LHS.search(loc)
         if sel:
@@ -4234,7 +4251,11 @@ class Lifter:
             # live, and those are one address whenever the argument is the receiver. 700
             # store sites in 286 of the 8,194 functions in the 3.12.2 clean build, against
             # 1,146 for the exact case, and covering them cost 356 more lines, 0.2%.
-            alias = re.compile(re.escape(sel.group(0)) + r"(?![0-9a-fA-F])")
+            # Every covered spelling's selector too, for the same reason as `pat`.
+            sels = [sel.group(0)] + [m.group(0) for m in
+                                     (_FIELD_LHS.search(x) for x in also) if m]
+            alias = re.compile("(?:" + "|".join(re.escape(x) for x in sels)
+                               + r")(?![0-9a-fA-F])")
         elif "[" in loc:
             # An element store off a base whose index is not a literal reaches any element
             # of that base, so every read through the same base goes.
@@ -4275,15 +4296,61 @@ class Lifter:
         # loaded as [P, #F-1]; untagged role registers (THR/HEAP/...) have no such bias.
         return disp if base_reg in _UNTAGGED else disp + 1
 
-    def _field(self, base_v: V, byte_off: int) -> V:
+    def _covers(self, base_v: V, byte_off: int, width: int) -> tuple:
+        """The other spellings of the bytes a `width`-byte write at `byte_off` covers.
+
+        The width is in the spelling, so one write's bytes have more than one text and no
+        two of them contain each other: a 16-byte write lands on what the two eight-byte
+        reads inside it say, and an eight-byte write lands inside what a 16-byte read says
+        at its own offset and at eight below it. `_pin_mem` matches all of them (#209).
+        """
+        if width == 16:
+            return (self._field(base_v, byte_off).text,
+                    self._field(base_v, byte_off + 8).text)
+        if width == 8:
+            out = (self._field(base_v, byte_off, 16).text,)
+            # Not below the object: `byte_off` carries the tag bias, so 8 is the first
+            # offset with a whole word under it.
+            return out if byte_off < 8 else out + (
+                self._field(base_v, byte_off - 8, 16).text,)
+        return ()
+
+    def _field(self, base_v: V, byte_off: int, width: int = 8) -> V:
+        """The read or write of `width` bytes at `byte_off` off `base_v`, as text.
+
+        `.field_0x8` is eight bytes, the word this machine spills and loads, and every
+        narrower access in the general file is that read masked or extended (`_extended`).
+        A SIXTEEN byte access says so: `.field16_0x8`. It had no spelling at all, so a
+        `ldr q0` printed the eight-byte read of its low half and a `str q0` printed an
+        eight-byte write, which makes a 16-byte copy character for character identical to
+        an 8-byte one and names half the bytes it moves. 195 printed assignments on each
+        fixture move sixteen bytes (#209).
+
+        The width goes in the spelling because this output has no types to put it in.
+        Ghidra gives a 128-bit register the type `undefined1 [16]` and slices it
+        `._0_8_`, offset then size; Hex-Rays gives it `_OWORD`, a type whose only known
+        property is that it is sixteen bytes, and casts for the halves. Neither leaves the
+        width unsaid, and with no declarations here the statement is the only place left.
+
+        A recovered field name is not taken for a 16-byte access, nor is `.tags`: a named
+        field and the object header are each one word, and a read spanning two of them is
+        not either of them.
+        """
         # A name is printed only when the base IS the receiver, because that is the one
         # value whose class the snapshot names (Function.owner). `x3.field_0x8` stays an
         # offset even where some class has a field there: attributing it would be a guess
         # about which class x3 holds, and a wrong field name reads as fact where a byte
         # offset reads as "the lifter does not know".
-        name = self.fields.get(byte_off) if base_v.text == _RECEIVER else None
+        # Only a WIDER access is marked. A narrower one in the general file is this read
+        # masked or extended, which is the convention `_reload` and `_extended` already
+        # spell out, and in the other file it declines; marking those too would change
+        # thousands of lines for a second reason, which is not this one (#209).
+        name = (self.fields.get(byte_off)
+                if base_v.text == _RECEIVER and width <= 8 else None)
         if name:
             tag = "." + name
+        elif width > 8:
+            tag = f".field{width}_0x{byte_off:x}"
         else:
             tag = ".tags" if byte_off == 0 else f".field_0x{byte_off:x}"
         return V(f"{_wrap(base_v, P_POST)}{tag}", P_POST)
@@ -4669,18 +4736,26 @@ class Lifter:
             # the register map the base is read through and the second half of an `stp`
             # would then be addressed off a temporary that names the base's old value.
             if index is not None or base in st.elem:          # element store
-                tgts = [(self._elem_access(base, index, scale, st, disp), val)]
+                # An element access carries no width: the index is already scaled by the
+                # element size, so a 16-byte element is `t3[t4]` either way (#209).
+                tgts = [(self._elem_access(base, index, scale, st, disp), val, ())]
             else:
-                tgts = [(self._field(g(base), self._byte_off(base, disp)), val)]
+                w = _access_width(mn, ops[0])
+                off = self._byte_off(base, disp)
+                tgts = [(self._field(g(base), off, w), val, self._covers(g(base), off, w))]
                 if pair:
-                    tgts.append((self._field(g(base), self._byte_off(base, pair[1])),
-                                 pair[2]))
+                    # `ops[1]` and not `pair[0]`, which `canon` has folded: s1 is d1
+                    # there and would read as eight bytes where the store writes four.
+                    # The offset step one line up has the same reason.
+                    w2, off2 = _access_width(mn, ops[1]), self._byte_off(base, pair[1])
+                    tgts.append((self._field(g(base), off2, w2), pair[2],
+                                 self._covers(g(base), off2, w2)))
             out = []
-            for tgt, v in tgts:
+            for tgt, v, also in tgts:
                 # The value being stored was read off the map before this, so `+=` still
                 # renders: the rhs keeps the field's own spelling even when a register
                 # holding it is pinned on the way past.
-                out.extend(self._pin_mem(st, tgt.text))
+                out.extend(self._pin_mem(st, tgt.text, also))
                 out.append(self._assign(tgt, v))
             self._last_mem = ("store", base, disp, src0)
             return out + self._bump(st, base, delta)
@@ -4847,9 +4922,11 @@ class Lifter:
                 st.pair[dst] = prev[3]
                 self._last_mem = None
                 return self._bump(st, base, delta)
-            st.set(dst, self._field(g(base), self._byte_off(base, disp)))
+            w = _access_width(mn, ops[0])
+            st.set(dst, self._field(g(base), self._byte_off(base, disp), w))
             if second:
-                st.set(second[0], self._field(g(base), self._byte_off(base, second[1])))
+                st.set(second[0], self._field(g(base), self._byte_off(base, second[1]),
+                                              _access_width(mn, ops[1])))
             self._last_mem = ("load", base, disp, dst)
             return self._bump(st, base, delta)
 

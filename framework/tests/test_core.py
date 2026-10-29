@@ -4634,7 +4634,7 @@ def test_the_memory_oracle_catches_a_stale_field_expression():
 
     pin = expr.Lifter._pin_mem
     try:
-        expr.Lifter._pin_mem = lambda self, st, loc: []
+        expr.Lifter._pin_mem = lambda self, st, loc, also=(): []
         assert irfuzz.run_mem(count=40, trials=20, seed=7, verbose=False) != 0, (
             "the memory oracle passed with the staleness defect put back")
     finally:
@@ -4679,7 +4679,7 @@ def test_the_control_flow_memory_oracle_catches_every_defect_it_found():
 
     pin, copy = expr.Lifter._pin_mem, expr.Lifter._parallel_copy
     try:
-        expr.Lifter._pin_mem = lambda self, st, loc: []
+        expr.Lifter._pin_mem = lambda self, st, loc, also=(): []
         for count, seed in ((60, 1), (150, 2), (200, 46)):
             assert irfuzz.run_cfgmem(count, 25, seed, False) != 0, (
                 f"the oracle passed at seed {seed} with the stale field read put back")
@@ -11982,6 +11982,64 @@ def test_liveness_is_asked_about_one_register_however_the_operand_spells_it():
     assert canon("s3") == "d3" and _fp_n("s3") is None
 
 
+def test_an_access_of_sixteen_bytes_says_so_and_not_eight():
+    """A 16-byte access is spelled `.field16_0x8`, and the bytes it covers are matched
+    under every spelling of them (#209).
+
+    Sixteen bytes had no spelling at all, so `ldr q0` printed the eight-byte read of its
+    low half and `str q0` an eight-byte write: a 16-byte copy came out character for
+    character identical to an 8-byte one and named half the bytes it moved. 195 printed
+    assignments on each fixture move sixteen bytes. The width goes in the spelling
+    because this output has no types to put it in, which is where Ghidra puts it
+    (`undefined1 [16]`, sliced `._0_8_`) and where Hex-Rays puts it (`_OWORD`).
+    """
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    # A 16-byte copy and an 8-byte copy are the same four instructions apart from the
+    # register file, and used to print the same two lines.
+    assert lift([("ldr", "q0, [x1, #0x10]"), ("str", "q0, [x2, #0x20]"), ("ret", "")]
+                )[0] == "x2.field16_0x21 = x1.field16_0x11;"
+    assert lift([("ldr", "d0, [x1, #0x10]"), ("str", "d0, [x2, #0x20]"), ("ret", "")]
+                )[0] == "x2.field_0x21 = x1.field_0x11;"
+    # A declined 16-byte reload off the frame names the read, now that there is a text
+    # for it; it kept the load's own register before, which the body never assigns.
+    frame = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+             ("sub", "x15, x15, #0x20"), ("bl", "#0x100"),
+             ("ldur", "q1, [x29, #-0x18]"), ("stur", "q1, [x2, #15]"), ("ret", "")]
+    got = lift(frame)
+    # The base is the name the call declares for x2, which it clobbers like any other
+    # volatile register (#216).
+    assert ["var t2 = (FP - 24).field16_0x1;", "t0.field16_0x10 = t2;"] == [
+        ln for ln in got if "field16" in ln], got
+    # A narrower access through that file still declines rather than claim a width: an
+    # `s` read is four bytes and a masked double is not what the machine loaded.
+    narrow = frame[:4] + [("ldur", "s1, [x29, #-0x18]"), ("stur", "s1, [x2, #15]"),
+                          ("ret", "")]
+    assert any(ln.endswith("= d1;") for ln in lift(narrow)), lift(narrow)
+
+    # The bytes one write covers have more than one spelling now, and no two of them
+    # contain each other, so a live value that reads any of them is pinned first. Without
+    # that every one of these three reads memory the write had already changed.
+    over = lift([("ldr", "x3, [x1, #0x10]"), ("str", "q0, [x1, #0x10]"),
+                 ("stur", "x3, [x2, #7]"), ("ret", "")])
+    assert over[:3] == ["var t0 = x1.field_0x11;", "x1.field16_0x11 = q0;",
+                        "x2.field_0x8 = t0;"], over
+    for store in (("str", "x3, [x1, #0x10]"), ("str", "x3, [x1, #0x18]")):
+        inside = lift([("ldr", "q0, [x1, #0x10]"), store,
+                       ("str", "q0, [x2, #0x20]"), ("ret", "")])
+        assert inside[0] == "var t0 = x1.field16_0x11;", (store, inside)
+        assert inside[2] == "x2.field16_0x21 = t0;", (store, inside)
+    # The note that reads a stored literal as a Smi is about one word, so a write wider
+    # than a field does not get one.
+    from jadart.expr import V, P_ATOM, _smi_note
+    assert _smi_note(V("x2.field_0x8", P_ATOM), V("4", P_ATOM)) != ""
+    assert _smi_note(V("x2.field16_0x8", P_ATOM), V("4", P_ATOM)) == ""
+
+
 def test_the_low_doubleword_lane_of_a_v_register_reads_what_dn_holds():
     """`v0.d[0]` is the low 64 bits of the register `d0` names, so a read of it reads d0.
 
@@ -12078,20 +12136,23 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
                         (12, "ret", "", "")]
     kept = [ln.strip() for ln in lift_function(copy)]
     ended = [ln.strip() for ln in lift_function(stale)]
-    assert kept[0] == "x2.field_0x11 = x1.field_0x11;", kept
-    assert ended[0] == "x2.field_0x11 = q0;", ended
+    # `field16`, both sides: these move SIXTEEN bytes, and with the eight-byte spelling
+    # the copy was character for character an eight-byte one and named half the bytes it
+    # moved (#209).
+    assert kept[0] == "x2.field16_0x11 = x1.field16_0x11;", kept
+    assert ended[0] == "x2.field16_0x11 = q0;", ended
     # and so does a call, which clobbers the register whatever it is called
     called = copy[:1] + [(4, "bl", "#0x100", ""), (8, "str", "q0, [x2, #0x10]", ""),
                          (12, "ret", "", "")]
     # The base is the name the call declares for x2, which it clobbers like any other
     # volatile register (#176); `= q0` is the point, that the copy ended at the call.
     got = [ln.strip() for ln in lift_function(called)]
-    assert any(re.fullmatch(r"t\d+\.field_0x11 = q0;", ln) for ln in got), got
+    assert any(re.fullmatch(r"t\d+\.field16_0x11 = q0;", ln) for ln in got), got
     # and so does a loop that writes d0, whose state after it forgets d0
     looped = copy[:1] + [(4, "fmov", "d0, #1.0", ""), (8, "subs", "x3, x3, #1", ""),
                          (12, "b.ne", "#0x4", ""), (16, "str", "q0, [x2, #0x10]", ""),
                          (20, "ret", "", "")]
-    assert "x2.field_0x11 = q0;" in [ln.strip() for ln in lift_function(looped)]
+    assert "x2.field16_0x11 = q0;" in [ln.strip() for ln in lift_function(looped)]
 
     # Zeroing a double for a comparison is no vote on what the function returns: x0 here.
     assert [ln.strip() for ln in lift_function(
@@ -13669,9 +13730,14 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
                      ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8"),
                      ("ldur", "q1, [x29, #-0x20]"), ("stur", "q1, [x2, #15]"),
                      ("ret", "")])
-    assert "x2.field_0x10 = q1;" in wide(("stur", "x5, [x29, #-0x18]"))
-    assert "x2.field_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x10]"))
-    assert "x2.field_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x28]"))
+    # The store moves sixteen bytes and says so (#209). Where the loop dropped the slot
+    # the reload now names the read as well, rather than keeping q1, which the printed
+    # body never assigns; where the slot survives, q0 IS what it holds, the register the
+    # function came in with, and that reads right.
+    assert ["var t1 = (FP - 32).field16_0x1;", "x2.field16_0x10 = t1;"] == [
+        l for l in wide(("stur", "x5, [x29, #-0x18]")) if "field16" in l]
+    assert "x2.field16_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x10]"))
+    assert "x2.field16_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x28]"))
     # The outgoing area goes whatever the loop does: a call in it takes what was pushed,
     # and the call after it printed the 7 for its arguments.
     out = lift([("mov", "x5, #7"), ("str", "x5, [x15]"), ("mov", "x9, #3"),

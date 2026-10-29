@@ -13,6 +13,30 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An access of sixteen bytes says so.** `.field_0x8` is eight bytes, and sixteen had no
+  spelling at all, so `ldr q0` printed the eight-byte read of its low half and `str q0` an
+  eight-byte write: a 16-byte copy came out character for character identical to an 8-byte
+  one and named half the bytes it moved. 195 printed assignments on each fixture move
+  sixteen bytes, 42 of them naming a bare q register, which the printed body never assigns
+  and so reads as the value the function came in with. They now read and write
+  `.field16_0x8`, a declined 16-byte reload names the read like any other, and all 198 of
+  them carry a value. The width goes in the spelling because this output has no types to
+  put it in: Ghidra gives a 128-bit register the type `undefined1 [16]` and slices it
+  `._0_8_`, offset then size, and Hex-Rays gives it `_OWORD`, a type whose only known
+  property is that it is sixteen bytes. Neither leaves the width unsaid. The bytes one
+  write covers now have more than one spelling and no two of them contain each other, so
+  `_pin_mem` matches every spelling of them (`_covers`); without that, three shapes in the
+  new test read memory the write had already changed, and one of them, an eight-byte write
+  to the top half of a live 16-byte read, is a staleness main could not represent at all.
+  A narrower access through the floating-point file still declines rather than claim a
+  width it cannot spell, and a narrower one in the general file is still the eight-byte
+  read masked or extended. 0.65% more output, 1,223 lines on each fixture, almost all of
+  it joins that now say which path a value came from instead of leaving a bare register to
+  stand for both. Every census invariant unchanged: `wrong` 2,579, `name` 836, `oos` 28,
+  `sole` 1,398, `empty`/`stale`/`unbalanced`/`twice`/`above` 0. A changed answer: every
+  16-byte access, and the Smi note no longer offered for a write wider than a field
+  (#209).
+
 - **The low doubleword lane of a V register reads what dN holds.** `v0.d[0]` is the low 64
   bits of the register `d0` names, and the two were keyed apart, so the read found nothing
   under its own spelling and fell back to the bare operand. The printed body never assigns

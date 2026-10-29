@@ -42,7 +42,10 @@ DEFAULT_LIB = os.path.join(ROOT, "flubench/artifacts/clean/lib/arm64-v8a/libapp.
 #: `regline` read as unaffected (#209).
 _REG_RE = re.compile(r"\b([wx](?:3[01]|[12]\d|\d)|[dsqvhb](?:3[01]|[12]\d|\d))\b")
 _GOTO_RE = re.compile(r"\bgoto L_0x")
-_FIELD_RE = re.compile(r"\.(?:field_0x[0-9a-fA-F]+|tags)\b")
+#: `field16_0x8` as well as `field_0x8`: a 16-byte access says its width in the
+#: spelling, and a line whose only field read is one of those counted as carrying none
+#: (#209).
+_FIELD_RE = re.compile(r"\.(?:field\d*_0x[0-9a-fA-F]+|tags)\b")
 _ELLIPSIS_RE = re.compile(r"\(\.\.\.\)")
 #: A trailing `// ...` is a note the lifter attaches to a statement it DID model, so it
 #: has to come off before asking whether the line ends like a statement.
