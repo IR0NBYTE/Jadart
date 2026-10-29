@@ -13,6 +13,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Every name the body reads is bound somewhere in it.** `parsePartialNumber` read four
+  names that no line declared or assigned anywhere in its 181 lines, six reads in all, so
+  the output was not valid Dart and a reader had nothing to go on, which is worse than a
+  name merely out of scope. A loop binds every carried register to a name and, once the
+  body is walked, collapses the ones the body never assigned, substituting the entry value
+  back through the body and the tail; a goto out of the loop is handed the state from
+  INSIDE it, which still holds the name, and no substitution reaches that target's lines.
+  `_carry_out` now counts such a register as escaped, the same way it counts one an exit
+  writes back, so the loop keeps the name and the declaration stays. Only where the target
+  has a single predecessor, since a join reads the register bare and a name kept for one
+  of those would be a tautology. And loop-carried names are hoistable now, like every
+  other name a join binds: #204 did that for `_mint` and left this site out, which is why
+  its reads were counted and not fixed. Four undeclared names on each fixture to 0, and
+  reads of a name whose declaration has closed from 28 in 11 ranges to 5 in 5.
+  `pbfuzz.census` counts the first as `undecl` and the gate holds it at exactly zero: it
+  is the one invariant here that is not a budget. 79 more lines on each fixture, 18 fewer
+  carrying a bare register, and every other census counter unchanged (#205).
+
 - **An access of sixteen bytes says so.** `.field_0x8` is eight bytes, and sixteen had no
   spelling at all, so `ldr q0` printed the eight-byte read of its low half and `str q0` an
   eight-byte write: a 16-byte copy came out character for character identical to an 8-byte

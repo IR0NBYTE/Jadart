@@ -14143,6 +14143,62 @@ def test_a_block_holding_a_nested_one_is_not_empty():
     assert _drop_dead_phis(arm_would_empty, {"t13"}) == arm_would_empty
 
 
+def test_every_name_the_body_reads_is_bound_somewhere_in_it():
+    """No read of a name no line of the body binds, at any depth (#205).
+
+    `parsePartialNumber` on the clean fixture, `0xd0c0` on the obfuscated one, read four
+    names that nothing declared or assigned anywhere in its 181 lines: six reads, and the
+    output is not valid Dart. Worse than a name merely out of scope, which at least has a
+    declaration to look at.
+
+    The cause is a loop collapsing a carried name. `_render_loop` binds every carried
+    register to a name and, once the body is walked, collapses the ones the body never
+    assigned, substituting the entry value back through the body and the tail. A goto out
+    of the loop is handed the state from INSIDE it by `_arrive`, which still holds the
+    name, and no substitution reaches that target's lines. `_carry_out` now counts such a
+    register as escaped, the same way it counts one an exit writes back, so the loop keeps
+    the name and the declaration stays.
+
+    This is the invariant SSA gives a decompiler for free, and why Ghidra cannot print
+    one: its `ClangVariableDecl` tokens come from the HighVariables the body uses, so a
+    declaration is derived from the variable set rather than emitted where the value is.
+    """
+    if not _capstone_available():
+        _skip("  SKIP test_every_name_the_body_reads_is_bound_somewhere_in_it")
+    from jadart.disasm import (load_instructions, disassemble_range, function_name_by_pc,
+                               build_pool_map)
+    from jadart.expr import lift_function
+
+    # The scan is deliberately free of any helper from `expr`: it reads the shipped text
+    # the way a reader does, so the same check runs against any commit.
+    name_re = re.compile(r"\bt\d+\b")
+    bound_re = re.compile(r"(?:^|[{};]|\bvar\s+)\s*(t\d+)\s*(?:[-+*/&|^]?=(?!=)|;)")
+
+    def undeclared(lines):
+        bound = set(bound_re.findall("\n".join(lines)))
+        out = []
+        for ln in lines:
+            rest = ln
+            for m in bound_re.finditer(ln):
+                rest = rest.replace(m.group(0), " ", 1)
+            out += [n for n in name_re.findall(rest) if n not in bound]
+        return out
+
+    image, fr, _hdr = load_instructions(CLEAN)
+    pc_to_name = function_name_by_pc(image, fr)
+    pool_map = build_pool_map(fr)
+    at = next((cr for cr in image.all_ranges if cr.pc_offset == 0x11090), None)
+    assert at is not None, "parsePartialNumber is not at 0x11090 in this fixture"
+    lines = lift_function(_ann(image, disassemble_range(image, at), pc_to_name, pool_map),
+                          pool_map)
+    body = [ln.rstrip() for ln in lines]
+    assert len(body) > 150, len(body)        # the shape this is about, not a stub
+    assert undeclared(body) == [], undeclared(body)
+    # The loop that collapsed them is still there, and still collapses the names no goto
+    # target was handed: the three it binds for registers the body does assign stay.
+    assert sum(1 for ln in body if re.match(r"\s*while \(true\) \{", ln)) >= 3, body
+
+
 def test_a_name_is_not_read_after_its_declaration_closed():
     """The lifter printed `var t1 = x7;` inside a `while` and read `t1` at a goto target
     after the loop closed: a reference to something no longer declared, which a Dart
@@ -14180,9 +14236,15 @@ def test_a_name_is_not_read_after_its_declaration_closed():
 
     got = pbfuzz.census(CLEAN)
     assert got["lifted"] > 8000, f"only {got['lifted']} ranges lifted"
-    assert got["oos"] <= 28, (
+    assert got["oos"] <= 5, (
         f"{got['oos']} reads of a name whose declaration has closed, in "
-        f"{got['oos_fns']} ranges, up from 28 in 11; see #204")
+        f"{got['oos_fns']} ranges, up from 5 in 5; see #204 and #205")
+    # And NO name read that the body never binds at all, which is not valid Dart and
+    # leaves a reader nothing to go on. Four of them shipped, six reads, all in
+    # `parsePartialNumber` on both fixtures (#205). A bound, not a budget: this one is
+    # exactly zero.
+    assert got["undecl"] == 0, (
+        f"{got['undecl']} names read that no line of the body binds; see #205")
 
 
 def test_a_declined_frame_reload_names_the_read_and_not_the_register():
