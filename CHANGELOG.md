@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A store through a base the join lost names it unknown.** The two arms left different
+  values in the register, so `x2.field_0xc = x1;` claimed the object the function came in
+  with while the machine has one of the two others, and the store wrote a field of the
+  wrong object. It now goes through a name with no initialiser, `var tN;`, which says the
+  lifter does not know what this points at: #206's rule at the other map, and #216's at
+  the other end of the same argument, that a fallback must not borrow a name that already
+  means something. 17 stores in 11 ranges of each fixture, `regline` 26,431 to 26,411, and
+  every other census counter unchanged, `sole` at 1,398 among them. The issue's own
+  measurement is 147 such stores over all 8,194 ranges; the other 130 come from a loop
+  exit, where naming them costs 152 more blocks holding nothing but a declaration nothing
+  reads and contradicts thirteen loop-reload expectations, so that half is measured and
+  written up on the issue rather than shipped (#208).
+
 - **A break out of two loops makes both of them carry the register.** `_render_loop`
   records an exit hazard for a register a break leaves holding something other than its
   own name, and `_lift_function` walks again with that register carried so the break names
