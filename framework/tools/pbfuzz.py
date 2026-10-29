@@ -633,6 +633,7 @@ def _census_hooks(expr):
     hist, alive, walk = {}, [], {"cur": None}
     tot = {"spelled": 0, "stale": 0, "same_reg": 0, "diff_reg": 0, "name": 0,
            "expr": 0, "never": 0, "ranges": 0, "oos": 0, "oos_fns": 0, "lifted": 0,
+           "undecl": 0,
            "regline": 0, "empty": 0, "unbalanced": 0, "twice": 0, "above": 0,
            "sole": 0}
     saved = {n: getattr(expr.State, n)
@@ -793,6 +794,16 @@ def _shape(flat: list) -> dict:
         m = _DECLARES.match(b)
         if a.endswith("{") and c.startswith("}") and m and m.group(1) not in read:
             out["sole"] += 1
+    # A name read where NO line of the body binds it, anywhere, at any depth. Worse than
+    # `oos`, which at least has a declaration to look at: this is not valid Dart and a
+    # reader has nothing to go on. `_DECLARES` matches a binding occurrence whether it
+    # declares or assigns, so the set it builds is every name the body ever writes (#205).
+    bound = set()
+    for ln in flat:
+        m = _DECLARES.match(ln)
+        if m:
+            bound.add(m.group(1))
+    out["undecl"] = sum(1 for n in read if n not in bound)
     return out
 
 
@@ -813,6 +824,13 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
       same_reg  the fallback spelled the register the slot held; correct, the spill and
                 reload round-trip
       never     the slot never held anything on this path; a genuine decline
+      undecl    names read where no line of the body binds them, anywhere. Must be 0:
+                the output is not valid Dart and a reader has nothing to go on, which is
+                worse than a name that is merely out of scope. Counted per name and
+                not per read, as `twice` is: four of them, six reads, shipped in
+                `parsePartialNumber` on both fixtures, from a loop collapsing a carried
+                name whose value a goto target outside the loop had already been handed
+                (#205)
       oos       reads of a minted name whose declaration has closed, by the lifter's own
                 `expr._out_of_scope`. Measured HERE and nowhere else: four separate
                 scripts of mine drifted from that function's rules and each one reported a

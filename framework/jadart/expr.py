@@ -5227,7 +5227,7 @@ class Lifter:
         """
         if not self._carrying:
             return []
-        _header, names, copied = self._carrying[-1]
+        header, names, copied = self._carrying[-1]
         # Read every value BEFORE any of them is written back: this is the same parallel
         # copy the back edge makes, and one name that another reads has to be captured
         # first. See _parallel_copy.
@@ -5240,6 +5240,22 @@ class Lifter:
             copied.add(r)
             if leaving:
                 st.reg[r] = V(names[r], P_ATOM)
+        # A register this edge does NOT write back still holds the NAME in the state the
+        # target is handed, so the target may print it. `_render_loop` collapses a name
+        # the body never assigned and substitutes the entry value back into the body and
+        # the tail, which does not reach a block outside the loop: six reads of a name no
+        # line declares, in `parsePartialNumber` on both fixtures (#205). Counted as
+        # escaped for the same reason a written-back one is: the name is out in the
+        # output, so the loop cannot take it back.
+        #
+        # Only where `_arrive` hands over that state at all, which is where the target has
+        # exactly ONE predecessor: a join starts from what every way in agrees on and
+        # reads the register bare, so the name never reaches it and keeping one would be a
+        # tautology, `var t1 = x7;`, with the note on a raw line then reporting `x7 holds
+        # t1`, which tells a reader nothing.
+        if target is not None and len(self._preds.get(target, ())) == 1:
+            live = _mask_regs(self._livein.get(target, 0))
+            copied.update(r for r in names if r in live)
         return out
 
     def _arrive(self, addr, st: State, moved: dict, pad: str = "") -> list:
@@ -6227,7 +6243,21 @@ class Lifter:
         fresh = self.carry_more.get(header, frozenset())
         self.carry_names[header] = {names[r]: r for r in fresh if r in names}
         self.phi_names.update(names.values())
-        out = [f"{pad}var {names[r]} = {init[r].text};" for r in sorted(names)]
+        # Hoistable, like every other name a join binds. A loop-carried name is declared
+        # at the loop, and a goto out of the loop can hand it to a target whose scope that
+        # declaration has closed before: 164 reads of a name declared elsewhere were fixed
+        # for `_mint` in #204 and this site was left out, so its reads were counted and
+        # not fixed. `wants_hoist` asks `phi_minted` (#205).
+        self.phi_minted.update(names.values())
+        out = []
+        for r in sorted(names):
+            if names[r] in self.hoist:
+                # Declared at the top; the INITIALISER stays here, because it is the value
+                # from before the loop and reads a different state at the top (`_phi`).
+                self.hoisted.add(names[r])
+                out.append(f"{pad}{names[r]} = {init[r].text};")
+            else:
+                out.append(f"{pad}var {names[r]} = {init[r].text};")
         out.append(f"{pad}while (true) {{")
         out.extend(blines)
         out.extend(tail)
