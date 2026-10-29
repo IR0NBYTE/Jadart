@@ -4120,7 +4120,7 @@ class Lifter:
             return name, f"{pad}var {name};"
         return name, f"{pad}var {name} = {text};"
 
-    def _pin(self, st: State, name: str, live=None) -> list:
+    def _pin(self, st: State, name: str, live=None, regs: bool = False) -> list:
         """Give a name to every tracked value that mentions `name`, before `name` changes.
 
         The register map holds expressions, not results, and they are substituted into
@@ -4132,7 +4132,9 @@ class Lifter:
         Writing the value out at the point the base changes is not a heuristic. The load
         already happened, so the value already exists; this only says so out loud.
 
-        `live`, a register mask, leaves out a register nothing reads again."""
+        `live`, a register mask, leaves out a register nothing reads again. `regs` asks
+        the register map alone, which is what a REGION wants: a slot is dropped across one
+        by `_stale_slots` instead, for the reason it gives (#228)."""
         pat = _USE_RE.get(name)
         if pat is None:
             pat = _USE_RE[name] = re.compile(rf"\b{re.escape(name)}\b")
@@ -4142,7 +4144,7 @@ class Lifter:
                                            for v in self._flags[2].values()):
             self._flags = None
         out = []
-        for holder in (st.reg, st.slot):
+        for holder in ((st.reg,) if regs else (st.reg, st.slot)):
             # Sorted by key, so the names handed out here depend only on WHICH registers
             # hold a mention of `name`, not on the order they happened to be inserted in
             # somewhere upstream. Relying on insertion order made the numbering a property
@@ -6205,9 +6207,91 @@ class Lifter:
         out.append(f"{pad}}}")
         return out
 
+    def _pin_loop(self, st: State, header, carried) -> list:
+        """Write out, above the loop at `header`, every live value a trip can make stale.
+
+        Two arguments, both of them ones already made at a single instruction:
+
+        `_pin`'s, that the register map holds EXPRESSIONS, and `x9 - 34` stops describing
+        anything the moment x9 is reassigned. A loop reassigns every register it writes,
+        so a value live across it whose text names one has to be named above it.
+
+        `_pin_mem`'s, that a value which READS MEMORY means what it meant while that
+        memory held what it did. A trip storing through an object pointer is the write,
+        and so is a call. The load already happened, so naming the value only says so.
+
+        Main needed neither here, by accident. `_loop_nodes` counted the blocks before
+        the loop as the loop's own, so a register assigned there came out loop-carried and
+        the carried name materialised its value above the loop, which is this. Asking the
+        body instead (#228) stops that, and without these `tools/irfuzz.py --cfgmem`
+        disagrees at seed 9, where a value loaded before the loop is printed after a trip
+        has stored to the field it reads.
+
+        This is the one place SSA hands a decompiler for nothing: a store makes a new
+        memory version rather than changing what an earlier load meant, and a register
+        write makes a new value rather than reaching into an expression that read the old
+        one. This map holds text, so where SSA would have a second version, this writes
+        the first one out.
+
+        The REGISTER map alone, at both. A slot whose text names a register the region
+        wrote is dropped by `_stale_slots`, and one that reads memory a trip may store to
+        by `_exit_slots`, both of which still ask `_loop_nodes`: this changes what the
+        loop's writes are read off, not what the slot map is kept across.
+
+        A carried register is left out of both, as the holder: the value it has before the
+        loop is what `init` binds to its name, above the loop, which is this same
+        materialisation. A carried register NAMED in another value's text is not left out,
+        because that text reads the machine register and the carried name does not change
+        what the machine does to it.
+
+        What a TRIP runs decides, `_trip_body`, and not the whole body: a stack check's
+        slow path that strip_boilerplate cut off still jumps back into the loop, and its
+        call would count as writing every register the stub gives back (#157), which put a
+        declaration above every loop that has one. The loop-exit `forget` keeps asking the
+        whole body, where over-approximating only forgets more.
+        """
+        trip = self._trip_body(header)
+        live = self._livein.get(header, 0) & ~_reg_mask(tuple(carried))
+        out = []
+        for r in sorted(self._written(trip) - (_SPECIAL - {_lr()})):
+            out += self._pin(st, r, live, regs=True)
+        # A call stores wherever its callee does, which is `_writes_heap`'s own
+        # over-approximation reached by the other door.
+        if self._writes_heap(trip) or any(
+                mn in _CALLS for b in trip if b in self.blocks
+                for (_a, mn, _o, _n) in self.blocks[b].insns):
+            for key in sorted(st.reg):
+                v = st.reg[key]
+                if v.text == key or not live & _reg_mask((key,)):
+                    continue                  # its own name, or nothing reads it again
+                if not _READS_MEMORY.search(v.text):
+                    continue
+                tmp, decl = self._mint(st, v.text)
+                out.append(decl)
+                st.reg[key] = V(tmp, P_ATOM)
+                st.elem.pop(key, None)
+                st.poolbase.pop(key, None)
+        # Anchored above the loop, as a carried name is. A goto out of the loop hands its
+        # target a state holding these names, and the declaration has to be visible there
+        # too (#204, #205).
+        for m in map(_DECL_RE.match, out):
+            if m:
+                self._anchor[int(m.group(2)[1:])] = self._loop_before
+        return out
+
     def _render_loop(self, header, body, st: State, indent, depth):
         pad = indent * depth
-        nodes = self._loop_nodes(header)
+        # The loop's OWN blocks, the natural body read off the back edges, and not
+        # `_loop_nodes`, which closes backward over the header's predecessors without
+        # stopping at the header and so returns every ANCESTOR of it. On the clean
+        # fixture that is 20,211 blocks across the 833 loops this is asked about where
+        # the body is 8,975, and 9,781 of the extra ones run BEFORE the loop. The three
+        # questions asked of this set are what the loop WRITES, what it carries, and
+        # whether a break leaves it, and a block that ran before the loop answers none of
+        # them (#228). It is also the body the field means: LLVM's loop is the maximal
+        # strongly connected set whose every entering edge reaches the header, and
+        # Ghidra's `LoopBody` marks the same one off the back edges.
+        nodes = self._back_loop(header)
         carried = self.carried.get(header)
         if carried is None:
             carried = (_live_in_header(self.blocks, nodes, header, self._preds,
@@ -6215,6 +6299,8 @@ class Lifter:
                        & self._written(nodes)) - (_SPECIAL - {_lr()})
             carried |= self.carry_more.get(header, frozenset())     # see below
             self.carried[header] = carried
+        written = self._written(nodes) - (_SPECIAL - {_lr()})
+        pre = self._pin_loop(st, header, carried)
         # A loop-carried register is a phi, and a phi reaching exactly one join has a name
         # in the source: bind it before the loop with the entry value, read that name in
         # the body, assign back at the bottom. Nothing new is claimed; the tail update was
@@ -6325,7 +6411,7 @@ class Lifter:
         # for `_mint` in #204 and this site was left out, so its reads were counted and
         # not fixed. `wants_hoist` asks `phi_minted` (#205).
         self.phi_minted.update(names.values())
-        out = []
+        out = [pad + ln for ln in pre]
         for r in sorted(names):
             if names[r] in self.hoist:
                 # Declared at the top; the INITIALISER stays here, because it is the value
@@ -6343,7 +6429,6 @@ class Lifter:
         # assigns WITHOUT reading first holding its value from before the loop: set x9 to
         # 5, write 7 to it in the body, and the code after the loop printed 5. The loop
         # body is where the value now comes from, so the name is what the reader gets.
-        written = self._written(self._loop_nodes(header)) - (_SPECIAL - {_lr()})
         # What the loop's OWN instructions write, a call's clobbers left out. After the
         # loop the machine holds what the last trip put in one of these, while the
         # register's own name says the value the function came in with, so a store
@@ -6386,7 +6471,7 @@ class Lifter:
                         # enclosing loops are the frames still on `_carrying`: this runs
                         # after the body walk has popped this loop's own (#176).
                         for out_h, _names, _copied in self._carrying:
-                            if s not in self._loop_nodes(out_h):
+                            if s not in self._back_loop(out_h):
                                 self.exit_hazards.setdefault(out_h, set()).add(r)
         # ...except the ones that got a name, whose value after the loop is that variable.
         # That is the second half of naming it: forgetting it here would put the machine
@@ -6732,6 +6817,17 @@ class Lifter:
             del st.slot[k]
 
     def _loop_nodes(self, header) -> frozenset:
+        """Every ANCESTOR of `header`: the backward closure over its predecessors, which
+        does not stop at the header and so takes the edge in from before the loop too.
+
+        One caller left, `_exit_slots`'s `near`, which wants exactly that: the slot map is
+        carried into the loop from before it, and the staleness it asks about is a
+        register reassigned anywhere between the store that filled a slot and the read
+        after the loop, so the blocks before the loop stand for the ones between the two
+        (#199). The three questions about what the loop itself does ask `_back_loop`, the
+        natural body: a block that ran before the loop is no part of what a trip does
+        (#228).
+        """
         got = self._loops.get(header)
         if got is not None:
             return got
