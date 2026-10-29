@@ -4666,7 +4666,9 @@ def test_the_control_flow_memory_oracle_catches_every_defect_it_found():
     entry state. Every carried value was therefore undecidable and never scored: with the
     fix off, 15,000 graphs across six seeds produced no mismatch at all. `--seed-outputs`
     loads those registers from memory first, which gives the chain a decidable start
-    without changing what a bare register means, and the defect is caught again."""
+    without changing what a bare register means, and the defect is caught again. It names
+    its case, as the heap-meet gate does and for the reason given there: the shape is one
+    graph in a thousand, and a seed is a draw (#230)."""
     if not _unicorn_available() or not _capstone_available():
         _skip("  SKIP test_the_control_flow_memory_oracle_catches_every_defect_it_found")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
@@ -4684,9 +4686,15 @@ def test_the_control_flow_memory_oracle_catches_every_defect_it_found():
             assert irfuzz.run_cfgmem(count, 25, seed, False) != 0, (
                 f"the oracle passed at seed {seed} with the stale field read put back")
         expr.Lifter._pin_mem = pin
+        case = [irfuzz.cfgmem_program(7, 1048)]
+        rc, out = _cfgmem_case(irfuzz, case, seed=7)
+        interp, scored = _cfgmem_scored(out)
+        assert rc == 0 and interp == 1 and scored, (
+            "the write-back gate's case is not interpreted and clean any more: "
+            f"{rc}, {out}")
         expr.Lifter._parallel_copy = lambda self, st, pairs, pad: [
             pad + self._assign(expr.V(n, expr.P_ATOM), v) for n, v in pairs]
-        assert irfuzz.run_cfgmem(1200, 25, 2, False, seed_outs=True) != 0, (
+        assert _cfgmem_case(irfuzz, case, seed=7)[0] != 0, (
             "the oracle passed with the loop write-back lowered to a plain sequence")
     finally:
         expr.Lifter._pin_mem, expr.Lifter._parallel_copy = pin, copy
@@ -5116,20 +5124,39 @@ def test_a_goto_join_gets_the_meet_for_the_heap_as_well_as_the_registers():
     just stored there, with that store a few lines up, right next to the goto.
 
     Held by the oracle rather than by a hand-built graph, because the shape needs an edge
-    `structure` cannot nest, which is not something to fake convincingly. The seeds are the
-    ones where switching `_writes_heap` off puts the disagreement back."""
+    `structure` cannot nest, which is not something to fake convincingly. It is held on
+    ONE NAMED case of the generator's own stream, and not on a count and a seed, because
+    the shape is about one generated graph in seven thousand: with the corpus pinned,
+    switching `_writes_heap` off disagreed at seed 1 and at seed 12 and nowhere else in
+    twelve runs of 1,200 graphs. Case 135 of seed 1 is one of them, a DAG whose `b` over
+    the next block is the goto, storing `x20.field_0x18` on one arm and reading it at the
+    join. Clean, it scores 50 printed expressions and 100 field values over 25 trials.
+
+    Asserting on a seed was asserting on the draw, and the draw used to move with the
+    lifter: `run_cfgmem` took the programs and the trial seeds from one generator, so an
+    ablation INSIDE the lifter changed which programs came after it and the gate read as
+    blind (#230). The scored counts are checked here too, so a case that stops being
+    interpreted fails loudly rather than passing as a clean run."""
     if not _unicorn_available() or not _capstone_available():
         _skip("  SKIP test_a_goto_join_gets_the_meet_for_the_heap_as_well_as_the_registers")
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import irfuzz
     from jadart import expr
 
-    assert irfuzz.run_cfgmem(400, 25, 14, False, seed_outs=True) == 0, (
+    # The broad clean run with `--seed-outputs` over a non-nested corpus, which the named
+    # case below replaces as the TEETH but not as coverage.
+    assert irfuzz.run_cfgmem(150, 25, 1, False, seed_outs=True) == 0, (
         "clean lifter, and it disagreed")
+    case = [irfuzz.cfgmem_program(1, 135)]
+    rc, out = _cfgmem_case(irfuzz, case)
+    assert rc == 0, "clean lifter, and it disagreed on the case this is about"
+    interp, scored = _cfgmem_scored(out)
+    assert interp == 1 and scored, (
+        f"the case is no longer interpreted, so the gate has nothing to catch: {out}")
     real = expr.Lifter._writes_heap
     try:
         expr.Lifter._writes_heap = lambda self, nodes: False
-        assert irfuzz.run_cfgmem(400, 25, 14, False, seed_outs=True) != 0, (
+        assert _cfgmem_case(irfuzz, case)[0] != 0, (
             "the oracle passed with the heap meet switched off")
     finally:
         expr.Lifter._writes_heap = real
@@ -6526,6 +6553,71 @@ def _unicorn_available():
         return True
     except Exception:
         return False
+
+
+def _cfgmem_case(irfuzz, progs, seed: int = 1) -> tuple:
+    """Run `--cfgmem` over NAMED programs, and give back its code and its report.
+
+    The report is the half that says whether the case was scored at all. A gate asserting
+    on the code alone reads a case gone undecidable as a clean pass (#230)."""
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = irfuzz.run_cfgmem(len(progs), 25, seed, False, seed_outs=True, progs=progs)
+    return rc, buf.getvalue().strip()
+
+
+def _cfgmem_scored(out: str) -> tuple:
+    """(graphs interpreted, printed expressions evaluated), from a `--cfgmem` report."""
+    m = re.search(r"(\d+) interpreted, (\d+) printed expressions", out)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def _cfgmem_drawn(irfuzz, expr, ablate: bool) -> tuple:
+    """The GENERATED graph counts `--cfgmem` reports, with `_pin_mem` off or on."""
+    import io, contextlib
+    real = expr.Lifter._pin_mem
+    if ablate:
+        expr.Lifter._pin_mem = lambda self, st, loc, also=(): []
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            irfuzz.run_cfgmem(120, 25, 5, False, seed_outs=True)
+    finally:
+        expr.Lifter._pin_mem = real
+    m = re.search(r"\((\d+) joins, (\d+) with a back edge, (\d+) needing a goto\)",
+                  buf.getvalue())
+    assert m, f"no report to read the corpus off:\n{buf.getvalue()}"
+    return m.groups()
+
+
+def test_the_memory_oracle_draws_the_same_corpus_whatever_the_lifter_does():
+    """The generator must not be able to see the lifter it is generating for.
+
+    `run_cfgmem` drew the programs AND the per-trial register seeds from one
+    `random.Random`. How many trials a case runs is decided by the lifter, which breaks
+    out of them on a mismatch and on an undecidable text, so an ablation inside the lifter
+    changed which programs came after it: 407 joins and 26 gotos clean against 414 and 30
+    with the heap meet switched off, over the same 400 graphs and the same seed.
+
+    Nothing inside the lifter may change a count of what the GENERATOR drew, and these
+    are such counts. Two trees cannot be compared while they can, and an ablation gate
+    hanging on one case in four hundred reads as blind the moment anything moves: #228
+    spent three generator rewrites and a sample raised to 2,400 cases on it before this
+    was found. `run_cfg` has always given the trials a generator of their own, and says
+    why in a comment; `run_cfgmem` is a copy of that loop which did not (#230).
+
+    `_pin_mem` off is the ablation used because it disagrees early and often, so it moves
+    the draw furthest."""
+    if not _unicorn_available() or not _capstone_available():
+        _skip("  SKIP test_the_memory_oracle_draws_the_same_corpus"
+              "_whatever_the_lifter_does")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import irfuzz
+    from jadart import expr
+
+    assert _cfgmem_drawn(irfuzz, expr, False) == _cfgmem_drawn(irfuzz, expr, True), (
+        "the graphs generated depend on what the lifter did with the ones before them")
 
 
 def _cpu(word: int, env: dict) -> int:

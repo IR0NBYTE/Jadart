@@ -13,6 +13,20 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The memory oracle drew its corpus from the lifter it was testing.** `--cfgmem` took
+  the programs it generates and the per-trial register seeds from one `random.Random`, and
+  how many trials a case runs is decided by the lifter, which breaks out of them on a
+  mismatch and on an undecidable text. An ablation INSIDE the lifter therefore changed
+  which programs came after it: 407 joins and 26 gotos clean against 414 and 30 with the
+  heap meet switched off, over the same 400 graphs at the same seed. Two trees could not
+  be compared on the result, and the two ablation gates that hang on a single case in
+  hundreds read as blind the moment anything moved. The trials now draw from a generator
+  of their own, as `run_cfg`'s have always done, and `run_mem` with them. With the corpus
+  holding still, a gate can name the ONE case it is about rather than a count and a seed:
+  the heap-meet gate asks case 135 of seed 1 and the loop write-back gate case 1048 of
+  seed 7, both of them checked for being interpreted at all so that a case gone
+  undecidable fails loudly instead of passing as a clean run (#230).
+
 - **A store through a base the loop wrote names it unknown.** After the loop the machine
   holds what the last trip put in that register, while the register's own name says the
   value the function came in with, so the store wrote a field of the wrong object. It now
