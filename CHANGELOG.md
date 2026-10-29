@@ -13,6 +13,26 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A frame read off SP says where it is in the frame the function was entered with.**
+  `SP` in a read's text means SP AT that line, and the pushes and pops that move it print
+  nothing, so `var t1 = SP.field_0x1; var t2 = SP.field_0x1;` stood for two addresses
+  sixteen bytes apart and nothing in the output said SP had moved. The reads through FP
+  were already rewritten into the coordinates of the frame FP started in (#165); this is
+  the half that was left. `_frame_plan` now records SP's place in that frame at every
+  access through it, and a declined reload spells its address against that place wherever
+  it is known exactly, so one address has one spelling whatever SP does since. The place
+  is recorded as the addressing mode sees it, BEFORE any write-back, because a
+  post-indexed `ldp` reads sixteen bytes below where it leaves SP, which is the shape the
+  issue opened with. Measured the same on both fixtures: 1,021 of 1,559 reads off SP
+  anchor, and of 641 reads in 71 ranges whose text stood for more than one address, 574
+  now say which. The 538 that decline are not a skipped analysis: the pass never places SP
+  in its frame at all there, and running it in every function that READS through SP rather
+  than only where something is stored through it anchors 0 more. A function with no
+  prologue has nothing to anchor to, FP there being the caller's, and its reads are
+  unchanged. A changed answer: every read off SP whose place is known now prints an offset
+  from FP where it printed one from SP. `docs/usage.md` says what each spelling means
+  (#207).
+
 - **The rendered output's shape is gated, not only its per-symptom counts.** A count says
   how much and not what shape, and that is how #206 came within one review round of
   shipping 112 blocks rendered as `if (c) {` with `}` under it: two rounds verified its

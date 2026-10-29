@@ -1987,11 +1987,13 @@ def _frame_access(mn: str, op: str, apart: bool = True):
     return [f"{fp}{disp:+d}"], delta, ops
 
 
-def _frame_slots(mn: str, op: str):
-    """(base, [(key, bytes)]) for a store `_step` files in the slot map, one entry per
-    register, keyed as `_step` keys it: off the base where a write-back has left it. None
-    for any other instruction."""
-    if mn not in _STORES:
+def _frame_at(mn: str, op: str):
+    """(base, the offset `_step` keys the access at) for a frame LOAD or store, else None.
+
+    `_frame_slots` answers this for a store alone, because its caller files slots; the
+    addressing arithmetic is the same for a load (#207).
+    """
+    if mn not in _STORES and mn not in _LOADS:
         return None
     ops = _split_ops(op)
     got = _addr(ops)
@@ -2000,7 +2002,20 @@ def _frame_slots(mn: str, op: str):
     (base, disp, index, _scale, wb), post = got
     if index is not None or _T.roles.get(base) not in ("SP", "FP"):
         return None
-    at = (0 if post else disp) - (disp if wb else post)
+    return base, (0 if post else disp) - (disp if wb else post)
+
+
+def _frame_slots(mn: str, op: str):
+    """(base, [(key, bytes)]) for a store `_step` files in the slot map, one entry per
+    register, keyed as `_step` keys it: off the base where a write-back has left it. None
+    for any other instruction."""
+    if mn not in _STORES:
+        return None
+    got = _frame_at(mn, op)
+    if got is None:
+        return None
+    base, at = got
+    ops = _split_ops(op)
     width = _access_width(mn, ops[0])
     n = 2 if mn == "stp" and len(ops) >= 3 else 1
     return base, [(f"{base}{at + i * width:+d}", width) for i in range(n)]
@@ -2507,10 +2522,10 @@ def _frame_plan(blocks, entry, raw):
                 elif got[0][0] == sp and mn in _STORES:
                     pushes = True
     if inner < 2 and not pushes:
-        return frozenset(), moves, frozenset(), {}
+        return frozenset(), moves, frozenset(), {}, {}
     passed = _frame_pass(blocks, entry, raw)
     into, _steps, _fixed, clash = passed
-    cross = {}
+    cross, spat = {}, {}
     for b, blk in blocks.items():
         d = into[b]
         for k, t in enumerate(blk.insns):
@@ -2520,10 +2535,20 @@ def _frame_plan(blocks, entry, raw):
                 got = _rekeyed(mn, op, d[4])
                 if got is not None:
                     blk.insns[k] = (t[0], t[1], got, t[3])
+            # SP as the instruction's own addressing mode sees it, which is BEFORE any
+            # write-back it does: `_name_blind` is handed the displacement off that base,
+            # so a post-indexed `ldp` off SP reads 16 bytes below where it leaves SP
+            # (#207). `cross` below wants the other one, because `_frame_slots` keys a
+            # store's slots off the base the write-back has already moved.
+            acc = _frame_at(mn, op)
+            off_sp = acc is not None and acc[0] == sp
+            before = (d[0] + d[4], d[1]) if off_sp and d[0] is not None else None
             if not _sp_neutral(mn, op):
                 d = _sp_step(d, t[0], mn, op)
             if t[1] in _STORES and (_frame_slots(t[1], t[2]) or ("",))[0] in (sp, fp):
                 cross[t[0]] = None if d[0] is None else (d[0] + d[4], d[1])
+            if off_sp:
+                spat[t[0]] = before
             if d[3] != where:
                 moves[t[0]] = (True, moves.get(t[0], (False, 0))[1])
             elif moves.get(t[0], (False,))[0]:
@@ -2535,7 +2560,7 @@ def _frame_plan(blocks, entry, raw):
         if blocks[b].insns:
             a = blocks[b].insns[0][0]
             moves[a] = (True, moves.get(a, (False, 0))[1])
-    return _frame_meets(blocks, entry, raw, passed), moves, clash, cross
+    return _frame_meets(blocks, entry, raw, passed), moves, clash, cross, spat
 
 
 def _rekeyed(mn: str, op: str, f: int):
@@ -2787,6 +2812,9 @@ class Lifter:
         #: {store through SP or FP: (SP less where its frame starts, slack) or None};
         #: see _frame_plan and _cross_write.
         self.frame_cross: dict = {}
+        #: address -> where SP sits there against the frame the function was entered
+        #: with, exact only (None where unknown or merely bounded by an alignment) (#207).
+        self.sp_at: dict = {}
         #: The instructions strip_boilerplate changed, as they were (_lift_function).
         self.raw: dict = {}
         self._trips: dict = {}
@@ -3788,7 +3816,7 @@ class Lifter:
         self._reload_blind = not got.text
         return got if got.text else V(canon(reg), P_ATOM)
 
-    def _frame_read(self, base: str, disp: int) -> V:
+    def _frame_read(self, base: str, disp: int, at=None) -> V:
         """A frame slot spelled as the read it is, `(FP - 8).field_0x1`.
 
         Spelled the way the lifter already spells the SAME address when it is held in a
@@ -3802,12 +3830,26 @@ class Lifter:
         would print `.tags`, the object header, for a read at the base itself, and a
         negative field offset for the frame slots that matter, which are all below FP.
         """
-        addr, off = V(_T.roles.get(base) or base, P_ATOM), disp
+        # Off SP, spelled against the frame the function was ENTERED with wherever SP's
+        # place there is known exactly. `SP` means SP at this line, so two reads of
+        # addresses a push apart printed one text and neither said SP had moved (#207).
+        # The accesses through FP are already rewritten into the coordinates of the frame
+        # FP started in, so this is the half that was left (`_frame_plan`, #165).
+        #
+        # `at` is the instruction's own address, which is what `_frame_plan` keys `sp_at`
+        # by; `isinstance`, so that anything that cannot be one of those keys declines
+        # rather than asking the dict about it, which an unhashable value would raise on.
+        role = _T.roles.get(base) or base
+        got = self.sp_at.get(at) if role == "SP" and isinstance(at, int) else None
+        sits = got[0] if got and not got[1] else None
+        if sits is not None:
+            role, disp = "FP", sits + disp
+        addr, off = V(role, P_ATOM), disp
         if disp < 0:
             addr, off = _bin(addr, "-", _num(-disp), P_ADD), 0
         return self._field(addr, off + 1)
 
-    def _name_blind(self, st: State, base: str, mn: str, blind: list) -> list:
+    def _name_blind(self, st: State, base: str, mn: str, blind: list, at=None) -> list:
         """Name what a DECLINED frame reload read, rather than keep the load's register.
 
         The fallback in `_reload` spells the load's own register, and the printed body
@@ -3840,7 +3882,7 @@ class Lifter:
             width, signed = _access_width(mn, op), mn in _SIGNED_LOADS
             if _reg_file(op) != "x" and width != 8:
                 continue
-            v = self._frame_read(base, disp)
+            v = self._frame_read(base, disp, at)
             if _reg_file(op) == "x" and (width < 4 or width < 8 and signed):
                 v = _extended(v, 8 * width, signed)
             tmp, decl = self._mint(st, v.text)
@@ -4403,6 +4445,9 @@ class Lifter:
 
     def _step_rest(self, st: State, addr, mn, op, note, ops, g) -> list:
         """_step past the flags: what the instruction does to `st`, and its lines."""
+        # The instruction's own address, under a name of its own because `addr` is
+        # reassigned to `_addr(ops)`, the parsed addressing mode, further down.
+        here = addr
 
         # A machine narrower than a Dart `int` splits one value across two registers.
         if _T.pairs:
@@ -4771,7 +4816,7 @@ class Lifter:
                     if self._reload_blind:
                         blind.append((canon(ops[1]), ops[1], second[1]))
                     st.set(second[0], g2)
-                out = self._name_blind(st, base, mn, blind)
+                out = self._name_blind(st, base, mn, blind, here)
                 self._last_mem = ("load", base, disp, dst)
                 self._frame_moved(st, base, delta)
                 return out
@@ -7554,7 +7599,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     stmts = structure(blocks, entry)
     dispatch = detect_dispatch(stripped)
     raw = {t[0]: t[1:3] for t, s in zip(ann, stripped) if s[1:3] != t[1:3]}
-    meets, moves, joins, cross = _frame_plan(blocks, entry, raw)
+    meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
 
     def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None):
@@ -7568,6 +7613,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.save_wrapped = save_wrapped
         lifter.frame_joins = joins
         lifter.frame_cross = cross
+        lifter.sp_at = spat
         lifter.raw = raw
         lifter.fp_moves = frozenset(a for a, (fp, _d) in moves.items() if fp)
         if returns is not None:

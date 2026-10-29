@@ -13632,7 +13632,10 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
                     ("stur", "x7, [x2, #15]"), ("ret", "")])
         # The slot is gone, so the reload says the read rather than keeping x7, which
         # read as the value the function came in with (#198).
-        m = [re.fullmatch(r"var (t\d+) = SP\.field_0x9;", l) for l in out]
+        # Anchored to the frame the function was entered with, not spelled off the live
+        # SP: this shape's frame is 0x50, so the read 8 above SP is FP - 72, and it stays
+        # that whatever the loop did to SP in between (#207).
+        m = [re.fullmatch(r"var (t\d+) = \(FP - 72\)\.field_0x1;", l) for l in out]
         named = next((g.group(1) for g in m if g), None)
         assert named and f"x2.field_0x10 = {named};" in out, out
     # A text that reads memory goes where the loop stores to memory or calls, and one
@@ -14157,6 +14160,47 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
     assert "var t1 = (FP - 8).field_0x1;" not in got, got
 
 
+def test_a_frame_read_off_sp_says_where_it_is_in_the_frame_it_was_entered_with():
+    """A read off SP is spelled against the frame the function was entered with (#207).
+
+    `SP` in a read's text means SP AT that line, and the pushes and pops that move it
+    print nothing, so two reads of two addresses printed one text and a reader had no way
+    to tell them apart. Where the pass knows SP's place in the frame exactly, the read
+    says that place instead, and one address then has one spelling whatever SP does. The
+    accesses through FP were already rewritten into the coordinates of the frame FP
+    started in (#165); this is the other half.
+    """
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    # The body from the issue, which pushes two pairs, calls, and pops them back. The two
+    # reads are sixteen bytes apart and both printed `SP.field_0x1`.
+    body = [("stp", "x2, x3, [x15, #-0x10]!"), ("stp", "x4, x5, [x15, #-0x10]!"),
+            ("bl", "#0x100"), ("ldp", "x4, x5, [x15], #0x10"),
+            ("ldp", "x2, x3, [x15], #0x10"), ("stur", "x4, [x20, #7]"),
+            ("stur", "x2, [x20, #0xf]"), ("ret", "")]
+    enter = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15")]
+    out = lift(enter + body)
+    # A post-indexed load reads where SP is BEFORE its write-back, so the first pop takes
+    # the pair 32 bytes under the frame and the second the pair 16 under it.
+    assert ["var t0 = sub_0x100(...);", "var t1 = (FP - 32).field_0x1;",
+            "var t2 = (FP - 16).field_0x1;"] == out[:3], out
+    # Nothing to anchor to without a prologue: FP there is the caller's frame pointer, so
+    # the reads stay off SP and the text still stands for both. This is the issue's own
+    # listing, and it is the shape the fix does NOT reach.
+    assert [l for l in lift(body) if "field_0x1;" in l] == [
+        "var t1 = SP.field_0x1;", "var t2 = SP.field_0x1;"], lift(body)
+    # An alignment leaves SP known only to within fifteen bytes, which names no address,
+    # so the read declines and keeps the spelling that says only "off SP".
+    aligned = enter + [("sub", "x15, x15, #0x20"), ("str", "x0, [x15, #8]"),
+                       ("and", "x15, x15, #0xfffffffffffffff0"),
+                       ("ldr", "x3, [x15, #8]"), ("stur", "x3, [x20, #7]"), ("ret", "")]
+    assert "var t0 = SP.field_0x9;" in lift(aligned), lift(aligned)
+
+
 def test_no_frame_slot_record_outlives_the_path_that_made_it():
     """The gate for #196's class, and the one check for it that needs no emulator.
 
@@ -14668,17 +14712,23 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     assert lift(frame(0x20, spill, ("add", "x29, x29, #8"), ("ldur", "x3, [x29, #-0x10]"),
                       *keep))[0] == held
     push, top = ("str", "x0, [x15, #8]"), ("ldr", "x3, [x15, #8]")
-    for move in (("sub", "x15, x15, #8"), ("add", "x15, x15, #8"),
-                 ("and", "x15, x15, #0xfffffffffffffff0")):
-        assert lift(frame(0x20, push, move, top, *keep))[:2] == gone_at(
-            "SP.field_0x9"), move
+    # Each of these three used to print `SP.field_0x9`, one text for three addresses,
+    # which is what made the spelling name nothing. Anchored to the frame the function was
+    # entered with, each says where it really is: the frame is 0x20, so SP sits at FP - 32
+    # before the move, and a read 8 above SP follows SP. The alignment is the one that
+    # cannot be said, because it leaves SP known only to within 15 bytes (#207).
+    for move, want in ((("sub", "x15, x15, #8"), "(FP - 32).field_0x1"),
+                       (("add", "x15, x15, #8"), "(FP - 16).field_0x1"),
+                       (("and", "x15, x15, #0xfffffffffffffff0"), "SP.field_0x9")):
+        assert lift(frame(0x20, push, move, top, *keep))[:2] == gone_at(want), move
     # A load INTO SP is a declined reload of its own, and its name goes unread, so
     # `_drop_unread` takes that line and the slot read keeps the number after it.
     got = lift(frame(0x20, push, ("ldr", "x15, [x15]"), top, *keep))
     assert lost(got) and not any("SP.field_0x1;" in l for l in got), got
+    # Dropped rather than moved with SP, so this is a fresh read; the address is the
+    # pushed slot's own, which SP - 8 plus 0x10 comes back to, and it now says so (#207).
     assert lift(frame(0x20, push, ("sub", "x15, x15, #8"), ("ldr", "x3, [x15, #0x10]"),
-                      *keep))[:2] == gone_at(
-        "SP.field_0x11")                   # dropped, not moved with it: passes on main
+                      *keep))[:2] == gone_at("(FP - 24).field_0x1")
     # An FFI call's frame and a leaf call's put FP back where it was: a slot kept from
     # before reads the same after, an access through the moved FP is to where it points,
     # and a store through it changes the slot it lands in.
