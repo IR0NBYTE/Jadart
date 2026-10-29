@@ -92,11 +92,14 @@ expression, and `.field_0x1` is the read at it, because a field offset carries t
 heap-object tag bias. That is the same spelling you get when the address is held in a
 register first, `sub x0, x29, #0x40; ldur x3, [x0, #8]` printing `(FP - 64).field_0x9`,
 and it is not the untagged spelling used for the thread, where `THR.field_0x68` is offset
-0x68 exactly. A field read is eight bytes, the word this machine spills and loads; an
-access of SIXTEEN says so, `(FP - 32).field16_0x1`, because a 16-byte copy would
-otherwise read character for character as an 8-byte one. A narrower access in the general
-file is the eight-byte read masked or extended, and in the floating-point file it declines
-rather than claim a width it cannot spell. An address written off `FP` is in the
+0x68 exactly. A plain field read is eight bytes, the word this machine spills and loads,
+and any other width says itself: `(FP - 32).field16_0x1` for sixteen, `.field2_0x1` and
+`.field1_0x1` for a halfword and a byte. Four is the exception and keeps the plain
+spelling, because this target compresses pointers, so a four-byte read is what a reference
+field read looks like and the lifter prints the pointer it becomes. A sign-extending load
+adds the shift pair that says so, `.field2_0x1 << 48 >> 48`, since the width alone does
+not. In the floating-point file an access narrower than eight declines rather than claim a
+width it cannot spell. An address written off `FP` is in the
 coordinates of the frame the function
 was ENTERED with, whatever FP and SP do inside it, so one address has one spelling. A read
 still written off `SP` is one whose place in that frame the analysis could not fix: `SP`

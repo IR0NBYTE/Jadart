@@ -3908,7 +3908,11 @@ class Lifter:
             if _reg_file(op) != "x" and width not in (8, 16):
                 continue
             v = self._frame_read(base, disp, at, width)
-            if _reg_file(op) == "x" and (width < 4 or width < 8 and signed):
+            # The spelling says how many bytes were read now, so the unsigned mask said it
+            # twice: `(FP - 8).field2_0x1` and not `((FP - 8).field_0x1 & 0xffff)`. The
+            # SIGN is a separate fact about the destination's 64 bits, and the shift pair
+            # is still the only thing that says it (#221).
+            if _reg_file(op) == "x" and signed and width < 8:
                 v = _extended(v, 8 * width, signed)
             tmp, decl = self._mint(st, v.text)
             self.blind_named.add(tmp)
@@ -4306,16 +4310,17 @@ class Lifter:
         reads inside it say, and an eight-byte write lands inside what a 16-byte read says
         at its own offset and at eight below it. `_pin_mem` matches all of them (#209).
         """
+        # Four is not in the list: it prints the same text as eight (see `_field`), so
+        # the eight-byte spelling already covers a four-byte access at this offset.
+        out = [self._field(base_v, byte_off, w).text
+               for w in (1, 2, 8, 16) if w != width]
         if width == 16:
-            return (self._field(base_v, byte_off).text,
-                    self._field(base_v, byte_off + 8).text)
-        if width == 8:
-            out = (self._field(base_v, byte_off, 16).text,)
+            out.append(self._field(base_v, byte_off + 8).text)   # its top half
+        elif width == 8 and byte_off >= 8:
             # Not below the object: `byte_off` carries the tag bias, so 8 is the first
             # offset with a whole word under it.
-            return out if byte_off < 8 else out + (
-                self._field(base_v, byte_off - 8, 16).text,)
-        return ()
+            out.append(self._field(base_v, byte_off - 8, 16).text)
+        return tuple(out)
 
     def _field(self, base_v: V, byte_off: int, width: int = 8) -> V:
         """The read or write of `width` bytes at `byte_off` off `base_v`, as text.
@@ -4343,15 +4348,27 @@ class Lifter:
         # offset even where some class has a field there: attributing it would be a guess
         # about which class x3 holds, and a wrong field name reads as fact where a byte
         # offset reads as "the lifter does not know".
-        # Only a WIDER access is marked. A narrower one in the general file is this read
-        # masked or extended, which is the convention `_reload` and `_extended` already
-        # spell out, and in the other file it declines; marking those too would change
-        # thousands of lines for a second reason, which is not this one (#209).
+        # A byte-offset spelling says nothing about how many bytes moved, so a byte store
+        # and a word store printed the same text and a reader could not tell them apart.
+        # Marked for every width but FOUR and eight (#221).
+        #
+        # Four is left alone because this target compresses pointers: 17,789 of the 20,941
+        # four-byte loads on the clean build are followed by `add xN, xN, x28, lsl #32`,
+        # the decompression, so a four-byte read is what a reference field read looks like
+        # and the lifter prints the pointer it becomes. Marking those would decorate the
+        # most common read in the output with the width of a representation, and say
+        # "four bytes" where the value is an object reference. The genuinely unsaid widths
+        # are one and two, 5,662 accesses, and sixteen, which has no other spelling at all.
+        #
+        # A RECOVERED name is still taken for a narrower access, because the name is the
+        # field the access is in and a narrower read of it is that field's low part. The
+        # width goes unsaid there, and saying it would need the name and the width both;
+        # the byte-offset spelling is where it was unsaid with nothing else to go on.
         name = (self.fields.get(byte_off)
                 if base_v.text == _RECEIVER and width <= 8 else None)
         if name:
             tag = "." + name
-        elif width > 8:
+        elif width not in (4, 8):
             tag = f".field{width}_0x{byte_off:x}"
         else:
             tag = ".tags" if byte_off == 0 else f".field_0x{byte_off:x}"
@@ -4951,11 +4968,22 @@ class Lifter:
                 st.pair[dst] = prev[3]
                 self._last_mem = None
                 return self._bump(st, base, delta)
+            # A sign-extending load's destination holds the read widened to 64 bits, which
+            # the field spelling's width does not say: `ldrsw x0` is the four bytes at that
+            # address with the top bit copied up, and the shift pair is how `_extended`
+            # spells that. Unsigned needs nothing, the width is in the spelling (#221).
+            sign = mn in _SIGNED_LOADS
             w = _access_width(mn, ops[0])
-            st.set(dst, self._field(g(base), self._byte_off(base, disp), w))
+            v = self._field(g(base), self._byte_off(base, disp), w)
+            if sign and w < 8 and _reg_file(ops[0]) == "x":
+                v = _extended(v, 8 * w, True)
+            st.set(dst, v)
             if second:
-                st.set(second[0], self._field(g(base), self._byte_off(base, second[1]),
-                                              _access_width(mn, ops[1])))
+                w2 = _access_width(mn, ops[1])
+                v2 = self._field(g(base), self._byte_off(base, second[1]), w2)
+                if sign and w2 < 8 and _reg_file(ops[1]) == "x":
+                    v2 = _extended(v2, 8 * w2, True)
+                st.set(second[0], v2)
             self._last_mem = ("load", base, disp, dst)
             return self._bump(st, base, delta)
 

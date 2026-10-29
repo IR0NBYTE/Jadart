@@ -11982,6 +11982,57 @@ def test_liveness_is_asked_about_one_register_however_the_operand_spells_it():
     assert canon("s3") == "d3" and _fp_n("s3") is None
 
 
+def test_an_access_narrower_than_a_word_says_how_many_bytes_it_moved():
+    """A byte or halfword access says its width, and four keeps the plain spelling (#221).
+
+    A byte-offset spelling said nothing about how many bytes moved, so `strb w0` printed
+    the same text as `str x0` and a reader could not tell a byte store from a word store.
+    The store side overstated and the load side understated.
+
+    FOUR is the exception. This target compresses pointers: 17,789 of the 20,941 four-byte
+    loads on the clean build are followed by `add xN, xN, x28, lsl #32`, the
+    decompression, so a four-byte read is what a reference field read looks like and the
+    lifter prints the pointer it becomes. Marking those would decorate the most common
+    read in the output with the width of a representation rather than of a value. The
+    genuinely unsaid widths are one and two, 5,662 accesses, and sixteen, which had no
+    other spelling at all (#209).
+    """
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    for mn, reg, want in (("strb", "w0", "x2.field1_0x11 = x0;"),
+                          ("strh", "w0", "x2.field2_0x11 = x0;"),
+                          ("str", "w0", "x2.field_0x11 = x0;"),
+                          ("str", "x0", "x2.field_0x11 = x0;")):
+        assert lift([(mn, f"{reg}, [x2, #0x10]"), ("ret", "")])[0] == want, (mn, reg)
+    # The load side, and the sign, which the width alone does not say: the shift pair is
+    # how `_extended` spells a sign-extending load, and the ordinary load path said
+    # neither the width nor the sign before.
+    for mn, reg, want in (
+            ("ldrb", "w0", "x2.field_0x8 = x1.field1_0x11;"),
+            ("ldrh", "w0", "x2.field_0x8 = x1.field2_0x11;"),
+            ("ldr", "w0", "x2.field_0x8 = x1.field_0x11;"),
+            ("ldrsb", "x0", "x2.field_0x8 = x1.field1_0x11 << 56 >> 56;"),
+            ("ldrsh", "x0", "x2.field_0x8 = x1.field2_0x11 << 48 >> 48;")):
+        got = lift([(mn, f"{reg}, [x1, #0x10]"), ("stur", "x0, [x2, #7]"), ("ret", "")])
+        assert got[0] == want, (mn, reg, got)
+    # One write's bytes have more than one spelling now, so a live value that reads any of
+    # them is still written out first. Without that these read memory the write changed.
+    for store in (("strb", "w0, [x1, #0x10]"), ("strh", "w0, [x1, #0x10]")):
+        got = lift([("ldr", "x3, [x1, #0x10]"), store,
+                    ("stur", "x3, [x2, #7]"), ("ret", "")])
+        assert got[0] == "var t0 = x1.field_0x11;", (store, got)
+        assert got[2] == "x2.field_0x8 = t0;", (store, got)
+    # and the other way round: an eight-byte write over a live one-byte read
+    got = lift([("ldrb", "w3, [x1, #0x10]"), ("str", "x0, [x1, #0x10]"),
+                ("stur", "x3, [x2, #7]"), ("ret", "")])
+    assert got[0] == "var t0 = x1.field1_0x11;", got
+    assert got[2] == "x2.field_0x8 = t0;", got
+
+
 def test_an_access_of_sixteen_bytes_says_so_and_not_eight():
     """A 16-byte access is spelled `.field16_0x8`, and the bytes it covers are matched
     under every spelling of them (#209).
@@ -14331,9 +14382,21 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
         "var t0 = SP.field_0x11;", "x2.field_0x8 = t0;"]
     assert lift([("ldur", "x3, [x29]")] + keep)[:2] == [
         "var t0 = FP.field_0x1;", "x2.field_0x8 = t0;"]
-    # A load that extends reads the slot as it is spelled elsewhere.
+    # A load narrower than a word says how many bytes it read, where it used to print
+    # the eight-byte spelling masked, which said the same thing twice (#221).
     assert lift([("ldurh", "w3, [x29, #-8]")] + keep)[:2] == [
-        "var t0 = (FP - 8).field_0x1 & 0xffff;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 8).field2_0x1;", "x2.field_0x8 = t0;"]
+    assert lift([("ldurb", "w3, [x29, #-8]")] + keep)[:2] == [
+        "var t0 = (FP - 8).field1_0x1;", "x2.field_0x8 = t0;"]
+    # The SIGN is a separate fact about the destination's 64 bits, and the shift pair is
+    # still the only thing that says it.
+    assert lift([("ldursh", "x3, [x29, #-8]")] + keep)[:2] == [
+        "var t0 = (FP - 8).field2_0x1 << 48 >> 48;", "x2.field_0x8 = t0;"]
+    # Four bytes keeps the plain spelling: this target compresses pointers, so a four-byte
+    # read is what a reference field read looks like and the width is the representation's
+    # rather than the value's (#221).
+    assert lift([("ldur", "w3, [x29, #-8]")] + keep)[:2] == [
+        "var t0 = (FP - 8).field_0x1;", "x2.field_0x8 = t0;"]
     # Only the half of a pair that is read again is named.
     assert lift([("ldp", "x3, x4, [x29, #-0x10]")] + keep)[:2] == [
         "var t0 = (FP - 16).field_0x1;", "x2.field_0x8 = t0;"]

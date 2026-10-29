@@ -13,6 +13,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An access narrower than a word says how many bytes it moved.** A byte-offset spelling
+  said nothing about the width, so `strb w0` printed the same text as `str x0` and a
+  reader could not tell a byte store from a word store: the store side overstated and the
+  load side understated. One and two bytes now say so, `.field1_0x8` and `.field2_0x8`, on
+  both sides, and a sign-extending load carries the shift pair that says the sign, which
+  the width alone does not; the ordinary load path printed neither before, so `ldrsb x0`
+  read as the whole eight bytes unextended. FOUR keeps the plain spelling, because this
+  target compresses pointers: 17,789 of the 20,941 four-byte loads on the clean build are
+  followed by `add xN, xN, x28, lsl #32`, the decompression, so a four-byte read is what a
+  reference field read looks like and the lifter prints the pointer it becomes. Marking
+  those would decorate the most common read in the output with the width of a
+  representation rather than of a value. In `_name_blind` the unsigned mask goes, since
+  the spelling now says the width and `((FP - 8).field_0x1 & 0xffff)` said it twice.
+  `_covers` gained the narrow spellings, so a write of one width still pins a live read of
+  the same bytes under another: 96 four-byte stores on the clean build pin something, and
+  without that they would stop. 491 lines change on the clean fixture, 10 more in all, and
+  every census counter holds (#221).
+
 - **A store through a base the join lost names it unknown.** The two arms left different
   values in the register, so `x2.field_0xc = x1;` claimed the object the function came in
   with while the machine has one of the two others, and the store wrote a field of the
