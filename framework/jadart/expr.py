@@ -318,8 +318,15 @@ _ALLOC_TYPE = {"Array": "List", "GrowableArray": "List", "Mint": "int", "Double"
 
 
 def _returns_x0(base: str) -> bool:
-    """The suppressed stubs that hand back a value in x0: `InitLate*` the field's,
-    `Await` the awaited one, `InitAsync` and `CloneContext` an object (see _rv_call)."""
+    """The stubs that hand a value back in x0: `InitLate*` the field's, `Await` the
+    awaited one, `InitAsync` and `CloneContext` an object.
+
+    They are not register-preserving machinery like the stack-check, write-barrier and
+    type-test stubs, so they are rendered as the calls they are rather than dropped.
+    Dropping them left the STALE x0 standing in for the value, which collapsed thirteen
+    lazy-init getters on the clean fixture to `return x0;` the moment stub naming started
+    working (#234): a whole body replaced by a bare register, where the unnamed call at
+    least printed the branch it came from."""
     return base.startswith("InitLate") or base in ("InitAsync", "Await", "CloneContext")
 
 
@@ -334,9 +341,10 @@ def _classify_stub(name: str):
         return ("throw", None)
     if base == "ReThrow":
         return ("rethrow", None)
-    if ("WriteBarrier" in base or "TypeTest" in base or base.startswith("StackOverflow")
-            or _returns_x0(base)):
+    if "WriteBarrier" in base or "TypeTest" in base or base.startswith("StackOverflow"):
         return ("suppress", None)
+    if _returns_x0(base):
+        return ("keep", base)        # hands a value back: a call, not machinery to drop
     if base.endswith("Error"):
         return ("throw_err", base)
     if base.startswith("Allocate"):
@@ -1595,19 +1603,16 @@ def _rv_call(mn: str, note: str):
     """False for what is not a call, None for a stub that gives every register back,
     True for any other call.
 
-    Not every stub the walk suppresses gives every register back. `Await` returns the
-    awaited value in x0, `InitLate*` the field's value, `InitAsync` and `CloneContext`
-    an object, so to the question of which register a `ret` hands back they are calls:
-    a write to d0 before one is not the last write a `ret` after it sees (#127). `_phi`
-    asks the same question of an arm, and there one of them now writes what a call does
-    where it wrote x0 alone, which can move a name's assignment into the arm."""
+    The stubs that hand a value back in x0 (_returns_x0) are not in that middle case: to
+    the question of which register a `ret` hands back they are calls, and a write to d0
+    before one is not the last write a `ret` after it sees (#127). `_phi` asks the same
+    question of an arm, and there one of them writes what a call does where it wrote x0
+    alone, which can move a name's assignment into the arm."""
     if mn not in ("bl", "blr", "blx"):
         return False
     name = note.split("-> ", 1)[1].strip() if "-> " in note else ""
     if "_iso_stub_" in name and _classify_stub(name)[0] == "suppress":
-        m = _STUB_RE.search(name)
-        if not (m and _returns_x0(m.group(1))):
-            return None
+        return None
     return True
 
 

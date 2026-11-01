@@ -427,6 +427,10 @@ open; it is a naming convention to decide on, not a recovery to build.
 five reasons turned out to have exactly one live entry. Of 25,373 direct call sites on the
 corpus (30,281 on HiveHex), the runtime-stub and ArgumentsDescriptor branches fire for none
 of them; 30.1% (64.9%) reach `...` solely because `entry_arity` declined for the callee.
+That count of the stub branch was a property of the INPUT and not of the code, and #234
+is why: with no stub named on a release build the branch could not fire anywhere. 16,438
+of the clean fixture's 34,979 direct call sites (47.0%) are calls to a stub, and that is
+where it fires now.
 
 `entry_arity` declines for one reason: the callee reads its arguments off the STACK. That
 is a statement that the caller pushed them, so the values are in the outgoing area at the
@@ -636,6 +640,76 @@ do (a lower rate, not a higher one) because that measurement is dominated by the
 stack-overflow slow paths `strip_boilerplate` disconnects on purpose. Recovering jump
 table targets is still worth doing for switch reconstruction; it is not a silent-loss bug
 on this evidence.
+
+### Where a runtime stub's name comes from, on a build that has no symbol for one
+
+Every stub-aware rule in the lifter keys off an `_iso_stub_<Base>Stub` NAME:
+`_classify_stub` decides whether a `bl` is a throw, an allocation or machinery to drop,
+`_noreturn` asks it whether a path ends there, `_call_args` falls back on it, and
+`_pin_call` treats a named stub as giving every register back. The names had two
+possible sources and a default `flutter build apk --release` has neither. A stub's
+`Code` object is owned by no `Function`, so the snapshot's name table has nothing for
+it, and the .so carries no symbol table at all. Both fixtures measured 0 stub names,
+which made the whole taxonomy dead code on the build a user actually has: 16,438 of the
+clean image's 34,979 direct call sites, 47.0%, were calls to a stub printed as
+`sub_0x2d5d00(...)`, an ordinary Dart call that returns, where six of those targets end
+in `blr x30; brk #0` and cannot (#234).
+
+THE THIRD SOURCE IS THE SNAPSHOT ITSELF. After the fill pass an AOT program snapshot
+writes its roots: the isolate `ObjectStore`'s pointer fields in declaration order, from
+`from()` through `to_snapshot(kFullAOT)` (app_snapshot.cc,
+`ProgramDeserializationRoots::ReadRoots`). The tail of that run is the stubs generated
+code calls, each a `Code` whose instructions-table slot already maps to a pc, so the
+root INDEX identifies the stub. The index means something only through the release's own
+`OBJECT_STORE_FIELD_LIST`, which tools/gen_objstore.py expands the way gen_cids.py
+expands the cid enum: ten distinct root runs cover the eighteen registered epochs, 244
+roots at 3.12 and 224 at 2.19.
+
+THE REASON IT IS A READING AND NOT A GUESS is that the binary confirms the table twice.
+The layout states which roots are `Code`-typed and the reader checks every one of them
+against the `Code` objects the fill pass recovered, all 244 of 244 agreeing on each
+fixture; a field inserted ahead of the stub block in some release the table was not
+generated from shifts every later index, and a shifted index lands a non-`Code` where a
+`Code` is declared, so the whole map is dropped and nothing is named. Independently, the
+root run has to END exactly where `dispatch.find_dispatch_table` anchors the dispatch
+table from an unrelated invariant, which it does on all seven binaries measured (both
+fixtures, three architectures, clean and obfuscated). A third check reads the TEXT: no
+stub named as a throw contains a `ret`, and every stub named as an allocation can
+return. The last two live in the tests rather than in the parse path, because they cost
+a scan and a disassembly.
+
+WHY NOT THE OTHER TWO CHANNELS. Recognising the prologue shape (the FLIRT and Ghidra
+FunctionID approach) identifies a shared stub but not which one, and the fixture holds
+the counterexample: `allocate_float64_array_stub` opens with the same `str x30, [x15,
+#-8]!` spill-everything prologue as the six error stubs and it returns. Deciding only
+the return discipline from the body (Ghidra's discovered non-returning functions, LLVM's
+attribute inference, Binary Ninja's `can_return`) is sound and needs no table, and it is
+kept here as the text check above, but it yields no source meaning: no `throw`, no
+allocation type, and a call still prints as a call. Blutter reaches the same facts this
+uses by compiling the matching Dart SDK per version; a generated table gets them without
+a toolchain.
+
+WHAT IT CHANGED, on the clean fixture's whole image: `(...)` calls 9,196 to 5,139, lines
+188,930 to 184,380, byte-offset fields 55,572 to 55,181, and 1,705 `throw` plus 886
+`new` renderings in the first 3,000 ranges where main had none of either. The obf
+fixture moves by the same amounts. Bare machine registers rise, 20,460 to 20,618, and
+that is the usual direction of this trade: a line that said `sub_0x2d5670(...)` carried
+no register and said nothing either.
+
+ONE LATENT DEFECT CAME WITH IT, and only naming could expose it. `_classify_stub`
+grouped the stubs that hand a value back in x0 (`InitLate*`, `Await`, `InitAsync`,
+`CloneContext`) with the ones that give every register back, and `_step` drops the call
+for both. Dropping a call that RETURNS something leaves the stale x0 standing in for the
+value, so a lazy-init getter whose `if` arm called `InitLateFinalInstanceField` came out
+as `return x0;`, a whole body replaced by a bare register, thirteen times on the clean
+fixture. They are rendered as the calls they are now, which is also what `_rv_call`
+already assumed about them (#127).
+
+TWO RESIDUALS, measured and not fixed here. 1,571 statements still print after a
+`throw`, which is the dead phi write-back the issue names: `_ends_path` ends the block
+for the graph while `_arrive`'s write-back still lands after it. And blocks whose only
+statement is an assignment nothing reads went 1,398 to 1,575, one shape: a type-test
+stub is dropped and the class-id load in front of it is left with no reader.
 
 ## Follow-ups (UNVERIFIED items to close)
 - wire-ref signed/unsigned history: `git log -p runtime/vm/datastream.h` across tags.

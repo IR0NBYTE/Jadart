@@ -9,6 +9,49 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
+## Unreleased
+
+### Fixed
+
+- **A release build names its runtime stubs.** Every stub-aware rule in the lifter keys
+  off an `_iso_stub_<Base>Stub` name: `_classify_stub` decides whether a `bl` is a
+  throw, an allocation or machinery to drop, `_noreturn` whether a path ends there, and
+  `_pin_call` whether the call gives every register back. A default `flutter build apk
+  --release` gives it none, because a stub's `Code` is owned by no `Function` and the
+  .so carries no symbol table, so both fixtures carried 0 stub names and the whole
+  taxonomy was dead code on the build a user actually has. 16,438 of the clean image's
+  34,979 direct call sites (47.0%) are calls to a stub, and six of those targets end in
+  `blr x30; brk #0` and cannot return, yet printed as `sub_0x2d5d00(...)`, an ordinary
+  Dart call that does. The name now comes from the snapshot's own object-store roots,
+  where the isolate's `ObjectStore` fields are serialised in declaration order and the
+  tail of that run is the stubs: 76 named on each fixture, from a table
+  `tools/gen_objstore.py` expands out of each release's `object_store.h` (ten distinct
+  root runs over the eighteen registered epochs). The table is checked against the
+  binary on every parse, all 244 of 244 roots agreeing on the fixtures about which are
+  `Code`, and nothing is named when they do not: naming a stub after its neighbour would
+  be worse than leaving it `sub_0x...`. Tier 3 output changes on every build. On the
+  clean image, `(...)` calls go from 9,196 to 5,139, lines from 188,930 to 184,380,
+  byte-offset fields from 55,572 to 55,181, bare-register lines from 20,460 to 20,618,
+  and `sub_0x2d5d00(...)` now prints as `throw NullCastError();`. The obf fixture moves
+  by the same amounts. Tiers 1 and 2 gain the name in their listings, 1,126 lines of the
+  clean disasm sample and 1,198 of the obf one, each a `bl` that gained a `; ->
+  _iso_stub_...Stub` note and nothing else. `jadart functions` gains a fifth name
+  origin, `roots`, kept apart from `snapshot`, `symtab` and `signature` because it is a
+  position read out of this binary interpreted through a per-release table; under it the
+  stack-overflow stub is the most-called range in the clean image, 5,093 callers. Part
+  of #234; the dead phi write-back after a call that cannot return is the other half,
+  1,571 statements on the clean fixture, and is not in this change.
+- **A stub that hands a value back is a call, not machinery to drop.** `_classify_stub`
+  grouped the stubs that return a value in x0 (`InitLate*`, `Await`, `InitAsync`,
+  `CloneContext`) with the stack-check, write-barrier and type-test stubs, which give
+  every register back and are dropped. Dropping a call that returns something left the
+  stale x0 standing in for the value: a lazy-init getter whose `if` arm called
+  `InitLateFinalInstanceField` came out as `return x0;`, a whole body replaced by a bare
+  register, thirteen times on the clean fixture once stub naming started working. They
+  render as the calls they are now, `var t0 = InitLateFinalInstanceField(...);`, which
+  is what `_rv_call` already assumed about them (#127). This was reachable before this
+  change on a dwarf build with a symbol table, where the stubs were named.
+
 ## 1.3.0 - 2026-10-29
 
 Upgrading from 1.2.0. The command set, the options and `--json`'s `format_version` are

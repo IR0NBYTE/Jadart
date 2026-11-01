@@ -38,6 +38,7 @@ except Exception as exc:                       # noqa: BLE001 - reported, not sw
 
 from .macho import open_container
 from .branches import code_target, printed_number
+from .objstore import stub_names
 from .fill import quoted
 from .stream import ReadStream
 from . import versions
@@ -179,6 +180,10 @@ class InstrImage:
     data_length: int = 0       # header.length: where the serialized stream ends
     arch: object = None        # the resolved target; the decoder below is arm64-only and
                                # has to know when it is not looking at arm64
+    epoch: object = None       # the resolved format epoch, carried for the same reason as
+                               # `arch`: function_name_by_pc needs it to read the
+                               # snapshot's object-store roots, which is where a runtime
+                               # stub's name comes from (objstore.py)
     # Where the image sits in the binary. pc_offset is relative to the exported symbol
     # below, not to .text: .text also holds the VM instructions image in front of it, so a
     # `.text+pc_offset` label names code that far into the WRONG image. `anchor_va +
@@ -289,6 +294,7 @@ def load_instructions(path):
     return InstrImage(text=text, pcs=pcs, first_code=first_code, code_ranges=ranges,
                       all_ranges=all_ranges, symbol_names=symbol_names,
                       data=data, data_length=header_length, arch=hdr.arch,
+                      epoch=hdr.epoch,
                       anchor_va=anchor_va, anchor_file_offset=anchor_off,
                       container="macho" if type(elf).__name__ == "MachO64" else "elf",
                       entry_offsets=entry_offsets), fr, hdr
@@ -636,6 +642,11 @@ def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
     backfill is what recovers real names on dwarf_stack_traces_mode builds, where the
     snapshot itself no longer carries them.
 
+    A runtime stub has neither: no Function object owns it, and a release build keeps no
+    symbol for one. Its name comes from the snapshot's object-store roots instead
+    (objstore.py, #234), which is what makes the lifter's stub taxonomy work on the build
+    a user actually has.
+
     Both come from the binary, so they are escaped and cut as names (fill.visible, #74,
     #94) unless `raw` asks for them as written, which only interop does: its JSON keeps
     them as written, and it escapes and cuts each one where it prints it."""
@@ -646,6 +657,11 @@ def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
         fname[ref] = S.get(name_ref, "")
     pc_to_name = {pc: (nm if raw else visible(nm, limit=NAME_CUT))
                   for pc, nm in (image.symbol_names or {}).items()}
+    # Fixed ASCII out of a generated table, not a string out of the binary, so `raw` makes
+    # no difference to these and they need no escaping. A symbol table that does name a
+    # stub wins, because it is the same name written by the same compiler.
+    for pc, nm in stub_names(image, fr, getattr(image, "epoch", None)).items():
+        pc_to_name.setdefault(pc, nm)
     for owner_ref, cr in image.code_ranges.items():
         nm = fname.get(owner_ref)
         if nm:
