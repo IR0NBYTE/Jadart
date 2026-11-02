@@ -635,7 +635,7 @@ def _census_hooks(expr):
            "expr": 0, "never": 0, "ranges": 0, "oos": 0, "oos_fns": 0, "lifted": 0,
            "undecl": 0,
            "regline": 0, "empty": 0, "unbalanced": 0, "twice": 0, "above": 0,
-           "sole": 0}
+           "sole": 0, "dead": 0}
     saved = {n: getattr(expr.State, n)
              for n in ("note_slot", "record_drop", "forget_slot", "copy",
                        "stale_on_write")}
@@ -745,6 +745,10 @@ def _census_hooks(expr):
 
 _DECLARES = re.compile(r"(?:var )?(t\d+)\s*(?:=[^=]|;)")
 _NAME = re.compile(r"\bt\d+\b")
+#: A statement no path runs past, as the printed body spells it. `return` and `goto` are
+#: left out on purpose: the structurer places a label or a brace after those, and anything
+#: it places after a THROW is code the machine cannot reach (#234).
+_ENDS_RE = re.compile(r"(?:throw [^;]+;|rethrow;)$")
 
 
 def _shape(flat: list) -> dict:
@@ -754,7 +758,7 @@ def _shape(flat: list) -> dict:
     review rounds verified its per-symptom counts and missed 112 empty blocks, because a
     count says how much and not what shape (#210).
     """
-    out = {"unbalanced": 0, "twice": 0, "above": 0, "sole": 0}
+    out = {"unbalanced": 0, "twice": 0, "above": 0, "sole": 0, "dead": 0}
     depth, bad = 0, False
     declared, first = {}, {}
     body: list = []
@@ -804,6 +808,14 @@ def _shape(flat: list) -> dict:
         if m:
             bound.add(m.group(1))
     out["undecl"] = sum(1 for n in read if n not in bound)
+    # A statement under a `throw`. Nothing runs past the throw, so the line is code the
+    # machine cannot reach, and the reader has no way to tell that from code it does run:
+    # a phi write-back for the path that never arrives, or a `goto` out of a throw, 1,427
+    # of them on the clean fixture before a call that cannot return ended its block
+    # (#234). A brace, a label and an `else` are the structure around it, not statements.
+    out["dead"] = sum(1 for a, b in zip(flat, flat[1:])
+                      if _ENDS_RE.search(a) and b
+                      and not b.startswith(("}", "{", "else", "L_0x")))
     return out
 
 
@@ -857,6 +869,7 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
       sole        blocks whose only statement is a declaration nothing reads. The guard in
                   `_drop_unread` trades an empty block for one of these on purpose, so it
                   is a bound and not a zero
+      dead        statements printed under a `throw`, which no path reaches. Must be 0
 
     A sixth was measured and NOT kept: a declaration whose text repeats one already used
     in the same function, which is the readability half of #207. It comes out at 12,192 on

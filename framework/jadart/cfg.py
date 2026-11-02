@@ -96,6 +96,11 @@ class Block:
     #: the cut was recorded nowhere, and a backward one printed as `while (true) { }`.
     past_cut: bool = False
     cut_next: int = -1
+    #: True when nothing runs past this block's last instruction although it is neither a
+    #: branch nor a return: a trap, or a call to a stub that throws (`ends` in build_cfg).
+    #: It has no successor, and `structure` steps from it to the block after it, because
+    #: that code can be a catch entry which only an exception edge leads to.
+    ends_path: bool = False
 
 
 _NEG = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<="}
@@ -308,7 +313,8 @@ def _shifted(parts):
     return None
 
 
-def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
+def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None,
+              ends=frozenset()) -> tuple[dict, int]:
     """Return ({addr: Block}, entry_addr) for a function's disasm
     (list of (addr, mn, op, note)).
 
@@ -317,9 +323,15 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
     `bx` do, and arm32's usual return, `pop {fp, pc}`, ran on into the code after it in a
     quarter of its functions (#45).
 
-    `traps` are the mnemonics that end a block with no successor (#57). Tier 3 passes
-    none, and keeps the edge past a trap it has always had, until the walk no longer
-    leans on it (#64); see `_lift_function`.
+    `traps` are the mnemonics that end a block with no successor (#57).
+
+    `ends` are the ADDRESSES of instructions nothing runs past although the mnemonic does
+    not say so, which in practice means a `bl` to a runtime stub that throws. Only the
+    caller knows which callee cannot return (expr._ends_path), so it has to say. Without
+    it such a block falls through and the structurer renders a path the machine never
+    takes: `nextFocus` is three one-instruction blocks, each a `bl` to the null-cast-error
+    stub, and the last printed as `throw NullCastError(); goto L_0x12c928;`, a jump out of
+    a throw (#234).
 
     `cut_end` is where the range ends when the instruction cut stopped `dis` short of it
     (disasm.cut_end), else None. A target from the end of `dis` up to it is inside this
@@ -333,7 +345,7 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
     cut = cut_end if cut_end is not None and cut_end > hi else None
     leaders = {lo}
     for i, (a, mn, op, _n) in enumerate(dis):
-        if _is_term(mn) or mn in traps or a in exits:
+        if _is_term(mn) or mn in traps or a in exits or a in ends:
             if i + 1 < len(dis):
                 leaders.add(dis[i + 1][0])
             if _is_cond(mn) or mn == "b":
@@ -367,11 +379,14 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
             # an indirect branch. Either way the successor is not in this function.
             elif mn in ("ret", "br", "bx"):
                 blk.succ = []
-            elif mn in traps:
+            elif mn in traps or a in ends:
                 # A trap ends its block with no successor. Falling through drew an edge
                 # into the code after it, and tier 2 printed that code as running next:
-                # 939 `brk` on the clean fixture sat mid-range (#57).
+                # 939 `brk` on the clean fixture sat mid-range (#57). A call that cannot
+                # return is the same edge wearing a `bl`: the compiler puts no trap after
+                # one it has nothing to fall into (#234).
                 blk.succ = []
+                blk.ends_path = True
             elif mn == "b":
                 t = _target(op)
                 if t is not None and lo <= t < hi:
@@ -403,9 +418,9 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None) -> tuple[dict, int]:
             else:
                 blk.succ = [end] if end < hi else []
             # The last decoded instruction, when it can fall through, falls into the part
-            # the cut left out. A trap never does, though tier 3 keeps the edge past one
-            # inside the function (`traps`).
-            if cut is not None and end == hi and (
+            # the cut left out. One that ends a path never does, trap or throw: there is
+            # nothing for it to fall into, inside the function or past the cut (#234).
+            if cut is not None and end == hi and not blk.ends_path and (
                     _is_cond(mn) or blk.cexit or not (
                         mn in ("b", "ret", "br", "bx") or mn in TRAPS or blk.exit)):
                 blk.cut_next = hi
@@ -822,13 +837,16 @@ def structure(blocks, entry, orphans: bool = False):
     # the goto named a label no tier ever defined. Sweep up whatever is left, as labelled
     # sections, until nothing is.
     #
-    # The code after a trap goes in the same way (#57). Nothing runs on past a trap, yet
-    # that code can be a catch entry, which only an exception edge leads to, and the CFG
-    # does not model those. Placing only what the entry reaches dropped 182 instructions
-    # in 12 sections of the clean fixture without a word, 5 of them opening with
+    # The code after a trap goes in the same way (#57), and so does the code after a call
+    # that cannot return (`Block.ends_path`, #234). Nothing runs on past either, yet that
+    # code can be a catch entry, which only an exception edge leads to, and the CFG does
+    # not model those. Placing only what the entry reaches dropped 182 instructions in 12
+    # sections of the clean fixture without a word, 5 of them opening with
     # `sub x15, x29, #imm`, the stack reset a catch entry starts with. So the walk also
-    # steps from a reached trap to the block after it, which is exactly the code the old
-    # edge out of the trap brought in.
+    # steps from a reached block that ends a path to the block after it, which is exactly
+    # the code the old edge out of it brought in. Ghidra and Hex-Rays drop that code
+    # instead, and a stub misidentified as non-returning there hides real source; placing
+    # it as its own section cannot.
     #
     # One walk and one pass in address order places blocks in the same order as taking the
     # lowest unplaced one again and again, since placing only ever adds to `visited`, and
@@ -841,7 +859,7 @@ def structure(blocks, entry, orphans: bool = False):
         reachable.add(n)
         blk = blocks[n]
         stack.extend(blk.succ)
-        if blk.term in TRAPS and blk.insns:
+        if blk.ends_path and blk.insns:
             stack.append(blk.insns[-1][0] + 4)
     # Which of them a real edge reaches, so a section that only the step past a trap
     # brought in is marked as one nothing leads into.

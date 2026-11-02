@@ -706,7 +706,7 @@ def _slot_regs(text: str) -> frozenset:
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
                  "src", "views", "lost", "lost_slot", "slot_by_reg", "dropped",
-                 "opaque")
+                 "opaque", "spilled", "hoist", "hoisted")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
@@ -730,6 +730,15 @@ class State:
         # Boxed so forked states keep numbering from a shared counter; two arms of an if
         # must not both mint a "t3".
         self.tmpc: list = [0]
+        #: `set` below is the one site that mints a name without going through
+        #: `Lifter._mint`, and #204 moved the other thirteen there so every name could be
+        #: HOISTED: declared at the top of the body, assigned where the value is. Without
+        #: that a spill declared inside an `if` arm and read after it closed had no way to
+        #: be fixed, which is a read of something undeclared. These three are shared with
+        #: the Lifter by reference, like `tmpc`, so a fork cannot lose them.
+        self.spilled: set = set()
+        self.hoist: frozenset = frozenset()
+        self.hoisted: set = set()
         # Which return register was written most recently. Dart returns integers and
         # references in R0 and doubles in V0 (constants_arm64.h kReturnReg/kReturnFpuReg),
         # and a function can touch both (a double-returning loop still counts in x0). So
@@ -790,6 +799,7 @@ class State:
         s.slot_by_reg = {r: set(ks) for r, ks in self.slot_by_reg.items()}
         s.dropped = dict(self.dropped)
         s.tmpc = self.tmpc
+        s.spilled, s.hoist, s.hoisted = self.spilled, self.hoist, self.hoisted
         s.src = self.src
         return s
 
@@ -958,7 +968,12 @@ class State:
             # only computed text is worth breaking up.
             name = f"t{self.tmpc[0]}"
             self.tmpc[0] += 1
-            self.spill.append(f"var {name} = {v.text};")
+            self.spilled.add(name)
+            if name in self.hoist:
+                self.hoisted.add(name)
+                self.spill.append(f"{name} = {v.text};")
+            else:
+                self.spill.append(f"var {name} = {v.text};")
             v = V(name, P_ATOM)
         self.reg[reg] = v
         self.elem.pop(reg, None)
@@ -1621,8 +1636,10 @@ def returns_in_d0(ann) -> bool:
     code (_return_registers without callers' evidence). For dispatch.recover_selectors."""
     with use_target(ARM64):
         # Honour traps so a `ret` only a trap's false fall-through reaches is not
-        # counted as a return (#178), as the lift and entry_arity do.
-        blocks, entry = build_cfg(strip_boilerplate(ann), traps=TRAPS)
+        # counted as a return (#178), as the lift and entry_arity do, and a call that
+        # cannot return for the same reason (#234).
+        stripped = strip_boilerplate(ann)
+        blocks, entry = build_cfg(stripped, traps=TRAPS, ends=_path_ends(stripped))
         if not blocks:
             return False
         got = _return_registers(blocks, entry)
@@ -2669,6 +2686,15 @@ def _ends_path(mn: str, note: str) -> bool:
     return False
 
 
+def _path_ends(rows) -> frozenset:
+    """The addresses in `rows` that no path runs past, for `build_cfg`'s `ends`.
+
+    A trap says so in its mnemonic and build_cfg knows them; a `bl` to a stub that throws
+    does not, and the callee's name is the only evidence there is, so the lift has to hand
+    the addresses over (_ends_path, #234)."""
+    return frozenset(t[0] for t in rows if _ends_path(t[1], t[3]))
+
+
 def _frame_accesses(insns, stop=False, meets=frozenset(), moves=frozenset()):
     """(index, slot keys, how far FP moves, operands, write-backs) for each load and store
     of one block that `_step` keeps in the slot map, in order. `write-backs` is None for a
@@ -2786,6 +2812,9 @@ class Lifter:
         self.hoist: frozenset = frozenset()
         #: The ones it actually hoisted, for `_lift_function` to declare.
         self.hoisted: set = set()
+        #: The names `State.set` minted for a value too long to inline, shared with the
+        #: state so `wants_hoist` can ask for one (#234).
+        self.spilled: set = set()
         #: The names `_phi` MINTED. `phi_names` is wider: `_render_loop` and `_join_write`
         #: add to it, and only `_phi` reads `self.hoist`, so deciding off `phi_names` put
         #: names in the set that nothing could act on (#198 review).
@@ -5710,7 +5739,12 @@ class Lifter:
         if insns and insns[-1][1] in _CONDB:
             self._flags = None              # cbz and tbz test a register, not the flags
         self._anchor.update(dict.fromkeys(range(first, st.tmpc[0]), addr))
-        falls = blk.term not in ("ret", "br", "bx")
+        # A block nothing runs past hands nothing to what the tree put after it, trap or
+        # throw (`Block.ends_path`). Saying it falls through made an `if` arm that throws
+        # contribute to the join: 212 arms on the clean fixture printed the join's
+        # write-back under their own `throw`, a line no path reaches, and the join met a
+        # value from a path that never arrives (#234).
+        falls = not blk.ends_path and blk.term not in ("ret", "br", "bx")
         # Kept for `_reenter`: a block emitted after something that did not fall through
         # needs the state of its own predecessor, not of whatever the tree put above it.
         self._exit[addr] = st.copy()
@@ -7048,7 +7082,8 @@ def entry_arity(ann: list, cut: bool = False):
     reach is then not known.
     """
     stripped = strip_boilerplate(ann)
-    blocks, entry = build_cfg(stripped, traps=TRAPS)   # honours traps, like the lift
+    # honours traps and calls that cannot return, like the lift
+    blocks, entry = build_cfg(stripped, traps=TRAPS, ends=_path_ends(stripped))
     if not blocks or entry not in blocks:
         return 0
     # A function that never moves SP reads its incoming stack arguments off SP itself,
@@ -7758,6 +7793,18 @@ def _out_of_scope(lines: list, hits=None) -> set:
     return bad
 
 
+def _unbound(lines: list) -> set:
+    """The `tN` names `lines` read where NO line of `lines` binds them, at any depth.
+
+    Worse than `_out_of_scope`'s set, which at least leaves the reader a declaration to
+    look at: this is not valid Dart at all, and it is what `tools/pbfuzz.py`'s `undecl`
+    counts and requires to be zero (#205). Bound is read the same way the census reads it,
+    `_SET_RE`, a declaration or an assignment, so the two cannot drift apart."""
+    bound = {m.group(1) for m in (_SET_RE.match(ln) for ln in lines) if m}
+    read = {n for ln in lines for n in _TMP_RE.findall(ln.split("   //")[0])}
+    return read - bound
+
+
 def _drop_dead_phis(lines: list, names: set) -> list:
     """Drop the declaration and assignments of each phi name in `names` nothing reads.
 
@@ -7966,7 +8013,10 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     # frame slot from reading as the field it was loaded from; naming frame slots across
     # a call (`Lifter._slot_crossings`) now covers that, so `forEach`'s concurrent
     # modification guard no longer prints `this.field_0xc != this.field_0xc` (#64).
-    blocks, entry = build_cfg(stripped, traps=TRAPS, cut_end=cut_end)
+    # A call to a stub that throws ends its block the same way, and nothing in a `bl`
+    # says so, which is why the addresses are handed over (#234).
+    blocks, entry = build_cfg(stripped, traps=TRAPS, cut_end=cut_end,
+                              ends=_path_ends(stripped))
     if not blocks:
         return []
     _fold_frame_offsets(blocks)
@@ -8002,7 +8052,11 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.join_phi = join_phi or {}
         lifter.printed_prior = printed_prior or frozenset()
         lifter.hoist = hoist or frozenset()
-        lines, _falls = lifter.walk(stmts, State(), indent, depth)
+        st = State()
+        # `State.set` mints a name for a value too long to inline, and it is the one such
+        # site outside `_mint`. Sharing these makes those names hoistable too.
+        st.hoist, st.spilled, st.hoisted = lifter.hoist, lifter.spilled, lifter.hoisted
+        lines, _falls = lifter.walk(stmts, st, indent, depth)
         return lifter, lines
 
     lifter, lines = walk(None)
@@ -8052,7 +8106,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                 _drop_unread(body, lf.raw_names | lf.blind_named), lf.slot_names),
                 lf.phi_names),
             lf.results | lf.slot_names, lf.slot_names)
-        return frozenset(_out_of_scope(shipped_body) & (lf.minted | lf.phi_minted))
+        return frozenset(_out_of_scope(shipped_body)
+                         & (lf.minted | lf.phi_minted | lf.spilled))
 
     hoist = wants_hoist(lifter, lines) or None
     carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
@@ -8120,4 +8175,17 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     # after. Restricted to `blind_named` on purpose. The other emitters' names have the
     # same pass-order limit, 3,878 of them on the clean build, and taking those too is a
     # far wider changed answer than this one concern.
-    return _drop_unread(lines, lifter.blind_named)
+    out = _drop_unread(lines, lifter.blind_named)
+    # Last resort, and for the invariant rather than for the shape. A name the shipped
+    # body READS and binds nowhere is not Dart and leaves the reader nothing to look at,
+    # which is why `undecl` has to be 0 (#205). `wants_hoist` fixes the ones it can: a
+    # name `_mint`, `_phi` or `State.set` handed out in the walk that ships gets its
+    # declaration moved to the top. One range of each fixture reaches here instead,
+    # holding a name a trial walk minted and the walk that shipped did not, so there is no
+    # assignment left to hoist to. Declaring it says `a value this lifter does not know`,
+    # which is what an initialiser-less declaration means everywhere else in this file.
+    missing = _unbound(out)
+    if missing:
+        pad = indent * depth
+        out = [f"{pad}var {n};" for n in sorted(missing, key=lambda n: int(n[1:]))] + out
+    return out

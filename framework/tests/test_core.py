@@ -1373,8 +1373,9 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
     saved again around a call, and the pre-loop text was right. A store keeps the slot
     when it writes back what it reloaded, or a register the loop never writes that held
     the slot's value on the way in; and a store on a path that throws never comes back
-    round. A throw stub is a call, so tier 3's graph still runs on from it; a trap ends
-    its block (#64), so the `b` after one closes no loop."""
+    round. A trap ends its block, and so does a call to a stub that throws, so a `b` after
+    either closes no loop (#64, #234); a throw INSIDE a loop leaves it, and the loop is
+    still a loop."""
     from jadart.expr import lift_function
 
     def lift(rows):
@@ -1390,37 +1391,42 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
              [("mov", "x20, x1"), ("stur", "x20, [x29, #-8]"), ("bl", "#0x100"),
               ("ldur", "x2, [x29, #-8]"), ("ldur", "x0, [x2, #7]"),
               ("stur", "x20, [x29, #-8]"), ("cbnz", "x0, #0x8"), ("ret", "")]),
-            ("past a throw stub",
-             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
-              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
-              ("stur", "x0, [x29, #-8]"),
-              ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
-              ("b", "#0x4")]),
+            # A throw inside the body leaves the loop, and the loop is still a loop: the
+            # `break` lands on the throw, and the trip after it is the one the back edge
+            # below the throw makes.
             ("a throw on the way round",
              [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
               ("ldur", "x0, [x2, #7]"), ("cbnz", "x0, #0x18"), ("stur", "x0, [x29, #-8]"),
               ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
-              ("bl", "#0x200"), ("cbnz", "x0, #0x4"), ("ret", "")]),
+              ("bl", "#0x200"), ("cbnz", "x0, #0x4"), ("ret", "")])):
+        body = lift(rows)
+        assert "while (true) {" in body and "this.field_0x8" in body, (why, body)
+        assert "x2.field_0x8" not in body, (why, body)
+    # Past a trap, and past a call that cannot return, there is no loop at all: the block
+    # ends there, so the `b` after it is unreachable and closes nothing (#64, #234). The
+    # code after it is still placed, as its own labelled section holding that `b`, and the
+    # slot still keeps `this`, not the register it was reloaded into.
+    throws = "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"
+    for why, rows in (
+            ("past a trap",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
+              ("stur", "x0, [x29, #-8]"), ("bl", "#0x100"), ("brk", "#0"),
+              ("b", "#0x4")]),
+            ("past a throw stub",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
+              ("stur", "x0, [x29, #-8]"), ("bl", "#0x100", throws), ("b", "#0x4")]),
             # The only way back to the top runs through the throw, so the store at the
             # top is never read by a next trip: there is no loop.
             ("a loop only a throw closes",
              [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
               ("ldur", "x0, [x2, #7]"), ("stur", "x0, [x29, #-8]"), ("cbz", "x0, #0x18"),
-              ("ret", ""),
-              ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
-              ("b", "#0x4")])):
+              ("ret", ""), ("bl", "#0x100", throws), ("b", "#0x4")])):
         body = lift(rows)
-        assert "while (true) {" in body and "this.field_0x8" in body, (why, body)
+        assert "while (true) {" not in body and "this.field_0x8" in body, (why, body)
         assert "x2.field_0x8" not in body, (why, body)
-    # Past a trap there is no loop at all: the `brk` ends its block, so the `b` after it
-    # is unreachable and closes nothing (#64). The slot still keeps `this`, not the
-    # register it was reloaded into.
-    body = lift([("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
-                 ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
-                 ("stur", "x0, [x29, #-8]"), ("bl", "#0x100"), ("brk", "#0"),
-                 ("b", "#0x4")])
-    assert "while (true) {" not in body and "this.field_0x8" in body, body
-    assert "x2.field_0x8" not in body, body
+        assert "goto L_0x4;" in body, (why, body)
     # ...and one that stores something else does forget it: the loop reads its own
     # value back at the top of the next trip, not `this`. So does a register that held
     # the slot's value on the way in, once the loop has changed it, and a loop that moves
@@ -1606,6 +1612,72 @@ def test_runtime_stubs_are_named_from_the_object_store_roots():
     assert _classify_stub(got[0x19f280]) == ("throw_err", "NullCastError")
     assert _classify_stub(got[0x19ebf0]) == ("suppress", None)
     assert _classify_stub(got[0x19e0e4]) == ("alloc", "Float64List")
+
+
+def test_a_call_that_cannot_return_ends_its_block():
+    """A `bl` to a stub that throws gets no fall-through, so the structurer cannot render
+    a path the machine never takes (#234).
+
+    Nothing in a `bl` says the callee does not come back, so the lift hands the addresses
+    over (`_path_ends`) and `build_cfg` ends those blocks the way it ends one at a trap
+    (#57). What was reached only through the old edge is still placed, as its own labelled
+    section: Ghidra and Hex-Rays drop such code, and a callee misidentified as
+    non-returning there hides real source, where a labelled section cannot."""
+    from jadart.cfg import TRAPS, build_cfg
+    from jadart.expr import _path_ends, lift_function
+    throw = "  ; -> _iso_stub_NullCastErrorSharedWithoutFPURegsStub"
+    rows = [("cbz", "x0, #0x8"), ("bl", "#0x100", throw), ("bl", "#0x100", throw),
+            ("mov", "x0, #1"), ("ret", "")]
+    ann = [(i * 4, r[0], r[1], r[2] if len(r) > 2 else "") for i, r in enumerate(rows)]
+    blocks, _entry = build_cfg(ann, traps=TRAPS, ends=_path_ends(ann))
+    assert [(a, b.succ, b.ends_path) for a, b in sorted(blocks.items())] == [
+        (0x0, [0x8, 0x4], False), (0x4, [], True), (0x8, [], True), (0xc, [], False)]
+    # Without the addresses the throw falls through to the next throw, and the code after
+    # it is not even a block of its own: that is what main rendered as running next.
+    kept, _e = build_cfg(ann, traps=TRAPS)
+    assert kept[0x4].succ == [0x8] and not kept[0x4].ends_path
+    assert 0xc not in kept
+    # Each arm throws, nothing is printed under either, and the tail nothing reaches is
+    # still there under its own label.
+    assert [ln.strip() for ln in lift_function(ann)] == [
+        "if (x0 != 0) {", "throw NullCastError();", "} else {",
+        "throw NullCastError();", "}", "L_0xc:", "return 1;"]
+
+
+def test_the_null_test_chain_that_found_the_false_edge_reads_as_source():
+    """`FocusTraversalPolicy.next` on the clean fixture, which is the shape #234 names.
+
+    The compiler lays out three one-instruction blocks, each a `bl` to the null-cast-error
+    stub, so the arms of three null tests can branch into them. With the fall-through kept,
+    the lift printed the last as `throw NullCastError(); goto L_0x12c928;`, a jump out of a
+    throw, and the two `if`s above it lost their else arms to the edge. Nothing in the
+    range changes but the edges, so the whole body is pinned here."""
+    if not _capstone_available() or not os.path.exists(CLEAN):
+        _skip("  SKIP test_the_null_test_chain_that_found_the_false_edge_reads_as_source")
+    from jadart.disasm import (load_instructions, disassemble_range,
+                               function_name_by_pc, build_pool_map)
+    from jadart.expr import lift_function, make_arity_resolver
+    image, fr, _ = load_instructions(CLEAN)
+    cr = next(c for c in image.all_ranges if c.pc_offset == 0x12c8bc)
+    dis = disassemble_range(image, cr)
+    body = [ln.rstrip() for ln in lift_function(
+        _ann(image, dis, function_name_by_pc(image, fr), build_pool_map(fr)),
+        build_pool_map(fr), arity=make_arity_resolver(image))]
+    assert body == [
+        "  if (THR.field_0x78.field_0xad1 != NULL) {",
+        "    if (THR.field_0x78.field_0xad1.field_0xf0 != NULL) {",
+        "      if (THR.field_0x78.field_0xad1.field_0xf0.field_0x14.field_0x2c != NULL) {",
+        "        return nextFocus(THR.field_0x78.field_0xad1.field_0xf0.field_0x14"
+        ".field_0x2c);",
+        "      } else {",
+        "        throw NullCastError();",
+        "      }",
+        "    } else {",
+        "      throw NullCastError();",
+        "    }",
+        "  } else {",
+        "    throw NullCastError();",
+        "  }"], body
 
 
 def test_the_object_store_root_run_ends_where_the_dispatch_table_begins():
@@ -14624,9 +14696,13 @@ def test_a_name_is_not_read_after_its_declaration_closed():
 
     got = pbfuzz.census(CLEAN)
     assert got["lifted"] > 8000, f"only {got['lifted']} ranges lifted"
-    assert got["oos"] <= 5, (
+    # Zero since #234, where the last five went: `State.set` mints a name for a value too
+    # long to inline, it was the one minting site outside `_mint`, and a name the hoist
+    # does not know about cannot be moved to the top of the body. Now that it is known,
+    # nothing is left reading a declaration that has closed.
+    assert got["oos"] == 0, (
         f"{got['oos']} reads of a name whose declaration has closed, in "
-        f"{got['oos_fns']} ranges, up from 5 in 5; see #204 and #205")
+        f"{got['oos_fns']} ranges, where there were none; see #204, #205 and #234")
     # And NO name read that the body never binds at all, which is not valid Dart and
     # leaves a reader nothing to go on. Four of them shipped, six reads, all in
     # `parsePartialNumber` on both fixtures (#205). A bound, not a budget: this one is
@@ -14819,29 +14895,29 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # scope, which cannot be spelled at all and so are a forced decline. Naming a spill
     # earlier moves reads from the first into the second without the reader gaining
     # anything, so a change that improves one must not quietly worsen the other.
-    # Both numbers moved at #234, which named the runtime stubs: a named stub ends a path
-    # or keeps the registers, so 217 more records get spelled at all (8,521 to 8,738)
-    # and the residual rose with them, 2,579 to 2,613. The SHARE fell, 30.3% to 29.9%,
-    # which is the direction that matters here.
-    assert got["wrong"] <= 2613, (
+    # Both numbers moved at #234, and down: a call that cannot return no longer hands its
+    # block's state to the join under it, so a reload on the far side finds the spelling
+    # the arm that DOES arrive left. 2,579 to 2,089, and the share with it, 30.3% to
+    # 23.3%, over 451 more records spelled.
+    assert got["wrong"] <= 2089, (
         f"{got['wrong']} reloads spell a register where the slot held a spelling that was "
-        f"available, up from 2613; see #198. {got['diff_reg']} held another register, "
+        f"available, up from 2089; see #198. {got['diff_reg']} held another register, "
         f"{got['expr']} an expression")
-    assert got["wrong"] / max(1, got["spelled"]) <= 0.30, (
+    assert got["wrong"] / max(1, got["spelled"]) <= 0.24, (
         f"{got['wrong']} of {got['spelled']} spelled records read back wrong, a higher "
-        f"share than the 29.9% #234 left; a count that rises with the records spelled is "
+        f"share than the 23.3% #234 left; a count that rises with the records spelled is "
         f"the same residual, a rising share is a new one")
-    assert got["wrong"] + got["name"] <= 3443, (
+    assert got["wrong"] + got["name"] <= 2856, (
         f"{got['wrong'] + got['name']} reloads in total name a different value than the "
-        f"slot held, up from 3443, of which {got['name']} are names out of scope")
+        f"slot held, up from 2856, of which {got['name']} are names out of scope")
     # And the reader-visible half of #198, which the two numbers above cannot see: they
     # score what `_reload` DECIDES, and the fix for a decline is at the call site, which
     # names the read rather than keeping the load's own register. A register the printed
     # body never assigns reads as the value the function came in with, so every line this
     # removes is a line that stopped claiming one. Counted with `tools/quality.py`'s own
     # regex, not a copy of it.
-    assert got["regline"] <= 26633, (
-        f"{got['regline']} lines carry a bare machine register, up from 26633; a reload "
+    assert got["regline"] <= 26393, (
+        f"{got['regline']} lines carry a bare machine register, up from 26393; a reload "
         f"that declines must name the read and not keep the register (#198)")
     # And no block is left holding nothing. A pass that drops a declaration nothing reads
     # can take the only line an `if` arm has: `_drop_unread_slots`, `_drop_dead_phis` and
@@ -14854,22 +14930,27 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # per-symptom COUNT cannot see a shape: #206 verified its counts over two review
     # rounds and still nearly shipped 112 empty blocks. Four are exact, because there is
     # no acceptable number of them.
+    # `dead` is #234's: a statement under a `throw` is code no path reaches, and with the
+    # runtime stubs named and the throw's fall-through edge still in the graph there were
+    # 1,224 of them on this fixture, phi write-backs for the path that never arrives and
+    # `goto`s out of a throw.
     for k, why in (("unbalanced", "functions whose braces do not balance"),
                    ("twice", "names the body declares twice"),
-                   ("above", "names read on a line above their declaration")):
-        assert got[k] == 0, f"{got[k]} {why} (#210)"
+                   ("above", "names read on a line above their declaration"),
+                   ("dead", "statements printed under a `throw`, which no path reaches")):
+        assert got[k] == 0, f"{got[k]} {why} (#210, #234)"
     # A bound, not a zero: `_drop_unread`'s guard trades an empty block for a block whose
     # only line is a declaration nothing reads, which is the honest side of that trade and
     # the same one `_drop_unread_slots` already makes.
-    # 1,398 to 1,575 at #234. The new ones are one shape, and a named stub is what
+    # 1,398 to 1,489 at #234, one shape, and a named stub is what
     # uncovers it: a type-test stub is dropped, so the class-id load in front of it
     # (`var t11 = 60; if (x & 1 != 0) { t11 = (x.tags >> 12) & 0xfffff; }`) is left with
     # nothing reading it, and the arm of that `if` is a block holding one dead assignment.
     # Dropping a computation whose only reader was a suppressed stub is the fix, and it is
     # `_drop_unread`'s business rather than the naming's.
-    assert got["sole"] <= 1575, (
+    assert got["sole"] <= 1489, (
         f"{got['sole']} blocks hold nothing but a declaration nothing reads, up from "
-        f"1575; see the guard in `_drop_unread` (#210)")
+        f"1489; see the guard in `_drop_unread` (#210)")
 
     # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
     real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,
@@ -15285,22 +15366,25 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     assert lift(frame(0x10, *push), **one)[0] == "return sub_0x100(...);"
     assert lift(frame(0x20, *push), **one)[0] == (
         "return sub_0x100(1, 2, 3, 4, 5, 6, x9);")
-    # SP where the code that reaches a push leaves it: not over a throw's edge, which
-    # tier 3 keeps (#64), from code that took SP down, and through the slow path
-    # strip_boilerplate cut off a box-or-tag check, there reached over a throw's edge.
+    # SP where the code that reaches a push leaves it: from code that took SP down, and
+    # through the slow path strip_boilerplate cut off a box-or-tag check. The throw's own
+    # edge is gone since #234, so the push is reached only by the branch, and what follows
+    # the throw is placed as its own section rather than running into the join.
     saves = [("str", "x3, [x15, #-8]!"), ("bl", "#0x500"), ("ldr", "x3, [x15], #8")]
     for after in ((), (("mov", "x9, #0"),), (("sub", "x15, x15, #0x10"),)):
-        # The throw ends its block or not, and what follows it moves SP or not.
         # The call in `saves` declares what it left in x2 (#176), so the base is that
-        # name; the slot reading x0 is what these cases are about.
-        assert _stores(lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
-                                  ("mov", "x15, x29"), ("bl", "#0x600", throw), *after,
-                                  "J", *saves, load, *keep))[-2], "x0"), after
-    assert _stores(lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
-                              ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
-                              ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"),
-                              ("b", "@K"), "T", ("bl", "#0x600", throw), "P", *saves,
-                              ("b", "@K"), "K", load, *keep))[-2], "x0")
+        # name; the slot reading x0 is what these cases are about, wherever the arm the
+        # branch takes ends up printing it.
+        body = lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
+                          ("mov", "x15, x29"), ("bl", "#0x600", throw), *after,
+                          "J", *saves, load, *keep))
+        assert any(_stores(ln, "x0") for ln in body), (after, body)
+    body = lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
+                      ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
+                      ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"),
+                      ("b", "@K"), "T", ("bl", "#0x600", throw), "P", *saves,
+                      ("b", "@K"), "K", load, *keep))
+    assert any(_stores(ln, "x0") for ln in body), body
 
     # A write-back store through FP is filed where FP is left, by the walk and by what
     # names a slot across a call alike, pre-index and post-index. SP's slots go when FP

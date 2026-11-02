@@ -711,6 +711,60 @@ for the graph while `_arrive`'s write-back still lands after it. And blocks whos
 statement is an assignment nothing reads went 1,398 to 1,575, one shape: a type-test
 stub is dropped and the class-id load in front of it is left with no reader.
 
+### The edge a call that cannot return used to have
+
+Naming the stubs made the second half of #234 visible, and it is the one the issue is
+titled for. `build_cfg` ends a block at a terminator, at a trap mnemonic (#57) or at an
+address `exits` names, and a `bl` is none of those, so a call to a stub that throws kept
+its fall-through edge. `FocusTraversalPolicy.next` is the shape that shows what that
+costs: the compiler lays out three one-instruction blocks, each a `bl` to the
+null-cast-error stub, so the arms of three null tests can branch into them, and the lift
+rendered the last as `throw NullCastError(); goto L_0x12c928;`, a jump out of a throw,
+while the two `if`s above it lost their else arms to the edge. The same edge fed joins:
+a phi met a value from a path that never arrives, and 1,224 statements on the clean
+fixture printed under a `throw`.
+
+THE FIX IS THE ONE EVERY OTHER TOOL MAKES, at the IR and not at the printer. angr adds
+an inferred return edge at a call and REMOVES it when the callee turns out not to
+return, re-recovering the CFG and dropping what is no longer reachable. Ghidra clears
+the fall-through of a non-returning call and its decompiler eliminates the unreachable
+code. Hex-Rays marks the call `__noreturn` and the microcode drops the rest of the
+block. LLVM puts `unreachable` after such a call and SimplifyCFG deletes what follows.
+So the lift hands `build_cfg` the addresses nothing runs past (`_path_ends`, from
+`_ends_path`, which already knew which callee throws), and those blocks end with no
+successor exactly as a trap's does.
+
+WHERE THIS DIFFERS FROM GHIDRA AND HEX-RAYS IS WHAT HAPPENS TO THE CODE AFTER THE CALL.
+Both drop it, and both document the hazard that follows: a callee wrongly marked as
+non-returning hides real source, which is why Ghidra has an `Eliminate unreachable code`
+switch and Hex-Rays tells you to clear the `noret` flag. Here that code is placed as its
+own labelled section, which is what #57 already does for the code after a trap, because
+it can be a catch entry and the CFG does not model exception edges. Measured, not
+argued: over the 16,382 ranges of the two fixtures, not one instruction that the
+structurer placed before this change stopped being placed, and none appeared that was
+not placed before. `cfgcheck` reports 0 edge violations and 0 dropped blocks on both.
+
+TWO SMALLER RULES FOLLOW FROM THE SAME FACT. A block nothing runs past hands nothing to
+the statement after it, so `_lift_block` reports it as not falling through; an `if` arm
+that throws then contributes nothing to the join, which takes the surviving arm's state
+exactly rather than meeting it with a path that never arrives. And `State.set`, which
+mints a name for a value too long to inline, was the one minting site outside `_mint`,
+so the hoist could not move its declaration to the top of the body; sharing those names
+took the last reads of a closed declaration out of the output.
+
+WHAT IT ADDS UP TO on the clean fixture, against main: statements under a `throw` 1,224
+to 0, `goto`s 6,830 to 5,493 and the functions that emit one 1,649 to 1,414 (20.1% to
+17.3%), the #198 wrong-reload residual 2,579 to 2,089, reads of a closed declaration 5
+to 0, lines with a bare machine register 20,460 to 20,015, byte-offset fields 55,572 to
+54,069, and 3,451 fewer lines in all. The obf fixture moves by the same amounts, and
+tier 2's export is byte-identical, since only the lift hands over the addresses.
+
+ONE RESIDUAL, measured and guarded rather than fixed. One range of each fixture reads a
+name that no line of its body binds, because a walk the lifter discarded minted it and
+the walk that shipped did not, so there is no assignment left to hoist to.
+`_lift_function` declares it at the top, which is what an initialiser-less declaration
+means everywhere else in the file, a value this lifter does not know. The leak itself, a
+name escaping a trial walk, is worth its own issue.
 ## Follow-ups (UNVERIFIED items to close)
 - wire-ref signed/unsigned history: `git log -p runtime/vm/datastream.h` across tags.
 - exact 2.18 / 3.4 stream deltas: diff app_snapshot.cc / class_id.h between those tags.
