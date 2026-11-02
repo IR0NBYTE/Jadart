@@ -12630,6 +12630,90 @@ def test_a_goto_into_a_loop_head_reads_no_name_the_goto_skipped():
                  ("str", "x0, [x4, #7]"), ("ret", "")])[0] == (
         "bfi x0, x1, #3, #8   // x0 holds x2 + 1")
 
+def test_a_32_bit_destination_clears_the_top_half():
+    """arm64 writes the w view of a register by clearing its top half, and `canon` folds
+    the two views onto one name, so a 32-bit result printed as a 64-bit one keeps bits the
+    machine does not have. DESIGN section 13 counted the fold at 59,073 sites; 3,000 of
+    them on the clean fixture compute a value into a w register.
+
+    Measured against the CPU rather than argued. With the `w` exclusion dropped from
+    `tools/irfuzz.py`'s operand filter, its text pass disagreed with the hardware on 32
+    printed expressions in 2,001 runs of the clean fixture's own code and on 30 of obf,
+    every one of them a 32-bit shift of a 64-bit shift's result (#235)."""
+    from jadart.expr import lift_function
+
+    def first(rows):
+        body = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(
+            list(rows) + [("str", "x6, [x2, #7]"), ("ret", "")])])
+        return body[0].strip().split(" = ", 1)[1].rstrip(";")
+    # The shape the oracle caught: a 64-bit shift, then a 32-bit shift of its result.
+    assert first([("lsl", "x2, x1, #1"), ("lsl", "w6, w2, #1")]) == (
+        "(x1 << 1 << 1).toUnsigned(32)")
+    # One truncation at the END of a chain of 32-bit operations and not one per step,
+    # because each of them reads the w view and drops the same bits itself. That is where
+    # a decompiler carrying a type puts its cast too.
+    assert first([("lsl", "x2, x1, #1"), ("lsl", "w3, w2, #1"), ("add", "w4, w3, #8"),
+                  ("sub", "w6, w4, #2")]) == "((x1 << 1 << 1) + 8 - 2).toUnsigned(32)"
+    # A value that provably fits needs none: a mask that small, a literal, a 32-bit shift
+    # right, or a result this already truncated.
+    assert first([("and", "w2, w1, #0xff"), ("add", "w6, w2, w2")]) == (
+        "(x1 & 255) + (x1 & 255)")
+    assert first([("mov", "w2, #7"), ("mul", "w6, w2, w2")]) == "7 * 7"
+    assert first([("lsr", "w2, w1, #3"), ("orr", "w6, w2, w2")]) == (
+        "(x1 & 0xffffffff) >>> 3 | (x1 & 0xffffffff) >>> 3")
+    # ...and a bound that follows the arithmetic, so a sum of two bytes needs no mask
+    # where a sum of two 32-bit values does.
+    assert first([("and", "w2, w1, #0xff"), ("and", "w3, w1, #0xff"),
+                  ("add", "w6, w2, w3")]) == "(x1 & 255) + (x1 & 255)"
+    assert first([("and", "w2, w1, #0xffffffff"), ("add", "w6, w2, w2")]) == (
+        "((x1 & 0xffffffff) + (x1 & 0xffffffff)).toUnsigned(32)")
+    # The 64-bit forms of the same instructions are untouched.
+    assert first([("lsl", "x2, x1, #1"), ("lsl", "x6, x2, #1")]) == "x1 << 1 << 1"
+    assert first([("add", "x2, x1, #8"), ("sub", "x6, x2, #2")]) == "x1 + 8 - 2"
+    # A store is not a destination: narrowing its first operand would rewrite a value the
+    # machine kept whole.
+    body = lift_function([(0, "lsl", "x2, x1, #1", ""), (4, "str", "w2, [x3, #7]", ""),
+                          (8, "ret", "", "")])
+    assert [ln.strip() for ln in body][0] == "x3.field_0x8 = x1 << 1;"
+
+
+def test_the_width_conversions_are_evaluated_by_the_oracle():
+    """The other half of #235. `tools/irfuzz.py` excluded every w operand by construction,
+    so no gate in this repo could see the class at all, and its evaluator knew neither
+    `toUnsigned` nor `toSigned`, so each expression carrying one DECLINED rather than
+    being checked.
+
+    Both halves matter in order. Dropping the exclusion alone leaves 3,500 of the clean
+    fixture's expressions undecidable and reports no mismatches, which is what a hollow
+    fix looks like. With the evaluator taught, its text pass checks 255,731 expressions
+    where main checks 250,770, and disagrees with the CPU nowhere."""
+    import ast
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import irfuzz
+
+    def ev(text, **env):
+        return irfuzz._ev(ast.parse(irfuzz._texpr(text), mode="eval"), env)
+    assert ev("x1.toUnsigned(32)", x1=0xdeadbeef00000001) == 1
+    assert ev("x1.toUnsigned(64)", x1=(1 << 64) - 1) == (1 << 64) - 1
+    assert ev("x1.toSigned(32)", x1=0x80000000) == -(1 << 31)
+    assert ev("x1.toSigned(32)", x1=0xffffffff7fffffff) == (1 << 31) - 1
+    assert ev("(x1 << 1).toUnsigned(32)", x1=0x90000000) == 0x20000000
+    # A width outside the range declines rather than guessing, as every other decline in
+    # that evaluator does.
+    for bad in ("x1.toUnsigned(0)", "x1.toSigned(65)", "x1.toDouble()"):
+        with pytest.raises(irfuzz._Undecidable):
+            ev(bad, x1=1)
+    # ...and the operand filter admits the class, which is what puts it under a gate: the
+    # text pass over the fixture's own code now draws runs that write a w register.
+    if not _capstone_available() or not os.path.exists(CLEAN):
+        _skip("  SKIP the operand-filter half (no capstone, or no clean fixture)")
+    runs = irfuzz.expr_cases(CLEAN, want=200)
+    assert runs, "no pure-arithmetic runs at all"
+    w = sum(1 for run, _code in runs
+            for _a, _mn, op in run if re.search(r"\bw\d+\b", op))
+    assert w > 0, "the oracle still draws no 32-bit operand"
+
+
 def test_a_negative_literal_and_a_32_bit_shift_read_as_dart_reads_them():
     # A negative literal is an atom to the lifter and a unary minus to Dart: `neg` of it
     # printed `--128`, a decrement, and a field read off it `-128.field_0x8`, which Dart
@@ -12648,7 +12732,9 @@ def test_a_negative_literal_and_a_32_bit_shift_read_as_dart_reads_them():
     assert first([("neg", "x5, x1"), ("neg", "x6, x5")]) == "-(-x1)"
     assert first([("mov", "x5, #-0x80"), ("sub", "x6, x1, x5")]) == "x1 - -128"
     assert first([("lsr", "w6, w1, #3")]) == "(x1 & 0xffffffff) >>> 3"
-    assert first([("asr", "w6, w1, #3")]) == "x1.toSigned(32) >> 3"
+    # The sign comes out of bit 31 and then the destination clears the top half, so the
+    # value is a 32-bit pattern and not a negative Dart int (#235).
+    assert first([("asr", "w6, w1, #3")]) == "(x1.toSigned(32) >> 3).toUnsigned(32)"
     assert first([("lsr", "x6, x1, #3")]) == "x1 >>> 3"
     # A value masked to fit already needs no second mask, as hash mixing mostly is.
     assert first([("and", "w5, w1, #0x7fffffff"), ("lsr", "w6, w5, #0xb")]) == (
@@ -12659,9 +12745,9 @@ def test_a_negative_literal_and_a_32_bit_shift_read_as_dart_reads_them():
         "(x1 & 0x7fffffff) >> 3")
     # ...but a sign still needs carrying out of bit 31,
     assert first([("ubfx", "x5, x1, #0, #0x20"), ("asr", "w6, w5, #3")]) == (
-        "(x1 & 0xffffffff).toSigned(32) >> 3")
+        "((x1 & 0xffffffff).toSigned(32) >> 3).toUnsigned(32)")
     assert first([("and", "w5, w1, #0x80000000"), ("asr", "w6, w5, #3")]) == (
-        "(x1 & 0x80000000).toSigned(32) >> 3")
+        "((x1 & 0x80000000).toSigned(32) >> 3).toUnsigned(32)")
     # and a mask under an `|` bounds only its own side.
     assert first([("and", "w5, w1, #0xff"), ("orr", "w5, w2, w5"),
                   ("lsr", "w6, w5, #3")]) == "((x2 | x1 & 255) & 0xffffffff) >>> 3"
@@ -12673,6 +12759,12 @@ def test_a_negative_literal_and_a_32_bit_shift_read_as_dart_reads_them():
         return v - (1 << n) if v >> (n - 1) & 1 else v
 
     def dart(t, x):
+        # The printed text, read as Dart reads it. `.toUnsigned(32)` is how a 32-bit
+        # destination says it cleared the top half (#235), and it can wrap a whole
+        # parenthesised expression, so it is taken off the tail rather than matched as a
+        # name like `.toSigned(32)` is.
+        while t.endswith(".toUnsigned(32)"):
+            t = f"({t[:-len('.toUnsigned(32)')]}) & {mask32}"
         t = re.sub(r"(\w+)\.toSigned\(32\)", r"_s(\1, 32)", t)
         t = t.replace(">>>", ">>").replace("x1", "_x")
         return eval(t, {"_s": signed, "_x": x}) & mask64

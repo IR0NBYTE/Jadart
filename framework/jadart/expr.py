@@ -504,6 +504,21 @@ P_TERN = 15
 #: number for every negative value, a confident wrong answer of exactly the kind
 #: the note above refuses for `ror`. 308 `lsr` sites in the 3.12.2 clean build.
 _SHIFT_SYM = {"lsl": "<<", "lsr": ">>>", "asr": ">>"}
+
+#: The mnemonics that COMPUTE a value, so that writing their w form truncates a result the
+#: text would otherwise keep whole (`_narrow`, #235). A load is not here: it moves as many
+#: bytes as its own form says and nothing above them. Nor is a store or a compare: their
+#: first operand is a source, and narrowing one would rewrite a value the machine kept.
+#: `uxtb`, `uxth` and `movz` are not here either, because what they write already fits.
+#: Only mnemonics this file MODELS: one it does not reaches `_verbatim`, which forgets the
+#: destination, so there is no value left to truncate and listing it would claim a
+#: coverage that is not there.
+_NARROW32 = frozenset({
+    "add", "adds", "sub", "subs", "neg", "negs", "mul", "madd", "msub", "mneg", "sdiv",
+    "and", "ands", "orr", "eor", "bic", "bics", "orn", "eon", "mvn", "lsl", "lsr", "asr",
+    "mov", "movk", "csel", "csinc", "csinv", "csneg", "cinc", "cinv", "cneg", "csetm",
+    "sbfx", "sxtb", "sxth", "sbfiz", "ubfiz", "adc", "sbc",
+})
 _EXTENDS = ("sxtw", "uxtw", "sxth", "uxth", "sxtb", "uxtb", "sxtx", "uxtx")
 
 #: `lsl #3`, and every extending form that also takes a shift: `sxtw #2` scales by four
@@ -567,6 +582,21 @@ def _folds_into(sym: str, rest: str) -> bool:
 class V:
     text: str
     prec: int = P_ATOM
+    #: The same value before a 32-bit destination truncated it, where one did (`_narrow`,
+    #: #235). A consumer that reads the w view of the register takes the low 32 bits
+    #: itself, so it reads THIS and truncates its own result instead, which leaves one
+    #: `.toUnsigned(32)` at the end of a chain of 32-bit operations rather than one on
+    #: every step of it. Compares structurally like the other two fields, so two arms of a
+    #: join agree exactly when their texts and their untruncated values do.
+    wide: "V | None" = None
+    #: An upper bound on the value: it is in [0, 2**bits). 64 is "nothing is known", which
+    #: is also what a value that may be NEGATIVE gets, since a negative Dart int is
+    #: exactly what a 32-bit destination cannot hold. Carried because the text does not
+    #: say it: `(x1 & 0xffffffff) >>> 3` fits in 32 bits and `x1 >>> 3` does not, and
+    #: their tails read the same. Only `_fits32` reads it, and only to leave a truncation
+    #: off a value that needs none (#235); it is the smallest useful piece of the
+    #: representation lattice DESIGN section 13 describes, not that lattice.
+    bits: int = 64
 
 
 def _wrap(v: V, ctx: int) -> str:
@@ -586,6 +616,39 @@ def _fits(v: V, bits: int) -> bool:
     return bool(m) and int(m.group(1), 0) < 1 << bits
 
 
+#: What `_narrow` writes, and what reading a 32-bit operand takes back off.
+_U32 = ".toUnsigned(32)"
+
+
+def _fits32(v: V) -> bool:
+    """Whether `v`'s value provably has no bit above 31, so a 32-bit destination holding
+    it needs no truncation in the text: a mask that small, a literal that small, a value
+    this already truncated, or one whose bound says so (`V.bits`)."""
+    if v.bits <= 32 or _fits(v, 32) or v.text.endswith(_U32):
+        return True
+    return bool(_INT_LITERAL.match(v.text)) and 0 <= int(v.text, 0) < (1 << 32)
+
+
+def _narrow(v: V) -> V:
+    """`v` as a 32-bit destination holds it: the low 32 bits, zero-extended.
+
+    arm64 writes the w view of a register by clearing the top half, and `canon` folds the
+    two views onto one name, so without this the text of a 32-bit result is the text of a
+    64-bit one and the top half it keeps is a value the machine does not have. Measured
+    against the CPU over the fixtures' own code, with the `w` exclusion dropped from
+    `tools/irfuzz.py`'s operand filter: 32 printed expressions in 2,001 runs on clean and
+    30 on obf disagree, every one of them a 32-bit shift of a 64-bit shift's result (#235).
+
+    `.toUnsigned(32)` rather than `& 0xffffffff` on purpose: a mask is what an `and`
+    instruction does, this is what the register width does, and a reader who cannot tell
+    them apart cannot tell which the program asked for. It pairs with the `.toSigned(32)`
+    an `asr` on a w register already prints. Hex-Rays and Ghidra carry the same fact in a
+    TYPE (`unsigned int`, `uint`) and Binary Ninja in the register name; this file has
+    neither, so it goes in the expression."""
+    return (v if _fits32(v)
+            else V(f"{_wrap(v, P_POST)}{_U32}", P_POST, wide=v, bits=32))
+
+
 def _prefix(sym: str, v: V) -> V:
     """`sym`, `-` or `~`, applied to `v`. A minus before a value that starts with a minus
     would read as Dart's decrement, `--128`, so that one is bracketed (#130)."""
@@ -595,6 +658,38 @@ def _prefix(sym: str, v: V) -> V:
     return V(sym + inner, P_UNARY)
 
 
+def _bits_of(a: V, op: str, b: V) -> int:
+    """An upper bound on `a op b`, as `V.bits` means it: the value is in [0, 2**bits).
+
+    64 wherever nothing follows, which is most places, and in particular wherever the
+    result can be NEGATIVE: `a - b` and `~a` can be, and a negative Dart int is what a
+    32-bit destination does not hold, so claiming a width for one would lose the
+    truncation that makes the text right. A shift amount that is not a literal is
+    unknown, and so is the result.
+
+    Only `_fits32` reads this, so an estimate that is too LARGE costs a truncation that
+    changes no value, and one that is too small would print a value the machine does not
+    have. Every rule here is therefore the loose side of the real bound (#235)."""
+    x, y = a.bits, b.bits
+    if op in ("+", "|", "^"):
+        return min(64, (max(x, y) + 1) if op == "+" else max(x, y))
+    if op == "*":
+        return min(64, x + y)
+    if op == "&":
+        return min(x, y)
+    if op in ("<<", ">>>", ">>"):
+        k = int(b.text, 0) if _INT_LITERAL.match(b.text) else None
+        if k is None or k < 0 or k >= 64:
+            return 64
+        if op == "<<":
+            return min(64, x + k)
+        # `>>` is arithmetic and `>>>` logical, but the text says `>>` for both and only
+        # the arithmetic one can carry a sign in. A value already bounded below 2**63 is
+        # non-negative either way, so the bound holds for both.
+        return max(0, x - k) if x < 64 else 64
+    return 64
+
+
 def _bin(a: V, op: str, b: V, prec: int) -> V:
     # The RIGHT operand is wrapped one level tighter than the left, because every operator
     # here associates to the left and several of them do not commute. `sub x2,x1,#2` then
@@ -602,11 +697,12 @@ def _bin(a: V, op: str, b: V, prec: int) -> V:
     # short of the `30 - (x1 - 2)` the CPU computes; `a * (b ~/ c)` printed `a * b ~/ c`,
     # which divides a different numerator. Found by evaluating the printed text against
     # the hardware, not by reading it.
-    return V(f"{_wrap(a, prec)} {op} {_wrap(b, prec + 1)}", prec)
+    return V(f"{_wrap(a, prec)} {op} {_wrap(b, prec + 1)}", prec, bits=_bits_of(a, op, b))
 
 
 def _num(n: int) -> V:
-    return V(str(n) if -256 < n < 256 else hex(n), P_ATOM)
+    return V(str(n) if -256 < n < 256 else hex(n), P_ATOM,
+             bits=n.bit_length() if n >= 0 else 64)
 
 
 _INT_LITERAL = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)\Z")
@@ -3603,10 +3699,16 @@ class Lifter:
 
     # leaf rendering
     def _leaf(self, reg: str, st: State) -> V:
+        # A `w` operand reads the low 32 bits, so a value a 32-bit destination truncated
+        # is read back untruncated: this consumer drops the same bits anyway, and if it
+        # writes a w register of its own `_step` truncates the result once at the end
+        # (#235). Nothing else looks at `V.wide`, so a 64-bit read sees the truncation.
+        narrow = reg.strip()[:1] == "w"
         reg = canon(reg)
         if reg in self.alias and reg not in st.reg:
             return V(self.alias[reg], P_ATOM)
-        return st.get(reg)
+        v = st.get(reg)
+        return v.wide if narrow and v.wide is not None else v
 
     def _sub(self, pc_offset: int) -> str:
         """A range with no name, as every other surface names it (disasm.sub_label)."""
@@ -4575,6 +4677,11 @@ class Lifter:
     # one instruction
     def _step(self, st: State, addr, mn, op, note) -> list:
         """Update `st`; return any emitted statement lines (usually none)."""
+        # Reading the `w` view of a register takes the low 32 bits, so a consumer that
+        # reads one needs no truncation of its own and `_leaf` hands it the value
+        # untruncated; the result is then truncated again here. The mask lands at the end
+        # of a chain of 32-bit operations rather than on every step of it, which is where
+        # a type-carrying decompiler puts its cast too (#235).
         ops = _split_ops(op)
         g = lambda r: self._leaf(r, st)
 
@@ -4585,9 +4692,16 @@ class Lifter:
             return []
 
         flagged = self._note_flags(st, mn, op, ops, addr in self._flag_reads)
-        if flagged:
-            return flagged + self._step_rest(st, addr, mn, op, note, ops, g)
-        return self._step_rest(st, addr, mn, op, note, ops, g)
+        out = self._step_rest(st, addr, mn, op, note, ops, g)
+        # One place, after the branch that modelled the instruction, because the rule is
+        # the machine's and not any one mnemonic's: a 32-bit destination clears the top
+        # half of its register (#235).
+        if mn in _NARROW32 and ops and ops[0].strip()[:1] == "w":
+            dst = canon(ops[0])
+            v = st.reg.get(dst)
+            if v is not None and not _fits32(v):
+                st.set(dst, _narrow(v))
+        return flagged + out if flagged else out
 
     def _step_rest(self, st: State, addr, mn, op, note, ops, g) -> list:
         """_step past the flags: what the instruction does to `st`, and its lines."""
@@ -5076,7 +5190,10 @@ class Lifter:
                 st.set(dst, _num(val))
                 return []
         if mn == "add" and len(ops) >= 3:
-            b, c = canon(ops[1]), ops[2]
+            # `b` is canonical because the role tables and `_UNTAGGED` are keyed that way;
+            # the VALUE comes from the operand as written, so that reading the w view of a
+            # register takes the low 32 bits (`_leaf`, #235).
+            raw_b, b, c = ops[1], canon(ops[1]), ops[2]
             imm = _imm(c)
             # `add xD, xN, #9, lsl #12` is a single immediate scaled by the shift. Only the
             # pool-base branch below used to fold it, so every other use was off by 4096x.
@@ -5094,7 +5211,7 @@ class Lifter:
                 st.poolbase[dst] = imm
                 return []
             if imm is not None:
-                st.set(dst, _bin(g(b), "+", _num(imm), P_ADD))
+                st.set(dst, _bin(g(raw_b), "+", _num(imm), P_ADD))
                 return []
             if _T.roles.get(canon(c)) == "HEAP":               # compressed-pointer decompress
                 st.set(dst, g(b))
@@ -5108,7 +5225,7 @@ class Lifter:
             val = self._src(ops, 2, st)
             if val is None:
                 return self._raw(st, dst, mn, op)
-            st.set(dst, _bin(g(b), "+", val, P_ADD))
+            st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
             # The 4th field records whether the machine's base register held an UNTAGGED
             # address, because that is what decides whether a later displacement off this
             # base is an object header or a real element offset. See _elem_access.
@@ -5170,14 +5287,15 @@ class Lifter:
             # A register shift amount is not a shift by zero, which is what `or 0` made it.
             rhs = _num(amt) if amt is not None else g(ops[2])
             src = g(ops[1])
-            if (mn != "lsl" and ops[0].strip()[:1] == "w"
-                    and not _fits(src, 32 if mn == "lsr" else 31)):
+            narrow = ops[0].strip()[:1] == "w"
+            fits = _fits(src, 32 if mn == "lsr" else 31)
+            if mn != "lsl" and narrow and not fits:
                 # A 32-bit shift right reads only the low half: the 64-bit register's top
                 # half would shift into it (#130). Shown as a 64-bit value like every w
                 # register, so exact in the low 32 bits for an amount under 32. A value
                 # already masked to fit, as w values and hash mixing mostly are, needs
                 # neither.
-                src = (_bin(src, "&", V("0xffffffff", P_ATOM), P_AND) if mn == "lsr"
+                src = (_bin(src, "&", V("0xffffffff", P_ATOM, bits=32), P_AND) if mn == "lsr"
                        else V(f"{_wrap(src, P_POST)}.toSigned(32)", P_POST))
             st.set(dst, _bin(src, sym, rhs, P_SHIFT))
             return []
@@ -5193,7 +5311,7 @@ class Lifter:
                 if width >= 64:
                     st.set(dst, src)
                 elif mn == "ubfx":
-                    st.set(dst, _bin(src, "&", V(hex((1 << width) - 1), P_ATOM), P_AND))
+                    st.set(dst, _bin(src, "&", V(hex((1 << width) - 1), P_ATOM, bits=width), P_AND))
                 else:
                     pad = 64 - width
                     st.set(dst, _bin(_bin(src, "<<", _num(pad), P_SHIFT), ">>",
@@ -5226,7 +5344,7 @@ class Lifter:
                 if lsb + width >= 64:
                     field = src
                 elif mn == "ubfiz":
-                    field = _bin(src, "&", V(hex((1 << width) - 1), P_ATOM), P_AND)
+                    field = _bin(src, "&", V(hex((1 << width) - 1), P_ATOM, bits=width), P_AND)
                 else:
                     field = V(f"{_wrap(src, P_POST)}.toSigned({width})", P_POST)
                 st.set(dst, _bin(field, "<<", _num(lsb), P_SHIFT))
@@ -5242,7 +5360,7 @@ class Lifter:
             src = g(ops[1])
             width = {"b": 8, "h": 16, "w": 32}[mn[3]]
             if mn.startswith("u"):
-                st.set(dst, _bin(src, "&", V(hex((1 << width) - 1), P_ATOM), P_AND))
+                st.set(dst, _bin(src, "&", V(hex((1 << width) - 1), P_ATOM, bits=width), P_AND))
             else:
                 pad = 64 - width
                 st.set(dst, _bin(_bin(src, "<<", _num(pad), P_SHIFT), ">>",
@@ -7585,7 +7703,7 @@ def _extended(v: V, bits: int, signed: bool) -> V:
     if signed:
         pad = 64 - bits
         return _bin(_bin(v, "<<", _num(pad), P_SHIFT), ">>", _num(pad), P_SHIFT)
-    return _bin(v, "&", V(hex((1 << bits) - 1), P_ATOM), P_AND)
+    return _bin(v, "&", V(hex((1 << bits) - 1), P_ATOM, bits=bits), P_AND)
 
 
 def _access_width(mn: str, reg: str) -> int:

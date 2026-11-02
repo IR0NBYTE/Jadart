@@ -86,6 +86,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   all, in one range of each fixture, where a walk the lifter discarded minted it and the
   walk that shipped did not; `_lift_function` declares it at the top, which everywhere
   else in that file means a value the lifter does not know.
+- **A 32-bit destination says it cleared the top half.** arm64 writes the w view of a
+  register by clearing its top 32 bits, and `canon()` folds the w view onto the x view,
+  so the lifter printed the same text for a 32-bit result as for a 64-bit one and the
+  top half it kept was a value the machine does not have. DESIGN section 13 listed the
+  fold as one of three latent correctness issues, 59,073 sites; 3,727 of the clean
+  fixture's 457,622 instructions compute into a w register. A 32-bit result now prints
+  `.toUnsigned(32)`, which pairs with the `.toSigned(32)` an `asr` on a w register
+  already printed, and that spelling says the register's width rather than a mask the
+  program asked for. Two rules keep it off the rest of the output: reading the w view of
+  a register takes the low 32 bits, so a consumer is handed the value as it was before
+  the truncation and truncates its own result instead, which leaves one
+  `.toUnsigned(32)` at the end of a chain of 32-bit operations rather than one on every
+  step; and a conservative bound on each value (`V.bits`) leaves alone a result that
+  provably has no bit above 31, a mask that small, a literal, a 32-bit shift right, or a
+  sum of two bytes. 638 truncations reach the clean export, and not one
+  `tools/quality.py` symptom moves on either fixture: the same 185,479 lines, 20,015
+  bare-register lines and 54,069 byte-offset fields.
+  `tools/irfuzz.py` no longer excludes w operands, which is what puts the class under a
+  gate at all, and its evaluator understands both conversions: without them 3,500 of the
+  clean fixture's printed expressions decline instead of being checked and nothing is
+  reported, where it now checks 255,731 of them against 250,770 on main and finds no
+  disagreement with the CPU in 2,002 runs on either fixture, where main has 32 and 30.
+  Closes #235.
 
 ## 1.3.0 - 2026-10-29
 

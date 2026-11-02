@@ -543,15 +543,35 @@ def _ev(node, env):
             if b == 0:
                 raise _Undecidable("division by zero")
             return a // b
+    if isinstance(node, ast.Call):
+        # `v.toUnsigned(n)` and `v.toSigned(n)`, the two width conversions the lifter
+        # prints: for a 32-bit destination (#235) and for a 32-bit arithmetic shift right
+        # (#130). Without them every expression carrying one DECLINED, so the convention
+        # the lifter already had went unchecked, and the one #235 adds would have too:
+        # 3,500 more declines and no mismatches is what a hollow fix looks like.
+        fn = node.func
+        if (isinstance(fn, ast.Attribute) and fn.attr in ("toUnsigned", "toSigned")
+                and len(node.args) == 1 and not node.keywords):
+            v, w = _ev(fn.value, env), _ev(node.args[0], env)
+            if not 0 < w <= 64:
+                raise _Undecidable("conversion width")
+            mask = (1 << w) - 1
+            if fn.attr == "toUnsigned":
+                return v & mask
+            return ((v & mask) ^ (1 << (w - 1))) - (1 << (w - 1))
     raise _Undecidable("unsupported syntax")
 
 
 def expr_cases(path: str, want: int, min_len: int = 3):
     """Straight-line runs of pure register arithmetic, as (run, code bytes).
 
-    Only x-register forms. `canon()` folds the w view onto the x view on purpose, which
-    erases the 32-bit truncation, a documented display choice, and not something an
-    oracle over 64-bit registers can or should adjudicate.
+    w-register forms included. They were excluded on the grounds that `canon()` folds the
+    w view onto the x view on purpose, so the 32-bit truncation it erases was a display
+    choice an oracle over 64-bit registers should not adjudicate. That was wrong twice
+    over: the truncation is a VALUE, not a display, and the exclusion meant no gate in
+    this repo could see the class at all. Dropping it put 32 real mismatches on the clean
+    fixture and 30 on obf in front of the first run (#235), every one of them a 32-bit
+    shift of a 64-bit shift's result.
     """
     from jadart.disasm import load_instructions, disassemble_range
 
@@ -571,7 +591,7 @@ def expr_cases(path: str, want: int, min_len: int = 3):
             t = t.strip().lstrip("#")
             if t.split()[0].lower() in _EXTEND_MODS if t else False:
                 return False
-            if t[:1] in ("w", "s", "d", "q", "v") and t[1:].split(".")[0].isdigit():
+            if t[:1] in ("s", "d", "q", "v") and t[1:].split(".")[0].isdigit():
                 return False
         return True
 
