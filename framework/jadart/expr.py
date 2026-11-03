@@ -5718,7 +5718,7 @@ class Lifter:
                                        self._writes_heap(back))
         return hit
 
-    def _join_write(self, addr, st: State, pad: str) -> list:
+    def _join_write(self, addr, st: State, pad: str, src=None) -> list:
         """Write each phi register of goto-join `addr` to its shared name, from `st`.
 
         The second walk calls this on every edge into the join, a goto's source (after
@@ -5729,11 +5729,17 @@ class Lifter:
         in `_join_name`, declared above the function body by `_lift_function`, and read at
         the join. `_join_wrote` records which predecessor set it, so the join binds the
         register to the name only where every way in did; anywhere else it stays a bare
-        register, the honest spelling of a value this walk cannot name."""
+        register, the honest spelling of a value this walk cannot name.
+
+        `src` is the edge the walk arrives by, for callers where the state no longer says:
+        the arrival guard replaces the state of a block a section nothing reaches falls
+        into (#237), and the record is about the EDGE and not about the values, so losing
+        it there left `_join_wrote` short of a predecessor, the join's name unbound on
+        every path, and the register bare at the join: #123 again, by another road."""
         regs = self.join_phi.get(addr)
         if not regs:
             return []
-        src = st.src
+        src = st.src if src is None else src
         pairs = []
         for r in sorted(regs):
             key = (addr, r)
@@ -5908,13 +5914,17 @@ class Lifter:
             st.dropped = {}
             st.slot_by_reg = {}
             st.result = _T.ret_int
-        # The state is `addr`'s now, not the block the tree happened to print above it.
-        # `_lift_block` sets this at its end, which was enough while this only ran where
-        # nothing fell through and the block was lifted straight after; `_unjustified`
-        # reads it on a LIVE arrival, and a stale source fired it a second time inside
-        # `_render_loop`, where it reset the registers the loop had just bound its carried
-        # names to and the body then updated nothing (#237 review).
-        st.src = addr
+        # Where the state came from NOW, which is the predecessor it was taken from, or
+        # nowhere when no single way in justified one. `_lift_block` sets this at its end,
+        # which was enough while this only ran where nothing fell through and the block
+        # was lifted straight after it; `_unjustified` reads it on a live arrival, and the
+        # disowned block left in it fired the guard a second time inside `_render_loop`,
+        # resetting the registers the loop had just bound its carried names to (#237).
+        #
+        # Not `addr`: the state did not come out of the block it is being handed to, and
+        # the one caller that needs the ARRIVING edge is handed it directly, because that
+        # edge is what a goto-join's phi record is about (`_join_write`).
+        st.src = preds[0] if carry is not None else None
 
     def _unjustified(self, addr, st: State) -> bool:
         """Whether `addr` is being handed a state out of a section the entry cannot reach
@@ -6204,13 +6214,15 @@ class Lifter:
                 # a state none of them justifies (`_unjustified`, #237). A loop header is
                 # excluded for the reason the meet below excludes it: `_render_loop` has
                 # already bound its carried registers in this state.
+                came = st.src
                 if (alive and s[1] not in self.carried
                         and self._unjustified(s[1], st)):
                     self._reenter(s[1], st)
                 # The fall-through edge into a goto-join writes its phi names BEFORE the
                 # label, so a goto that jumps to the label does not re-run them (#123).
                 if join and alive and s[1] in self.join_phi:
-                    out.extend(pad + ln for ln in self._join_write(s[1], st, ""))
+                    out.extend(pad + ln
+                               for ln in self._join_write(s[1], st, "", src=came))
                 label(s[1])
                 if not alive:
                     self._reenter(s[1], st)

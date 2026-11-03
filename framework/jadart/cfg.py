@@ -610,6 +610,13 @@ def structure(blocks, entry, orphans: bool = False):
         The lifter's `_back_loop` keeps such a predecessor on purpose, because there the
         question is what the loop MAY write and a handler the graph has no edge into has
         to count. Here the question is where the loop goes, and that is a claim.
+
+        A block the entry cannot reach is not the only thing the dominance half excludes.
+        In a multi-entry cycle a body block reached from outside the loop is not dominated
+        by the header either, so it leaves the set and its edges into the body become exit
+        votes; the back edge then reads as a `goto` to the header below the loop, which is
+        what this function already does with an irreducible loop and is written down
+        rather than wrong.
         """
         latches = [n for n in blocks
                    if header in blocks[n].succ and dominates(header, n)]

@@ -862,6 +862,17 @@ makes four lines below it, where the reason is already written down: a loop head
 registers are bound by then, and killing them puts the machine register back into every
 line of the body.
 
+AND THE PHI RECORD IS ABOUT THE EDGE, which is the third thing the guard had to learn and
+the one that cost a wrong value. `_join_write` runs on the same fall-through, right after
+the guard, and records WHICH WAY IN wrote the join's shared name; the join binds the
+register to that name only where every way in wrote it (#123). It read the writing edge
+off `State.src`, which the guard had just replaced, so the record named the block being
+entered instead of the edge, no set of edges could cover the predecessors, and the join
+dropped to the bare machine register: on a loop that writes a register on two arms and
+prints it on one, the join read `x2` where the machine has `x9 + 1`. The caller hands the
+arriving edge over directly now, and `_reenter` says whose state it installed rather than
+whose it replaced, which is the predecessor it took it from or nowhere at all.
+
 WHAT THAT LEAVES IS A FIX WITH NO CORPUS WITNESS, stated plainly because the alternative
 is to imply one. With both questions asked the guard fires nowhere on either fixture and
 nowhere in 8,000 generated graphs: the shape needs a section whose address is below a join

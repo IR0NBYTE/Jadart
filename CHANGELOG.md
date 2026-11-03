@@ -70,7 +70,11 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   with it. A counter's declaration and both of its write-backs left a loop, so the printed
   loop could not advance and the `sub x7, x7, #1` that drives it was nowhere in the body:
   a wrong answer rather than a vague one. The call site also makes the same `carried`
-  exclusion the meet four lines below it makes, for the reason stated there.
+  exclusion the meet four lines below it makes, for the reason stated there, and hands
+  `_join_write` the edge the walk arrived by, since a goto-join's phi record is about the
+  EDGE and not the values: taking it from a state the guard has just replaced left
+  `_join_wrote` short of a predecessor, so no join could bind its name on every way in and
+  the register read bare there, which is #123 by another road.
 
   Widening the meet instead, so that a join forgets whatever an unreachable ancestor
   writes whichever way the walk came in, costs 1,488 bare-register lines on the clean
