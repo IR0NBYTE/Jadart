@@ -622,13 +622,44 @@ point and a loud warning on non-convergence; flags as values; the representation
 the nominal cid lattice. Stages 5 and 6 change what the tool CLAIMS TO KNOW and carry the
 heaviest validation.
 
-Three latent correctness issues the measurement surfaced, independent of readability:
-`canon()` maps `w` to `x` and erases operand width at 59,073 sites (12.9%), which matters
-because compressed builds do Smi arithmetic in 32-bit registers; SP is still written by
-`and` (428 sites) and `mov` (630) after `strip_boilerplate`, which the stack-slot map
-assumes cannot happen; and pre-index writeback pushes are all filed at displacement 0, so
-two consecutive pushes may alias (2,260 sites, NOT yet demonstrated to produce wrong
-output, so it stays on this list rather than in a fix).
+Three latent correctness issues the measurement surfaced, independent of readability. The
+first is FIXED and the paragraph after this one says how: `canon()` maps `w` to `x` and
+erases operand width at 59,073 sites (12.9%), which matters because compressed builds do
+Smi arithmetic in 32-bit registers. Two remain: SP is still written by `and` (428 sites)
+and `mov` (630) after `strip_boilerplate`, which the stack-slot map assumes cannot happen;
+and pre-index writeback pushes are all filed at displacement 0, so two consecutive pushes
+may alias (2,260 sites, NOT yet demonstrated to produce wrong output, so it stays on this
+list rather than in a fix).
+
+WHERE THE WIDTH WENT, since it was the first of the three to produce a measured wrong
+value (#235). A 32-bit destination clears the top half of its register, `canon` folds
+the two views onto one name, and the printed text of a 32-bit result was therefore the
+text of a 64-bit one. 3,727 of the clean fixture's 457,622 instructions compute into a w
+register, and the machine's value differs from the printed one wherever the result's bit
+32 or above would be set. `_narrow` writes the truncation as `.toUnsigned(32)`, which
+pairs with the `.toSigned(32)` an `asr` on a w register already printed; Hex-Rays and
+Ghidra carry the same fact in a TYPE (`unsigned int`, `uint`) and Binary Ninja in the
+register name, and this file has neither.
+
+Two rules keep that from flooding the output. Reading the w view of a register takes the
+low 32 bits, so `_leaf` hands a consumer the value as it was before the truncation
+(`V.wide`) and the consumer truncates its own result instead: one `.toUnsigned(32)` at
+the end of a chain of 32-bit operations rather than one on every step, which is where a
+type-carrying decompiler puts its cast too. And `V.bits` carries a conservative upper
+bound, so a result that provably has no bit above 31 is left alone: a mask that small, a
+literal, a 32-bit shift right, a sum of two bytes. 638 truncations reach the clean
+export, and not one `tools/quality.py` symptom moves on either fixture: the same 185,479
+lines, 20,015 bare-register lines and 54,069 byte-offset fields.
+
+The second half of that issue was the GATE. `tools/irfuzz.py` excluded every w operand
+by construction, on the grounds that the fold was a display choice an oracle over 64-bit
+registers should not adjudicate, so no gate in this repo could see the class at all.
+Dropping the exclusion put 32 real mismatches on the clean fixture and 30 on obf in
+front of the first run. Dropping it WITHOUT teaching the evaluator `toUnsigned` and
+`toSigned` leaves 3,500 of the clean fixture's expressions undecidable and reports no
+mismatches, which is what a hollow fix looks like; with both, the clean fixture's text
+pass checks 255,731 printed expressions where main checks 250,770, and disagrees with the
+CPU nowhere.
 
 INVESTIGATED AND NOT CONFIRMED, recorded so it is not re-reported as fact: `cfg.py` gives
 a block ending in `br` no successors, and that was reported as silently truncating the CFG
