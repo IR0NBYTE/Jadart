@@ -796,6 +796,115 @@ the walk that shipped did not, so there is no assignment left to hoist to.
 `_lift_function` declares it at the top, which is what an initialiser-less declaration
 means everywhere else in the file, a value this lifter does not know. The leak itself, a
 name escaping a trial walk, is worth its own issue.
+
+### A block the entry cannot reach, and the two things it was allowed to decide
+
+Both halves of #237 are the same fact: `structure` and `expr` ask questions of a block no
+path from the entry reaches, and two of their answers were claims rather than refusals.
+
+THE DEFINITION HAS TWO HALVES AND ONLY ONE WAS ASKED OF THE BODY. The natural loop of a
+back edge n -> h is the set of nodes h dominates that can reach n without passing through
+h. `loop_nodes` asked `dominates(header, n)` of its LATCHES and only the reaching half of
+the body, and the two differ in exactly one place: a block the entry cannot reach is
+dominated by nothing, so it answers the reaching half and no more. The backward walk from
+the latch took one in, `loop_exit` counted its edge out of the node set as a vote for
+where the loop goes, the votes tied at one apiece, and the lowest address won, so the
+block printed after the loop was one no run enters, and the state the lines after the loop
+are spelled from carried its writes. On a generated graph that state said `x2 = x9 + 27`
+where the CPU leaves x2 at the value the function was called with.
+
+WHERE THE OTHER TOOLS ARE. LLVM states the rule from the other end: for a basic block not
+reachable from the entry the concept of loops is undefined, since dominance is undefined
+as well, and its LoopInfo is built over the dominator tree, which holds no such block.
+Hex-Rays deletes them outright (`mba_t::remove_empty_and_unreachable_blocks`), and
+Ghidra's decompiler has an "Eliminate unreachable code" analysis option that is on by
+default; turn it off and the code still does not appear in the decompiler, only in the
+disassembler. Deleting makes the question moot, and jadart cannot: a catch entry is
+exactly a block with no edge in, because the CFG does not model the exception edge, and
+dropping it loses real code (#57, #234). So the block stays in the output and is refused
+an answer instead, which is the same trade this file makes for a call that cannot return.
+
+THE SECOND HALF IS WHAT THE SECTION HANDS DOWNWARD. Such a section is placed, and it FALLS
+THROUGH into whatever the tree put below it. `_reenter` already says that a block emitted
+after something that did not fall through takes the state its own predecessors justify,
+and a fall-through out of a section nothing reaches is the case it did not cover: the
+block below read what the section wrote, on a way in none of its predecessors takes. The
+goto-join's meet (`_join_kill`) exists for exactly this and cannot see it, because the
+narrowing it makes from the join's immediate dominator can never hold a block the entry
+does not reach. The guard is `_reenter` again, asked on arrival rather than on re-entry.
+A fall-through is the only way such a section hands a state anywhere, since every other
+way out of one is a `goto`, and `_arrive` hands a state over only where the target has a
+single predecessor, which is the section itself.
+
+IT TAKES TWO QUESTIONS AND THE FIRST VERSION ASKED ONE, which is worth writing down
+because the one it asked is the obvious one. A region nothing reaches is still a region:
+its own flow is the only flow there is, so a join inside one, every way into which is
+inside it too, has nothing to meet with and its state is as justified as that region gets.
+Asking only whether the state came out of such a region wiped exactly that join in
+`resolve` (`.text+0x1753f0`) on both fixtures, where both paths carry `x9 + 27` and the
+store printed it, leaving `x8.field_0x1 = x2;`: a bare register no line of that body
+binds, standing in for a value the output had, which is the shape this file calls a wrong
+answer and not a vaguer one. Every firing the first version had on either fixture was that
+case, all three of them. So the guard asks for a predecessor the entry CAN reach as well,
+the way in the arriving state cannot speak for, and `_join_kill` keeps the ways in it can.
+
+AND `_reenter` HAS TO SAY WHOSE STATE IT JUST INSTALLED, which is the other thing the
+first version got wrong. It replaces the register map, the slot map and their records and
+left `State.src` naming the block it had just disowned; `_lift_block` sets that at its
+end, which was enough while `_reenter` only ran where nothing fell through and the block
+was lifted straight after it. Read on a LIVE arrival, the stale source fired the guard a
+second time: once at the loop statement, rightly, and again at the header's own block
+inside `_render_loop`, after the loop had bound its carried registers to names, where the
+reset took those names with it. A counter's declaration and both of its write-backs left
+the loop, which could then not advance at all, with the `sub x7, x7, #1` that drives it
+nowhere in the body. The call site also makes the `carried` exclusion the goto-join meet
+makes four lines below it, where the reason is already written down: a loop header's
+registers are bound by then, and killing them puts the machine register back into every
+line of the body.
+
+WHAT THAT LEAVES IS A FIX WITH NO CORPUS WITNESS, stated plainly because the alternative
+is to imply one. With both questions asked the guard fires nowhere on either fixture and
+nowhere in 8,000 generated graphs: the shape needs a section whose address is below a join
+that the main walk left for the sweep, and neither the corpus nor `_gen_nested` draws one.
+A hand-built graph does, and the wrong value on it is real, so the gate is a test rather
+than an oracle; teaching `tools/irfuzz.py` to generate a trap and a section after it is
+the way to put this class under an oracle, and it is its own piece of work.
+
+MEASURED, INCLUDING THE FIX THAT WAS NOT SHIPPED. 980 of the clean fixture's 1,154 loops
+held a block the entry cannot reach, in 621 ranges, and not one of them picked a different
+exit, so the corpus never showed the first half either: `tools/irfuzz.py --cfg --nested`
+found it at 2 in about 36,000 generated graphs. Over both fixtures the printed output does
+not move at all: the same 185,479 and 185,280 lines with every `tools/quality.py` symptom
+unchanged, the clean export byte-identical, the same 435,854 and 435,633 instructions
+placed over 8,194 and 8,188 ranges, and `pbfuzz --census` unchanged.
+
+WHERE THE EXIT PICK DOES CHANGE, TIER 3 PRINTS LESS, and the gate that says "nothing is
+dropped" cannot see it, which is worth being exact about. `cfgcheck` structures with
+`orphans=True`; the lifter does not, so a block nothing reaches is placed for Tier 2 and
+not for Tier 3 (#67). The old exit pick printed some of those blocks anyway, after the
+loop, with no label and no note, as if they ran. Over 4,000 generated graphs, 6 now place
+20 instructions fewer with `orphans=False`, every one of them in a block nothing reaches,
+and 0 place fewer with `orphans=True`. The check for that is the placement comparison per
+range, not `cfgcheck`: both fixtures place the same instructions as before, 435,854 and
+435,633.
+
+The first attempt at the second half widened `_join_kill` instead, so that a join forgot
+whatever an unreachable ancestor writes whichever way the walk arrived; that is the static
+reading of a meet, and it cost 1,488 bare-register lines on the clean fixture and 1,643 on
+obf while fixing nothing the arrival guard does not.
+
+ONE RESIDUAL, measured and not shipped. `_reenter` rebuilds the register map, the slot map
+and their records from the predecessor it takes the state from, and leaves `State.lost`,
+`opaque`, `lost_slot` and `views` as the path it is replacing left them. That was
+invisible while it only ran where nothing fell through; it now also runs on a live
+arrival, where a leftover `lost` or `opaque` does reach a printed line, since a store
+through such a base is spelled as a freshly minted raw name (#208). Rebuilding the four
+from the same predecessor takes one bare-register line off each fixture and adds one
+byte-offset field, with the suite green. It is not here because the no-carry direction is
+a real question and not an oversight: clearing them says nothing is lost, where the honest
+reading of a block with no justified way in may be that everything is. That belongs with
+#140 and #208.
+
 ## Follow-ups (UNVERIFIED items to close)
 - wire-ref signed/unsigned history: `git log -p runtime/vm/datastream.h` across tags.
 - exact 2.18 / 3.4 stream deltas: diff app_snapshot.cc / class_id.h between those tags.

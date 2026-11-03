@@ -596,8 +596,21 @@ def structure(blocks, entry, orphans: bool = False):
                 loop_header[s] = True
 
     def loop_nodes(header):
-        """Natural-loop node set: header plus every block that can reach a latch
-        (back-edge source) without passing through the header."""
+        """Natural-loop node set: the header, plus every block it DOMINATES that can
+        reach a latch (back-edge source) without passing through the header.
+
+        The dominance half is the half this asked of its latches and not of the body.
+        A block the entry reaches by no path is dominated by nothing, so it answers the
+        reaching half and no more, and the backward walk took it in: `loop_exit` then
+        counted its edge out of the set as a vote, and with the votes tied the lowest
+        address won, so the structurer printed a block no run enters as the one the loop
+        falls out to (#237). LLVM says the same from the other end, that for a block not
+        reachable from the entry the concept of a loop is undefined, since dominance is.
+
+        The lifter's `_back_loop` keeps such a predecessor on purpose, because there the
+        question is what the loop MAY write and a handler the graph has no edge into has
+        to count. Here the question is where the loop goes, and that is a claim.
+        """
         latches = [n for n in blocks
                    if header in blocks[n].succ and dominates(header, n)]
         nodes = {header}
@@ -608,7 +621,7 @@ def structure(blocks, entry, orphans: bool = False):
                 continue
             nodes.add(n)
             for p in preds.get(n, ()):
-                if p not in nodes:
+                if p not in nodes and dominates(header, p):
                     stack.append(p)
         return nodes
 

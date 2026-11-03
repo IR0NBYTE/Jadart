@@ -5908,6 +5908,47 @@ class Lifter:
             st.dropped = {}
             st.slot_by_reg = {}
             st.result = _T.ret_int
+        # The state is `addr`'s now, not the block the tree happened to print above it.
+        # `_lift_block` sets this at its end, which was enough while this only ran where
+        # nothing fell through and the block was lifted straight after; `_unjustified`
+        # reads it on a LIVE arrival, and a stale source fired it a second time inside
+        # `_render_loop`, where it reset the registers the loop had just bound its carried
+        # names to and the body then updated nothing (#237 review).
+        st.src = addr
+
+    def _unjustified(self, addr, st: State) -> bool:
+        """Whether `addr` is being handed a state out of a section the entry cannot reach
+        while it also has a way in that the entry does reach.
+
+        `structure` places a block no edge leads into, and the code after a trap or a call
+        that cannot return, as its own labelled section (#57, #234), because an exception
+        edge the CFG does not model may reach it. The section FALLS THROUGH into whatever
+        the tree put below it, and that is a way in no path from the entry takes, so what
+        it carries justifies nothing about the OTHER ways in: on a generated graph
+        (`tools/irfuzz.py --cfg --nested`) the join below one read `x9 + 27` from an `add
+        x2, x9, #0x1b` the CPU never executes (#237).
+
+        Both halves of the question are needed. A block whose only predecessor is the
+        section takes its state from that edge, which is the one it has. And INSIDE such a
+        section the same is true of every join it contains: a region nothing reaches is
+        still a region, its own flow is the only flow there is, and wiping a value both of
+        its paths agree on would put a bare register where the output had the value. So
+        this asks for a predecessor the entry reaches, the one the arriving state cannot
+        speak for; `_join_kill` is what meets the ways in that it can.
+
+        `st.src` is the last block lifted into this state, which after an `if` is the
+        block that decided it rather than the arm that ran. That is enough: a block the
+        entry cannot reach has only predecessors it cannot reach either, so a state whose
+        last block is unreachable came through unreachable blocks the whole way.
+        """
+        preds = self._preds.get(addr, ())
+        if len(preds) < 2 or not isinstance(st.src, int):
+            return False
+        if self._idom is None:
+            self._idom = _idoms(self.blocks, self.entry, lambda n: (
+                self.blocks[n].succ if n in self.blocks else ()))[0]
+        return (st.src not in self._idom
+                and any(p in self._idom for p in preds))
 
     def _cond(self, cond: str, st: State) -> str:
         """Render cfg's register-level condition with lifted expressions substituted.
@@ -6158,6 +6199,14 @@ class Lifter:
             if kind == "asm":
                 join = (s[1] in self.labels and len(self._preds.get(s[1], ())) > 1
                         and s[1] not in self.carried)
+                # Before the phi write below, which spells the arriving value: a section
+                # the entry cannot reach falling into a block with other ways in hands it
+                # a state none of them justifies (`_unjustified`, #237). A loop header is
+                # excluded for the reason the meet below excludes it: `_render_loop` has
+                # already bound its carried registers in this state.
+                if (alive and s[1] not in self.carried
+                        and self._unjustified(s[1], st)):
+                    self._reenter(s[1], st)
                 # The fall-through edge into a goto-join writes its phi names BEFORE the
                 # label, so a goto that jumps to the label does not re-run them (#123).
                 if join and alive and s[1] in self.join_phi:
@@ -6286,6 +6335,8 @@ class Lifter:
                 # block falls straight into them; anything else anchors them nowhere.
                 prev = stmts[i - 1] if i and alive else None
                 self._loop_before = prev[1] if prev and prev[0] == "asm" else None
+                if alive and self._unjustified(s[1], st):
+                    self._reenter(s[1], st)      # the same way in, into a loop head
                 label(s[1])
                 if s[1] in self.labels:
                     # A goto into the loop's head brings a state the walk never saw: the
