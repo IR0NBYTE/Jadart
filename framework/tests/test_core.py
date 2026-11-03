@@ -15995,6 +15995,48 @@ def test_a_loop_the_walk_re_enters_keeps_the_names_it_carries():
         f"the trip's update is missing, so the printed loop cannot advance\n{body}")
 
 
+def test_a_join_a_section_falls_into_still_binds_its_phi_name():
+    # The arrival guard of #237 replaces the state of a block a section nothing reaches
+    # falls into. `_join_write` runs right after it, on the same fall-through, and records
+    # WHICH EDGE wrote the join's phi name; the join binds the register to that name only
+    # where every way in wrote it. `_reenter` had put the join's own address in
+    # `State.src` by then, so the record named the join and not the edge, no set of edges
+    # could
+    # ever cover the predecessors, and the join dropped to the bare machine register: #123
+    # again, by another road.
+    #
+    # Here the loop writes x2 on both arms and prints it on one (`clz x2, x9` is a raw
+    # line); the join at 0xc reads it. With the record right, the join reads a name every
+    # edge binds, and the section's own edge binds it to the bare register, since that
+    # value is the one no way in justifies. With the record wrong it read `x2`, which on
+    # the `x10 == 0` path is the value the function came in with and not the `x9 + 1` the
+    # machine has.
+    import re
+    from jadart.cfg import build_cfg
+    from jadart.expr import lift_function
+    rows = [("cbz", "xzr, #0x14"), ("brk", "#0"), ("add", "x2, x9, #0x1b"),
+            ("orr", "x0, x2, x11"), ("ret", ""),
+            ("cbz", "x10, #0x20"), ("clz", "x2, x9"), ("b", "#0x24"),
+            ("add", "x2, x9, #1"),
+            ("cbz", "x8, #0xc"), ("cbz", "x12, #0x34"),
+            ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x14"),
+            ("add", "x4, x4, #2"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    blocks, _entry = build_cfg(ann)
+    assert not [a for a in blocks if 0x8 in blocks[a].succ], "0x8 must have no way in"
+    assert len([a for a in blocks if 0xc in blocks[a].succ]) > 1, "0xc has to be a join"
+    body = "\n".join(lift_function(ann, arch="arm64"))
+    ret = re.search(r"return (\S+) \| x11;", body)
+    assert ret, f"no return rendered\n{body}"
+    name = ret.group(1)
+    assert re.fullmatch(r"t\d+", name), (
+        f"the join returns `{name}`, which only one arm of the loop prints a write to"
+        f"\n{body}")
+    assert sum(1 for ln in body.split("\n")
+               if re.match(rf"\s*{name} = ", ln)) >= 2, (
+        f"`{name}` has to be written on every way into the join\n{body}")
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
