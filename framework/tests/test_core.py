@@ -1373,8 +1373,9 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
     saved again around a call, and the pre-loop text was right. A store keeps the slot
     when it writes back what it reloaded, or a register the loop never writes that held
     the slot's value on the way in; and a store on a path that throws never comes back
-    round. A throw stub is a call, so tier 3's graph still runs on from it; a trap ends
-    its block (#64), so the `b` after one closes no loop."""
+    round. A trap ends its block, and so does a call to a stub that throws, so a `b` after
+    either closes no loop (#64, #234); a throw INSIDE a loop leaves it, and the loop is
+    still a loop."""
     from jadart.expr import lift_function
 
     def lift(rows):
@@ -1390,37 +1391,42 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
              [("mov", "x20, x1"), ("stur", "x20, [x29, #-8]"), ("bl", "#0x100"),
               ("ldur", "x2, [x29, #-8]"), ("ldur", "x0, [x2, #7]"),
               ("stur", "x20, [x29, #-8]"), ("cbnz", "x0, #0x8"), ("ret", "")]),
-            ("past a throw stub",
-             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
-              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
-              ("stur", "x0, [x29, #-8]"),
-              ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
-              ("b", "#0x4")]),
+            # A throw inside the body leaves the loop, and the loop is still a loop: the
+            # `break` lands on the throw, and the trip after it is the one the back edge
+            # below the throw makes.
             ("a throw on the way round",
              [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
               ("ldur", "x0, [x2, #7]"), ("cbnz", "x0, #0x18"), ("stur", "x0, [x29, #-8]"),
               ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
-              ("bl", "#0x200"), ("cbnz", "x0, #0x4"), ("ret", "")]),
+              ("bl", "#0x200"), ("cbnz", "x0, #0x4"), ("ret", "")])):
+        body = lift(rows)
+        assert "while (true) {" in body and "this.field_0x8" in body, (why, body)
+        assert "x2.field_0x8" not in body, (why, body)
+    # Past a trap, and past a call that cannot return, there is no loop at all: the block
+    # ends there, so the `b` after it is unreachable and closes nothing (#64, #234). The
+    # code after it is still placed, as its own labelled section holding that `b`, and the
+    # slot still keeps `this`, not the register it was reloaded into.
+    throws = "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"
+    for why, rows in (
+            ("past a trap",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
+              ("stur", "x0, [x29, #-8]"), ("bl", "#0x100"), ("brk", "#0"),
+              ("b", "#0x4")]),
+            ("past a throw stub",
+             [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+              ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
+              ("stur", "x0, [x29, #-8]"), ("bl", "#0x100", throws), ("b", "#0x4")]),
             # The only way back to the top runs through the throw, so the store at the
             # top is never read by a next trip: there is no loop.
             ("a loop only a throw closes",
              [("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
               ("ldur", "x0, [x2, #7]"), ("stur", "x0, [x29, #-8]"), ("cbz", "x0, #0x18"),
-              ("ret", ""),
-              ("bl", "#0x100", "  ; -> _iso_stub_NullErrorSharedWithoutFPURegsStub"),
-              ("b", "#0x4")])):
+              ("ret", ""), ("bl", "#0x100", throws), ("b", "#0x4")])):
         body = lift(rows)
-        assert "while (true) {" in body and "this.field_0x8" in body, (why, body)
+        assert "while (true) {" not in body and "this.field_0x8" in body, (why, body)
         assert "x2.field_0x8" not in body, (why, body)
-    # Past a trap there is no loop at all: the `brk` ends its block, so the `b` after it
-    # is unreachable and closes nothing (#64). The slot still keeps `this`, not the
-    # register it was reloaded into.
-    body = lift([("stur", "x1, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
-                 ("ldur", "x0, [x2, #7]"), ("cbz", "x0, #0x14"), ("ret", ""),
-                 ("stur", "x0, [x29, #-8]"), ("bl", "#0x100"), ("brk", "#0"),
-                 ("b", "#0x4")])
-    assert "while (true) {" not in body and "this.field_0x8" in body, body
-    assert "x2.field_0x8" not in body, body
+        assert "goto L_0x4;" in body, (why, body)
     # ...and one that stores something else does forget it: the loop reads its own
     # value back at the top of the next trip, not `this`. So does a register that held
     # the slot's value on the way in, once the loop has changed it, and a loop that moves
@@ -1558,6 +1564,234 @@ def test_tier3_renders_runtime_stubs_semantically():
         news += body.count("new ")
     assert leaked == 0, f"{leaked} functions leaked a raw _iso_stub_ call"
     assert throws > 0 and news > 0, "expected some throw / new renderings on a real app"
+
+
+def test_runtime_stubs_are_named_from_the_object_store_roots():
+    """A stub has no Function object and a release build keeps no symbol for one, so its
+    name comes from the isolate snapshot's own object-store roots (#234).
+
+    Both fixtures are plain `flutter build apk --release` output, features
+    `no-dwarf_stack_traces_mode`, and before this they carried ZERO stub names: every
+    stub-aware rule in the lifter was dead code on the build a user actually has, and a
+    call that cannot return printed as `sub_0x2d5d00(...)`, an ordinary call that does."""
+    from jadart.disasm import load_instructions
+    from jadart.expr import _classify_stub
+    from jadart.objstore import stub_names
+    for lib in (CLEAN, OBF):
+        image, fr, hdr = load_instructions(lib)
+        got = stub_names(image, fr, hdr.epoch)
+        assert len(got) == 76, (lib, len(got))
+        # Each named pc is a range the image really has, and none of them had a name of
+        # its own: a stub's Code is owned by no Function, which is why the map had none.
+        starts = {cr.pc_offset for cr in image.all_ranges}
+        assert set(got) <= starts, sorted(set(got) - starts)
+        fname = {ref: fr.strings.get(nr, "") for ref, nr, _ow, _kt in fr.functions}
+        owned = {cr.pc_offset for ow, cr in image.code_ranges.items() if fname.get(ow)}
+        assert not (set(got) & owned), sorted(set(got) & owned)
+        names = set(got.values())
+        for want in ("_iso_stub_ThrowStub", "_iso_stub_AllocateArrayStub",
+                     "_iso_stub_NullCastErrorSharedWithoutFPURegsStub",
+                     "_iso_stub_StackOverflowSharedWithoutFPURegsStub"):
+            assert want in names, (lib, want)
+    # The eight ranges #234 measured, which are 50.1% of the clean export's printed calls.
+    # The last of them is the reason a prologue-shape heuristic was not enough: it spills
+    # the whole register file like the shared stubs do, and it returns.
+    image, fr, hdr = load_instructions(CLEAN)
+    got = stub_names(image, fr, hdr.epoch)
+    want = {0x19f280: "NullCastErrorSharedWithoutFPURegs",
+            0x19f120: "RangeErrorSharedWithoutFPURegs",
+            0x19ebf0: "StackOverflowSharedWithoutFPURegs",
+            0x19f1b0: "RangeErrorSharedWithFPURegs",
+            0x19f508: "LateInitializationErrorSharedWithoutFPURegs",
+            0x19f430: "NullErrorSharedWithoutFPURegs",
+            0x19f2cc: "NullCastErrorSharedWithFPURegs",
+            0x19e0e4: "AllocateFloat64Array"}
+    for pc, nm in want.items():
+        assert got.get(pc) == f"_iso_stub_{nm}Stub", (hex(pc), got.get(pc))
+    # and the taxonomy those names wake up, which is the point of naming them
+    assert _classify_stub(got[0x19f280]) == ("throw_err", "NullCastError")
+    assert _classify_stub(got[0x19ebf0]) == ("suppress", None)
+    assert _classify_stub(got[0x19e0e4]) == ("alloc", "Float64List")
+
+
+def test_a_call_that_cannot_return_ends_its_block():
+    """A `bl` to a stub that throws gets no fall-through, so the structurer cannot render
+    a path the machine never takes (#234).
+
+    Nothing in a `bl` says the callee does not come back, so the lift hands the addresses
+    over (`_path_ends`) and `build_cfg` ends those blocks the way it ends one at a trap
+    (#57). What was reached only through the old edge is still placed, as its own labelled
+    section: Ghidra and Hex-Rays drop such code, and a callee misidentified as
+    non-returning there hides real source, where a labelled section cannot."""
+    from jadart.cfg import TRAPS, build_cfg
+    from jadart.expr import _path_ends, lift_function
+    throw = "  ; -> _iso_stub_NullCastErrorSharedWithoutFPURegsStub"
+    rows = [("cbz", "x0, #0x8"), ("bl", "#0x100", throw), ("bl", "#0x100", throw),
+            ("mov", "x0, #1"), ("ret", "")]
+    ann = [(i * 4, r[0], r[1], r[2] if len(r) > 2 else "") for i, r in enumerate(rows)]
+    blocks, _entry = build_cfg(ann, traps=TRAPS, ends=_path_ends(ann))
+    assert [(a, b.succ, b.ends_path) for a, b in sorted(blocks.items())] == [
+        (0x0, [0x8, 0x4], False), (0x4, [], True), (0x8, [], True), (0xc, [], False)]
+    # Without the addresses the throw falls through to the next throw, and the code after
+    # it is not even a block of its own: that is what main rendered as running next.
+    kept, _e = build_cfg(ann, traps=TRAPS)
+    assert kept[0x4].succ == [0x8] and not kept[0x4].ends_path
+    assert 0xc not in kept
+    # Each arm throws, nothing is printed under either, and the tail nothing reaches is
+    # still there under its own label.
+    assert [ln.strip() for ln in lift_function(ann)] == [
+        "if (x0 != 0) {", "throw NullCastError();", "} else {",
+        "throw NullCastError();", "}", "L_0xc:", "return 1;"]
+
+
+def test_the_null_test_chain_that_found_the_false_edge_reads_as_source():
+    """`FocusTraversalPolicy.next` on the clean fixture, which is the shape #234 names.
+
+    The compiler lays out three one-instruction blocks, each a `bl` to the null-cast-error
+    stub, so the arms of three null tests can branch into them. With the fall-through kept,
+    the lift printed the last as `throw NullCastError(); goto L_0x12c928;`, a jump out of a
+    throw, and the two `if`s above it lost their else arms to the edge. Nothing in the
+    range changes but the edges, so the whole body is pinned here."""
+    if not _capstone_available() or not os.path.exists(CLEAN):
+        _skip("  SKIP test_the_null_test_chain_that_found_the_false_edge_reads_as_source")
+    from jadart.disasm import (load_instructions, disassemble_range,
+                               function_name_by_pc, build_pool_map)
+    from jadart.expr import lift_function, make_arity_resolver
+    image, fr, _ = load_instructions(CLEAN)
+    cr = next(c for c in image.all_ranges if c.pc_offset == 0x12c8bc)
+    dis = disassemble_range(image, cr)
+    body = [ln.rstrip() for ln in lift_function(
+        _ann(image, dis, function_name_by_pc(image, fr), build_pool_map(fr)),
+        build_pool_map(fr), arity=make_arity_resolver(image))]
+    assert body == [
+        "  if (THR.field_0x78.field_0xad1 != NULL) {",
+        "    if (THR.field_0x78.field_0xad1.field_0xf0 != NULL) {",
+        "      if (THR.field_0x78.field_0xad1.field_0xf0.field_0x14.field_0x2c != NULL) {",
+        "        return nextFocus(THR.field_0x78.field_0xad1.field_0xf0.field_0x14"
+        ".field_0x2c);",
+        "      } else {",
+        "        throw NullCastError();",
+        "      }",
+        "    } else {",
+        "      throw NullCastError();",
+        "    }",
+        "  } else {",
+        "    throw NullCastError();",
+        "  }"], body
+
+
+def test_the_object_store_root_run_ends_where_the_dispatch_table_begins():
+    """The binary's own confirmation of the root count.
+
+    The count comes from a generated table (tools/gen_objstore.py), so something has to
+    check it against the binary. After `count` refs and the two initial-field tables the
+    stream must be exactly at the dispatch table, which `dispatch.find_dispatch_table`
+    locates from an unrelated invariant: the varint after the table length is the Code
+    cluster's first ref id. Two independent anchors agreeing is what makes the count a
+    measurement rather than a transcription (#234)."""
+    from jadart.disasm import load_instructions
+    from jadart.dispatch import find_dispatch_table
+    from jadart.stream import ReadStream
+    for lib in (CLEAN, OBF):
+        image, fr, hdr = load_instructions(lib)
+        st = ReadStream(image.data, fr.end_pos)
+        for _ in range(hdr.epoch.roots.count):
+            st.read_ref_id()
+        for _ in range(2):          # the initial field table, then the shared one
+            for _ in range(st.read_unsigned()):
+                st.read_ref_id()
+        found = find_dispatch_table(image.data, fr.end_pos, image.data_length,
+                                    fr.code_first_ref, len(image.pcs) + 1)
+        assert found is not None, lib
+        assert found[0] == st.pos, (lib, found[0], st.pos)
+
+
+def test_a_root_layout_that_does_not_describe_the_binary_names_nothing():
+    """Naming a stub after its neighbour is worse than leaving it `sub_0x...`, so a layout
+    that does not fit refuses rather than guessing (#234).
+
+    The hazard is a field inserted or dropped ahead of the stub block in a release the
+    bundled table was not generated from: every later index shifts by one and each stub
+    takes its neighbour's name. The layout says which roots are Code-typed, and the reader
+    checks every one of them against the Code objects the fill pass recovered, so a shift
+    lands a non-Code where a Code is declared and the whole map is dropped."""
+    from types import SimpleNamespace
+    from jadart.disasm import load_instructions
+    from jadart.objstore import RootLayout, stub_names
+    image, fr, hdr = load_instructions(CLEAN)
+    real = hdr.epoch.roots
+    assert len(stub_names(image, fr, SimpleNamespace(roots=real))) == 76
+    shifted = RootLayout(count=real.count + 1,
+                         stubs={i + 1: nm for i, nm in real.stubs.items()},
+                         unnamed=frozenset(i + 1 for i in real.unnamed))
+    claims_a_class = RootLayout(count=real.count, unnamed=real.unnamed,
+                                stubs={**real.stubs, 0: "Throw"})
+    for bad in (shifted, claims_a_class):
+        assert stub_names(image, fr, SimpleNamespace(roots=bad)) == {}
+    # and nothing to name with is not an error either: that is every epoch before #234
+    assert stub_names(image, fr, None) == {}
+    assert stub_names(image, fr, SimpleNamespace(roots=None)) == {}
+
+
+def test_a_named_stub_agrees_with_what_its_body_does():
+    """The one cross-check that reads the TEXT rather than the stream.
+
+    A root index could still be mis-mapped by a release that replaced one Code field with
+    another in place, where the count and the Code positions both still fit. The body says
+    otherwise: a stub named as a throw cannot contain a `ret` (all 17 of them on each
+    fixture have none), and one named as an allocation has to be able to return, by a
+    `ret` or by the tail jump `AllocateUnhandledException` ends with. This is also the
+    structural reading on its own terms, which is how Ghidra and LLVM decide a function
+    cannot return, kept as a check here because it needs a disassembly (#234)."""
+    if not _capstone_available():
+        _skip("  SKIP test_a_named_stub_agrees_with_what_its_body_does (no capstone)")
+    from jadart.disasm import load_instructions, disassemble_range
+    from jadart.expr import _classify_stub
+    from jadart.objstore import stub_names
+    jumps = ("br", "braa", "brab", "braaz", "brabz")
+    for lib in (CLEAN, OBF):
+        image, fr, hdr = load_instructions(lib)
+        ranges = {cr.pc_offset: cr for cr in image.all_ranges}
+        seen = {}
+        for pc, nm in sorted(stub_names(image, fr, hdr.epoch).items()):
+            kind = _classify_stub(nm)[0]
+            mns = [mn for _a, mn, _op in disassemble_range(image, ranges[pc])]
+            seen[kind] = seen.get(kind, 0) + 1
+            if kind in ("throw", "rethrow", "throw_err"):
+                assert "ret" not in mns, (lib, nm, "named as a throw and it returns")
+            if kind == "alloc":
+                assert "ret" in mns or any(m in jumps for m in mns), (lib, nm)
+        assert seen["throw_err"] == 15 and seen["throw"] == 1 and seen["rethrow"] == 1
+        assert seen["alloc"] == 36, (lib, seen)
+
+
+def test_tier3_renders_runtime_stubs_semantically_on_a_release_build():
+    """The fixture half of the real-app test above, which a release build could not reach
+    before #234: with no stub named, every one of these printed as a plain call, so the
+    whole semantic rendering path had no test that ran in CI.
+
+    Over the first 3,000 ranges of the clean fixture this is 1,705 `throw` and 886 `new`
+    where main has none of either, and still no range leaking a raw `_iso_stub_` call."""
+    if not _capstone_available():
+        _skip("  SKIP test_tier3_renders_runtime_stubs_semantically_on_a_release_build")
+    from jadart.disasm import (load_instructions, disassemble_range,
+                               function_name_by_pc, build_pool_map)
+    from jadart.expr import lift_function, make_arity_resolver
+    image, fr, _ = load_instructions(CLEAN)
+    p2n, pm, ar = function_name_by_pc(image, fr), build_pool_map(fr), \
+        make_arity_resolver(image)
+    leaked = throws = news = 0
+    for cr in image.all_ranges[:3000]:
+        dis = disassemble_range(image, cr)
+        if not dis:
+            continue
+        body = "\n".join(lift_function(_ann(image, dis, p2n, pm), pm, arity=ar))
+        if "_iso_stub_" in body:
+            leaked += 1
+        throws += body.count("throw ")
+        news += body.count("new ")
+    assert leaked == 0, f"{leaked} functions leaked a raw _iso_stub_ call"
+    assert throws > 1000 and news > 500, (throws, news)
 
 
 def test_tier3_attributes_virtual_dispatch():
@@ -8931,8 +9165,14 @@ def test_the_decompiler_prints_code_addresses_as_virtual_addresses():
               " (no capstone, or no clean fixture)")
     from jadart import cli
     from jadart.program import decompile_class
-    for tier, want in ((1, ("bl 0x2d5670", "bl 0x1ee6e0 ; -> _run@310063981")),
-                       (2, ("bl 0x2d5670",))):
+    # Tier 1 annotates the call, tier 2 prints a named callee as a call and so shows no
+    # address for it at all, which is what naming the stubs changed (#234). The rule under
+    # test is the same either way, so tier 2 checks it on a call with no name of its own:
+    # an entry into the middle of the write-barrier wrappers stub, whose start is named.
+    stub = "bl 0x2d5670 ; -> _iso_stub_StackOverflowSharedWithoutFPURegsStub"
+    for tier, want in ((1, (stub, "bl 0x1ee6e0 ; -> _run@310063981")),
+                       (2, ("call _iso_stub_StackOverflowSharedWithoutFPURegsStub();",
+                            "bl 0x2d3bf0"))):
         out = decompile_class(CLEAN, "_FluBenchPageState@310063981", tier=tier)
         body = {" ".join(line.split()) for line in out.splitlines()}
         missing = [w for w in want if w not in body]
@@ -10244,9 +10484,13 @@ def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
 #: `sub_0x<pc_offset>` to `sub_0x<va>`: 514 and 512 lines of the samples, nothing else.
 #: Regenerated for #83, which escapes a quote inside a quoted literal: 6 and 2 lines of the
 #: samples, each a pool note holding a `"`, in text and in `-j`, nothing else.
+#: Regenerated for #234, which names the runtime stubs from the snapshot's object-store
+#: roots: 1,126 lines of the clean sample and 1,198 of the obf one, each a `bl` to a stub
+#: that gained a `; -> _iso_stub_...Stub` note, half of them that note in `-j`. Checked
+#: line by line: both samples keep their line count and nothing else differs.
 _ARM64_DISASM_SAMPLE_SHA = {
-    "clean": "47efe1c2fb03d58cf1e44883c5883cdf538afa4ac5001d9b4bb9aab58f0f553f",
-    "obf": "f6d0ebbd84db3c5218df01ec956fb072a691cf1948910868b5f96344d7dbee3b",
+    "clean": "e7bec2a97810e4f12160b75652585e93b4b1df6d8527119303df105376628660",
+    "obf": "57ed088614707e44ca805bee9606ec9439f5b70c8a945c5aefa90439b23e0715",
 }
 
 
@@ -12673,10 +12917,11 @@ def test_a_dispatch_offset_other_selectors_share_is_not_named():
 
 
 def test_a_stub_that_returns_a_value_is_a_call_to_the_return_rule():
-    # The walk suppresses `InitLate*`, `Await`, `InitAsync` and `CloneContext` as it does
-    # the stubs that give every register back, and the return rule took them that way
-    # too: a d0 written before one read as what the `ret` after it hands back. They
-    # return their value in x0 (#127).
+    # `InitLate*`, `Await`, `InitAsync` and `CloneContext` hand a value back in x0, so the
+    # return rule must not read a d0 written before one as what the `ret` after it hands
+    # back (#127). They are also not dropped like the stubs that give every register back:
+    # dropping them left the stale x0 standing in for the value they return, which is a
+    # whole lazy-init getter printed as `return x0;` (#234).
     from jadart.expr import lift_function
 
     def lift(stub):
@@ -12686,7 +12931,7 @@ def test_a_stub_that_returns_a_value_is_a_call_to_the_return_rule():
             [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)])]
     for stub in ("InitLateStaticField", "InitLateFinalInstanceField", "Await",
                  "InitAsync", "CloneContext"):
-        assert lift(stub) == ["return x0;"], stub
+        assert lift(stub) == [f"return {stub}(...);"], stub
     # A stub that does give every register back leaves the double where it was.
     assert lift("StackOverflowSharedWithoutFPURegs") == [
         "return x1.field_0x10 + x1.field_0x10;"]
@@ -14451,9 +14696,13 @@ def test_a_name_is_not_read_after_its_declaration_closed():
 
     got = pbfuzz.census(CLEAN)
     assert got["lifted"] > 8000, f"only {got['lifted']} ranges lifted"
-    assert got["oos"] <= 5, (
+    # Zero since #234, where the last five went: `State.set` mints a name for a value too
+    # long to inline, it was the one minting site outside `_mint`, and a name the hoist
+    # does not know about cannot be moved to the top of the body. Now that it is known,
+    # nothing is left reading a declaration that has closed.
+    assert got["oos"] == 0, (
         f"{got['oos']} reads of a name whose declaration has closed, in "
-        f"{got['oos_fns']} ranges, up from 5 in 5; see #204 and #205")
+        f"{got['oos_fns']} ranges, where there were none; see #204, #205 and #234")
     # And NO name read that the body never binds at all, which is not valid Dart and
     # leaves a reader nothing to go on. Four of them shipped, six reads, all in
     # `parsePartialNumber` on both fixtures (#205). A bound, not a budget: this one is
@@ -14646,21 +14895,29 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # scope, which cannot be spelled at all and so are a forced decline. Naming a spill
     # earlier moves reads from the first into the second without the reader gaining
     # anything, so a change that improves one must not quietly worsen the other.
-    assert got["wrong"] <= 2608, (
+    # Both numbers moved at #234, and down: a call that cannot return no longer hands its
+    # block's state to the join under it, so a reload on the far side finds the spelling
+    # the arm that DOES arrive left. 2,579 to 2,089, and the share with it, 30.3% to
+    # 23.3%, over 451 more records spelled.
+    assert got["wrong"] <= 2089, (
         f"{got['wrong']} reloads spell a register where the slot held a spelling that was "
-        f"available, up from 2608; see #198. {got['diff_reg']} held another register, "
+        f"available, up from 2089; see #198. {got['diff_reg']} held another register, "
         f"{got['expr']} an expression")
-    assert got["wrong"] + got["name"] <= 3427, (
+    assert got["wrong"] / max(1, got["spelled"]) <= 0.24, (
+        f"{got['wrong']} of {got['spelled']} spelled records read back wrong, a higher "
+        f"share than the 23.3% #234 left; a count that rises with the records spelled is "
+        f"the same residual, a rising share is a new one")
+    assert got["wrong"] + got["name"] <= 2856, (
         f"{got['wrong'] + got['name']} reloads in total name a different value than the "
-        f"slot held, up from 3427, of which {got['name']} are names out of scope")
+        f"slot held, up from 2856, of which {got['name']} are names out of scope")
     # And the reader-visible half of #198, which the two numbers above cannot see: they
     # score what `_reload` DECIDES, and the fix for a decline is at the call site, which
     # names the read rather than keeping the load's own register. A register the printed
     # body never assigns reads as the value the function came in with, so every line this
     # removes is a line that stopped claiming one. Counted with `tools/quality.py`'s own
     # regex, not a copy of it.
-    assert got["regline"] <= 26633, (
-        f"{got['regline']} lines carry a bare machine register, up from 26633; a reload "
+    assert got["regline"] <= 26393, (
+        f"{got['regline']} lines carry a bare machine register, up from 26393; a reload "
         f"that declines must name the read and not keep the register (#198)")
     # And no block is left holding nothing. A pass that drops a declaration nothing reads
     # can take the only line an `if` arm has: `_drop_unread_slots`, `_drop_dead_phis` and
@@ -14673,16 +14930,27 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # per-symptom COUNT cannot see a shape: #206 verified its counts over two review
     # rounds and still nearly shipped 112 empty blocks. Four are exact, because there is
     # no acceptable number of them.
+    # `dead` is #234's: a statement under a `throw` is code no path reaches, and with the
+    # runtime stubs named and the throw's fall-through edge still in the graph there were
+    # 1,224 of them on this fixture, phi write-backs for the path that never arrives and
+    # `goto`s out of a throw.
     for k, why in (("unbalanced", "functions whose braces do not balance"),
                    ("twice", "names the body declares twice"),
-                   ("above", "names read on a line above their declaration")):
-        assert got[k] == 0, f"{got[k]} {why} (#210)"
+                   ("above", "names read on a line above their declaration"),
+                   ("dead", "statements printed under a `throw`, which no path reaches")):
+        assert got[k] == 0, f"{got[k]} {why} (#210, #234)"
     # A bound, not a zero: `_drop_unread`'s guard trades an empty block for a block whose
     # only line is a declaration nothing reads, which is the honest side of that trade and
     # the same one `_drop_unread_slots` already makes.
-    assert got["sole"] <= 1398, (
+    # 1,398 to 1,489 at #234, one shape, and a named stub is what
+    # uncovers it: a type-test stub is dropped, so the class-id load in front of it
+    # (`var t11 = 60; if (x & 1 != 0) { t11 = (x.tags >> 12) & 0xfffff; }`) is left with
+    # nothing reading it, and the arm of that `if` is a block holding one dead assignment.
+    # Dropping a computation whose only reader was a suppressed stub is the fix, and it is
+    # `_drop_unread`'s business rather than the naming's.
+    assert got["sole"] <= 1489, (
         f"{got['sole']} blocks hold nothing but a declaration nothing reads, up from "
-        f"1398; see the guard in `_drop_unread` (#210)")
+        f"1489; see the guard in `_drop_unread` (#210)")
 
     # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
     real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,
@@ -15098,22 +15366,25 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     assert lift(frame(0x10, *push), **one)[0] == "return sub_0x100(...);"
     assert lift(frame(0x20, *push), **one)[0] == (
         "return sub_0x100(1, 2, 3, 4, 5, 6, x9);")
-    # SP where the code that reaches a push leaves it: not over a throw's edge, which
-    # tier 3 keeps (#64), from code that took SP down, and through the slow path
-    # strip_boilerplate cut off a box-or-tag check, there reached over a throw's edge.
+    # SP where the code that reaches a push leaves it: from code that took SP down, and
+    # through the slow path strip_boilerplate cut off a box-or-tag check. The throw's own
+    # edge is gone since #234, so the push is reached only by the branch, and what follows
+    # the throw is placed as its own section rather than running into the join.
     saves = [("str", "x3, [x15, #-8]!"), ("bl", "#0x500"), ("ldr", "x3, [x15], #8")]
     for after in ((), (("mov", "x9, #0"),), (("sub", "x15, x15, #0x10"),)):
-        # The throw ends its block or not, and what follows it moves SP or not.
         # The call in `saves` declares what it left in x2 (#176), so the base is that
-        # name; the slot reading x0 is what these cases are about.
-        assert _stores(lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
-                                  ("mov", "x15, x29"), ("bl", "#0x600", throw), *after,
-                                  "J", *saves, load, *keep))[-2], "x0"), after
-    assert _stores(lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
-                              ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
-                              ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"),
-                              ("b", "@K"), "T", ("bl", "#0x600", throw), "P", *saves,
-                              ("b", "@K"), "K", load, *keep))[-2], "x0")
+        # name; the slot reading x0 is what these cases are about, wherever the arm the
+        # branch takes ends up printing it.
+        body = lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbnz", "x4, @J"),
+                          ("mov", "x15, x29"), ("bl", "#0x600", throw), *after,
+                          "J", *saves, load, *keep))
+        assert any(_stores(ln, "x0") for ln in body), (after, body)
+    body = lift(frame(0x20, ("stur", "x0, [x29, #-8]"), ("cbz", "x4, @T"),
+                      ("sbfiz", "x1, x0, #1, #0x1f"), ("cmp", "x0, x1, asr #1"),
+                      ("b.eq", "@K"), ("cmp", "x5, x6"), ("b.ls", "@P"),
+                      ("b", "@K"), "T", ("bl", "#0x600", throw), "P", *saves,
+                      ("b", "@K"), "K", load, *keep))
+    assert any(_stores(ln, "x0") for ln in body), body
 
     # A write-back store through FP is filed where FP is left, by the walk and by what
     # names a slot across a call alike, pre-index and post-index. SP's slots go when FP

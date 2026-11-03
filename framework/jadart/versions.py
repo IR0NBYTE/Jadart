@@ -30,6 +30,7 @@ from .errors import JadartError
 from dataclasses import dataclass, field
 
 from .cidtables import ERA_2_19, ERA_3_0, ERA_3_1, ERA_3_4, ERA_3_6, ERA_3_9, CidTable
+from .objstore import LAYOUTS, RootLayout
 
 
 @dataclass
@@ -225,6 +226,12 @@ class Epoch:
     # (word_size, compressed) combinations this epoch's cluster grammar covers.
     # Declaring it lets an unsupported target be rejected instead of mis-parsed.
     grammars: frozenset = frozenset({(8, True)})
+    # Where this release's AOT snapshot roots are, which is what names a runtime stub on a
+    # build that carries no symbol for one (objstore.py). Keyed on the RELEASE and not on
+    # the epoch: the root count is the ObjectStore's field count, and that moves nearly
+    # every release while the cluster grammar holds still for years. None means stubs stay
+    # unnamed, which is what every epoch did before #234.
+    roots: RootLayout | None = None
     notes: str = ""
 
     def typed_data_kind(self, cid: int) -> str | None:
@@ -251,6 +258,7 @@ _EPOCHS: dict[str, Epoch] = {
         # RODataDeserializationCluster; android arm32 is uncompressed on a 32-bit word,
         # which needs that same ROData grammar plus a 32-bit container.
         grammars=frozenset({(8, True), (8, False), (4, False)}),
+        roots=LAYOUTS["3.12.2"],
         notes="ObjectHeader tag era. cid numbering + Class/Closure alloc match the "
               "3.9-3.12 profile, which differs from the SDK main (3.13) checkout the base "
               "grammar was read from.",
@@ -395,6 +403,7 @@ for _h, (_name, _dart, _table, _td0, _tdv, _imm) in _IDENTIFIED.items():
         record_has_field_names=(_name == "cidcanonical-2.19"),
         type_class_id_shift=(4 if _name in _WIDE_NULLABILITY else 3),
         td_int8_cid=_td0, td_byte_data_view_cid=_tdv, td_stride=4,
+        roots=LAYOUTS.get(_dart),
         grammars=(frozenset() if _name in _UNVALIDATED
                   else frozenset({(8, True), (8, False), (4, False)})),
         notes=(f"Dart {_dart}: identified, but the cluster grammar has not passed the "

@@ -9,6 +9,84 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
+## Unreleased
+
+### Fixed
+
+- **A release build names its runtime stubs.** Every stub-aware rule in the lifter keys
+  off an `_iso_stub_<Base>Stub` name: `_classify_stub` decides whether a `bl` is a
+  throw, an allocation or machinery to drop, `_noreturn` whether a path ends there, and
+  `_pin_call` whether the call gives every register back. A default `flutter build apk
+  --release` gives it none, because a stub's `Code` is owned by no `Function` and the
+  .so carries no symbol table, so both fixtures carried 0 stub names and the whole
+  taxonomy was dead code on the build a user actually has. 16,438 of the clean image's
+  34,979 direct call sites (47.0%) are calls to a stub, and six of those targets end in
+  `blr x30; brk #0` and cannot return, yet printed as `sub_0x2d5d00(...)`, an ordinary
+  Dart call that does. The name now comes from the snapshot's own object-store roots,
+  where the isolate's `ObjectStore` fields are serialised in declaration order and the
+  tail of that run is the stubs: 76 named on each fixture, from a table
+  `tools/gen_objstore.py` expands out of each release's `object_store.h` (ten distinct
+  root runs over the eighteen registered epochs). The table is checked against the
+  binary on every parse, all 244 of 244 roots agreeing on the fixtures about which are
+  `Code`, and nothing is named when they do not: naming a stub after its neighbour would
+  be worse than leaving it `sub_0x...`. Tier 3 output changes on every build. On the
+  clean image, `(...)` calls go from 9,196 to 5,139, lines from 188,930 to 184,380,
+  byte-offset fields from 55,572 to 55,181, bare-register lines from 20,460 to 20,618,
+  and `sub_0x2d5d00(...)` now prints as `throw NullCastError();`. The obf fixture moves
+  by the same amounts. Tiers 1 and 2 gain the name in their listings, 1,126 lines of the
+  clean disasm sample and 1,198 of the obf one, each a `bl` that gained a `; ->
+  _iso_stub_...Stub` note and nothing else. `jadart functions` gains a fifth name
+  origin, `roots`, kept apart from `snapshot`, `symtab` and `signature` because it is a
+  position read out of this binary interpreted through a per-release table; under it the
+  stack-overflow stub is the most-called range in the clean image, 5,093 callers. Half
+  of #234; the entry below is the other half, and the two go together because a call
+  that cannot return is only visible as one once the stub is named.
+- **A stub that hands a value back is a call, not machinery to drop.** `_classify_stub`
+  grouped the stubs that return a value in x0 (`InitLate*`, `Await`, `InitAsync`,
+  `CloneContext`) with the stack-check, write-barrier and type-test stubs, which give
+  every register back and are dropped. Dropping a call that returns something left the
+  stale x0 standing in for the value: a lazy-init getter whose `if` arm called
+  `InitLateFinalInstanceField` came out as `return x0;`, a whole body replaced by a bare
+  register, thirteen times on the clean fixture once stub naming started working. They
+  render as the calls they are now, `var t0 = InitLateFinalInstanceField(...);`, which
+  is what `_rv_call` already assumed about them (#127). This was reachable before this
+  change on a dwarf build with a symbol table, where the stubs were named.
+- **A call that cannot return no longer falls through.** `build_cfg` ended a block at a
+  terminator, at a trap mnemonic (#57) or at an address `exits` named, and a `bl` is
+  none of those, so a call to a stub that throws kept its fall-through edge and the
+  structurer rendered a path the machine never takes. `FocusTraversalPolicy.next` is the
+  shape: three one-instruction blocks, each a `bl` to the null-cast-error stub, where
+  the last printed `throw NullCastError(); goto L_0x12c928;`, a jump out of a throw, and
+  the two `if`s above it lost their else arms to the edge. The same edge fed joins, so a
+  phi met a value from a path that never arrives: 1,224 statements on the clean fixture
+  printed under a `throw`. The lift now hands `build_cfg` the addresses nothing runs
+  past (`expr._path_ends`) and those blocks end with no successor, as a trap's does; a
+  block that ends a path also reports that it does not fall through, so an `if` arm that
+  throws contributes nothing to the join. The code that was reached only through the old
+  edge is still placed, as its own labelled section, the way the code after a trap is:
+  angr drops such blocks after removing the edge, and Ghidra and Hex-Rays eliminate
+  them, which is why both document a callee wrongly marked as non-returning hiding real
+  source. Measured instead of argued: over the 16,382 ranges of the two fixtures not one
+  instruction the structurer placed before stopped being placed, and `cfgcheck` reports
+  0 edge violations and 0 dropped blocks on both. On the clean image this takes
+  statements under a `throw` to 0, `goto`s from 6,830 to 5,493 and the functions
+  emitting one from 1,649 to 1,414 (20.1% to 17.3%), lines with a bare machine register
+  from 20,460 to 20,015, byte-offset fields from 55,572 to 54,069, and 3,451 lines off
+  the output; the obf fixture moves by the same amounts. Tier 2 is untouched, and its
+  export of the clean fixture is byte-identical. `tools/pbfuzz.py`'s census gains a
+  `dead` counter for a statement under a `throw`, which has to be 0. Closes #234.
+- **A spill name can be hoisted, so nothing reads a declaration that has closed.**
+  `State.set` mints a name when a value is too long to inline, and it was the one
+  minting site outside `Lifter._mint`, which #204 moved the other thirteen into so that
+  a declaration could be lifted to the top of the body and the assignment left where the
+  value is. A name the hoist does not know about cannot be moved, so a spill declared
+  inside an `if` arm and read after the arm closed had no way to be fixed: five such
+  reads shipped on the clean fixture, the residual #205 left. Those names are shared
+  with the lifter now, and the count is 0. One read remains of a name no line binds at
+  all, in one range of each fixture, where a walk the lifter discarded minted it and the
+  walk that shipped did not; `_lift_function` declares it at the top, which everywhere
+  else in that file means a value the lifter does not know.
+
 ## 1.3.0 - 2026-10-29
 
 Upgrading from 1.2.0. The command set, the options and `--json`'s `format_version` are

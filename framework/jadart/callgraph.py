@@ -44,6 +44,7 @@ from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassembl
                      require_decoder,
                      MAX_INSNS, A64Words, A64_BL, A64_BLR, A64_DISPATCH, _PP, _word_load,
                      _word_add_pp, _word_loadstore, _word_loads_x)
+from .objstore import stub_names
 
 
 @dataclass
@@ -447,9 +448,12 @@ class Func:
 
 #: Where a name came from, strongest evidence first. `snapshot` was serialised into the
 #: binary; `symtab` was backfilled from the ELF symbol table on a dwarf_stack_traces_mode
-#: build; `signature` was matched against a reference binary and is an inference, not a
-#: reading. Keeping them apart is the whole point of showing an origin column.
-ORIGINS = ("snapshot", "symtab", "signature", "anonymous")
+#: build; `roots` is a runtime stub placed by its index in the snapshot's object-store
+#: root run, which is read out of this binary but means something only through a table
+#: generated per release (objstore.py, #234); `signature` was matched against a
+#: reference binary and is an inference, not a reading. Keeping them apart is the whole
+#: point of showing an origin column.
+ORIGINS = ("snapshot", "symtab", "roots", "signature", "anonymous")
 
 
 def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
@@ -477,6 +481,7 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
         if nm and cr is not None:
             snapshot_names[cr.pc_offset] = nm
     symtab = dict(image.symbol_names or {})
+    roots = stub_names(image, fr, getattr(image, "epoch", None))
 
     names = function_name_by_pc(image, fr)
     matched = {}
@@ -532,6 +537,8 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
             origin = "snapshot"
         elif nm and pc in symtab:
             origin = "symtab"
+        elif nm and pc in roots:
+            origin = "roots"
         elif pc in matched:
             nm = visible(matched[pc].name, limit=NAME_CUT) + MARK     # a name (#74, #94)
             origin = "signature"
