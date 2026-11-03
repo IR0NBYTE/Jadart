@@ -13,6 +13,68 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop falls out to a block some run can enter.** A natural loop is the header plus
+  the blocks it DOMINATES that reach a latch without passing the header, and `loop_nodes`
+  asked the dominance half of its latches and only the reaching half of the body. A block
+  no path from the entry reaches is dominated by nothing, so it answers the reaching half
+  and no more: the backward walk took one in, `loop_exit` counted its edge out of the node
+  set as a vote for where the loop goes, and with the votes tied the lowest address won,
+  so the structurer printed a block no run enters as the one the loop falls out to, and
+  the state the code after the loop is spelled from carried that block's writes. LLVM says
+  the same from the other end, that for a block the entry cannot reach the concept of a
+  loop is undefined, since dominance is. Hex-Rays
+  (`mba_t::remove_empty_and_unreachable_blocks`) and Ghidra (its "Eliminate unreachable
+  code" option, on by default) get there by deleting the block, which this does not do,
+  because a catch entry is such a block and the CFG does not model the exception edge
+  (#57, #234). 980 of the clean fixture's 1,154 loops held one, in 621 ranges, and not one
+  of them picked a different exit, so no line of either fixture moves and the clean export
+  is byte-identical. `tools/irfuzz.py --cfg --nested` finds the ones that do, 2 in about
+  36,000 generated graphs, where the exit state claimed `x2 = x9 + 27` and `x2 = x14 *
+  x12` for a register the CPU leaves at the value it was called with. Where the pick does
+  change, Tier 3 prints less: 6 of 4,000 generated graphs place 20 instructions fewer, all
+  of them in blocks nothing reaches, which Tier 3 does not place at all
+  (`structure(..., orphans=False)`) and only printed here because the bogus exit put them
+  after the loop with no label and no note. Tier 2 asks for the orphans and still places
+  every one of them: 0 of the same 4,000 graphs place fewer with `orphans=True`. The
+  lifter's `_back_loop` keeps such a predecessor deliberately, because there the question
+  is what the loop MAY write and a handler with no edge in has to count; where the loop
+  GOES is a claim, and the two now differ on purpose.
+- **A section nothing reaches hands no state to a block that has another way in.**
+  `structure` places a block no edge leads into, and the code after a trap or a call that
+  cannot return, as its own labelled section, for the same reason: an exception edge may
+  reach it. The section FALLS THROUGH into whatever the tree put below it, and `_reenter`
+  stated the rule for a section that does not fall through only, so where the block below
+  had other ways in it read what the section wrote on a path none of them takes. That is
+  what a goto-join's own meet (`_join_kill`) exists to prevent, and it could not see this
+  one: the narrowing it makes from the join's dominator cannot hold a block the entry does
+  not reach. The guard is `_reenter` itself, asked on arrival.
+
+  It asks TWO things, and the first attempt asked only one. A region nothing reaches is
+  still a region, so a join inside one, every way into which is inside it too, has nothing
+  to meet with: asking only where the state came from wiped such a join in `resolve`
+  (`.text+0x1753f0`) on both fixtures, where both paths carry `x9 + 27` and the store
+  printed it, and left `x8.field_0x1 = x2;`, a bare register no line of that body binds,
+  for a value the output had. Every firing the naive version had on either fixture was
+  that case. So the guard also asks for a predecessor the entry CAN reach, the one way in
+  the arriving state cannot speak for, and then it fires nowhere on either fixture and
+  nowhere in 8,000 generated graphs: no `tools/quality.py` symptom moves, the clean export
+  is byte-identical, and `pbfuzz --census` is unchanged. The shape is neither fixture's
+  and the generator does not draw it, so the gate for it is a test, which fails both
+  without the guard and with the naive one.
+
+  And `_reenter` hands the state to the block it is entering now. It replaced the register
+  map and left `State.src` naming the block it had just disowned, which was enough while
+  it only ran where nothing fell through and the block was lifted straight after it; read
+  on a live arrival, the stale source fired the guard a second time inside `_render_loop`,
+  after the loop had bound its carried registers to names, and that reset took the names
+  with it. A counter's declaration and both of its write-backs left a loop, so the printed
+  loop could not advance and the `sub x7, x7, #1` that drives it was nowhere in the body:
+  a wrong answer rather than a vague one. The call site also makes the same `carried`
+  exclusion the meet four lines below it makes, for the reason stated there.
+
+  Widening the meet instead, so that a join forgets whatever an unreachable ancestor
+  writes whichever way the walk came in, costs 1,488 bare-register lines on the clean
+  fixture and 1,643 on obf and fixes nothing this does not. Closes #237.
 - **A release build names its runtime stubs.** Every stub-aware rule in the lifter keys
   off an `_iso_stub_<Base>Stub` name: `_classify_stub` decides whether a `bl` is a
   throw, an allocation or machinery to drop, `_noreturn` whether a path ends there, and

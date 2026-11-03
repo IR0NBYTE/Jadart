@@ -4735,19 +4735,50 @@ _CFG_ASM = [
 ]
 
 
+#: A section nothing reaches, placed because the walk steps past a trap to the block
+#: after it (#57), followed by a section a `goto` reaches. The `orr x0, x13, x11` at 0x8
+#: is the only write to x0, and 0x10 has no edge from it.
+#:
+#: This shape used to be `_CFG_ASM` above, where the block nothing reaches was what the
+#: loop fell out to. #237 took it out of the loop's node set, so there it is no longer
+#: printed above the return at all and the test could no longer see its defect; the fact
+#: it pins is unchanged, and the walk still prints a section nothing reaches here.
+_UNREACHED_ASM = [
+    ("cbz", "x1, #0x18"),                                   # 0x00
+    ("brk", "#0"),                                          # 0x04  nothing runs past it
+    ("orr", "x0, x13, x11"),                                # 0x08  no edge in
+    ("ret", ""),                                            # 0x0c  and no fall-through
+    ("add", "x5, x0, #0x36"),                               # 0x10  a goto target
+    ("ret", ""),                                            # 0x14
+    ("mul", "x5, x6, x12"),                                 # 0x18  the loop header
+    ("cbz", "x8, #0x10"),                                   # 0x1c  out, and it loses
+    ("cbz", "x9, #0x2c"),                                   # 0x20
+    ("sub", "x7, x7, #1"),                                  # 0x24  the latch
+    ("cbnz", "x7, #0x18"),                                  # 0x28
+    ("add", "x4, x4, #2"),                                  # 0x2c  the way out two take
+    ("ret", ""),                                            # 0x30
+]
+
+
 def test_a_block_nothing_reaches_does_not_supply_a_value():
     # `structure` emits blocks in an order that is not always a path, and a block reachable
     # from nothing is still emitted, rightly, since dropping it would hide code an
     # exception edge may reach and the CFG does not model. What the walker was carrying then
-    # flowed into whatever was printed after it: here `orr x0, x13, x11`, in a block the
-    # entry jumps over, supplied the value for a `return` in a block it has no edge to.
+    # flowed into whatever was printed after it: `orr x0, x13, x11`, in a block nothing
+    # reaches, supplied the value for a `return` in a block it has no edge to.
     # 5,181 of the 8,194 functions in the 3.12.2 clean build contain such a block.
     import re
+    from jadart.cfg import build_cfg
     from jadart.expr import lift_function
-    body = "\n".join(lift_function(
-        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(_CFG_ASM)], arch="arm64"))
-    ret = re.search(r"return ([^;]+);", body)
-    assert ret, f"no return rendered\n{body}"
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(_UNREACHED_ASM)]
+    blocks, _entry = build_cfg(ann)
+    assert not [a for a in blocks if 0x8 in blocks[a].succ], "0x8 must have no way in"
+    assert [a for a in blocks if 0x10 in blocks[a].succ] == [0x18], (
+        "0x10 has to take its state from 0x18, the one edge into it")
+    body = "\n".join(lift_function(ann, arch="arm64"))
+    assert "L_0x8:" in body, f"the section itself still has to be placed\n{body}"
+    ret = re.search(r"return ([^;]+);\s*$", body)
+    assert ret, f"no return rendered last\n{body}"
     assert "x13" not in ret.group(1), (
         f"returns `{ret.group(1)}`, which only the unreachable block computes\n{body}")
 
@@ -4761,7 +4792,12 @@ def test_a_loop_exit_writes_the_carried_values_back():
     from jadart.expr import lift_function
     lines = lift_function(
         [(i * 4, mn, op, "") for i, (mn, op) in enumerate(_CFG_ASM)], arch="arm64")
-    leave = next((i for i, ln in enumerate(lines) if ln.strip().startswith("goto")), None)
+    # `break` or `goto`: #237 narrowed the loop's node set to the blocks its header
+    # dominates, and with the block nothing reaches out of the exit vote this graph leaves
+    # by the edge the loop falls out to, which reads as `break` where it read as `goto`.
+    # Either jumps over the copy at the bottom of the body, which is what this pins.
+    leave = next((i for i, ln in enumerate(lines)
+                  if ln.strip().startswith(("goto", "break"))), None)
     assert leave is not None, "\n".join(lines)
     before = [ln.strip() for ln in lines[:leave]]
     # the exiting path has to carry the trip it just ran, not leave it to the back edge
@@ -15809,6 +15845,154 @@ def test_a_goto_out_of_nested_loops_names_what_the_join_reads():
     assert re.fullmatch(r"t\d+", name), body          # a phi name, not the bare `x7`
     # It is written on every edge into the join: the goto out and the loops' own exit.
     assert sum(1 for ln in body if re.match(rf"{name} = ", ln)) >= 2, body
+
+
+def test_a_loop_falls_out_to_a_block_some_run_can_enter():
+    # A natural loop is the header plus the blocks IT DOMINATES that reach a latch without
+    # passing it, and `loop_nodes` asked only the reaching half. A block no path from the
+    # entry reaches is dominated by nothing, so it answers that half and no more, and the
+    # backward walk from the latch took 0xc in. `loop_exit` counts each edge out of the
+    # node set as a vote for where it goes, the three votes tie at one apiece, and the
+    # lowest address wins, so 0x10 was printed as the block the loop falls out to: a path
+    # no run takes, whose `add x2, x9, #0x1b` then supplied the value the join at 0x30
+    # reads. On main this returns `x9 + 27 | x11` (#237).
+    #
+    # Found by `tools/irfuzz.py --cfg --nested` on two seeds the suite does not use, 2 in
+    # about 36,000 generated graphs, both this shape. The lifter's `_back_loop` keeps such
+    # a predecessor deliberately, because there the question is what the loop MAY write
+    # and a handler with no edge in has to count; where the loop GOES is a claim.
+    from jadart.cfg import build_cfg, structure
+    from jadart.expr import lift_function
+    rows = [("sub", "x7, x7, x7"), ("add", "x7, x7, #3"), ("b", "#0x18"),
+            ("cbnz", "x9, #0x20"), ("add", "x2, x9, #0x1b"), ("b", "#0x30"),
+            ("mul", "x5, x6, x12"), ("cbz", "x8, #0x2c"),
+            ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x18"), ("b", "#0x30"),
+            ("mul", "x1, x5, x3"), ("orr", "x0, x2, x11"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    blocks, entry = build_cfg(ann)
+    assert not [a for a in blocks if 0xc in blocks[a].succ], "0xc must have no way in"
+    stmts = structure(blocks, entry)
+    at = next(i for i, st in enumerate(stmts) if st[0] == "loop")
+    nxt = next(st for st in stmts[at + 1:] if st[0] in ("asm", "label"))
+    assert nxt[1] == 0x28, (
+        f"the loop falls out to 0x{nxt[1]:x}, which no run can enter; 0x28 is the way "
+        f"out its own blocks take")
+    body = "\n".join(lift_function(ann, arch="arm64"))
+    assert "x9 + 27" not in body, (
+        f"the join reads a value only the unreachable block computes\n{body}")
+    assert "return x2 | x11;" in body, body
+
+
+def _flat_stmts(stmts, out=None):
+    """Every statement in a structured list, nesting flattened, for a membership test."""
+    out = [] if out is None else out
+    for st in stmts:
+        out.append(st)
+        if st[0] == "if":
+            _flat_stmts(st[2], out)
+            _flat_stmts(st[3], out)
+        elif st[0] == "loop":
+            _flat_stmts(st[2], out)
+    return out
+
+
+def test_the_section_after_a_trap_does_not_feed_the_join_below_it():
+    # `structure` places the code after a trap, or after a call that cannot return, as its
+    # own section (#57, #234), because an exception edge the CFG does not model may reach
+    # it. That section FALLS THROUGH into the block below it, and `_reenter` stated the
+    # rule for a section that does not fall through only, so what the walk was carrying
+    # out of it reached a block with other ways in: `add x2, x9, #0x1b` at 0x8 flowed into
+    # the join at 0xc, whose other way in is the `goto` out of the loop, and `return x9 +
+    # 27 | x11;` came out of a value that way in never computes (#237).
+    #
+    # The goto-join's own meet (`_join_kill`) is what exists to stop that, and it cannot
+    # see this one: the narrowing it makes from the join's immediate dominator can never
+    # hold a block no path from the entry reaches. The guard is `_reenter` asked on
+    # arrival. The section is still placed either way, which is the point: Ghidra and
+    # Hex-Rays answer this by deleting the block, and a catch entry is one of these.
+    from jadart.cfg import build_cfg, structure
+    from jadart.expr import lift_function
+    rows = [("cbz", "x1, #0x14"), ("brk", "#0"), ("add", "x2, x9, #0x1b"),
+            ("orr", "x0, x2, x11"), ("ret", ""),
+            ("mul", "x5, x6, x12"), ("cbz", "x8, #0xc"), ("cbz", "x9, #0x28"),
+            ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x14"),
+            ("add", "x4, x4, #2"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    blocks, entry = build_cfg(ann)
+    assert not [a for a in blocks if 0x8 in blocks[a].succ], "0x8 must have no way in"
+    assert sorted(a for a in blocks if 0xc in blocks[a].succ) == [0x8, 0x14]
+    assert ("goto", 0xc) in _flat_stmts(structure(blocks, entry)), (
+        "the join has to be one a goto reaches, or this tests nothing")
+    body = "\n".join(lift_function(ann, arch="arm64"))
+    assert "x9 + 27" not in body, (
+        f"the join reads what the section above it wrote, on a path that never ran\n"
+        f"{body}")
+    assert "return x2 | x11;" in body, body
+    assert "L_0x8:" in body, f"the section itself still has to be placed\n{body}"
+
+
+def test_a_join_inside_a_section_nothing_reaches_keeps_what_both_its_paths_agree_on():
+    # The other half of the question above, and the first fix for it got this wrong. A
+    # region nothing reaches is still a region: its own flow is the only flow there is,
+    # so a join INSIDE one, whose every way in is inside it too, has nothing to meet with.
+    # Asking only whether the arriving state came out of such a region wiped the join at
+    # 0x20 here, where both paths carry `x2 = x9 + 27` and the store printed it; the
+    # output then read `x8.field_0x1 = x2;`, a bare register no line of the body binds,
+    # for a value it had. So the guard asks for a predecessor the entry CAN reach, the one
+    # the arriving state cannot speak for (#237).
+    from jadart.cfg import build_cfg
+    from jadart.expr import lift_function
+    rows = [("cbz", "x1, #0x28"), ("brk", "#0"), ("add", "x2, x9, #0x1b"),
+            ("cbz", "x3, #0x1c"), ("str", "x4, [x7]"), ("b", "#0x20"),
+            ("nop", ""), ("str", "x5, [x7]"), ("str", "x2, [x8]"), ("ret", ""),
+            ("str", "x6, [x9]"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    blocks, _entry = build_cfg(ann)
+    reach = {0x0, 0x4, 0x28}
+    assert not [a for a in blocks if 0x8 in blocks[a].succ], "0x8 must have no way in"
+    assert not [p for p in (0x10, 0x1c) if p in reach], "the join's ways in are both in"
+    body = "\n".join(lift_function(ann, arch="arm64"))
+    assert "x8.field_0x1 = x9 + 27;" in body, (
+        f"both ways into the join carry x9 + 27, so the store has it\n{body}")
+
+
+def test_a_loop_the_walk_re_enters_keeps_the_names_it_carries():
+    # Third shape of #237, and the one the first guard broke. `_reenter` replaced the
+    # register map and left `State.src` naming the block it had just disowned, and the
+    # guard reads `src` on a LIVE arrival, so where a section nothing reaches falls into a
+    # reachable loop HEADER the guard fired twice: once at the loop, rightly, and again at
+    # the header's own block inside `_render_loop`, after the loop had bound its carried
+    # registers to names. The second firing reset the map and took those names with it:
+    # the counter's declaration and both of its write-backs left the output, so the
+    # printed loop updated nothing and `sub x7, x7, #1` was nowhere in it. A loop that
+    # cannot advance is a wrong answer, not a vague one.
+    #
+    # `_reenter` hands the state to the block it is entering now, and the call site makes
+    # the same exclusion the goto-join meet makes four lines below it, for the same
+    # reason. The shape: a trap at 0x4, the section after it at 0x8, and the header at
+    # 0xc reachable only by the escape `goto` out of the loop whose header is 0x20.
+    import re
+    from jadart.cfg import build_cfg
+    from jadart.expr import lift_function
+    rows = [("cbz", "x1, #0x20"), ("brk", "#0"), ("add", "x2, x9, #0x1b"),
+            ("mul", "x3, x9, x9"), ("sub", "x7, x7, #1"), ("cbnz", "x7, #0xc"),
+            ("orr", "x0, x3, x11"), ("ret", ""),
+            ("mul", "x5, x6, x12"), ("cbz", "x8, #0xc"), ("cbz", "x9, #0x3c"),
+            ("cbz", "x10, #0x3c"), ("sub", "x6, x6, #1"), ("cbnz", "x6, #0x20"),
+            ("ret", ""), ("add", "x4, x4, #2"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    blocks, _entry = build_cfg(ann)
+    assert not [a for a in blocks if 0x8 in blocks[a].succ], "0x8 must have no way in"
+    assert 0x20 in [a for a in blocks if 0xc in blocks[a].succ], (
+        "0xc has to be reachable, by the escape out of the other loop")
+    body = "\n".join(lift_function(ann, arch="arm64"))
+    name = re.search(r"var (t\d+) = x7;", body)
+    assert name, f"the loop carries x7 and nothing binds it\n{body}"
+    held = name.group(1)
+    assert f"({held} - 1) == 0" in body, (
+        f"the loop tests the register, not the name it carries\n{body}")
+    assert body.count(f"{held} -= 1;") >= 2, (
+        f"the trip's update is missing, so the printed loop cannot advance\n{body}")
 
 
 if __name__ == "__main__":
