@@ -14707,8 +14707,8 @@ def test_a_self_referential_write_is_right_under_printed_body_semantics():
             stur(4, P.OBS, 7), ret],
     }
     for what, rows in cases.items():
-        clean, wrong, _undec, lines = oracle.score(rows, trials=40, seed=7,
-                                                   bind_values=False)
+        clean, wrong, _dec, _undec, lines = oracle.score(rows, trials=40, seed=7,
+                                                         bind_values=False)
         assert wrong == 0 and clean >= 30, (
             f"{what} disagreed with the CPU in {wrong} of {clean + wrong} "
             "environments:\n  " + "\n  ".join(l.strip() for l in lines))
@@ -14717,20 +14717,100 @@ def test_a_self_referential_write_is_right_under_printed_body_semantics():
     # and that is the one case in this family that is a real defect. With both guards
     # disabled the oracle must call it wrong, or a pass above proves nothing.
     stale = [addi(3, 9, 0xAD), ldr_post(4, 9, 8), stur(3, P.OBS, 7), ret]
-    clean, wrong, _u, lines = oracle.score(stale, trials=40, seed=7, bind_values=True)
+    clean, wrong, _d, _u, lines = oracle.score(stale, trials=40, seed=7,
+                                               bind_values=True)
     assert wrong == 0 and clean >= 30, "\n  ".join(l.strip() for l in lines)
     real_pin, real_name = expr.Lifter._pin, expr.Lifter._name_stale_reg
     expr.Lifter._pin = lambda self, st, name, live=None: []
     expr.Lifter._name_stale_reg = lambda self, st, name, live, guard_feed=False: []
     try:
-        clean, wrong, _u, lines = oracle.score(stale, trials=40, seed=7,
-                                               bind_values=True)
+        clean, wrong, _d, _u, lines = oracle.score(stale, trials=40, seed=7,
+                                                   bind_values=True)
     finally:
         expr.Lifter._pin, expr.Lifter._name_stale_reg = real_pin, real_name
     assert wrong >= 30 and clean == 0, (
         "with both pins disabled the oracle still agreed with the CPU, so it is not "
         "measuring the staleness it claims to:\n  "
         + "\n  ".join(l.strip() for l in lines))
+
+
+def test_a_declined_frame_read_is_not_scored_as_a_disagreement():
+    """A frame reload the lifter DECLINES to spell is not a defect, and the sweep used to
+    report it as one (#238).
+
+    `tools/pbfuzz.py --cases 3000` reported nine disagreements and every one of them was
+    this shape. A spill to a frame slot is tracked in the slot map and printed as
+    nothing, so the CPU's slot holds the register it spilled while the printed body's
+    still holds the bytes the run started with, and the read #198 prints where the reload
+    declines, `var t1 = (FP - 24).field_0x1;`, is the one line that reads one of each.
+    The text is right; the harness was comparing two different images and calling the gap
+    a wrong answer, which is the one thing an oracle may not do.
+
+    Three scorings of one shape, because the two halves of the fix answer different
+    questions. With both, the spill is replayed into the image both sides start from, so
+    the declined read is still SCORED and agrees: the path #198 added gets a gate and not
+    an exemption. With the replay off and the write log on, the read is a DECLINE and not
+    a disagreement, which is the floor under every spill of a value the machine computes.
+    With neither, the false positive is back, which is what says this test measures it.
+    """
+    if not _unicorn_available() or not _capstone_available():
+        _skip("  SKIP test_a_declined_frame_read_is_not_scored_as_a_disagreement")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pbfuzz
+
+    adcs = next(x for x in pbfuzz.RAW if x[0].startswith("adcs"))
+    # The smallest run that shows it, shrunk from the first case the sweep reported: the
+    # slot holds x3, a PRINTED write to x3 supersedes that record, and the reload of the
+    # slot can then spell nothing and says the read instead.
+    rows = [("stur x3, [x29, #-0x18]", pbfuzz.enc_stur(3, pbfuzz.FPR, -24)),
+            ("ldr x3, [x11], #0x8", pbfuzz.enc_ldr_post(3, 11, 8)),
+            ("adcs x3, x3, x4", adcs[1](3, 3, 4)),
+            ("ldur x5, [x29, #-0x18]", pbfuzz.enc_ldur(5, pbfuzz.FPR, -24)),
+            ("stur x5, [x20, #0x17]", pbfuzz.enc_stur(5, pbfuzz.OBS, 23)),
+            ("ret", pbfuzz.RET_WORD)]
+    oracle = pbfuzz.Oracle()
+    out = oracle.score(rows, trials=12, seed=7, bind_values=True)
+    body = "\n  ".join(l.strip() for l in out[-1])
+    assert "var t1 = (FP - 24).field_0x1;" in body, body   # the shape, still the shape
+    assert out[1] == 0, (
+        f"the scorer called a declined frame read a disagreement in {out[1]} of 12 "
+        f"environments (#238):\n  {body}")
+    assert out[0] == 12, (
+        f"the declined read was not scored at all ({out[:-1]}), so the path #198 added "
+        f"is exempt rather than gated:\n  {body}")
+
+    class _Deaf(list):
+        """A write log that records nothing, which is the state before #238."""
+
+        def append(self, item):
+            pass
+
+    real = pbfuzz.entry_spills
+    pbfuzz.entry_spills = lambda ann, defuse: {}
+    try:
+        half = oracle.score(rows, trials=12, seed=7, bind_values=True)
+        oracle.wrote = _Deaf()
+        none = oracle.score(rows, trials=12, seed=7, bind_values=True)
+    finally:
+        pbfuzz.entry_spills = real
+        oracle.wrote = []
+    assert (half[0], half[1], half[2]) == (0, 0, 12), (
+        f"without the replay the frame read scored {half[:-1]}, where it has to be a "
+        f"decline in all 12: a spill of a computed value cannot be replayed and must "
+        f"fall back on this")
+    assert none[1] == 12, (
+        f"with neither half the scorer called the shape wrong in only {none[1]} of 12 "
+        f"environments, so this test is not measuring the false positive it claims to")
+
+    # And the sweep the issue reports, at the size the suite can afford. Two of these
+    # four hundred cases were disagreements before, and the number nothing gated is how
+    # a real defect of this class would have arrived: "three instead of two".
+    tot = pbfuzz.run(400, 12, 1, False, False)
+    assert tot["wrong"] == 0, f"{tot['wrong']} of {tot['scored']} scored runs disagreed"
+    assert tot["scored"] >= 320 and tot["disagreed"] == 0, tot
+    # Not a sweep that scores nothing: every class is reported, and the declines are the
+    # runs where the printed body refused rather than runs this harness could not read.
+    assert tot["clean"] == tot["scored"] and tot["declined"] > 0, tot
 
 
 def test_a_self_referential_write_keeps_the_spelling_that_cancels():
@@ -15089,7 +15169,7 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     #197 shipped 2,023 stale spellings past four green CI jobs, a clean suite and five
     CPU-verified shapes: nothing automated looked at this class, in either direction
     (`irfuzz` generates no x29-relative frame slot, and `tools/pbfuzz.py`'s fuzzing half
-    scores any store resting on a written register as undecidable).
+    scores any store resting on a written register as a decline).
 
     Two assertions, and they are different in kind. STALE must be zero: a record spelled
     after its own path superseded it is `#199` and there is no acceptable number of them.

@@ -27,13 +27,31 @@ that scores #187's class, and the frame-slot path the issue asks for ("the repo'
 tools/irfuzz.py memory and corpus oracles use x20 for every object base, never x29, so
 they never exercise the frame-slot path").
 
-WHAT IS NOT SCORED. A bare register in the output can be the lifter DECLINING rather than
-naming the entry value, and FINDINGS.md records that a lost value "rests on the bare
-register meaning nothing to the reader". A printed store is therefore scored only when
-every register in its text is either one the generated code never writes, so it is an
-argument and means the entry value, or one the printed body has already assigned, so it
-is a claim. Anything else is counted undecidable, never as a defect: a harness that reads
-a decline as a wrong answer reports defects that are its own.
+WHAT IS NOT SCORED, AND UNDER WHICH NAME. Three outcomes are counted apart, because a
+differential tester that merges them reports defects that are its own: DISAGREED, where
+the printed body made a claim the CPU contradicts; DECLINED, where the printed body
+refuses to answer, which is correct behaviour and never a defect; and UNDECIDABLE, where
+this harness cannot read the text at all. Alive2 keeps the same three ("incorrect
+transformations", "failed-to-prove transformations" and its own errors), and Csmith
+excludes an undefined program instead of calling it a miscompilation. `tools/irfuzz.py`
+draws the line with two exception types, `_Undecidable` and `_Unsound`, and by leaving the
+registers a generated run writes UNBOUND so that a bare one declines by itself.
+
+A bare register in the output can be the lifter DECLINING rather than naming the entry
+value, and FINDINGS.md records that a lost value "rests on the bare register meaning
+nothing to the reader". A printed store is therefore scored only when every register in
+its text is either one the generated code never writes, so it is an argument and means
+the entry value, or one the printed body has already assigned, so it is a claim.
+
+MEMORY is the other half of the same rule and was missing until #238. A spill to a frame
+slot is tracked in the slot map and printed as nothing, so the CPU's slot holds the
+spilled register while the printed body's still holds the bytes the run started with, and
+a reload the lifter DECLINES to spell reads one of each. Two things close it. The spills
+of a register still holding the value the function came in with are replayed into the
+image both sides start from, so the machine's store writes bytes that are already there
+and the declined reload stays scored, which is the gate #198's path deserves. Everything
+else the machine wrote and the printed body never printed a store for is recorded from a
+write hook, and a read of it declines.
 
 WHAT IT CANNOT SEE. It lifts ONE BLOCK through `_lift_block`, so a decision
 `lift_function` makes over the whole body is invisible: the `keep`, `carry` and
@@ -47,7 +65,7 @@ not a pass, and `run()` returning 0 while scoring nothing is tracked in #199.
 Usage:
   python framework/tools/pbfuzz.py --cases 400 --trials 12 --seed 1
   python framework/tools/pbfuzz.py --no-args      # destinations preloaded, declines kept
-Exit code 1 if any scored store disagreed with the CPU.
+Exit code 1 if any scored store disagreed with the CPU. A decline is not a disagreement.
 """
 import argparse
 import ast
@@ -245,9 +263,47 @@ def _row(rng):
     return f"stur x{d2}, [x{OBS}, #{off:#x}]", enc_stur(d2, OBS, off)
 
 
+#: `x3, [x29, #-0x18]`, a spill to a frame slot. The lifter tracks one in the slot map
+#: and prints nothing for it, so it is a store the CPU performs and the printed body does
+#: not (#238).
+SPILL = re.compile(rf"^(x(?:3[01]|[12]\d|\d)), \[x{FPR}, #(-?(?:0x)?[0-9a-f]+)\]$")
+
+
+def entry_spills(ann, defuse) -> dict:
+    """{frame offset: register} for the spills of a register the run has not written yet,
+    so the value stored is the one the function came in with.
+
+    Those are the spills a replay can get exactly right, and they are the ones that
+    matter: `gen` opens with one per frame slot. A spill of a COMPUTED value is left out,
+    because putting it in the image before the run would hand the slot a value the
+    machine only writes later; the write hook turns a read of that slot into a decline
+    instead.
+    """
+    seed, done = {}, set()
+    for _a, mn, op, _n in ann:
+        m = SPILL.match(op) if mn in ("stur", "str") else None
+        if m and m.group(1) not in done and int(m.group(2), 0) not in seed:
+            seed[int(m.group(2), 0)] = m.group(1)
+        done |= defuse[f"{mn} {op}".strip()][0]
+    return seed
+
+
 class Undecidable(Exception):
     """The printed body says something this harness cannot resolve, so the case is
     dropped rather than scored. A gap here must never read as a defect in the lifter."""
+
+
+class Declined(Undecidable):
+    """The printed body refuses to answer: it rests on a register nothing bound, or on
+    memory the machine wrote and the body never printed a store for.
+
+    A subclass, so every `except Undecidable` here still drops the case, and a separate
+    name because the two are different facts about the LIFTER: "I do not know" is the
+    answer #198's declined reload is supposed to give, and counting it with this
+    harness's own limits hides whether the sweep is scoring anything (#238). The same
+    split `tools/irfuzz.py` draws between `_Undecidable` and what it says about a decline
+    at `run_cfgmem`: "binding them would read every gap as a claim about the entry
+    state"."""
 
 
 DECL = re.compile(r"^\s*var (t\d+) = (.+);$")
@@ -270,7 +326,7 @@ class Body:
     with and mean what the body last assigned them; memory is a real array its stores
     update, so a moved base reads where it now points."""
 
-    def __init__(self, uc, ureg, nzcv_id, regs, mem, written):
+    def __init__(self, uc, ureg, nzcv_id, regs, mem, written, dirty=()):
         self.uc = uc
         self.ureg = ureg
         self.nzcv_id = nzcv_id
@@ -281,12 +337,23 @@ class Body:
         self.written = written      # registers the generated code writes somewhere
         self.bound = set()          # registers the printed body has assigned
         self.writes = {}            # addr -> whether its last printed store was scorable
+        self.dirty = list(dirty)    # byte spans the machine wrote and the body did not
+        self.undef = set()          # temps and registers whose value rests on one
+        self.rested = False         # set while the current statement reads one
 
     def load(self, addr):
         addr &= MASK
         if not (MEM <= addr < MEM + MEMSZ - 8):
             raise Undecidable("load outside the mapped window")
-        return struct.unpack_from("<Q", self.mem, addr - MEM)[0]
+        off = addr - MEM
+        if any(a < off + 8 and off < b for a, b in self.dirty):
+            # The machine wrote these bytes and the printed body printed no store for
+            # them, which here is a frame spill the lifter tracked in the slot map. The
+            # text is reading the machine's frame slot and this harness cannot say what
+            # the machine left in it, so the value carries a decline (#238). Not an
+            # exception: a store that does not read it is still a claim and still scored.
+            self.rested = True
+        return struct.unpack_from("<Q", self.mem, off)[0]
 
     def store(self, addr, val):
         addr &= MASK
@@ -310,14 +377,18 @@ class Body:
             if isinstance(n, ast.Name):
                 if n.id in self.t:
                     if self.t[n.id] is None:
-                        raise Undecidable(f"{n.id} read before an arm assigned it")
+                        raise Declined(f"{n.id} read before an arm assigned it")
+                    if n.id in self.undef:
+                        self.rested = True
                     return self.t[n.id]
                 if n.id == "xzr":
                     return 0
                 key = ROLE.get(n.id, n.id)
                 if key in self.reg:
+                    if key in self.undef:
+                        self.rested = True
                     return self.reg[key]
-                raise Undecidable(f"unbound {n.id}")
+                raise Declined(f"unbound {n.id}")
             if isinstance(n, ast.Attribute):
                 if not n.attr.startswith("field_"):
                     raise Undecidable(f"unknown attribute {n.attr}")
@@ -365,7 +436,10 @@ class Body:
             regs[r] = self.ev(text)
         for u in uses:
             if u != "xzr" and u not in regs:
-                raise Undecidable(f"{line!r} reads {u}, which the body never bound")
+                raise Declined(f"{line!r} reads {u}, which the body never bound")
+        # Whatever the line reads, it passes on: a destination read back from the CPU
+        # after a source that itself rested on a decline rests on the same one (#238).
+        rested = self.rested or bool(set(uses) & self.undef)
         uc = self.uc
         uc.mem_write(CODE, struct.pack("<I", word))
         uc.mem_write(MEM, bytes(self.mem))
@@ -380,8 +454,18 @@ class Body:
             if d != "xzr" and REGTOK.fullmatch(d):
                 self.reg[d] = uc.reg_read(self.ureg[int(d[1:])])
                 self.bound.add(d)
+                self.mark(d, rested)
         self.nzcv = uc.reg_read(self.nzcv_id)
         self.mem = bytearray(uc.mem_read(MEM, MEMSZ))
+
+    def mark(self, name, rested):
+        """Record whether `name`'s new value rests on something the body never
+        established. Both directions matter: a register reassigned from values the body
+        does hold stops resting on the decline its old value rested on."""
+        if rested:
+            self.undef.add(name)
+        else:
+            self.undef.discard(name)
 
     def run(self, lines, words, defuse):
         for ln in lines:
@@ -390,6 +474,7 @@ class Body:
             s = (ln[:cut] if cut >= 0 else ln).strip()
             if not s:
                 continue
+            self.rested = False
             if not s.endswith((";", "{", "}", ":")):
                 if s not in words:
                     raise Undecidable(f"raw line {s!r} is not one of the generated words")
@@ -402,6 +487,7 @@ class Body:
             m = DECL.match(s)
             if m:
                 self.t[m.group(1)] = self.ev(m.group(2))
+                self.mark(m.group(1), self.rested)
                 continue
             if RETL.match(s):
                 return
@@ -410,8 +496,10 @@ class Body:
                 val = self.ev(m.group(3))
                 if m.group(2):
                     val = COMPOUND[m.group(2)](self.reg[m.group(1)], val) & MASK
+                    self.rested = self.rested or m.group(1) in self.undef
                 self.reg[m.group(1)] = val
                 self.bound.add(m.group(1))
+                self.mark(m.group(1), self.rested)
                 continue
             m = FLDA.match(s)
             if m:
@@ -421,7 +509,12 @@ class Body:
                     val = COMPOUND[m.group(3)](self.load(addr), val) & MASK
                 self.store(addr, val)
                 risky = set(REGTOK.findall(m.group(1) + " " + m.group(4)))
-                self.writes[addr & MASK] = not (risky & self.written) - self.bound
+                # Scored only where every register in the text is an argument or a value
+                # the body assigned, AND where nothing it read rests on a decline. The
+                # second half is #238: without it a store reading a frame slot the body
+                # never wrote was scored against the register the CPU spilled there.
+                unbound = (risky & self.written) - self.bound
+                self.writes[addr & MASK] = not unbound and not self.rested
                 continue
             raise Undecidable(f"unmodelled statement {s!r}")
 
@@ -442,11 +535,18 @@ def lift(ann):
     return lines
 
 
-def env_for(rng, bind_values: bool):
+def env_for(rng, bind_values: bool, spills=()):
     """(cpu registers, printed-body registers, memory).
 
     The CPU gets every register. The printed body gets the value registers only when the
     run reads them before writing them, which is what an argument is.
+
+    `spills` is `entry_spills`' map, replayed into the ONE image both sides start from:
+    the slot already holds what the machine is about to store there, so the store the
+    lifter tracked instead of printing writes bytes that are already there and a reload
+    of that slot reads the same value on both sides (#238). The draws from `rng` are
+    unchanged in number and order, so the programs and environments a sweep visits are
+    the same ones they were before the replay existed.
     """
     cpu = {}
     for i in XI:
@@ -455,9 +555,14 @@ def env_for(rng, bind_values: bool):
         else:
             cpu[f"x{i}"] = (MEM + 0x1000 + i * 0x600
                             + 16 * rng.randrange(0, 0x20)) & ~0xF
+    mem = bytearray(rng.randbytes(MEMSZ))
+    for off, reg in (spills.items() if spills else ()):
+        at = cpu[f"x{FPR}"] + off - MEM
+        if 0 <= at <= MEMSZ - 8:
+            struct.pack_into("<Q", mem, at, cpu[reg])
     body = (dict(cpu) if bind_values
             else {k: v for k, v in cpu.items() if int(k[1:]) not in VALUES})
-    return cpu, body, bytes(rng.randbytes(MEMSZ))
+    return cpu, body, bytes(mem)
 
 
 class Oracle:
@@ -465,7 +570,7 @@ class Oracle:
 
     def __init__(self):
         from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
-        from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN
+        from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_LITTLE_ENDIAN, UC_HOOK_MEM_WRITE
         from unicorn import arm64_const as A
         self.md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
         self.ureg = {i: getattr(A, f"UC_ARM64_REG_X{i}") for i in XI}
@@ -477,13 +582,24 @@ class Oracle:
             uc.mem_map(MEM, MEMSZ)
             return uc
         self.runner, self.scratch = fresh(), fresh()
+        #: Every store the machine performs, as (address, size, value). Taken from the
+        #: CPU rather than read off the instruction list, so it says what the machine
+        #: wrote and not what this file believes the generator emits (#238).
+        self.wrote = []
+        self.runner.hook_add(
+            UC_HOOK_MEM_WRITE,
+            lambda _uc, _acc, at, size, val, _d: self.wrote.append((at, size, val)))
 
     def score(self, rows, trials=12, seed=0, bind_values=True):
-        """(clean, wrong, undecidable, lines) for ONE run over `trials` environments.
+        """(clean, wrong, declined, undecidable, lines) for ONE run over `trials`
+        environments.
 
-        `clean` counts environments where every SCORED store agreed with the CPU, `wrong`
-        those where one did not, and `undecidable` those with nothing to score. A shape
-        the tests hand to this either agrees everywhere or it does not.
+        `clean` counts environments where every SCORED store agreed with the CPU and
+        `wrong` those where one did not. The other two are the environments with nothing
+        to score, and they are counted apart (#238): `declined` is the printed body
+        refusing to answer, which is correct behaviour, and `undecidable` is this harness
+        reaching its own limit. A shape the tests hand to this either agrees everywhere
+        or it does not.
         """
         from jadart.expr import use_target, ARM64, _def_use, canon
         code = b"".join(struct.pack("<I", w) for _t, w in rows)
@@ -498,10 +614,12 @@ class Oracle:
                 defuse[f"{m} {o}".strip()] = (defs, uses)
                 written |= defs
         lines = lift(ann)
+        spills = entry_spills(ann, defuse)
         rng = random.Random(seed)
-        clean = wrong = undec = 0
+        clean = wrong = declined = undec = 0
         for _ in range(trials):
-            cpu, body_regs, mem = env_for(rng, bind_values)
+            cpu, body_regs, mem = env_for(rng, bind_values, spills)
+            del self.wrote[:]
             self.runner.mem_write(CODE, code)
             self.runner.mem_write(MEM, mem)
             for i in XI:
@@ -516,49 +634,87 @@ class Oracle:
                 undec += 1
                 continue
             want = bytes(self.runner.mem_read(MEM, MEMSZ))
-            body = Body(self.scratch, self.ureg, self.nzcv_id, body_regs, mem, written)
+            # The bytes the machine wrote that the printed body does not account for.
+            # Nothing clears a span once the body stores over it: the write log carries no
+            # order, so a span the machine wrote AFTER the body's own store would read as
+            # settled, and a conservative decline is the only safe way round that.
+            dirty = []
+            for at, size, val in self.wrote:
+                off = at - MEM
+                if off < 0 or off + size > MEMSZ:
+                    continue
+                put = (val & ((1 << (8 * size)) - 1)).to_bytes(size, "little")
+                if mem[off:off + size] != put:
+                    dirty.append((off, off + size))
+            body = Body(self.scratch, self.ureg, self.nzcv_id, body_regs, mem, written,
+                        dirty)
             try:
                 body.run(lines, words, defuse)
+            except Declined:
+                declined += 1
+                continue
             except Undecidable:
                 undec += 1
                 continue
             keep = [a for a, flag in body.writes.items() if flag]
             if not keep:
-                undec += 1
+                # Every printed store rested on something the body never established, so
+                # the body declined; with no printed store at all there was no claim and
+                # this harness has nothing to say either way.
+                if body.writes:
+                    declined += 1
+                else:
+                    undec += 1
             elif all(body.mem[a - MEM:a - MEM + 8] == want[a - MEM:a - MEM + 8]
                      for a in keep):
                 clean += 1
             else:
                 wrong += 1
-        return clean, wrong, undec, lines
+        return clean, wrong, declined, undec, lines
 
 
-def run(cases, trials, seed, preload, verbose):
+def run(cases, trials, seed, preload, verbose) -> dict:
+    """The sweep, as totals per outcome class.
+
+    A caller that wants the exit code reads `wrong`, which is the only class that is a
+    defect: `declined` is the printed body refusing to answer and `undecidable` is this
+    harness's own limit, and a sweep that reported either as a disagreement would be
+    reporting its own defects (#238). An empty dict means the tools are missing.
+    """
     if _unicorn() is None or _capstone() is None:
         print("SKIP: pbfuzz needs unicorn and capstone")
-        return 0
+        return {}
     bad_enc = verify_encodings()
     if bad_enc:
         for want, got in bad_enc:
             print(f"  ENCODER: wanted {want!r}, capstone read {got!r}")
-        return 2
+        return {"encoder": len(bad_enc)}
     oracle = Oracle()
     rng = random.Random(seed)
-    scored = clean = wrong = skipped = 0
+    scored = clean = wrong = declined = skipped = 0
+    envs = [0, 0, 0, 0]                      # agreed, disagreed, declined, undecidable
     worst = []
     for case in range(cases):
         rows = gen(rng, preload)
         try:
-            ok, no, _undec, lines = oracle.score(rows, trials, seed * 10007 + case,
-                                                 not preload)
+            ok, no, dec, und, lines = oracle.score(rows, trials, seed * 10007 + case,
+                                                   not preload)
         except AssertionError:
             continue
         except Exception as exc:                       # a lifter crash is a defect too
             print(f"  LIFTER RAISED {type(exc).__name__}: {exc}")
             wrong += 1
             continue
+        for i, n in enumerate((ok, no, dec, und)):
+            envs[i] += n
         if ok == 0 and no == 0:
-            skipped += 1
+            # Nothing to score. Which of the two it was decides whether the run says
+            # something about the lifter: a decline is the printed body refusing, and
+            # only the other kind is this harness's own limit (#238).
+            if dec:
+                declined += 1
+            else:
+                skipped += 1
             continue
         scored += 1
         if no == 0:
@@ -567,8 +723,10 @@ def run(cases, trials, seed, preload, verbose):
         wrong += 1
         if len(worst) < 3:
             worst.append((rows, lines, ok, no))
-    print(f"\n{cases} generated runs, {scored} scored ({skipped} undecidable), "
-          f"{clean} clean, {wrong} with a disagreement")
+    print(f"\n{cases} generated runs, {scored} scored, {clean} clean, "
+          f"{wrong} with a disagreement; {declined} declined, {skipped} undecidable")
+    print(f"  environments: {envs[0]} agreed, {envs[1]} disagreed, {envs[2]} declined, "
+          f"{envs[3]} undecidable")
     for rows, lines, ok, no in (worst if verbose or wrong else []):
         print("\n  run:")
         for t, _w in rows:
@@ -576,7 +734,9 @@ def run(cases, trials, seed, preload, verbose):
         print(f"  printed body (agreed in {ok} of {ok + no} environments):")
         for ln in lines:
             print(f"    {ln.strip()}")
-    return 1 if wrong else 0
+    return {"cases": cases, "scored": scored, "clean": clean, "wrong": wrong,
+            "declined": declined, "undecidable": skipped, "agreed": envs[0],
+            "disagreed": envs[1], "env_declined": envs[2], "env_undecidable": envs[3]}
 
 
 def main() -> int:
@@ -610,7 +770,10 @@ def main() -> int:
     if a.cases < 1 or a.trials < 1:
         ap.error("--cases and --trials must be positive")
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return run(a.cases, a.trials, a.seed, a.preload, a.verbose)
+    tot = run(a.cases, a.trials, a.seed, a.preload, a.verbose)
+    if tot.get("encoder"):
+        return 2
+    return 1 if tot.get("wrong") else 0
 
 
 
