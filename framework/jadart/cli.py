@@ -284,7 +284,7 @@ def cmd_lift(args) -> int:
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import recover_fields
+    from .fields import recover_allocations, recover_fields
     try:
         image, fr, hdr = load_instructions(args.libapp)
     except JadartError as e:
@@ -310,6 +310,7 @@ def cmd_lift(args) -> int:
     returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
+    allocs = recover_allocations(image, fr, layout)
     out = []
     for nm, cr in ranges:
         dis = disassemble_range(image, cr)
@@ -321,6 +322,7 @@ def cmd_lift(args) -> int:
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
+                             allocs=allocs,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
                              returns=returns)
         if getattr(args, "json", False):
@@ -865,7 +867,7 @@ def cmd_ffi(args) -> int:
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import recover_fields
+    from .fields import recover_allocations, recover_fields
     from .program import static_function_refs, receiver_for
     try:
         image, fr, hdr = load_instructions(args.libapp)
@@ -890,6 +892,7 @@ def cmd_ffi(args) -> int:
         returns = make_return_resolver(image)
         selectors = recover_selectors(image, fr, hdr)
         layout = recover_fields(fr, getattr(image, "arch", None))
+        allocs = recover_allocations(image, fr, layout)
         lit = _literal_re()
         for pc, cr in by_fn.items():
             dis = disassemble_range(image, cr)
@@ -902,6 +905,7 @@ def cmd_ffi(args) -> int:
                                      arity=arity, selectors=selectors,
                                      arch=getattr(image, "arch", None),
                                      fields=layout.for_function(cr.owner_ref),
+                                     allocs=allocs,
                                      show=rebaser(image), returns=returns)
             except JadartError:
                 # Tier 3 declines on a target it has no register model for (UnsupportedArch

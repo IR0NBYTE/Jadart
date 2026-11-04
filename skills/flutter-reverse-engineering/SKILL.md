@@ -43,7 +43,7 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | You see | It means | Do not say |
 |---|---|---|
 | `x2`, `x19`, `r4` | a machine register whose value was not reconstructed | "the counter", "the index" |
-| `field_0x8` | an instance field at byte offset 8; its name is not in the snapshot | "the `balance` field" |
+| `field_0x8` | an instance field at byte offset 8; its name was not recovered | "the `balance` field" |
 | `(...)` | a call whose arguments were not reconstructed | "called with the user id" |
 | `pool_0x1234` | an object pool slot that resolved to no name | "the HTTP client" |
 | `sub_0x1234` | a call to an unnamed function at that address | "the validator" |

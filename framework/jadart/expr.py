@@ -1104,6 +1104,18 @@ def _use_re(name: str):
     return pat
 
 
+def _base_re(name: str):
+    """A matcher for `name` used as the BASE of a dotted access, `t7.`.
+
+    Same cache as `_use_re`, keyed on the spelling it compiles, so the two cannot
+    collide."""
+    key = name + "."
+    pat = _USE_RE.get(key)
+    if pat is None:
+        pat = _USE_RE[key] = re.compile(rf"\b{re.escape(name)}\.")
+    return pat
+
+
 def _mentions(names):
     """A test for whether a text mentions any of `names`, word-bounded."""
     pats = [_use_re(n) for n in sorted(names)]
@@ -2854,7 +2866,7 @@ class Lifter:
     _reload_blind = False
 
     def __init__(self, blocks, pool_map=None, receiver=None, arity=None, dispatch=None,
-                 selectors=None, entry=None, fields=None):
+                 selectors=None, entry=None, fields=None, allocs=None):
         self.blocks = blocks
         self.pool_map = pool_map or {}
         #: Prints an operand kept as is, and names a range with no name; see
@@ -2882,10 +2894,25 @@ class Lifter:
         # table (dispatch.py). Missing entries keep the honest `sel_0x<off>` rendering.
         self.selectors = selectors or {}
         # fields: byte offset -> the RECEIVER's field name, recovered from the surviving
-        # Field objects (fields.py). Only the receiver, because that is the only value in
-        # the register file whose class the snapshot states; every other base keeps its
-        # offset. Empty by default, which is exactly the pre-existing rendering.
+        # Field objects (fields.py). Empty by default, which is exactly the pre-existing
+        # rendering.
         self.fields = fields or {}
+        # allocs: the per-class allocation stubs, pc -> AllocSite
+        # (fields.recover_allocations). A `bl` to one of these allocates an instance of a
+        # class the snapshot names, so the result is the SECOND base in the register file
+        # whose class is read rather than guessed; every other one keeps its offset.
+        self.allocs = {} if allocs is None else allocs.by_pc
+        #: The names this body minted for such a result, name -> AllocSite. Keyed by TEXT,
+        #: which is sound because `_mint` hands each name out once per lift and the only
+        #: line that assigns one is the `new` that produced it, so `t7` means that object
+        #: wherever it is read. Dropped for a base an access contradicts; see
+        #: `_alloc_field`.
+        self.alloc_of: dict = {}
+        #: Every name that has EVER been one, which `_reads_mem` asks. It only grows,
+        #: because a name dropped from the map above is still a name whose dotted reads
+        #: were printed, and a value holding one of those still has to go stale with the
+        #: memory it reads.
+        self._alloc_bases: set = set()
         # Block addresses a goto refers to; the renderer defines each exactly once.
         self.labels: set = set()
         self._labelled: set = set()
@@ -3155,7 +3182,7 @@ class Lifter:
         dying = _CALL_CLOBBERS if dying is None else dying
         out = []
         for key, v in sorted(st.reg.items()):
-            if key in dying or not _READS_MEMORY.search(v.text):
+            if key in dying or not self._reads_mem(v.text):
                 continue
             if not (self._live_after & _reg_mask((key,))):
                 continue
@@ -3568,7 +3595,7 @@ class Lifter:
         for k, v in st.slot.items():
             if (k.startswith(fp) and k[len(fp):][:1] in "+-" and k not in narrow
                     and len(files.get(k, ())) == 1
-                    and not _ANY_REG.search(v.text) and not _READS_MEMORY.search(v.text)):
+                    and not _ANY_REG.search(v.text) and not self._reads_mem(v.text)):
                 held[k] = v.text
         for b in trip:
             insns = self.blocks[b].insns
@@ -3701,7 +3728,7 @@ class Lifter:
             st.note_slot(key, v)
             return []
         st.lost_slot.pop(key, None)
-        if (at, key) not in self._slot_crossings() or not _READS_MEMORY.search(v.text):
+        if (at, key) not in self._slot_crossings() or not self._reads_mem(v.text):
             st.slot[key] = v
             if fp is not None and key.startswith(fp):
                 st.note_slot(key, v)
@@ -3832,7 +3859,7 @@ class Lifter:
                 return False
         return False
 
-    def _result(self, st: State, expr: str, reg: str = None) -> list:
+    def _result(self, st: State, expr: str, reg: str = None, alloc=None) -> list:
         """Emit a call, and give its result a name when anything reads it.
 
         `bl f` leaves the result in x0, and the lifter used to say so by putting the bare
@@ -3851,7 +3878,12 @@ class Lifter:
         double is the result and gets the name. It was left as d0, which is also how the
         d0 the function was handed reads, and two calls' results compared printed
         `if (d0 > d0)` (#134, #127). Liveness alone does not say it: a `ret` reads both
-        registers, so a call followed by `return NULL;` looked like it returned d0."""
+        registers, so a call followed by `return NULL;` looked like it returned d0.
+
+        `alloc` is the AllocSite of a per-class allocation stub, recorded against the name
+        so a field loaded off the new object can be named (#240). Against a NAME only:
+        where nothing reads the result the register keeps its own spelling, and
+        attributing a class to a bare `x0` would outlive the one value it is true of."""
         if reg is None:
             fp = self._d0_read(self._insns[self._at][0]) or self._reads_next(_T.ret_fp)
             reg = (_T.ret_fp if fp and not self._live_after & _reg_mask((_T.ret_int,))
@@ -3859,6 +3891,9 @@ class Lifter:
         if self._live_after & _reg_mask((reg,)):
             name, decl = self._mint(st, expr)
             self.results.add(name)
+            if alloc is not None:
+                self.alloc_of[name] = alloc
+                self._alloc_bases.add(name)
             st.set(reg, V(name, P_ATOM))
             return [decl]
         st.set(reg, V(reg, P_ATOM))
@@ -3957,7 +3992,7 @@ class Lifter:
             _forget_frame(st)       # and it may write the heap all the same
         st.stale_mem()
         out = self._pin_call(st, _def_use(mn, op)[0])
-        for k in [k for k, v in st.slot.items() if _READS_MEMORY.search(v.text)]:
+        for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
             st.forget_slot(k)
         return out
 
@@ -3995,7 +4030,7 @@ class Lifter:
             held = st.dropped.get(key)
             if held is not None:
                 v, fresh = held
-                if ((fresh or not _READS_MEMORY.search(v.text))
+                if ((fresh or not self._reads_mem(v.text))
                         and not any(r in self._printed_regs or r in self.printed_prior
                                     for r in _slot_regs(v.text))):
                     self.spelled_regs.update(_slot_regs(v.text))
@@ -4558,8 +4593,9 @@ class Lifter:
         field and the object header are each one word, and a read spanning two of them is
         not either of them.
         """
-        # A name is printed only when the base IS the receiver, because that is the one
-        # value whose class the snapshot names (Function.owner). `x3.field_0x8` stays an
+        # A name is printed for two bases and no others: the RECEIVER, whose class the
+        # snapshot names through Function.owner, and the result of an ALLOCATION this body
+        # made, whose class it names through Code.owner (#240). `x3.field_0x8` stays an
         # offset even where some class has a field there: attributing it would be a guess
         # about which class x3 holds, and a wrong field name reads as fact where a byte
         # offset reads as "the lifter does not know".
@@ -4579,8 +4615,10 @@ class Lifter:
         # field the access is in and a narrower read of it is that field's low part. The
         # width goes unsaid there, and saying it would need the name and the width both;
         # the byte-offset spelling is where it was unsaid with nothing else to go on.
-        name = (self.fields.get(byte_off)
-                if base_v.text == _RECEIVER and width <= 8 else None)
+        name = None
+        if width <= 8:
+            name = (self.fields.get(byte_off) if base_v.text == _RECEIVER
+                    else self._alloc_field(base_v.text, byte_off, width))
         if name:
             tag = "." + name
         elif width not in (4, 8):
@@ -4588,6 +4626,60 @@ class Lifter:
         else:
             tag = ".tags" if byte_off == 0 else f".field_0x{byte_off:x}"
         return V(f"{_wrap(base_v, P_POST)}{tag}", P_POST)
+
+    def _reads_mem(self, text: str) -> bool:
+        """True when this rendered value reads the heap somewhere inside it.
+
+        `_READS_MEMORY` is the pattern, and this adds the one case a pattern cannot see.
+        Its own comment gives the argument: once a field has a name the read no longer
+        spells `field_0x`, so a pattern that only knew the byte offset would leave
+        exactly the fields we understand best stale across a call. That was handled for
+        the receiver by matching `this.<name>`, which is a fixed spelling. An allocation's
+        result is a MINTED name, `t7`, so there is no spelling to match, and `t7.<name>`
+        and `t7.someGetter` are the same shape; which names are allocation bases is a
+        fact about this body rather than about the text (#240).
+
+        Free where nothing was allocated, which is most functions: the set is empty and
+        this is the pattern and nothing else."""
+        if _READS_MEMORY.search(text):
+            return True
+        return any(_base_re(n).search(text) for n in self._alloc_bases)
+
+    def _alloc_field(self, base: str, byte_off: int, width: int):
+        """The field name at `byte_off` of an object this body ALLOCATED, or None.
+
+        `base` is the name `_result` minted for an allocation stub's result, so the class
+        is the one the stub's owner Class states (fields.recover_allocations) and the map
+        is that class's own. Not an inference about which class a register holds: it is
+        the one object in the register file besides the receiver whose class was read.
+
+        AND THE REFUSAL, which is the point. `instance_size` bounds the object, so an
+        offset outside it cannot be a field of this class, and one that happens says
+        either the attribution or the base tracking is wrong. Either way nothing off this
+        base may be named again, so the whole attribution goes rather than the one access;
+        the same argument `recover_fields` makes for refusing the whole map when one
+        offset places outside its owner. Measured: all 7,504 accesses this attributes on
+        the clean fixture and all 7,515 on the obfuscated one land inside, so the drop is
+        a guard against being wrong and not a path the fixtures exercise.
+
+        The WIDTH is deliberately not added to the bound, and `width` is here only to say
+        why. The question is whether this offset can be a field of this class, and a field
+        starts inside the object; a `ldr x` over the last two compressed slots is a read
+        the compiler does emit, and its eight bytes overhang an instance_size that ends
+        four bytes in. So does the eight-byte spelling `_covers` asks for to cover a
+        four-byte write there. Neither is evidence that the class is wrong, and treating
+        them as such cost 19 names on the clean fixture and 2 on the obf one.
+
+        An offset INSIDE the object with no entry keeps its byte offset, which is 6,812 of
+        the 7,504: the slot is real, its `Field` object was tree-shaken, and there is
+        nothing to call it."""
+        site = self.alloc_of.get(base)
+        if site is None:
+            return None
+        if not 0 <= byte_off < site.instance_size:
+            del self.alloc_of[base]
+            return None
+        return site.fields.get(byte_off)
 
     def _call_args(self, name, target, st: State, pushed=None) -> str:
         """Reconstruct a direct call's argument list, or `...` when it cannot be done
@@ -4851,8 +4943,14 @@ class Lifter:
                 terse = label.replace("stub ", "").replace("_iso_stub_", "")
                 # terse, without the stub prefix; a stub's result is an object
                 return pre + self._result(st, f"{terse}(...)", _T.ret_int)
+            # A per-class allocation stub, which the snapshot names through the Code's
+            # owner Class rather than through any symbol (#240). Taken ahead of the name
+            # because the owner is the stronger statement: a dwarf_stack_traces build's
+            # symbol for one of these is a mangled stub label, and `new Color()` says the
+            # same thing in the spelling the object-store allocation stubs already use.
+            site = self.allocs.get(target) if target is not None else None
             call = name or self._sub(target or 0)
-            args = self._call_args(name, target, st, pushed)
+            args = "" if site is not None else self._call_args(name, target, st, pushed)
             # after the arguments are read, not before: they live in the very registers the
             # call is about to destroy, and reading them afterwards would print the bare
             # register for every argument of every call. `_pin_call` goes here for the same
@@ -4860,6 +4958,12 @@ class Lifter:
             # earlier would rename the arguments too.
             pins = self._pin_call(st)
             pins += self._clobber_call(st)
+            # An allocation enters the runtime on its slow path, so it keeps the ordinary
+            # call's invalidation rather than the register-preserving treatment a named
+            # stub gets: the only thing that changes here is what the line says.
+            if site is not None:
+                return pins + self._result(st, f"new {site.name}()", _T.ret_int,
+                                           alloc=site)
             # The receiver is NOT dropped from `pushed`, unlike the dispatch case. A `blr`
             # prints its receiver as the base of the call (`x.foo(...)`) so listing it
             # again would show it twice; a direct call has no base, so argument zero is
@@ -6239,7 +6343,7 @@ class Lifter:
                 memory is decided by text exactly as before, and where it does the arm
                 assigns the name itself, after its own store, which is the only place the
                 read is sound. Found by tools/irfuzz.py --cfgmem --seed-outputs."""
-                return v != pre or bool(_READS_MEMORY.search(v.text))
+                return v != pre or bool(self._reads_mem(v.text))
             # The initialiser exists only for an arm that leaves the value alone. Where
             # both arms assign it, giving one anyway would DUPLICATE the entry expression
             # 506 extra byte-offset field lines on the corpus, paid for a value no path
@@ -6416,7 +6520,7 @@ class Lifter:
                         # REGISTER is not enough and dropping every register is far too
                         # much, so what goes is exactly the values that read memory.
                         for r, v in sorted(st.reg.items()):
-                            if v.text != r and _READS_MEMORY.search(v.text):
+                            if v.text != r and self._reads_mem(v.text):
                                 st.forget(r)
                         st.elem.clear()
                 blines, bfalls = self._lift_block(s[1], st)
@@ -6494,7 +6598,7 @@ class Lifter:
                         self._stale_slots(st, kill)
                     if heap:
                         for r, v in sorted(st.reg.items()):
-                            if v.text != r and _READS_MEMORY.search(v.text):
+                            if v.text != r and self._reads_mem(v.text):
                                 st.forget(r)
                         st.elem.clear()
                     doms = self._dominators(s[1])
@@ -6614,7 +6718,7 @@ class Lifter:
                 v = st.reg[key]
                 if v.text == key or not live & _reg_mask((key,)):
                     continue                  # its own name, or nothing reads it again
-                if not _READS_MEMORY.search(v.text):
+                if not self._reads_mem(v.text):
                     continue
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
@@ -6949,7 +7053,7 @@ class Lifter:
                             st.slot.pop(f"{fp}{off:+d}", None)
         if self._writes_heap(loop) or any(mn in ("bl", "blr") for b in loop
                                           for (_a, mn, _o, _n) in self.blocks[b].insns):
-            for k in [k for k, v in st.slot.items() if _READS_MEMORY.search(v.text)]:
+            for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
                 del st.slot[k]
         ended = self._ended_blocks()
         near = {b for b in self._loop_nodes(header)
@@ -8221,13 +8325,15 @@ def _drop_unread_slots(lines: list, names: set) -> list:
 
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
                   indent="  ", depth=1, selectors=None, arch=None, fields=None,
-                  show=None, cut_end=None, returns=None) -> list:
+                  show=None, cut_end=None, returns=None, allocs=None) -> list:
     """Annotated disasm -> pseudo-Dart body lines (Tier 3). `receiver` is an optional
     register-alias map, e.g. {"x1": "this"} for an instance method; `arity` is an optional
     `pc -> int` resolver (see make_arity_resolver) enabling call-argument reconstruction;
     `selectors` maps a dispatch-call immediate to its source name (see dispatch.py);
     `fields` maps a byte offset to the receiver's field name at that offset (see
-    fields.py), and only the receiver's, so an unresolved base still prints its offset.
+    fields.py); `allocs` is the AllocLayout of per-class allocation stubs from the same
+    module, which names the class of an object this body allocates. Those are the two
+    bases a field name is printed off, and an unresolved base still prints its offset.
     `show` prints the operand of an instruction kept as it is, rebaser(image) from disasm
     so that an `adr` target reads as a virtual address; without it the operand is
     capstone's. `cut_end` is where the range ends when the instruction cut stopped `ann`
@@ -8251,7 +8357,7 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     with use_target(TARGETS[name] if name else ARM64):
         try:
             return _lift_function(ann, pool_map, receiver, arity, indent, depth,
-                                  selectors, fields, show, cut_end, returns)
+                                  selectors, fields, show, cut_end, returns, allocs)
         except RecursionError:
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
@@ -8316,7 +8422,8 @@ def use_target(tgt: Target):
 
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                   fields=None, show=None, cut_end=None, returns=None) -> list:
+                   fields=None, show=None, cut_end=None, returns=None,
+                   allocs=None) -> list:
     slow = set()
     stripped = strip_boilerplate(ann, slow)
     # Tier 3 honours traps, the rule tier 2 took in #57: a block ends at a `brk`/`udf`
@@ -8340,7 +8447,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
-                        fields=fields)
+                        fields=fields, allocs=allocs)
         lifter.show = show
         lifter.slow_paths = frozenset(slow)
         lifter.frame_meets = meets
