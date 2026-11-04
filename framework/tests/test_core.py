@@ -11958,28 +11958,32 @@ def test_a_branch_reads_the_operands_its_flags_were_set_from():
     def lift(rows):
         return [ln.strip() for ln in lift_function(rows)]
 
+    # The `subs` prints no line of its own in these bodies: #239 models the VALUE a
+    # flag-setting op writes, through the same twin `sub` is read by, and nothing here
+    # reads the x1 it leaves. What this pins is the condition, which still has to read
+    # the operands as the flags saw them.
     assert lift([(0, "subs", "x1, x1, #8", ""), (4, "b.ne", "#0xc", ""),
                  (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")]) == [
-        "var t0 = x1;", "subs x1, x1, #8", "if (t0 == 8) {", "x2.field_0x8 = 0;", "}",
-        "return x0;"]
+        "var t0 = x1;", "if (t0 == 8) {", "x2.field_0x8 = 0;", "}", "return x0;"]
     assert lift([(0, "ands", "x3, x3, #0xfffffff9", ""), (4, "b.eq", "#0xc", ""),
-                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[2] == (
-        "if ((t0 & 0xfffffff9) != 0) {")
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[:2] == [
+        "var t0 = x3;", "if ((t0 & 0xfffffff9) != 0) {"]
     # an operand that is a field read keeps its text, and needs no name
     assert lift([(0, "ldur", "x1, [x2, #0xf]", ""), (4, "subs", "x1, x1, #8", ""),
                  (8, "b.ne", "#0x10", ""), (12, "str", "xzr, [x2, #7]", ""),
-                 (16, "ret", "", "")])[1] == "if (x2.field_0x10 == 8) {"
-    # and in the copy loop the loop's own name for x1 is the old value
+                 (16, "ret", "", "")])[0] == "if (x2.field_0x10 == 8) {"
+    # and in the copy loop the loop's own name for x1 is the old value, which the trip
+    # now also updates, since the `subs` writes one
     body = lift([(0, "ldr", "x0, [x3], #8", ""), (4, "str", "x0, [x4], #8", ""),
                  (8, "subs", "x1, x1, #8", ""), (12, "b.ne", "#0x0", ""),
                  (16, "ret", "", "")])
-    at = next(i for i, ln in enumerate(body) if ln.startswith("subs x1, x1, #8"))
-    assert body[at + 1] == "if (t0 == 8) {", body
+    assert "if (t0 == 8) {" in body, body
+    assert "t0 -= 8;" in body, body
     # The flags are set from the sources, and an x1 the instruction only writes is no
     # source: nothing is named for it.
     assert lift([(0, "subs", "x1, x0, x2", ""), (4, "b.ne", "#0xc", ""),
-                 (8, "str", "xzr, [x3, #7]", ""), (12, "ret", "", "")])[:2] == [
-        "subs x1, x0, x2", "if (x0 == x2) {"]
+                 (8, "str", "xzr, [x3, #7]", ""), (12, "ret", "", "")])[0] == (
+        "if (x0 == x2) {")
     # A compare sets the flags without writing, and reads as it always did.
     assert lift([(0, "cmp", "x1, #8", ""), (4, "b.ne", "#0xc", ""),
                  (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[0] == (
@@ -11987,26 +11991,30 @@ def test_a_branch_reads_the_operands_its_flags_were_set_from():
     # A select reads the flags as the branch does.
     assert lift([(0, "subs", "x1, x1, #8", ""), (4, "csel", "x0, x3, x4, ne", ""),
                  (8, "ret", "", "")]) == [
-        "var t0 = x1;", "subs x1, x1, #8", "return t0 != 8 ? x3 : x4;"]
+        "var t0 = x1;", "return t0 != 8 ? x3 : x4;"]
     # cbz and tbz test their register as it is when they run, not the flags left by
     # the instruction before, and with nothing reading the flags nothing is named.
+    # The register they test is the one the `subs` wrote, and #239 knows what that is
+    # now, so it reads as the value rather than as the bare name after a raw line.
     assert lift([(0, "subs", "x1, x1, #8", ""), (4, "cbz", "x1, #0xc", ""),
-                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[:2] == [
-        "subs x1, x1, #8", "if (x1 != 0) {"]
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[0] == (
+        "if ((x1 - 8) != 0) {")
     assert lift([(0, "subs", "x1, x1, #2", ""), (4, "tbnz", "x1, #1, #0xc", ""),
-                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[1] == (
-        "if ((x1 >> 1) & 1 == 0) {")
+                 (8, "str", "xzr, [x2, #7]", ""), (12, "ret", "", "")])[0] == (
+        "if (((x1 - 2) >> 1) & 1 == 0) {")
     assert lift([(0, "ldur", "x0, [x2, #7]", ""), (4, "cmp", "x0, #5", ""),
                  (8, "stur", "xzr, [x2, #7]", ""), (12, "cbz", "x0, #0x14", ""),
                  (16, "stur", "x0, [x2, #0xf]", ""), (20, "ret", "", "")])[2] == (
         "if (t0 != 0) {")
     assert lift([(0, "subs", "x1, x1, #8", ""), (4, "str", "x1, [x2, #7]", ""),
-                 (8, "ret", "", "")])[0] == "subs x1, x1, #8"
+                 (8, "ret", "", "")])[0] == "x2.field_0x8 = x1 - 8;"
     # ...nor where the flags are replaced, or an operand overwritten, before the select.
+    # What says the select was declined is the select itself staying raw, since the
+    # `subs` above it no longer prints a line of its own (#239).
     for row in (("sbcs", "x5, x6, x7"), ("mov", "x1, #3")):
         body = lift([(0, "subs", "x1, x1, #8", ""), (4, *row, ""),
                      (8, "csel", "x0, x3, x4, ne", ""), (12, "ret", "", "")])
-        assert body[0] == "subs x1, x1, #8", body
+        assert any(ln.startswith("csel ") for ln in body), body
 
 
 def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
@@ -12018,7 +12026,10 @@ def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
     def lift(rows):
         return [ln.strip() for ln in lift_function(
             [(i * 4, *r, "") for i, r in enumerate(rows)])]
-    for raw in (("subs", "x1, x1, #8"), ("adcs", "x1, x1, x3"), ("mrs", "x1, nzcv"),
+    # `subs` was the first of these and is no longer one: #239 models the value it
+    # writes, so it prints no raw line. `adcs` still does, because its value needs the
+    # carry bit and nothing here can spell that.
+    for raw in (("adcs", "x1, x1, x3"), ("mrs", "x1, nzcv"),
                 ("fmov", "x1, d0"), ("ldr", "x1, [x1, #-8]!")):
         body = lift([("add", "x5, x1, #1"), raw, ("str", "x5, [x2, #7]"), ("ret", "")])
         assert body == ["var t0 = x1 + 1;", " ".join(raw), "x2.field_0x8 = t0;",
@@ -12071,9 +12082,13 @@ def test_a_value_spelled_with_a_register_a_raw_line_writes_is_named_first():
             ("br", "x16", set(), {"x16"})):
         assert _def_use(mn, op) == (defs, uses), (mn, _def_use(mn, op))
     # Nothing reads x5 after the line, so nothing is named, and a name nothing prints
-    # is left out: `ret` counts d0 as read, and `isNaN` returns x0.
+    # is left out: `ret` counts d0 as read, and `isNaN` returns x0. The `subs` prints no
+    # line of its own either, since #239 models the value and nothing reads x1 (`adcs`
+    # below is the raw one, and its value needs a carry bit nothing here can spell).
     assert lift([("add", "x5, x1, #1"), ("subs", "x1, x1, #8"), ("ret", "")]) == [
-        "subs x1, x1, #8", "return x0;"]
+        "return x0;"]
+    assert lift([("add", "x5, x1, #1"), ("adcs", "x1, x1, x3"), ("ret", "")]) == [
+        "adcs x1, x1, x3", "return x0;"]
     assert lift([("ldur", "d0, [x0, #7]"), ("fcmp", "d0, d0"),
                  ("csel", "x0, x16, x0, vc"), ("ret", "")]) == [
         "csel x0, x16, x0, vc", "return x0;"]
@@ -16035,6 +16050,115 @@ def test_a_join_a_section_falls_into_still_binds_its_phi_name():
     assert sum(1 for ln in body.split("\n")
                if re.match(rf"\s*{name} = ", ln)) >= 2, (
         f"`{name}` has to be written on every way into the join\n{body}")
+
+
+def test_a_flag_setting_alu_op_prints_the_value_it_wrote():
+    # The flags and the value are two definitions of one instruction, and only the flags
+    # were modelled: `subs x0, x1, x2` printed as arm64 where `sub x0, x1, x2` prints
+    # `x1 - x2`, and the register it wrote read as nothing. 262 raw lines on the clean
+    # fixture, the only difference being the flag suffix (#239).
+    #
+    # Every other tool splits the two. Ghidra translates one instruction to a sequence of
+    # p-code operations each writing at most one varnode; Binary Ninja lifts the value as
+    # the ordinary definition and puts the flag IL beside it; LLVM's `SUBSWrr` writes its
+    # GPR and carries `implicit-def $nzcv`. So the value comes from the plain twin.
+    from jadart.expr import lift_function
+    rows = lambda rs: [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rs)]
+
+    def one(mn, op):
+        return [ln.strip() for ln in lift_function(rows([(mn, op), ("ret", "")]),
+                                                   arch="arm64")]
+    for mn, want in (("subs", "return x1 - x2;"), ("adds", "return x1 + x2;"),
+                     ("ands", "return x1 & x2;"), ("bics", "return x1 & ~x2;")):
+        assert one(mn, "x0, x1, x2") == [want], (mn, one(mn, "x0, x1, x2"))
+    assert one("negs", "x0, x1") == ["return -x1;"], one("negs", "x0, x1")
+    # Writing the zero register is what `cmp` is, and `State.set` drops it, so there is
+    # no value to print and the entry x0 is what the return reads.
+    assert one("subs", "xzr, x1, x2") == ["return x0;"], one("subs", "xzr, x1, x2")
+    # The flags still hold the comparison: the condition AND the value, from one line.
+    body = [ln.strip() for ln in lift_function(
+        rows([("subs", "x3, x1, x2"), ("b.eq", "#0x10"), ("mov", "x0, x3"), ("ret", ""),
+              ("mov", "x0, xzr"), ("ret", "")]), arch="arm64")]
+    assert "if (x1 != x2) {" in body, body
+    assert "return x1 - x2;" in body, body
+
+
+def test_a_select_reads_a_comparison_from_the_one_block_that_reaches_it():
+    # `_flag_cond` declined wherever the flags were set in another block, which was 102
+    # of its 106 declines on the clean fixture, and 78 `csel` lines printed as arm64 while
+    # the same select beside its own `cmp` rendered exactly (#239).
+    #
+    # The other tools keep the fact in state rather than per block: VEX holds the last
+    # flag-setting op and its operands in guest state and computes the condition where it
+    # is READ, so it crosses an edge like any value. `self._flags` already is such a
+    # thunk, so what was missing is the edge, and it is taken only where the block has
+    # ONE way in, which is the only case with nothing to meet.
+    from jadart.cfg import build_cfg
+    from jadart.expr import lift_function
+    rows = lambda rs: [(0x1000 + i * 4, mn, op, "") for i, (mn, op) in enumerate(rs)]
+
+    def body(rs):
+        return [ln.strip() for ln in lift_function(rows(rs), {}, arch="arm64")]
+
+    # one way in, over an unconditional branch: the predicate is known exactly
+    assert body([("cmp", "x1, x2"), ("b", "#0x1008"),
+                 ("csel", "x0, x1, x2, lt"), ("ret", "")]) == [
+        "return x1 < x2 ? x1 : x2;"]
+    # and over a conditional one, where the condition is spelled from it as well
+    out = body([("cmp", "x1, x2"), ("b.eq", "#0x1010"), ("csel", "x0, x1, x2, lt"),
+                ("ret", ""), ("mov", "x0, xzr"), ("ret", "")])
+    assert "if (x1 != x2) {" in out and "return x1 < x2 ? x1 : x2;" in out, out
+    # TWO ways in and it stays raw: the select would have to meet two comparisons, and
+    # `_flag_cond`'s bar is that the predicate is known exactly.
+    two = [("cmp", "x1, x2"), ("b.eq", "#0x100c"), ("cmp", "x3, x4"),
+           ("csel", "x0, x1, x2, lt"), ("ret", "")]
+    blocks, _e = build_cfg(rows(two))
+    assert len([a for a in blocks if 0x100c in blocks[a].succ]) == 2
+    assert any(ln.startswith("csel ") for ln in body(two)), body(two)
+    # A comparison that overwrote an operand it compared is declined rather than re-read:
+    # the arriving state has the NEW x1, and only the text the predecessor captured has
+    # the old one (#116).
+    assert any(ln.startswith("csel ") for ln in body(
+        [("subs", "x1, x1, #8"), ("b", "#0x1008"), ("csel", "x0, x3, x4, ne", ),
+         ("ret", "")])), "a comparison that overwrote its own operand must decline"
+    # one it did not overwrite is read across the edge
+    assert body([("subs", "x5, x1, x2"), ("b", "#0x1008"),
+                 ("csel", "x0, x3, x4, ne"), ("ret", "")]) == [
+        "return x1 != x2 ? x3 : x4;"]
+
+
+def test_the_generated_corpus_can_draw_a_flag_setting_alu_op():
+    # The gate for the value above, and the reason it had to be built: a flag-setting op
+    # sits next to the branch that reads it, and a branch ends a straight-line run, so
+    # `expr_cases` draws 5 runs containing one out of 6,623 over the whole clean fixture
+    # and the default sweep reaches none of them. Nothing in this repo could see the
+    # class, which is what #235 says is the real defect.
+    #
+    # Its own pool, drawn under `--flags`, because every named case in this suite is a
+    # (seed, index) coordinate into a generator stream and widening the shared pool moves
+    # all of them (#230).
+    #
+    # The encoding half needs capstone to decode what it claims, so it skips without it,
+    # the way every other test that reaches a disassembler here does. The pool itself is
+    # checked either way, since the tables and the generator are stdlib only.
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import irfuzz
+    import random
+    if _capstone_available():
+        assert not irfuzz.verify_fuzz_encodings(), "a claimed text does not decode"
+    flagged = {t.split()[0] for t, _enc in irfuzz._FUZZ_FLAG_ALU + irfuzz._FUZZ_FLAG_IMM}
+    assert flagged == {"adds", "subs", "ands", "bics"}, flagged
+    assert flagged <= irfuzz._PURE, "the oracle has to treat them as value-preserving"
+    plain = {t.split()[0] for t, _enc in irfuzz._FUZZ_ALU + irfuzz._FUZZ_IMM}
+    assert not (plain & flagged), "the shared pool must not move: named cases index it"
+    # and the graphs really contain them when asked, and really do not when not
+    for flags, want in ((True, True), (False, False)):
+        seen = set()
+        for i in range(60):
+            words = irfuzz._gen_function(random.Random(i), flags=flags)
+            seen |= {w & 0xFF800000 for w in words}
+        drew = bool(seen & {0xAB000000, 0xEB000000, 0xEA000000, 0xB1000000, 0xF1000000})
+        assert drew == want, (flags, drew)
 
 
 if __name__ == "__main__":

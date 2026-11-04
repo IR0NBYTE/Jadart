@@ -916,6 +916,75 @@ a real question and not an oversight: clearing them says nothing is lost, where 
 reading of a block with no justified way in may be that everything is. That belongs with
 #140 and #208.
 
+### What a flag-setting instruction writes, and where its comparison can be read
+
+Two halves of #239, and the same shape as the other tools' answer in both.
+
+THE VALUE AND THE FLAGS ARE TWO DEFINITIONS OF ONE INSTRUCTION, and only the flags were
+modelled. `subs x0, x1, x2` printed as arm64 where `sub x0, x1, x2` prints `x1 - x2`, the
+only difference between them being the flag suffix, and the register it wrote read as
+nothing after it: 262 raw lines on the clean fixture. Ghidra translates one machine
+instruction to a sequence of p-code operations, each of which writes at most one varnode,
+so the register result is its own operation and the flag bits are theirs. Binary Ninja
+lifts the value as the ordinary definition and emits the flag IL beside it, only where a
+consumer reads it. LLVM's AArch64 `SUBSWrr` writes its GPR and carries
+`implicit-def $nzcv`, and where the value is unused the selector emits `$wzr = SUBSWrr`,
+which is what `cmp` is. Here the value comes from the plain twin and the flags stay with
+`_note_flags`, which is also LLVM's own rewrite in the other direction: its
+`AArch64PostSelectOptimize` turns a flag-setting op back into the plain one when NZCV is
+dead.
+
+THE COMPARISON LIVES IN STATE, NOT IN A BLOCK. `_flag_cond` declined wherever the flags
+were set anywhere but the block it was asked in, and that was 102 of its 106 declines on
+the clean fixture. VEX keeps a thunk of the last flag-setting op and its operands in GUEST
+STATE (`CC_OP`, `CC_DEP1`, `CC_DEP2`) and computes the condition where it is READ, so the
+fact crosses an edge like any other value; Hex-Rays makes the condition its own
+microinstruction over the two comparands, so it is an operand; Binary Ninja resolves a
+flag use where the flags were set by one instruction that reaches the use, a unique
+reaching definition rather than same-block adjacency. `self._flags` already IS that
+thunk, mnemonic and operands and their rendered values, so the only thing missing was the
+edge, and it is taken where the block has one predecessor, which is the one case with
+nothing to meet.
+
+THE VALUES ARE RE-READ AT THE USE rather than carried as text, which is the part #237 paid
+for twice. The text a predecessor captured can name a temp it declared, and `structure`
+prints blocks in an order that is not a path, so that name need not be in scope where the
+condition is read. For a block with one way in the arriving state IS the predecessor's
+exit state, so re-reading spells the same values in names that are in scope, and it is
+exact because the thunk's own invalidation guarantees nothing after the comparison wrote
+an operand of it. The exception is a comparison that overwrote an operand it compared,
+`subs x1, x1, #8`, where the arriving state holds the new value and only the captured text
+holds the old one (#116); that one declines.
+
+MEASURED, AND THE CEILING IS A MEASUREMENT TOO. On the clean fixture raw arm64 goes
+1,553 to 1,288, with `subs`, `ands` and `adds` gone from the histogram entirely, lines
+carrying a bare machine register 20,015 to 19,446, 254 lines off the output, byte-offset
+fields 13 fewer, and the #198 wrong-reload residual 2,089 to 2,086; the obf fixture
+moves by the same amounts. The second half is worth 3 of the 78 raw selects, and the
+other 99 declines are accounted for rather than assumed: 48 are joins, whose two ways in
+would have to agree before anything could be spelled, 32 are the `subs x1, x1, #8` shape
+above, 13 had their comparison dropped before the edge, and 4 are blocks nothing
+reaches. The joins are the next step and the largest one.
+
+AND THE GATE DID NOT EXIST, which is the part worth copying from #235. A flag-setting op
+sits next to the branch that reads it and a branch ends a straight-line run, so
+`expr_cases` draws 5 runs containing one out of 6,623 over the whole clean fixture, and
+the default sweep of 2,001 runs reaches none of them: the class could not be adjudicated
+at all. The forms are drawn in the generated graphs now, under `--flags` and in a pool
+of their own, because every named case in the suite is a (seed, index) coordinate into a
+generator stream and widening the shared pool moves all of them (#230, and two ablation
+gates read as blind the moment it did). On those graphs the oracle goes from 300
+register results run against a CPU to 17,800, and from 127,350 printed expressions to
+246,750, with no disagreement on any seed.
+
+ONE THING MEASURED AND NOT SHIPPED. The thunk is invalidated by a write to any register in
+the comparison's operand list, which includes the DESTINATION: `subs x5, x1, x2` compares
+x1 and x2, and a later write to the dead x5 cannot change what either says. Narrowing that
+to the registers the captured values rest on renders 31 more selects, taking the raw count
+to about 44, and costs 9 more #198 wrong reloads, 2,086 to 2,095. That is a trade across
+two numbers the census deliberately keeps apart, so it belongs to its own change with its
+own measurement rather than riding in here.
+
 ## Follow-ups (UNVERIFIED items to close)
 - wire-ref signed/unsigned history: `git log -p runtime/vm/datastream.h` across tags.
 - exact 2.18 / 3.4 stream deltas: diff app_snapshot.cc / class_id.h between those tags.
