@@ -13,6 +13,54 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A flag-setting ALU op prints the value it wrote.** `subs x0, x1, x2` printed as arm64
+  where `sub x0, x1, x2` prints `x1 - x2`, the only difference being the flag suffix, and
+  the register it wrote then read as nothing: 262 raw lines on the clean fixture, 131
+  `subs`, 103 `ands` and 28 `adds`. The flags and the value are two definitions of one
+  instruction and only the flags were modelled. Every other tool splits them. Ghidra
+  translates one instruction to a sequence of p-code operations each of which writes at
+  most one varnode, so the register result is its own operation and the flag bits are
+  theirs. Binary Ninja lifts the value as the ordinary definition and puts the flag IL
+  beside it, only where a consumer reads it. LLVM's AArch64 `SUBSWrr` writes its GPR and
+  carries `implicit-def $nzcv`, and the selector emits `$wzr = SUBSWrr` where the value
+  is unused, which is what `cmp` is. So the value is taken from the plain twin
+  (`_FLAG_VALUE`) and the flags stay with `_note_flags`; writing the zero register is that
+  same `cmp` form written out, and `State.set` already drops it. On the clean fixture raw
+  arm64 lines go 1,553 to 1,291 with `subs`, `ands` and `adds` gone from the histogram
+  entirely, lines carrying a bare machine register 20,015 to 19,449, 254 lines off the
+  output, and the #198 wrong-reload residual 2,089 to 2,086. The obf fixture moves by the
+  same amounts.
+- **A select reads the comparison the one block that reaches it left.** `_flag_cond`
+  declined wherever the flags were set in another block, which was 102 of its 106 declines
+  on the clean fixture, and 78 `csel` lines printed as arm64 while the same select beside
+  its own `cmp` rendered exactly. The other tools keep this fact in state rather than per
+  block: VEX holds the last flag-setting op and its operands in guest state (`CC_OP`,
+  `CC_DEP1`, `CC_DEP2`) and computes the condition where it is READ, so it crosses an edge
+  like any value; Hex-Rays makes the condition its own microinstruction over the two
+  comparands; Binary Ninja resolves a flag use where the flags were set by one instruction
+  that reaches it. `self._flags` already is such a thunk, so what was missing is the edge.
+  It is taken only where the block has ONE predecessor, the one case with nothing to meet,
+  and the values are re-read from the arriving state rather than carried as the text the
+  predecessor captured, since that text can name a temp declared in a block `structure`
+  printed elsewhere (#237). A comparison that overwrote an operand it compared is declined
+  instead of re-read, because only the captured text has the old value there (#116). Three
+  more selects render, raw arm64 1,291 to 1,288, and the census does not move. The ceiling
+  is in the measurement rather than in an argument: of the 99 that still decline, 48 are
+  joins, whose two ways in would have to agree before anything could be spelled, 13 had
+  their comparison dropped before the edge and 4 are blocks nothing reaches.
+- **The generated corpus can draw a flag-setting ALU op.** No gate in this repo could
+  see the value above. One of those ops sits next to the branch that reads it, and a
+  branch ends a straight-line run, so `tools/irfuzz.py`'s `expr_cases` draws 5 runs
+  containing one out of 6,623 over the whole clean fixture and the default sweep reaches
+  none of them, which is the shape #235 calls the real defect. The four register forms
+  and two immediate forms are drawn now under `--flags`, in a pool of their own and as a
+  pass of its own in the standard sweep, because every named case in the suite is a
+  (seed, index) coordinate into a generator stream and widening the shared pool would
+  move all of them (#230). On the generated graphs the oracle goes from 300 register
+  results run against a CPU to 17,800, and from 127,350 printed expressions to 246,750,
+  with no disagreement on any seed. `bic` and `bics` join the value-preserving set with
+  them, since `xN & ~xM` is the operation exactly and leaving `bic` out would say the
+  suffix mattered to the arithmetic.
 - **A loop falls out to a block some run can enter.** A natural loop is the header plus
   the blocks it DOMINATES that reach a latch without passing the header, and `loop_nodes`
   asked the dominance half of its latches and only the reaching half of the body. A block

@@ -1337,6 +1337,25 @@ _FLAG_SRC = frozenset({"cmp", "cmn", "tst", "fcmp", "fcmpe", "subs", "adds",
 _FLAG_KILL = frozenset({"negs", "adcs", "sbcs", "ccmp", "ccmn", "fccmp", "fccmpe",
                         "bl", "blr"})
 
+#: A flag-setting ALU op, and the plain twin that computes the same VALUE.
+#:
+#: The flags and the value are two definitions of one instruction, and only the flags
+#: were modelled here, so `subs x0, x1, x2` printed as arm64 where `sub x0, x1, x2`
+#: prints `x1 - x2`, and the register it wrote read as nothing: 262 raw lines on the
+#: clean fixture, the only difference being the flag suffix (#239). Every other tool
+#: splits the two. Ghidra translates one instruction to a sequence of p-code operations
+#: each of which writes at most one varnode, so the register result is its own operation
+#: and the flag bits are theirs. Binary Ninja lifts the value as the ordinary definition
+#: and emits the flag IL beside it, only where a consumer reads it. LLVM's AArch64
+#: `SUBSWrr` writes its GPR and carries `implicit-def $nzcv`, and the selector emits
+#: `$wzr = SUBSWrr` where the value is unused, which is what `cmp` is.
+#:
+#: So the value is taken from the twin and the flags stay with `_note_flags`. `State.set`
+#: drops a write to xzr, which is that same `cmp` form written out, so it needs no case
+#: of its own here.
+_FLAG_VALUE = {"subs": "sub", "adds": "add", "ands": "and", "bics": "bic",
+               "negs": "neg"}
+
 #: Conditional select and its aliases -> how many operands sit between the destination
 #: and the condition code. Each is an exact expression, not an approximation: the
 #: architecture defines them as "d = cond ? a : f(b)" with f the identity, +1, ~ or -.
@@ -2877,6 +2896,8 @@ class Lifter:
                 if s in self._preds:
                     self._preds[s].append(a)
         self.carried = {}    # loop header -> set of carried regs
+        #: block -> the comparison it left live, for `_flags_in`.
+        self._flags_out: dict = {}
         # (mnemonic, operands, {reg: rendered value}, register set) for the comparison
         # whose result is sitting in the condition flags right now, or None.
         self._flags = None
@@ -4692,7 +4713,10 @@ class Lifter:
             return []
 
         flagged = self._note_flags(st, mn, op, ops, addr in self._flag_reads)
-        out = self._step_rest(st, addr, mn, op, note, ops, g)
+        # The flags are noted above and the value comes from the plain twin
+        # (`_FLAG_VALUE`, #239). `mn` itself is kept for the width rule below, which is
+        # the machine's and knows both spellings.
+        out = self._step_rest(st, addr, _FLAG_VALUE.get(mn, mn), op, note, ops, g)
         # One place, after the branch that modelled the instruction, because the rule is
         # the machine's and not any one mnemonic's: a 32-bit destination clears the top
         # half of its register (#235).
@@ -5760,7 +5784,7 @@ class Lifter:
     def _lift_block(self, addr, st: State):
         """Return (lines, falls_through) for one basic block, mutating `st`."""
         blk = self.blocks[addr]
-        self._flags = None         # flags do not survive into a block from an unknown one
+        self._flags = self._flags_in(addr, st)
         # Both of these are adjacency claims about consecutive instructions, and adjacency
         # does not survive a branch any more than flag provenance does.
         self._last_mem = None
@@ -5872,6 +5896,9 @@ class Lifter:
         # Kept for `_reenter`: a block emitted after something that did not fall through
         # needs the state of its own predecessor, not of whatever the tree put above it.
         self._exit[addr] = st.copy()
+        # The comparison the block leaves live, for the one successor that can justify
+        # taking it (`_flags_in`).
+        self._flags_out[addr] = self._flags
         st.src = addr
         return lines, falls
 
@@ -5925,6 +5952,59 @@ class Lifter:
         # the one caller that needs the ARRIVING edge is handed it directly, because that
         # edge is what a goto-join's phi record is about (`_join_write`).
         st.src = preds[0] if carry is not None else None
+
+    def _flags_in(self, addr, st: State):
+        """The comparison `addr` may read on arrival, or None.
+
+        Flags do not survive into a block from an unknown one, and that is what this used
+        to say for EVERY block: the thunk was dropped at each entry. `_flag_cond` then
+        declined for want of a live comparison, which is what 101 of its 106 declines on
+        the clean fixture were, and 78 `csel` lines printed as arm64 while the same select
+        in the same block as its `cmp` rendered exactly (#239).
+
+        The other tools keep this fact in state rather than per block. VEX holds a thunk
+        of the last flag-setting op and its operands in GUEST STATE (`CC_OP`, `CC_DEP1`,
+        `CC_DEP2`) and computes the condition where it is READ, so it crosses an edge like
+        any value; Hex-Rays makes the condition its own microinstruction over the two
+        comparands, so it is an operand; Binary Ninja resolves a flag use when the flags
+        were set by one instruction that reaches it, which is a unique reaching
+        definition and not same-block adjacency. `self._flags` already IS such a thunk,
+        mnemonic and operands and their rendered values, so what was missing is the edge.
+
+        Taken only where the block has ONE predecessor in the graph: then the comparison
+        it reads is the one that edge left and there is nothing to meet. A branch does not
+        write the flags, so a thunk still live at the predecessor's exit is live on the
+        edge out of it. Of the 99 that still decline on the clean fixture, 48 are joins,
+        whose two ways in would have to AGREE before anything could be spelled, 13 had
+        their comparison dropped before the edge and 4 are blocks nothing reaches.
+
+        The VALUES are re-read from the arriving state rather than taken from the text the
+        predecessor captured, which is what VEX does with `CC_DEP1`/`CC_DEP2`: keep the
+        operands and compute the condition where it is READ. The captured text would be
+        the wrong thing to carry twice over. It can name a temp the predecessor declared,
+        and `structure` prints blocks in an order that is not a path (#237), so that name
+        need not be in scope here. And the state this block is entered with IS the
+        predecessor's exit state, since one way in is all it has, so re-reading spells the
+        same values in names that are in scope.
+
+        That holds because of what the thunk's own invalidation guarantees: no instruction
+        after the comparison wrote an operand of it, or the predecessor would have dropped
+        the thunk (`_note_flags`). The one case it does not cover is a comparison that
+        overwrote an operand it compared, `subs x1, x1, #8`, where the arriving state has
+        the NEW x1 and only the predecessor's captured text has the old one (#116). That
+        one is declined rather than re-read.
+        """
+        preds = self._preds.get(addr, ())
+        if len(preds) != 1:
+            return None
+        got = self._flags_out.get(preds[0])
+        if got is None:
+            return None
+        mn, op, vals, regs = got
+        ops = _split_ops(op)
+        if mn not in _CMP and ops and canon(ops[0]) in vals:
+            return None                 # it overwrote an operand it compared (#116)
+        return (mn, op, {r: self._leaf(r, st) for r in vals}, regs)
 
     def _unjustified(self, addr, st: State) -> bool:
         """Whether `addr` is being handed a state out of a section the entry cannot reach

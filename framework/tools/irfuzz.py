@@ -241,9 +241,13 @@ def main() -> int:
     ap.add_argument("--nested", action="store_true",
                     help="with --cfg or --cfgmem: generate a loop inside a loop with a "
                          "branch out of both, the shape a goto's write-back meets")
+    ap.add_argument("--flags", action="store_true",
+                    help="with --cfg: draw the flag-setting ALU forms too, whose value "
+                         "no other corpus here contains (#239)")
     a = ap.parse_args()
     if a.cfg is not None:
-        return run_cfg(a.cfg, max(a.trials // 4, 25), a.seed, a.verbose, a.nested)
+        return run_cfg(a.cfg, max(a.trials // 4, 25), a.seed, a.verbose, a.nested,
+                       flags=a.flags)
     if a.mem is not None:
         return run_mem(a.mem, max(a.trials // 4, 25), a.seed, a.verbose)
     if a.cfgmem is not None:
@@ -263,6 +267,12 @@ def main() -> int:
         # Generated, so it does not read the corpus binary; sized off the same flag so one
         # command covers all three and a caller cannot run two of them by accident.
         rc |= run_cfg(max(a.runs // 4, 100), max(a.trials // 4, 25), a.seed, a.verbose)
+        print()
+        # The same graphs with the flag-setting ALU forms drawn too. A pass of its own
+        # rather than a wider pool in the one above, so that every named case in the
+        # suite keeps pointing at the program it was written for (#239).
+        rc |= run_cfg(max(a.runs // 4, 100), max(a.trials // 4, 25), a.seed, a.verbose,
+                      flags=True)
         print()
         rc |= run_mem(max(a.runs // 4, 100), max(a.trials // 4, 25), a.seed, a.verbose)
         print()
@@ -422,6 +432,11 @@ _PURE = frozenset({
     "mov", "movz", "movk", "movn", "mvn", "neg", "add", "sub", "mul", "madd", "msub",
     "mneg", "sdiv", "and", "orr", "eor", "lsl", "lsr", "asr", "ubfx",
     "cmp", "cmn", "tst", "subs", "adds",
+    # `bic` and `bics` print `xN & ~xM`, which is the operation exactly, and they are
+    # here so the flag-setting one can be drawn (#239). `bic` comes with it because the
+    # two are the same instruction, and leaving it out would make the pool say the
+    # suffix mattered to the arithmetic.
+    "bic", "bics",
     "ands", "csel", "csinc", "csinv", "csneg", "cset", "csetm", "cinc", "cinv", "cneg",
 })
 
@@ -1276,6 +1291,30 @@ _FUZZ_IMM = [
     ("add {d}, {n}, #{i}", lambda d, n, i: 0x91000000 | (i << 10) | (n << 5) | d),
     ("sub {d}, {n}, #{i}", lambda d, n, i: 0xD1000000 | (i << 10) | (n << 5) | d),
 ]
+
+#: The flag-setting forms, whose VALUE is the same arithmetic as the twin above.
+#:
+#: Their own pool, and drawn only under `--flags`, because every named case in the suite
+#: is a (seed, index) coordinate into a generator stream: widening the shared pool moves
+#: all of them, and the two gates that name one case each read as blind the moment it is
+#: a different program (#230 says why they name a case at all). So this adds a corpus
+#: rather than changing one.
+#:
+#: It is needed because nothing else here can see the class. A flag-setting op sits next
+#: to the branch that reads it, and a branch ends a straight-line run, so `expr_cases`
+#: draws 5 runs containing one out of 6,623 over the whole clean fixture and the default
+#: sweep reaches none of them. In a generated graph the printed body is run and compared
+#: register by register, which is where the value can be put in front of a CPU (#239).
+_FUZZ_FLAG_ALU = [
+    ("adds {d}, {n}, {m}", lambda d, n, m: 0xAB000000 | (m << 16) | (n << 5) | d),
+    ("subs {d}, {n}, {m}", lambda d, n, m: 0xEB000000 | (m << 16) | (n << 5) | d),
+    ("ands {d}, {n}, {m}", lambda d, n, m: 0xEA000000 | (m << 16) | (n << 5) | d),
+    ("bics {d}, {n}, {m}", lambda d, n, m: 0xEA200000 | (m << 16) | (n << 5) | d),
+]
+_FUZZ_FLAG_IMM = [
+    ("adds {d}, {n}, #{i}", lambda d, n, i: 0xB1000000 | (i << 10) | (n << 5) | d),
+    ("subs {d}, {n}, #{i}", lambda d, n, i: 0xF1000000 | (i << 10) | (n << 5) | d),
+]
 _RET_WORD = 0xD65F03C0
 
 
@@ -1329,7 +1368,8 @@ def verify_fuzz_encodings() -> list:
     return bad
 
 
-def _gen_function(rng, mem: bool = False, seed_outs: bool = False):
+def _gen_function(rng, mem: bool = False, seed_outs: bool = False,
+                  flags: bool = False):
     """A random function, as a list of encoded words.
 
     `mem` mixes loads and stores through x20 into the arithmetic and appends a tail of
@@ -1367,10 +1407,12 @@ def _gen_function(rng, mem: bool = False, seed_outs: bool = False):
                 body[b].append(_enc_stur(rng.choice(src), _MEM_BASE,
                                          rng.choice(_MEM_DISPS)))
             elif rng.random() < 0.25:
-                _t, enc = rng.choice(_FUZZ_IMM)
+                pool = _FUZZ_IMM + (_FUZZ_FLAG_IMM if flags else [])
+                _t, enc = rng.choice(pool)
                 body[b].append(enc(d, rng.choice(src), rng.randint(1, 63)))
             else:
-                _t, enc = rng.choice(_FUZZ_ALU)
+                pool = _FUZZ_ALU + (_FUZZ_FLAG_ALU if flags else [])
+                _t, enc = rng.choice(pool)
                 body[b].append(enc(d, rng.choice(src), rng.choice(src)))
     # terminator kind per block; the last one returns
     term = []
@@ -1780,7 +1822,7 @@ def _reachable(blocks, entry):
 
 
 def run_cfg(count: int, trials: int, seed: int, verbose: bool,
-            nested: bool = False) -> int:
+            nested: bool = False, flags: bool = False) -> int:
     import ast
     uc_mod = _unicorn()
     if uc_mod is None:
@@ -1805,7 +1847,8 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool,
     withgoto = joins = loops = 0
 
     for _case in range(count):
-        words = _gen_nested(rng) if nested else _gen_function(rng)
+        words = (_gen_nested(rng) if nested
+                 else _gen_function(rng, flags=flags))
         code = b"".join(struct.pack("<I", w) for w in words)
         ann = [(i.address, i.mnemonic, i.op_str, "")
                for i in md.disasm(code, BASE)]
