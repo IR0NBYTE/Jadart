@@ -12494,6 +12494,71 @@ def test_an_access_of_sixteen_bytes_says_so_and_not_eight():
     assert _smi_note(V("x2.field16_0x8", P_ATOM), V("4", P_ATOM)) == ""
 
 
+def test_a_displacement_below_the_base_is_not_a_negative_field_offset():
+    """`ldr x16, [x1, #-8]!` is a read at x1 - 8, not field -7 of anything (#236).
+
+    The biased offset came out negative and printed as one, `t3.field_0x-3`. There is no
+    field at a negative offset: `.field_0xN` says offset N of the object the base points
+    at, so a reader who takes it at face value is reading a claim nothing made. 236 lines
+    of the clean export and 2 of the obf one, from 511 accesses over 60 of the clean
+    image's ranges, nearly all of them `_quickCopy`'s backward copy loop at 0x1aace0.
+
+    `Lifter._frame_read` was written to avoid exactly this, and its docstring says so, but
+    nothing applied the rule to a base that is not a frame register. So the fix is that
+    rule for every base: the displacement goes into the base expression and the offset
+    stays a field offset, which is what the lifter already prints when the same address
+    arrives in a register first.
+
+    The other tools do the same or refuse. Ghidra composes the identical default name,
+    `field_0x` + hex, only after `if (ct->getSize() <= suboff || suboff < 0) throw
+    LowlevelError("PTRSUB out of bounds into struct")` (printc.cc, PrintC::opPtrsub).
+    Hex-Rays moves the negative part into the base: a structure offset applied to a
+    negative number "usually converts the whole (var-num) expression into the
+    CONTAINING_RECORD macro". Binary Ninja cannot spell one, a member offset being
+    unsigned.
+    """
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    # The two instructions the issue cites, 0x1aadf4 and 0x1aadf8. The rebased base is
+    # the same text the write-back prints on the next line, so the two agree on sight.
+    got = lift([("ldr", "x16, [x1, #-8]!"), ("str", "x16, [x0, #-8]!"), ("ret", "")])
+    assert got[:4] == ["var t0 = (x1 - 8).field_0x1;", "x1 -= 8;",
+                       "(x0 - 8).field_0x1 = t0;", "x0 -= 8;"], got
+    # 0x1aae00, the four-byte step, and 0x1aae10, the pair: both halves rebase, the
+    # second one slot on from the first.
+    assert lift([("ldr", "w16, [x1, #-4]!"), ("ret", "")])[0] == \
+        "var t0 = (x1 - 4).field_0x1;"
+    assert lift([("ldp", "x16, x17, [x1, #-0x10]!"), ("ret", "")])[:2] == [
+        "var t0 = (x1 - 16).field_0x1;", "var t1 = (x1 - 8).field_0x1;"]
+    # A narrower access keeps saying its width; only the offset moves.
+    assert lift([("ldrh", "w16, [x1, #-2]!"), ("ret", "")])[0] == \
+        "var t0 = (x1 - 2).field2_0x1;"
+    # A store below the base, no write-back: both halves of the pair rebase too.
+    assert lift([("stp", "x3, x4, [x1, #-0x10]"), ("ret", "")])[:2] == [
+        "(x1 - 16).field_0x1 = x3;", "(x1 - 8).field_0x1 = x4;"]
+
+    # What must NOT move. A displacement of -1 off a tagged pointer is offset 0, the
+    # object header, because kHeapObjectTag is 1; it is the tag and not a step below the
+    # base, and 11,184 of the clean image's 11,695 negative displacements are it.
+    assert lift([("ldur", "x2, [x1, #-1]"), ("mov", "x0, x2"), ("ret", "")])[0] == \
+        "return x1.tags;"
+    # An untagged role register keeps its exact offset (docs/usage.md), and a positive
+    # displacement keeps the bias. Neither is rebased.
+    assert lift([("ldr", "x2, [x26, #0x68]"), ("mov", "x0, x2"), ("ret", "")])[0] == \
+        "return THR.field_0x68;"
+    assert lift([("ldur", "x2, [x1, #7]"), ("mov", "x0, x2"), ("ret", "")])[0] == \
+        "return x1.field_0x8;"
+    # And the rebase is exact for BOTH representations, because it folds the raw
+    # displacement rather than the biased offset: the address is base + disp either way.
+    # THR - 8 is one byte below where the old spelling's `THR.field_0x-8` would have read.
+    assert lift([("ldur", "x2, [x26, #-8]"), ("mov", "x0, x2"), ("ret", "")])[0] == \
+        "return (THR - 8).field_0x1;"
+
+
 def test_the_low_doubleword_lane_of_a_v_register_reads_what_dn_holds():
     """`v0.d[0]` is the low 64 bits of the register `d0` names, so a read of it reads d0.
 
