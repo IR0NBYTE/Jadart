@@ -4473,6 +4473,50 @@ class Lifter:
         # loaded as [P, #F-1]; untagged role registers (THR/HEAP/...) have no such bias.
         return disp if base_reg in _UNTAGGED else disp + 1
 
+    def _rebase(self, base_reg: str, base_v: V, disp: int) -> tuple:
+        """The (base expression, NON-NEGATIVE field offset) `[base_reg, #disp]` names.
+
+        `_frame_read`'s rule, for every base. A displacement that reaches BELOW the base
+        goes into the base expression and the offset stays a field offset, so a read at
+        an address is spelled as the read at that address: `(t4 - 8).field_0x1`, which is
+        what the lifter already prints when the same address arrives in a register first.
+
+        Without it the biased offset came out negative and printed as one, `t4.field_0x-7`
+        for `ldr x16, [x1, #-8]!`. There is no field at -7 of anything: `.field_0xN` says
+        offset N of the object the base points at, and a reader who takes that at face
+        value is reading a claim the snapshot never made. `_frame_read` was written to
+        avoid exactly this ("a negative field offset for the frame slots that matter") and
+        nothing applied the same rule to a base that is not a frame register, so a
+        pre-indexed copy loop printed the case it refuses: 236 lines of the clean export
+        and 2 of the obf one, 511 accesses over 60 of the clean image's ranges, at
+        displacements -2, -4, -8, -16 and a run of -64 down to -176 off one saved pointer.
+
+        Ghidra prints the same default name, and guards it. `PrintC::opPtrsub` composes
+        `field_0x` + hex only after `if (ct->getSize() <= suboff || suboff < 0) throw
+        LowlevelError("PTRSUB out of bounds into struct")`, so a negative sub-offset is an
+        error there rather than a field; upstream of that, `TypeStruct::isOffsetValid`
+        rejects a negative offset and `RulePtrsubUndo` turns the PTRSUB back into an
+        INT_ADD, which prints as plain pointer arithmetic. Hex-Rays moves the negative
+        part into the base instead: applying a structure offset to a negative number
+        "usually converts the whole (var-num) expression into the CONTAINING_RECORD
+        macro", which is this rewrite with a name. Binary Ninja cannot spell one at all,
+        a structure member's offset being unsigned. None of the three prints a negative
+        member, and this does not either.
+
+        The fold is exact for both representations BECAUSE it uses the displacement and
+        not the biased offset: the address is `base + disp` either way, and offset 1 is
+        the read at the base expression (a field offset carries the tag bias, which is
+        the convention `_frame_read`, `_FRAME_TEXT_RE` and docs/usage.md all state). Only
+        a displacement below the base can bias negative, so the two cases do not overlap:
+        `ldur x0, [x1, #-1]` on a tagged pointer is offset 0, the object header, and still
+        prints `.tags`. 11,184 of the clean image's 11,695 negative displacements are that
+        header read and are untouched.
+        """
+        off = self._byte_off(base_reg, disp)
+        if off >= 0:
+            return base_v, off
+        return _bin(base_v, "-", _num(-disp), P_ADD), 1
+
     def _covers(self, base_v: V, byte_off: int, width: int) -> tuple:
         """The other spellings of the bytes a `width`-byte write at `byte_off` covers.
 
@@ -4973,15 +5017,18 @@ class Lifter:
                 tgts = [(self._elem_access(base, index, scale, st, disp), val, ())]
             else:
                 w = _access_width(mn, ops[0])
-                off = self._byte_off(base, disp)
-                tgts = [(self._field(g(base), off, w), val, self._covers(g(base), off, w))]
+                # `_rebase` and not `_byte_off`: a displacement below the base goes into
+                # the base expression, so the offset is a field offset, never negative.
+                bv, off = self._rebase(base, g(base), disp)
+                tgts = [(self._field(bv, off, w), val, self._covers(bv, off, w))]
                 if pair:
                     # `ops[1]` and not `pair[0]`, which `canon` has folded: s1 is d1
                     # there and would read as eight bytes where the store writes four.
                     # The offset step one line up has the same reason.
-                    w2, off2 = _access_width(mn, ops[1]), self._byte_off(base, pair[1])
-                    tgts.append((self._field(g(base), off2, w2), pair[2],
-                                 self._covers(g(base), off2, w2)))
+                    w2 = _access_width(mn, ops[1])
+                    bv2, off2 = self._rebase(base, g(base), pair[1])
+                    tgts.append((self._field(bv2, off2, w2), pair[2],
+                                 self._covers(bv2, off2, w2)))
             out = list(basedecl)
             for tgt, v, also in tgts:
                 # The value being stored was read off the map before this, so `+=` still
@@ -5160,13 +5207,16 @@ class Lifter:
             # spells that. Unsigned needs nothing, the width is in the spelling (#221).
             sign = mn in _SIGNED_LOADS
             w = _access_width(mn, ops[0])
-            v = self._field(g(base), self._byte_off(base, disp), w)
+            # `_rebase` folds a displacement below the base into the base expression, so a
+            # pre-indexed `ldr x16, [x1, #-8]!` reads `(t4 - 8).field_0x1` and not a
+            # field at -7, which is not a field (see `_rebase`).
+            v = self._field(*self._rebase(base, g(base), disp), w)
             if sign and w < 8 and _reg_file(ops[0]) == "x":
                 v = _extended(v, 8 * w, True)
             st.set(dst, v)
             if second:
                 w2 = _access_width(mn, ops[1])
-                v2 = self._field(g(base), self._byte_off(base, second[1]), w2)
+                v2 = self._field(*self._rebase(base, g(base), second[1]), w2)
                 if sign and w2 < 8 and _reg_file(ops[1]) == "x":
                     v2 = _extended(v2, 8 * w2, True)
                 st.set(second[0], v2)

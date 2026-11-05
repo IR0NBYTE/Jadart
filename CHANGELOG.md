@@ -13,6 +13,43 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A displacement below the base is not a negative field offset.** A pre-indexed access
+  kept the heap-object tag bias and came out as `t3.field_0x-3`, which is not a field and
+  not an address a reader can use: `.field_0xN` says offset N of the object the base
+  points at, and no object has one at -3. 236 lines of the clean export and 2 of the obf
+  one, from 511 accesses over 60 of the 2,082 clean ranges that use one at all,
+  nearly all of them `_quickCopy`'s backward copy loop at 0x1aace0 (`ldr x16, [x1, #-8]!`,
+  at -2, -4, -8 and -16) plus a walk off one saved interior pointer from -64 to -176.
+  `Lifter._frame_read` was written to avoid exactly this and its docstring says so, but
+  nothing applied the rule to a base that is not a frame register. The other tools move
+  the negative part into the base or refuse to spell it. Ghidra composes the same default
+  name, `field_0x` plus hex, only past `if (ct->getSize() <= suboff || suboff < 0) throw
+  LowlevelError("PTRSUB out of bounds into struct")` (`PrintC::opPtrsub`), and upstream of
+  the printer `TypeStruct::isOffsetValid` answers false for a negative offset, so
+  `RulePtrsubUndo` rewrites the PTRSUB back to an INT_ADD and the access prints as plain
+  pointer arithmetic. Hex-Rays does this change's rewrite: a structure offset applied to a
+  negative number "usually converts the whole (var-num) expression into the
+  CONTAINING_RECORD macro". Binary Ninja cannot spell one, a structure member's offset
+  being unsigned. So `_rebase` is `_frame_read`'s rule for every base: the displacement
+  goes into the base expression and the offset stays a field offset, `(t4 - 8).field_0x1`,
+  which is the same text the write-back prints on the next line. It folds the RAW
+  displacement rather than the biased offset, so it is exact for a tagged and an untagged
+  base alike and needs no representation bit; and the tag case does not overlap, so
+  `ldur x0, [x1, #-1]` is still offset 0, the object header, `.tags`, which is 11,184 of
+  the clean image's 11,695 negative displacements. Both exports lose every negative
+  spelling, 236 lines to 0 and 2 to 0, and in the whole-image sweep 284 lines become 286
+  on each fixture. The two added lines are #209's may-alias pin firing where it could not:
+  `_pin_mem` takes the written selector with `_FIELD_LHS`, which `.field_0x-7` does not
+  match, so a store below the base never froze a live read at the same offset through
+  another base, and one of those reads is now named instead of re-read after the store.
+  `tools/quality.py` reports the class 210 lines larger on each fixture for the same kind
+  of reason, its `_FIELD_RE` cannot match a negative number either, so the byte-offset
+  field symptom was understated rather than absent (clean 54,056 to 54,266, obf 54,831 to
+  55,041); no other symptom moves. `pbfuzz --census` is unchanged on both fixtures, 2,086
+  wrong reads and 0 stale records, and `irfuzz --corpus --runs 2001`, `--mem 15000` and
+  `--cfgmem 6000` report 0 mismatches. None of those oracles can score this class:
+  `corpus_cases` and `expr_cases` drop any operand containing `[`, and the memory
+  generator draws only the displacements 7, 15, 23 and 31, so the gate for it is a test.
 - **A flag-setting ALU op prints the value it wrote.** `subs x0, x1, x2` printed as arm64
   where `sub x0, x1, x2` prints `x1 - x2`, the only difference being the flag suffix, and
   the register it wrote then read as nothing: 262 raw lines on the clean fixture, 131

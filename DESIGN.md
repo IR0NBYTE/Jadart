@@ -985,6 +985,63 @@ to about 44, and costs 9 more #198 wrong reloads, 2,086 to 2,095. That is a trad
 two numbers the census deliberately keeps apart, so it belongs to its own change with its
 own measurement rather than riding in here.
 
+### A displacement below the base, and why it is not a field
+
+#236. One number was carrying two facts: where the access is, and which field of the
+object it lands in. Those two agree only at or above the base.
+
+THE TAG IS NOT THE SAME THING AS A STEP BELOW THE BASE, and counting separates them.
+`Lifter._byte_off` decides the bias from the base REGISTER's name, tagged unless the name
+is an untagged role register, and for `[P, #-1]` that is exactly right: kHeapObjectTag is
+1, so offset 0 of a tagged pointer sits one byte below the pointer, it is the object
+header, and `.tags` is the text. 11,184 of the clean fixture's 11,695 accesses with a
+negative displacement are that read. The other 511, over 60 of the 2,082 ranges that use
+one at all, step BELOW the object: a pre-indexed backward copy (`_quickCopy` at 0x1aace0,
+`ldr x16, [x1, #-8]!`, at -2, -4, -8 and -16) and a walk off one saved interior pointer at
+-64 down to -176. Their biased offset came out negative and printed as one,
+`t3.field_0x-3`, 236 lines of the clean export and 2 of the obf one. None of the 511 has
+an untagged role base, so the old spelling's one genuine ambiguity never arose in
+practice; it printed a field at a negative offset instead, which no object has.
+
+THE OTHER TOOLS EITHER MOVE THE NEGATIVE PART INTO THE BASE OR REFUSE. Ghidra builds the
+very same default name this output borrowed, `field_0x` plus hex, and guards it:
+`PrintC::opPtrsub` reaches that `ostringstream` only past
+`if (ct->getSize() <= suboff || suboff < 0) throw LowlevelError("PTRSUB out of bounds into
+struct")`. Upstream of the printer, `TypeStruct::isOffsetValid` answers false for a
+negative offset (`getSubType` finds no field, `getFieldIter` returning -1, and the
+leftover lands in the `extra < 0` test), so `RulePtrsubUndo` rewrites the PTRSUB back to
+an INT_ADD and the access prints as plain pointer arithmetic with a cast. Hex-Rays does
+the rewrite this change does: applying a structure offset to a negative number "usually
+converts the whole (var-num) expression into the CONTAINING_RECORD macro", which is the
+base moved down by a member offset so the member can stay non-negative. Binary Ninja
+cannot spell one at all, a structure member's offset being unsigned (`u64`).
+
+THE FOLD IS EXACT WITHOUT THE REPRESENTATION LATTICE THIS SECTION ASKS FOR. `_rebase`
+folds the RAW displacement, not the biased offset: the address is `base + disp` for a
+tagged and an untagged base alike, and offset 1 is the read at the base expression, which
+is the convention `_frame_read`, `_FRAME_TEXT_RE` and docs/usage.md already state for any
+base that is not a bare role register. So `(t4 - 8).field_0x1` needs no bit on `V` saying
+Tagged or Untagged, and it is the text the write-back prints on the next line, which is
+the reader's own cross-check. What the lattice is still for is the OTHER half of #236, a
+base register holding an untagged pointer the lifter LOADED rather than one of the role
+registers it has a table for. 2,876 accesses on the clean fixture have a base the register
+tables call tagged and an even displacement, so they print an ODD field offset, and
+`THR.field_0x78.field_0x6a1` (114 of them) is +0x6a0 of the pointer in THR+0x78 with
+nothing in the text saying to subtract one. That is a spelling question about a positive
+offset and is left open; this change only stops the output naming offsets no object has.
+
+MEASURED. Every negative spelling is gone from both exports, 236 lines to 0 on clean and 2
+to 0 on obf, and nothing else in either export moves except one line that is added. That
+line is #209's may-alias pin finally firing: `_pin_mem` takes the written selector with
+`_FIELD_LHS`, which `.field_0x-7` never matched, so a store below the base never froze a
+live read at the same offset through a different base. `tools/quality.py` reads the class
+210 lines larger on each fixture for the same kind of reason, its `_FIELD_RE` cannot match
+a negative number either, so the byte-offset-field symptom was understated, not absent.
+`pbfuzz --census` does not move on either fixture, 2,086 wrong reads and 0 stale records,
+and no irfuzz oracle reports a mismatch. The oracles cannot score this class directly:
+`corpus_cases` and `expr_cases` drop any operand containing `[`, and the memory generator
+draws only the displacements 7, 15, 23 and 31, so the gate for it is a test.
+
 ## Follow-ups (UNVERIFIED items to close)
 - wire-ref signed/unsigned history: `git log -p runtime/vm/datastream.h` across tags.
 - exact 2.18 / 3.4 stream deltas: diff app_snapshot.cc / class_id.h between those tags.
