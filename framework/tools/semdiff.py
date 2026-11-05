@@ -97,7 +97,7 @@ def lift_named(path, symbol):
                                function_name_by_pc, build_pool_map)
     from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
-    from jadart.fields import recover_fields
+    from jadart.fields import recover_allocations, recover_fields
 
     image, fr, hdr = load_instructions(path)
     ranges = named_ranges(image, fr, symbol)
@@ -109,6 +109,7 @@ def lift_named(path, symbol):
     returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
+    allocs = recover_allocations(image, fr, layout)
     out = []
     for _nm, cr in ranges:
         dis = disassemble_range(image, cr)
@@ -119,7 +120,8 @@ def lift_named(path, symbol):
                                  receiver={"x1": "this"}, arity=arity, selectors=selectors,
                                  returns=returns,
                                  arch=getattr(image, "arch", None),
-                                 fields=layout.for_function(cr.owner_ref)))
+                                 fields=layout.for_function(cr.owner_ref),
+                                 allocs=allocs))
     return out
 
 

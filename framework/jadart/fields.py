@@ -32,10 +32,11 @@ a plausibility argument:
     (verify.py G14), and the same getter's register WIDTH agrees with the owner's
     unboxed-fields bitmap on all 58 it can be read from (G15).
 
-WHAT IT DOES NOT DO. It names a slot only where the receiver's class is known, which today
-means `this` in a method whose owner class resolves. Everything else stays `field_0x8`,
-because a name attributed to the wrong class is worse than an offset: the reader can see
-that an offset is opaque and cannot see that a name is wrong.
+WHAT IT DOES NOT DO. It names a slot only where the base's class is known. `this` in a
+method whose owner class resolves is one such base, and `recover_allocations` below adds a
+second. Everything else stays `field_0x8`, because a name attributed to the wrong class is
+worse than an offset: the reader can see that an offset is opaque and cannot see that a
+name is wrong.
 """
 from __future__ import annotations
 
@@ -187,4 +188,194 @@ def recover_fields(fr, arch) -> FieldLayout:
         if m:
             out.by_class[ref] = m
     out.func_owner = {ref: ow for ref, _n, ow, _kt in fr.functions if ow in cls_cid}
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# A SECOND base whose class the snapshot states: the result of an allocation.
+
+#: A64 `MOVZ Xd, #imm16, LSL #hw*16` and `MOVK Xd, #imm16, LSL #hw*16`, 64-bit forms.
+#: sf=1, opc=10 for MOVZ and 11 for MOVK, then 100101, so the top nine bits decide.
+_MOV_MASK, _MOVZ64, _MOVK64 = 0xFF800000, 0xD2800000, 0xF2800000
+
+#: `AllocateObjectABI::kTagsReg` (constants_arm64.h), the register an allocation stub
+#: leaves the new object's header word in for the shared stub to store. Pinned to R2
+#: rather than searched for, so the cid check below is a REFUTATION and not a hunt for
+#: any immediate in the body that happens to carry the right bits: all 921 stubs on both
+#: 3.12.2 fixtures load their tags word into x2.
+_TAGS_REG = 2
+
+#: UntaggedObject::tags_, the two fields of it this reads. The class id is bits 12..31,
+#: the same field `expr.detect_dispatch` already extracts with `ubfx cid, tags, #0xc,
+#: #0x14` on every epoch the lifter runs on. The size tag is bits 8..11, holding
+#: instance_size / kObjectAlignment, and 0 where the size does not fit in four bits.
+_CID_POS, _CID_BITS = 12, 20
+_SIZE_POS, _SIZE_BITS = 8, 4
+
+#: How far into a stub the tags word is looked for. Every one of the 921 stubs on each
+#: 3.12.2 fixture is three or five instructions long.
+_MAX_STUB_WORDS = 16
+
+
+@dataclass(frozen=True)
+class AllocSite:
+    """One allocation stub: what `new` of this class leaves in the result register."""
+    class_ref: int
+    name: str                 # the owner class's name, as printed
+    fields: dict              # byte offset -> field name, the owner's FULL map
+    instance_size: int        # bytes, the bound an access off this result must respect
+
+
+@dataclass
+class AllocLayout:
+    """pc offset -> AllocSite for every per-class allocation stub, plus why any was
+    dropped."""
+    by_pc: dict = _dcfield(default_factory=dict)
+    stubs: int = 0             # Code objects whose owner is a Class
+    confirmed: int = 0         # ...whose tags word carries the owner's own class id
+    unreadable: int = 0        # ...whose tags word does not decode as MOVZ/MOVK into x2
+    size_disagreed: int = 0    # ...whose size tag is not the owner's instance size
+    ambiguous: int = 0         # ...whose pc another Class's Code also claims
+    unnamed: int = 0           # ...whose owner Class's name did not survive
+    disagreed: int = 0         # ...that name another class, which refuses the whole map
+    refused: str = ""          # non-empty when the map is deliberately empty
+
+
+def _tags_immediate(words) -> int | None:
+    """The value a run of MOVZ/MOVK builds in `_TAGS_REG`, or None.
+
+    MOVZ starts a value and zeroes the rest of the register; MOVK replaces one halfword
+    of it. Anything else writing the register, or a MOVK with no MOVZ before it, means the
+    word this is trying to read is not being built here, and None is the only answer that
+    does not invent one."""
+    acc = None
+    for w in words:
+        kind = w & _MOV_MASK
+        if kind != _MOVZ64 and kind != _MOVK64:
+            continue
+        if (w & 0x1F) != _TAGS_REG:
+            continue
+        part = ((w >> 5) & 0xFFFF) << (((w >> 21) & 3) * 16)
+        if kind == _MOVZ64:
+            acc = part
+        elif acc is None:
+            return None
+        else:
+            acc = (acc & ~(0xFFFF << (((w >> 21) & 3) * 16))) | part
+    return acc
+
+
+def recover_allocations(image, fr, layout: FieldLayout) -> AllocLayout:
+    """Per-class allocation stubs, so a field loaded off one's result can be named.
+
+    WHY THERE IS A CLASS HERE AT ALL. `Code::owner()` is the Function, Class or
+    AbstractType the code belongs to (object.h), and the VM sets a CLASS as the owner of
+    exactly one kind of code: that class's allocation stub, which
+    `StubCode::GetAllocationStubForClass` builds and `Class::allocation_stub_` holds. So a
+    `bl` to a Code object the snapshot says a Class owns allocates an instance of that
+    class, and the class of the value in the result register is read rather than guessed.
+    921 of the 8,194 Code objects on the clean 3.12.2 fixture are such stubs, called from
+    3,185 sites.
+
+    WHY IT IS SAFE TO ACT ON. The stub's own body says which class it allocates, and it
+    says so in a form nothing here produced. Each one loads the header word the new object
+    will carry into `AllocateObjectABI::kTagsReg` and tail-branches to the shared stub
+    that stores it:
+
+        mov  x2, #0x401c          ; tags: class id 804 in bits 12..31
+        movk x2, #0x32, lsl #16
+        b    #...                 ; the shared AllocateObject stub
+
+    Bits 12..31 of that immediate are the class id, and they have to be the owner Class's
+    own class id. Measured over both 3.12.2 fixtures: 921 of 921, with 0 disagreements,
+    and ONE disagreement refuses the whole map, because a stub whose header word names
+    another class says `Code.owner` does not mean what this reads it to mean and every
+    other owner was read the same way. Bits 8..11 are a second, independent agreement:
+    they hold instance_size / kObjectAlignment, which matches the owner's instance size
+    from the Class cluster on all 916 where a four-bit field can hold it (the other 5 and
+    any disagreement drop that one stub, not the map, because that bit position is not
+    load-bearing anywhere else in the tool).
+
+    AND WHAT STILL REFUSES. The name comes out of the owner's field map, so a slot whose
+    `Field` object was tree-shaken has none and keeps its offset: of the 7,504 accesses
+    this attributes on the clean fixture, 692 are named and 6,812 are not. Every one of
+    the 7,504 lands inside the owner's instance size, which is the check `recover_fields`
+    applies to the map itself, and the lifter drops the whole attribution for a base where
+    one does not (expr.Lifter._alloc_field, which fires 0 times on either fixture).
+
+    Empty on anything but arm64: the decoder above is A64, and the lifter runs nowhere
+    else (expr.LIFTABLE_ARCHS)."""
+    out = AllocLayout()
+    arch = getattr(image, "arch", None)
+    if arch is None or arch.name != "arm64" or not image.text:
+        out.refused = "the allocation-stub reader decodes A64 only"
+        return out
+    cws = arch.compressed_word_size
+    align = arch.word_size * 2          # kObjectAlignment, 2 * kWordSize
+    cls_cid = {ref: cid & 0xFFFFFFFF for ref, _n, cid, _s in fr.classes}
+    seen: dict = {}
+    for _ref, owner, _ci in fr.codes:
+        cid = cls_cid.get(owner)
+        if cid is None:
+            continue
+        cr = image.code_ranges.get(owner)
+        if cr is None:
+            continue
+        out.stubs += 1
+        seen.setdefault(cr.pc_offset, {})[owner] = (cid, cr)
+    for pc, claims in seen.items():
+        if len(claims) > 1:
+            # Two DIFFERENT classes claiming one range cannot both be right, and nothing
+            # here says which is, so neither is named. Keyed by owner, so two Code objects
+            # of the same class are one claim rather than a false ambiguity.
+            out.ambiguous += len(claims)
+            continue
+        owner, (cid, cr) = next(iter(claims.items()))
+        # A size bound, because `size` and `pc_offset` both come out of the file. Every
+        # stub on both fixtures is three or five instructions, so anything outside that is
+        # not stub-shaped, and this is also what stops a range claiming megabytes from
+        # turning into a word list that long.
+        if not (0 < cr.size <= 4 * _MAX_STUB_WORDS) or pc < 0:
+            out.unreadable += 1
+            continue
+        body = image.text[pc:pc + cr.size]
+        words = [int.from_bytes(body[i:i + 4], "little")
+                 for i in range(0, len(body) - 3, 4)]
+        tags = _tags_immediate(words)
+        if tags is None:
+            out.unreadable += 1
+            continue
+        if ((tags >> _CID_POS) & ((1 << _CID_BITS) - 1)) != cid:
+            out.disagreed += 1
+            continue
+        out.confirmed += 1
+        sizes = fr.class_sizes.get(cid)
+        if sizes is None:
+            out.unreadable += 1
+            continue
+        size = sizes[0] * cws
+        tag = (tags >> _SIZE_POS) & ((1 << _SIZE_BITS) - 1)
+        if tag and tag * align != size:
+            out.size_disagreed += 1
+            continue
+        name = layout.class_name.get(owner, "")
+        if not name:
+            # The class id is proven and the field map would still be the right one, but
+            # with no name for the class there is nothing to print at the allocation, and
+            # a field name off a value whose provenance the reader cannot see is a name
+            # with no way to check it.
+            out.unnamed += 1
+            continue
+        m = layout.by_class.get(owner)
+        out.by_pc[pc] = AllocSite(
+            class_ref=owner, name=name,
+            fields={} if not m else {off: fi.name for off, fi in m.items()},
+            instance_size=size)
+    if out.disagreed:
+        return AllocLayout(stubs=out.stubs, confirmed=out.confirmed,
+                           unreadable=out.unreadable, ambiguous=out.ambiguous,
+                           size_disagreed=out.size_disagreed, unnamed=out.unnamed,
+                           disagreed=out.disagreed,
+                           refused=f"{out.disagreed} allocation stubs carry a class id "
+                                   f"their owner Class does not")
     return out

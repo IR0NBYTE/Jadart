@@ -315,7 +315,7 @@ Three refusals, all deliberate:
 | an instruction the lifter does not model | the raw arm64 line |
 | a call whose argument list cannot be proven | `name(...)` |
 | a field whose `Field` object was tree-shaken | `field_0x8` |
-| a field on a receiver whose class is not known | `field_0x8`, even where a name exists |
+| a field off a base whose class is not stated | `field_0x8`, even where a name exists |
 
 Each of these could be replaced with a plausible guess that would improve a readability
 metric. A fabricated argument is indistinguishable from a real one, which is exactly why it
@@ -395,10 +395,13 @@ The `unboxed` marks come from the class's unboxed-fields bitmap and say the slot
 raw double rather than a tagged pointer, which is why those offsets are eight apart where
 the tagged tail is four.
 
-In a method body the name is substituted only on `this`, because that is the one value in
-the register file whose class the snapshot states. `x3.field_0x8` keeps its offset even
-where some class has a field there, since attributing it would be a claim about what x3
-holds that nothing in the binary makes.
+In a method body the name is substituted on two bases, and they are the two values in the
+register file whose class the snapshot states. `this`, through `Function.owner`; and the
+result of an allocation this body made, through `Code.owner`, which names a Class for
+exactly one kind of code, that class's allocation stub. A `bl` to one of those prints
+`new Paint()` and a field loaded off its result can be looked up in that class's map.
+`x3.field_0x8` keeps its offset even where some class has a field there, since attributing
+it would be a claim about what x3 holds that nothing in the binary makes.
 
 Three cross-checks decide whether this is safe to print, and all three are byte-exact:
 

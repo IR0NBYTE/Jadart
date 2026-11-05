@@ -11,6 +11,62 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ## Unreleased
 
+### Added
+
+- **A field of an object the body allocated is named, and the allocation says which
+  class it is.** `Lifter._field` printed a recovered name only off `this`, because
+  `Function.owner` was the only thing in the snapshot that stated a base's class, and
+  59,131 of the 69,074 byte-offset field accesses on the clean fixture (85.6%) are off
+  something else. There is a second such statement. `Code::owner()` is the Function,
+  Class or AbstractType the code belongs to, and the VM makes a CLASS the owner of
+  exactly one kind of code: that class's allocation stub, which
+  `StubCode::GetAllocationStubForClass` builds and `Class::allocation_stub_` holds. 921
+  of the 8,194 Code objects on each fixture are such stubs, called from 3,185 sites, so
+  a `bl` to one allocates an instance of a class the snapshot names and the result is a
+  base whose class is read rather than guessed.
+
+  The stub's own body confirms it, which is what makes this a fact rather than a reading
+  of one. Each loads the header word the new object will carry into
+  `AllocateObjectABI::kTagsReg`, and bits 12..31 of that word are the class id, the same
+  field `expr.detect_dispatch` extracts with `ubfx cid, tags, #0xc, #0x14`. That id is
+  the owner Class's own id on 921 of 921 stubs on both fixtures, 0 disagreements, and
+  one disagreement refuses the whole map on the argument `recover_fields` already makes
+  about an offset outside its owner: all 921 owners were read the same way. Bits 8..11
+  hold instance_size / kObjectAlignment and agree with the Class cluster's instance size
+  on all 916 where four bits can hold it, which is a second agreement from a different
+  half of the serialiser.
+
+  Measured over all 8,194 and 8,188 ranges. Byte-offset field accesses 69,074 to 68,388
+  on the clean fixture and 70,764 to 70,536 on the obf one; `tools/quality.py`'s
+  per-line count 54,266 to 53,740 (29.3% to 29.0%) and 55,041 to 54,970, with `regline`,
+  `ellipsis`, `goto`, `rawasm` and the line total identical on both. 2,573 allocations
+  rendered as `new C()` becomes 5,193 and 5,138, so a call that printed
+  `sub_0x16a418(...)` now prints `new Paint()`. Every one of the 2,410 changed export
+  lines is a one-for-one substitution and none of them prints a byte offset it did not
+  print before. `tools/pbfuzz.py --census` is unchanged at 2,086 wrong reads and 0 stale
+  records on both, and `tools/irfuzz.py --corpus` on both fixtures, `--mem 15000` and
+  `--cfgmem 6000` report 0 mismatches.
+
+  The refusals are the half that had to hold. A name still comes only out of the owner's
+  field map, so a slot whose `Field` object was tree-shaken keeps its offset: 6,812 of
+  the 7,504 accesses this attributes on the clean fixture are not named. `instance_size`
+  bounds the object, so an offset outside it cannot be a field of this class, and one
+  that appears drops the whole attribution for that base rather than naming the one
+  access it could still look up. The guard fires 0 times on either fixture, which is
+  7,504 and 7,515 independent displacements out of the compiled code agreeing with the
+  owner's instance geometry. A stub whose owner class has no surviving name is left out
+  as well, 12 of 921 and 17 of 921: the class id is proven either way, but a field name
+  off a value whose provenance the reader cannot see is a name with no way to check it.
+
+  What this is NOT is the `_ALLOC_TYPE` half of the same idea, which was measured first
+  and is worth exactly nothing. The object-store allocation stubs name `List`,
+  `Context`, `Closure`, `double` and the typed-data arrays, and 2,536 field accesses on
+  each fixture are off one of those results; 0 of them can be named, because every type
+  in that table is a VM representation with no Dart `Field` object. The other source, a
+  dominating cid comparison, was measured too: 1,631 single-cid comparisons feed an
+  eq/ne branch on the clean fixture and 535 field accesses sit off the proven receiver
+  on the proven edge, of which the field map names 17. See DESIGN section 13.
+
 ### Fixed
 
 - **A displacement below the base is not a negative field offset.** A pre-indexed access
@@ -85,6 +141,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   touched, `tools/quality.py --json` and `jadart export` are byte-identical on both
   fixtures, and `pbfuzz --census` is unchanged at 2,086 wrong reads and 0 stale records
   on each.
+- **A named field off an allocation still goes stale with the memory it reads.**
+  `_READS_MEMORY` decides which tracked values an invalidation drops, and it matches the
+  `field_0x` spelling plus `this.<name>`, the second alternative existing for exactly
+  this reason: once a field has a name the read no longer spells `field_0x`. An
+  allocation's result is a minted name, so there is no fixed spelling to match and
+  `t7.<name>` is the same shape as `t7.someGetter`; which names are allocation bases is
+  a fact about the body rather than about the text, so the ten invalidation sites ask
+  the lifter (`Lifter._reads_mem`) and it consults that set. Without it `_pin_call`
+  stopped seeing two values on the clean fixture and both were read after a call that
+  could have written them. Free where nothing was allocated, which is most functions.
+
 - **A flag-setting ALU op prints the value it wrote.** `subs x0, x1, x2` printed as arm64
   where `sub x0, x1, x2` prints `x1 - x2`, the only difference being the flag suffix, and
   the register it wrote then read as nothing: 262 raw lines on the clean fixture, 131

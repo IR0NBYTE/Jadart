@@ -1041,6 +1041,154 @@ a negative number either, so the byte-offset-field symptom was understated, not 
 and no irfuzz oracle reports a mismatch. The oracles cannot score this class directly:
 `corpus_cases` and `expr_cases` drop any operand containing `[`, and the memory generator
 draws only the displacements 7, 15, 23 and 31, so the gate for it is a test.
+### 13.1 Which base may carry a field name, and the three candidate proofs
+
+The byte-offset field is the largest single symptom in the output, 69,074 accesses over
+all 8,194 ranges of the clean fixture and 70,764 over the 8,188 of the obf one, and
+until #240 a name was printed off one base only: `this`, whose class `Function.owner`
+states. Counted per site, that is where they are:
+
+| where the access is | clean | obf |
+|---|---|---|
+| on the receiver, `this` | 9,943 | 12,512 |
+| ...of which the field map has no entry for the offset | 9,770 | 12,274 |
+| NOT on the receiver | 59,131 | 58,252 |
+
+The second row is #240's population 1, a slot whose `Field` object was tree-shaken, and
+nothing about the base is wrong there: the class is known and the name is gone. The
+third is population 2, and naming any of it needs a source of the base's class that is
+not a guess. Three were measured before anything was built, and only one of the three is
+worth building.
+
+**A generic allocation stub, which is worth nothing.** `expr._ALLOC_TYPE` maps the
+object-store allocation stubs to a type for the `var t0 = new List(...)` spelling, so
+the class of those results has been known since the stubs were named (#234). 2,536 field
+accesses on each fixture are off one. **0 of them can be named**, on both fixtures, and
+the reason is structural rather than incidental: that table names `List`, `Context`,
+`Closure`, `double`, `Record` and the typed-data arrays, every one of them a VM
+representation whose slots are native rather than Dart `Field` objects, so there is
+nothing in the map to look up. A measured zero, and the first thing the attribution
+said.
+
+**A PER-CLASS allocation stub, which is the one that pays.** `Code::owner()` is the
+Function, Class or AbstractType the code belongs to, and the VM makes a CLASS the owner
+of exactly one kind of code: that class's allocation stub
+(`StubCode::GetAllocationStubForClass`, `Class::allocation_stub_`). 921 of the 8,194
+Code objects on each fixture are owned by a Class, called from 3,185 and 3,183 sites,
+and the body of each is three or five instructions that load the new object's header
+word into `AllocateObjectABI::kTagsReg` and tail-branch to the shared stub. Two
+byte-exact agreements, neither of them a plausibility argument:
+
+* bits 12..31 of that immediate are the class id, the field `detect_dispatch` already
+  extracts with `ubfx cid, tags, #0xc, #0x14`, and they are the owner Class's own id on
+  **921 of 921** stubs on both fixtures, 0 disagreements. One disagreement refuses the
+  whole map, for the reason an out-of-range field offset does in `recover_fields`: all
+  921 owners were read the same way.
+* bits 8..11 hold instance_size / kObjectAlignment and match the Class cluster's
+  instance size on **916 of 916** where four bits can hold it, 0 disagreements.
+
+7,504 field accesses on the clean fixture and 7,515 on the obf one are off such a
+result, of which the field map names **692** and **234**; 686 and 228 reach the output,
+the rest sitting in values a later pass renames or folds. The others refuse: 611 on each
+land inside `instance_size` but past `next_field_offset`, and 6,201 and 6,670 land on a
+slot inside the object whose `Field` object was tree-shaken, which is population 1 again
+under another base. **0 of the 7,504 and 0 of the 7,515 land OUTSIDE the owner's
+instance size**, which is the test that decides whether the attribution is a proof: a
+class misattributed to a stub would scatter accesses past the end of its object, and
+7,504 independent displacements out of the compiled code agree with the geometry the
+Class cluster records. One that did not would drop the whole attribution for that base,
+and that guard fires 0 times on either fixture.
+
+**A dominating cid comparison, which is the bigger idea and currently worth 17 names.**
+Above, this page counts 2,841 cid comparisons as flow-sensitive proofs of a receiver's
+class on one branch edge. Narrowing that to the ones that could carry a field name:
+5,808 sites extract a cid from a tags word on the clean fixture, 1,631 of them compare
+it against a single immediate and feed an eq/ne branch (1,630 on the obf one), 1,608 of
+those name a class this snapshot has, and 388 name one with a field map. Walking the
+proven edge straight-line until the receiver register is redefined finds **535** field
+accesses off the proven receiver, of which the map names **17** (11 on the obf fixture).
+The ceiling is the field map's coverage, not the class attribution, and the cost is a
+flow-sensitive refinement the textual lifter has no place to put. The remaining 4,177
+cid sites are RANGE checks, `sub x9, x9, #0x438; cmp x9, #0x5a; b.hi`, which prove a
+contiguous span of the class hierarchy rather than one class; the common ancestor's map
+is the honest thing to read there and it is not read today.
+
+### 13.2 What marking a recovered name as INFERRED costs, and why nothing is marked
+
+The rule this repo holds, that output must never state what the input does not prove, is
+the mainstream convention stated more strictly than the tools state it, and the
+convention is worth citing rather than reinventing.
+
+The `field_0x` plus the hex offset is Ghidra's own spelling, synthesised in `printc.cc`
+for an access a structure has no declared member at, and Ghidra's help documents that
+spelling as an epistemic signal: "If the initial name looks like field_0x.., it may be
+that the field offset was discovered by the Decompiler, and the field does not exist in
+the structure definition." The decompiler core never invents a structure at all;
+`RulePtrsubUndo` converts a field access back to integer addition when the type
+information turns out not to support it, so the output degrades to `*(undefined4
+*)(param_1 + 8)`. Automatic structure creation is a user-invoked Java action whose
+results are marked three ways at once, by name (`astruct`), by category path
+(`/auto_structs`) and by every member being `undefined*` and `field..._0x...`;
+provenance is carried program-wide by `SourceType`, ordered `USER_DEFINED > IMPORTED >
+ANALYSIS > DEFAULT`, and type propagation stops dead at a `typelock`. Conflicts resolve
+most-specific-wins and residual disagreement becomes a cast or an inline `/* WARNING:
+... */` comment, which is the one tool here that writes its doubt into the text.
+
+Hex-Rays draws the same line in three states rather than two: `lvar_t::flags` carries
+`CVAR_TYPE` ("the type is defined?") and `CVAR_UTYPE` ("user-defined type") separately,
+so inferred and confirmed are distinguishable in the API, and `set_lvar_type`'s own
+documentation says the type "is not considered as final by the decompiler and may be
+modified later by the type derivation". With no type bound it prints the mechanism and
+no name, `*(_DWORD *)(a1 + 1713)`, and its sized-unknown keywords (`_BYTE`, `_DWORD`,
+`_QWORD`, `_OWORD`, `_UNKNOWN`) say the width and nothing else, which is why `_field`
+cites `_OWORD` for the 16-byte spelling. Its structure proposal is a dialog the user
+accepts, and its members are `dword18` and `gap1C`, offsets again. Once a type IS bound,
+even one the decompiler guessed, member names print plainly and the only marking is
+colour, gray for guessed against blue for definite.
+
+Binary Ninja is the one mainstream tool that carries a numeric confidence,
+`BNTypeWithConfidence` over five named levels (`BN_FULL_CONFIDENCE` 255,
+`BN_DEBUGINFO_CONFIDENCE` 200, `BN_HEURISTIC_CONFIDENCE` 192, `BN_DEFAULT_CONFIDENCE`
+96, `BN_MINIMUM_CONFIDENCE` 1, with 0 reserved for unknown), composed multiplicatively
+and floored, and it reaches the rendered output only as a theme colour
+(`uncertainColor`). Its auto-created members are `field_` plus the hex offset, and an
+access with no member at all prints `var->__offset(0x28).d`, the offset and the width.
+It is also the counterexample to the claim that nobody prints an unproven name:
+`var_18_1->field_4` appears in HLIL off a machine-guessed structure with nothing in the
+text to say so. angr's Typehoon does the same automatically, `v->field_8` off pure
+inference. In both cases the name IS the offset, so no semantic claim is smuggled in,
+which is the same answer as refusing.
+
+The academic line is where the argument for refusing is made rather than assumed. TIE
+(NDSS 2011) outputs an interval instead of a type, "an upper and lower bound on the type
+for each variable", and says why: "outputting a range is much more general, and can make
+explicit the uncertainty due to the nature of the problem." It takes the conservative
+branch at the one place it could trade soundness for specificity ("TIE always applies
+the former, since our goal is to always infer types conservatively"), and its two
+scoring definitions are the formal version of this repo's rule: a correct-but-general
+answer is conservative and scores a small lattice distance, while an incompatible one
+fails conservativeness and scores the maximum. It also removes what it cannot support,
+"If B of record types has fields of T, we remove the fields", and its judgement on the
+alternative is blunt: "it appears that in many cases Hex-rays seems to be guessing
+types". REWARDS annotates memory it never saw as `unused` and says its field symbols "do
+not represent their symbolic names, which we do not know, but rather the type tags
+derived for these fields". Howard puts the precondition in one line: "we cannot
+recognize what is not there."
+
+Two dissents are worth recording rather than hiding. OSPREY (S&P 2021) scores a `void *`
+recovered for a `Socket *` as INCORRECT, not as conservative, which is the opposite of
+REWARDS' and Howard's "correct or unused" grading; and DIRTY (USENIX Security 2022)
+argues outright that a wrong-but-suggestive name helps, "the type suggested by DIRTY
+(MpegEncContext_0 *) could still be quite useful to a reverse engineer, even if it is
+inaccurate". DIRTY's own mitigation is the shape of an answer this project could take if
+it ever wanted to print a probable class: a separate suggestion channel over the
+decompiler's output, not a fact inside it.
+
+So nothing is marked, because nothing unproven is printed. The three candidate sources
+above are each a statement the snapshot makes, cross-checked against a second encoding
+of the same number, and bounded by `instance_size` the way `recover_fields` bounds the
+map. Where a name cannot be reached that way the byte offset stands, which is Ghidra's
+documented spelling for exactly this, and the reader can see that it is opaque.
 
 ## Follow-ups (UNVERIFIED items to close)
 - wire-ref signed/unsigned history: `git log -p runtime/vm/datastream.h` across tags.

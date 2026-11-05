@@ -4562,8 +4562,8 @@ def test_a_caller_reading_the_result_says_which_register_it_is():
 
 def test_the_callers_of_real_functions_say_what_they_return():
     # On the clean fixture (3.12.2), against what main printed (#115). `Rect.topRight`
-    # (0x2c30d0) allocates its Offset through an unnamed stub and printed the last field
-    # stored into it. `MatrixUtils.getAsTranslation` (0x19b324) does the same on one path
+    # (0x2c30d0) allocates its Offset and printed the last field stored into it, and
+    # `MatrixUtils.getAsTranslation` (0x19b324) does the same on one path
     # and returns null on the other, where a double it compared is still in d0: its own
     # code cannot say which register comes back, and the callers, which read x0, do. It
     # printed `return d0;`. `Threshold.transformInternal` (0x28a76c) returns 0.0 or 1.0
@@ -4587,7 +4587,11 @@ def test_the_callers_of_real_functions_say_what_they_return():
     assert res(len(image.text) + 64) is None          # an address in no function
 
     top = jadart.decompile(CLEAN, "0x2c30d0")[0]["body"]
-    alloc = re.compile(r"var (t\d+) = sub_0x[0-9a-f]+\(\);")
+    # `new Offset()` rather than `sub_0x...()`: the stub it allocates through is a Code
+    # object the snapshot says the Offset class owns, which is where the name comes
+    # from now (#240). What this test is about, which register the result comes back
+    # in, is the same question either way.
+    alloc = re.compile(r"var (t\d+) = new [A-Za-z0-9_$@]+\(\);")
     made = next(m for m in map(alloc.match, top) if m)
     assert top[-1] == f"return {made.group(1)};", top
     from jadart.cfg import build_cfg
@@ -4603,7 +4607,7 @@ def test_the_callers_of_real_functions_say_what_they_return():
     # Every surface that lifts asks the callers: the API, `lift`, and `decompile`.
     def made_and_returned(lines):
         got = [ln.strip() for ln in lines]
-        made = [m.group(1) for ln in got for m in [re.match(r"var (t\d+) = sub_0x", ln)]
+        made = [m.group(1) for ln in got for m in [re.match(r"var (t\d+) = new ", ln)]
                 if m]
         rets = [ln for ln in got if ln.startswith("return ")]
         return made, rets
@@ -7851,6 +7855,101 @@ def test_a_field_name_is_printed_for_the_receiver_and_nothing_else():
     assert "this.field_0x8" in plain and "balance" not in plain, plain
 
 
+def test_every_allocation_stub_carries_its_owner_classs_own_class_id():
+    # The fact the allocation rendering rests on. `Code::owner()` is a Function, a Class
+    # or an AbstractType, and the VM makes a CLASS the owner of exactly one kind of
+    # code: that class's allocation stub. The stub's body says so independently, because
+    # it loads the header word the new object will carry, and bits 12..31 of that word
+    # are the class id. Both fixtures: 921 stubs, 921 agreements, 0 disagreements.
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_allocations, recover_fields
+    for path in (CLEAN, OBF):
+        image, fr, hdr = load_instructions(path)
+        layout = recover_fields(fr, hdr.arch)
+        a = recover_allocations(image, fr, layout)
+        assert a.refused == "", a.refused
+        assert a.stubs == 921, a.stubs
+        assert a.confirmed == a.stubs and a.disagreed == 0, (a.confirmed, a.disagreed)
+        assert a.unreadable == 0 and a.size_disagreed == 0 and a.ambiguous == 0, a
+        assert len(a.by_pc) >= 900, len(a.by_pc)
+        # and the size tag in the same word is the owner's instance size, read from the
+        # Class cluster: a second agreement, from a different half of the serialiser
+        assert all(s.instance_size % 4 == 0 and s.instance_size >= 8
+                   for s in a.by_pc.values())
+
+
+def test_one_allocation_stub_naming_another_class_refuses_the_whole_map():
+    # Teeth, and the same argument `recover_fields` makes about an offset outside its
+    # owner: the owner relation is read the same way for all 921, so a stub whose header
+    # word names a class other than its owner says the relation is not what this reads it
+    # to mean, and the ones that did agree agreed by arithmetic that is equally suspect.
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_allocations, recover_fields
+    image, fr, hdr = load_instructions(CLEAN)
+    layout = recover_fields(fr, hdr.arch)
+    good = recover_allocations(image, fr, layout)
+    pc = min(good.by_pc)
+    word = int.from_bytes(image.text[pc:pc + 4], "little")
+    assert word & 0xFF800000 == 0xD2800000, hex(word)       # the MOVZ of the tags word
+    bumped = (word ^ (1 << 17)).to_bytes(4, "little")       # imm16 bit 12: class id bit 0
+    image.text = image.text[:pc] + bumped + image.text[pc + 4:]
+    bad = recover_allocations(image, fr, layout)
+    assert bad.disagreed == 1, bad.disagreed
+    assert bad.by_pc == {} and "class id" in bad.refused, bad.refused
+
+
+def test_a_field_of_an_object_this_body_allocated_is_named():
+    # `_DataUri._computeUri` on the clean fixture allocates a _DataUri and initialises
+    # the four `late final` fields _Uri declares to the uninitialised sentinel. Before
+    # this, every one of them printed a byte offset off a `sub_0x...()` whose class
+    # nothing said.
+    _needs_capstone()
+    body = "\n".join(jadart.decompile(CLEAN, "0x1597f4")[0]["body"])
+    assert "new _DataUri@0150898()" in body, body
+    for name in ("._text@0150898 = ", ".pathSegments = ", ".hashCode = ",
+                 ".queryParametersAll = "):
+        assert name in body, (name, body)
+    # The slots whose own Field object was tree-shaken still print their offset, in the
+    # same statement list: the attribution is not a licence to name what is not there.
+    assert ".field_0x8 = " in body, body
+    for off in ("0x24", "0x28", "0x2c", "0x30"):
+        assert f".field_{off}" not in body, (off, body)
+
+
+def test_a_field_is_named_off_an_allocation_and_off_nothing_else():
+    # The refusal, which is the half that has to hold. A base the snapshot does not
+    # place in a class keeps its byte offset however ordinary the offset looks, and an
+    # access OUTSIDE the allocated class drops the attribution for that base entirely
+    # rather than naming the one access it could still look up.
+    from jadart.expr import lift_function
+    from jadart.fields import AllocLayout, AllocSite
+    site = AllocSite(class_ref=1, name="Point", fields={8: "x", 0xc: "y"},
+                     instance_size=0x10)
+    allocs = AllocLayout(by_pc={0x100: site})
+    #  bl 0x100  -> new Point();  then a store into each of its two fields, four bytes
+    #  each, which is what a tagged slot is on a compressed-pointer target.
+    #  bl 0x200  -> an unnamed call, whose result is a base nothing places in a class
+    rows = [("bl", "#0x100"), ("stur", "x1, [x0, #7]"), ("stur", "w2, [x0, #0xb]"),
+            ("bl", "#0x200"), ("stur", "x3, [x0, #7]"), ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    out = "\n".join(lift_function(ann, allocs=allocs))
+    assert "new Point()" in out, out
+    assert re.search(r"\bt\d+\.x = ", out) and re.search(r"\bt\d+\.y = ", out), out
+    assert re.search(r"\bt\d+\.field_0x8 = ", out), out       # the unnamed call's result
+    # Without the map the body is exactly what it was, byte offsets and a `sub_` label.
+    plain = "\n".join(lift_function(ann))
+    assert "sub_0x100" in plain and ".x" not in plain, plain
+    # An offset past `instance_size` cannot be a field of this class. It prints its
+    # offset AND the attribution goes, so the in-range store after it prints one too.
+    rows = [("bl", "#0x100"), ("stur", "x1, [x0, #0x27]"), ("stur", "x2, [x0, #7]"),
+            ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    dropped = "\n".join(lift_function(ann, allocs=allocs))
+    assert "new Point()" in dropped, dropped
+    assert ".field_0x28 = " in dropped and ".field_0x8 = " in dropped, dropped
+    assert ".x" not in dropped and ".y" not in dropped, dropped
+
+
 def test_the_smi_note_still_fires_on_a_named_field():
     # `_smi_note` recognised a store target by the literal spelling `.field_0x..`, so
     # recovering the name would have silently dropped the note that says what the stored
@@ -10276,8 +10375,11 @@ def test_the_function_table_and_lifted_bodies_name_an_anonymous_range_alike():
     anon = [f for f in rows.values() if not f.name]
     assert all(_parse_addr(f.label, image) == f.pc_offset for f in anon)
     buf = io.StringIO()
+    # `putIfAbsent`, not `mapToString`: the only range mapToString called by label was
+    # its StringBuffer allocation, which the owner Class of the stub's Code object now
+    # names (#240). This test is about the LABEL of a range that has no name at all.
     with contextlib.redirect_stdout(buf):
-        assert cli.main(["lift", CLEAN, "mapToString"]) == 0
+        assert cli.main(["lift", CLEAN, "putIfAbsent"]) == 0
     called = re.search(r"\b(sub_0x[0-9a-f]+)\(\)", buf.getvalue()).group(1)
     assert rows[_parse_addr(called, image)].label == called, called
     buf = io.StringIO()
