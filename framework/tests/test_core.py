@@ -6371,11 +6371,25 @@ def test_fencecheck_reads_a_heading_after_a_quote_in_a_list():
 def test_fencecheck_runs_in_linear_time_on_container_markers():
     """check.sh runs the check on every Markdown file, so no line may make it slow. Two
     alternatives of the container pattern once matched the same spaces, and a 114-byte
-    line of footnote markers took ten seconds, each marker tripling it."""
+    line of footnote markers took ten seconds, each marker tripling it.
+
+    The budget is RELATIVE to a linear pass measured in this process, and in CPU time,
+    because the claim is about this code's complexity and an absolute wall-clock second
+    measures the machine. It cost 0.24 seconds here and 1.3 to 1.7 on all three CI
+    runners, which run the suite under `pytest -n auto`, so the gate failed on hardware
+    rather than on a defect; which worker it shares a core with also moves it, and that
+    changes whenever a test is added anywhere. Against the reference the cases sit at
+    4.6x to 4.9x on this machine, the bound is 20x, and the defect above was about 200x,
+    so the headroom is four times the spread and the defect is still caught."""
     import time
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     from fencecheck import check
-    start = time.perf_counter()
+    # A linear scan over a comparable amount of plain text, as the unit of "fast".
+    ref = time.process_time()
+    for _ in range(3):
+        check("x " + "a " * 200000 + "\n")
+    ref = time.process_time() - ref
+    start = time.process_time()
     check("[^a]:  " * 14 + "x\n")
     check("[^a]:" + " " * 20000 + "x\n")
     check("- " * 5000 + "x\n")
@@ -6394,7 +6408,8 @@ def test_fencecheck_runs_in_linear_time_on_container_markers():
     check("x `a\n" + "`<b>`\n" * 20000)                 # one report per paragraph
     check("x " + "](" * 40000 + "`<b>`\n")               # link tails, each to the end
     check("x " + "[a](b) " * 20000 + "`<b>`\n")
-    assert time.perf_counter() - start < 1.0
+    took = time.process_time() - start
+    assert took < 20 * max(ref, 0.001), f"{took:.3f}s against a {ref:.3f}s linear pass"
 
 
 def test_fencecheck_refuses_html_in_a_line_of_markdown():
