@@ -50,6 +50,41 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `--cfgmem 6000` report 0 mismatches. None of those oracles can score this class:
   `corpus_cases` and `expr_cases` drop any operand containing `[`, and the memory
   generator draws only the displacements 7, 15, 23 and 31, so the gate for it is a test.
+- **`tools/pbfuzz.py --cases` no longer scores a declined frame read as a disagreement.**
+  The sweep reported 9 disagreements at 3,000 runs and every one of them was the harness's
+  own. A spill to a frame slot is tracked in the slot map and printed as nothing, so the
+  CPU runs `stur x1, [x29, #-8]` while the printed body's slot still holds the bytes the
+  run started with, and the read #198 prints where a reload declines,
+  `var t1 = (FP - 24).field_0x1;`, is the one line that reads one of each. Measured over
+  the same corpus: 9 of the 2,429 scored runs printed a frame read and all 9 were called
+  wrong, 2,411 printed none and none were. Keeping the three outcomes apart is the
+  convention wherever this is done. Alive2 counts "incorrect transformations",
+  "failed-to-prove transformations" and its own errors in three separate fields, and its
+  `error()` adds "Couldn't prove the correctness of the transformation" without the
+  unsound flag wherever an approximation reached the model, so a limit of the checker is
+  never a defect of the subject. Csmith keeps its generated programs clear of the 191
+  undefined and 52 unspecified behaviours of C99 rather than reading a diverging checksum
+  on one as a miscompilation. `tools/irfuzz.py` draws the same line with two exception
+  types and by leaving the registers a run writes unbound, so a bare one declines by
+  itself. So both halves are modelled here: the spills of a register still holding the
+  value the function came in with are replayed into the one memory image both sides start
+  from, which leaves the declined reload SCORED rather than exempt, and everything else
+  the machine wrote and the printed body printed no store for is taken from a unicorn
+  write hook and read as a decline, which is where a spill of a computed value lands.
+  `Declined` is a subclass of `Undecidable`, `Oracle.score` returns the four counts and
+  `run` returns totals per class. Over the same 3,000 generated runs the sweep goes from
+  2,429 scored, 2,420 clean and 9 disagreeing to 2,429 scored, 2,429 clean and 0
+  disagreeing, the 571 unscored runs are reported as declines rather than as this
+  harness's own limit, and 400 cases of the sweep are now gated so the next one of these
+  cannot arrive as "10 instead of 9". At seed 9100 the same 3,000 runs go from 2,456
+  scored, 2,449 clean and 7 disagreeing to 2,454 scored, 2,454 clean and 0 disagreeing:
+  five of the seven are scored and agree, and the other two read a slot a later spill had
+  overwritten with a value the machine computes, which no replay can anticipate, so they
+  decline. No run that agreed before stopped being scored. The number moved because the
+  scoring was wrong and not because the lifter changed: nothing under `jadart/` is
+  touched, `tools/quality.py --json` and `jadart export` are byte-identical on both
+  fixtures, and `pbfuzz --census` is unchanged at 2,086 wrong reads and 0 stale records
+  on each.
 - **A flag-setting ALU op prints the value it wrote.** `subs x0, x1, x2` printed as arm64
   where `sub x0, x1, x2` prints `x1 - x2`, the only difference being the flag suffix, and
   the register it wrote then read as nothing: 262 raw lines on the clean fixture, 131
