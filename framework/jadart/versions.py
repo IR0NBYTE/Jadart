@@ -218,6 +218,15 @@ class Epoch:
     # lands on the same ~56% plateau afterwards, which is what makes this the right shift
     # rather than merely a better one.
     type_class_id_shift: int = 3
+    # Which of a FunctionType's six serialized refs is `parameter_types`. The range is
+    # `VISIT_FROM(type_test_stub) .. VISIT_TO`, and `hash` MOVED at 3.1: it is the last
+    # field of UntaggedFunctionType through 3.0.6 (type_test_stub, type_parameters,
+    # result_type, parameter_types, named_parameter_names, hash) and the second field of
+    # UntaggedAbstractType from 3.1.5, which pushes the four that follow it down by one.
+    # Read off raw_object.h for all nineteen registered releases, 3.13.0 included
+    # (type_test_stub and hash at :2984-2985, parameter_types at :3051); the count stays
+    # six, so the byte-count checks agree either way and only a slot's meaning changes.
+    ftype_params_index: int = 4
     # Per-cluster fill-spec overrides, same shape as fillwalk._REFS. A class can change how
     # many refs it serializes without app_snapshot.cc changing a line, because the range is
     # `VISIT_FROM .. to_snapshot(kFullAOT)` in raw_object.h and that cutoff moves on its own
@@ -474,6 +483,9 @@ _ALL_GRAMMARS = frozenset({(8, True), (8, False), (4, False)})
 _PRE_BEHAVIOUR = frozenset({"cidcanonical-2.19", "cidcanonical-3.0", "cidcanonical-3.1",
                             "cidcanonical-3.2"})
 _TAGGED_FIRST = frozenset({"cidcanonical-2.19", "cidcanonical-3.0", "cidcanonical-3.1"})
+#: `hash` is UntaggedFunctionType's last pointer through 3.0 and UntaggedAbstractType's
+#: second from 3.1, so `parameter_types` is one slot earlier on these two families.
+_FTYPE_HASH_LAST = frozenset({"cidcanonical-2.19", "cidcanonical-3.0"})
 #: NullabilityBits narrowed from 2 bits to 1 at 3.5, moving TypeClassIdBits down.
 _WIDE_NULLABILITY = frozenset({"cidcanonical-2.19", "cidcanonical-3.0", "cidcanonical-3.1",
                                "cidcanonical-3.2", "cidcanonical-3.3", "objectheader-3.4"})
@@ -501,6 +513,7 @@ for _h, (_name, _dart, _table, _td0, _tdv, _imm) in _IDENTIFIED.items():
         objpool_tagged_first=(_name in _TAGGED_FIRST),
         record_has_field_names=(_name == "cidcanonical-2.19"),
         type_class_id_shift=(4 if _name in _WIDE_NULLABILITY else 3),
+        ftype_params_index=(3 if _name in _FTYPE_HASH_LAST else 4),
         td_int8_cid=_td0, td_byte_data_view_cid=_tdv, td_stride=4,
         roots=LAYOUTS.get(_dart),
         grammars=(frozenset() if _name in _UNVALIDATED else

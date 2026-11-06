@@ -1277,6 +1277,151 @@ printed lines per app gain a name, every one a one-for-one substitution.
 Reading the VM snapshot's strings would name those Fields directly and make this channel
 redundant. See `fields.recover_accessors`, #240 and #258.
 
+**THE TYPE SYSTEM, measured per access before anything was built.** Dart 3 AOT is
+sound-mode, so a static type `C` says a value is null or an instance of `C` or a subtype,
+and where every subtype the class table holds EXTENDS `C` rather than only implementing
+it (a class whose `interfaces` name `C` has its own layout), the offsets below `C`'s
+`next_field_offset` are `C`'s own. A stated type is then a proof for those offsets, and
+the snapshot states more of them than this page assumed. The issue's sentence "AOT does
+not keep a field's declared type" is wrong: `FieldSerializationCluster::WriteFill` writes
+`type` unconditionally (app_snapshot.cc:2214) and 217 of the clean fixture's 245 instance
+`Field` objects carry a `Type` that names a class; what AOT drops is the guarded cid, the
+nullability and the exactness state, which sit behind `kind != kFullAOT` ten lines down
+(2224-2231). A `FunctionType` keeps its result and parameter types wherever the Function
+kept a signature, 1,912 of 7,892 on the clean fixture and all 1,602 on the obf one. And a
+cast names its destination `Type` in the pool.
+
+The measurement is a forward must-analysis over each range's CFG: a value number per
+register and per FP slot, intersected at every join, each channel adding its fact where
+it is stated and the fact following the value through copies and spills. 44,971
+single-register field loads and stores on the clean fixture and 44,956 on the obf one,
+of which the receiver reaches 8,943 and the allocation stubs 6,837. Per channel, sites
+whose base the channel gives a class, the ones that class's map can name, and the ones
+not already named by the two shipped channels:
+
+| source of the base's class | clean: reached | nameable | new | obf: reached | nameable |
+|---|---|---|---|---|---|
+| (a) own signature, parameter type of an incoming argument | 156 | 17 | 0 | 0 | 0 |
+| (b) callee's signature, result type of a direct call | 39 | 2 | 2 | 17 | 0 |
+| (b') callee's owner class, for the receiver it is handed | 1,969 | 142 | 11 | 0 | 0 |
+| (c) cast or type test against a pool `Type`, on its edge | 257 | 86 | 86 | 257 | 0 |
+| (d) declared type of the field a value was loaded from | 37 | 1 | 1 | 0 | 0 |
+| (e) common ancestor of a named selector's implementers | 33 | 0 | 0 | 1 | 0 |
+| (f) class of a constant instance read out of the pool | 61 | 2 | 2 | 61 | 0 |
+| (f') receiver of a method whose owner is a PatchClass | 707 | 73 | 73 | 0 | 0 |
+
+The same on the seven real apps in the appsweep cache, new names per channel, measured
+with the accessor channel as #258 left it; `*` marks the two 3.11.5 builds on which
+`program.static_bit` does not calibrate, where the receiver was assumed to be bit 16 for
+the measurement and the product refuses:
+
+| app | Dart | (a) | (b) | (b') | (c) | (d) | (e) | (f) | (f') |
+|---|---|---|---|---|---|---|---|---|---|
+| xyz.deepdaikon.xeonjia | 2.19.6 | 0 | 4 | 0 | 273 | 2 | 0 | 1 | 0 |
+| io.github.petlyh.jsdict | 3.3.4 | 0 | 4 | 0 | 295 | 0 | 0 | 0 | 0 |
+| dev.labplus.app | 3.5.4 | 0 | 2 | 40 | 302 | 37 | 0 | 0 | 104 |
+| uk.me.amugofjava.anytime | 3.6.2 | 8 | 3 | 48 | 392 | 53 | 0 | 0 | 165 |
+| com.predidit.kazumi `*` | 3.11.5 | 0 | 0 | 161 | 351 | 52 | 0 | 2 | 411 |
+| kzs.th000.tsdm_client `*` | 3.11.5 | 0 | 3 | 98 | 1 | 41 | 0 | 2 | 342 |
+| chat.fluffy.fluffychat | 3.13.0 | 0 | 2 | 125 | 1 | 74 | 0 | 2 | 293 |
+
+Two builds below 3.4 pass every argument on the stack, so (a), (b') and (f') have no
+register to reach there, and 3.11.5's receiver is the one the measurement assumed.
+
+**(b) and (b') are refuted, not merely small.** Both rest on "the call target is a known
+Function", and under `dedup_instructions` it is not: identical code is kept once, the
+other Function objects that owned it are tree-shaken, and the one Function the Code still
+names is not the one every caller means. `RenderParagraph.assembleSemanticsNode` on the
+clean fixture calls 0x39e78 with `this` in x1; the only Function at that range is
+`_RenderInkFeatures.hitTestSelf`, three instructions that read offset 0x58, and
+`RenderParagraph` is not a subclass of `_RenderInkFeatures`. Where (b') and the
+receiver's own class both speak they disagree 13 times out of 1,070 on the clean fixture
+and 146 of 3,953 on dev.labplus.app, so a callee's result type (b) says nothing about a
+call site's result either. AOTopsy seeds every function's receiver from its owner and
+copies a callee's exit state into the caller (internal/typetrack/interproc.go:245,
+intraproc_handlers_call.go:185); this is the counterexample to that.
+
+**(a), (d), (e) and (f) are measured to zero or single digits on the fixture** and are
+not built. (a) names 17 accesses on the clean fixture and all 17 are the receiver, which
+`Function.owner` already names: the signature survives on closures, forwarders and the
+dynamically called, and the parameter it types is rarely the base of a direct field
+load. Where it and the owner both speak they agree 101 times of 101, which is the same
+agreement (f') is built on. (d) is a proof at the value's definition, the load, and it
+pays 37 to 74 names on the five real apps above 3.4 and 1 on the fixture, because a
+loaded value's declared class rarely has a map of its own there: 118 of the 217 typed
+fields name a class no other layout implements, and 23 of those have a map. Where an
+allocated object is stored into a typed field the allocated class is under the field's
+type 56 times of 56 on the clean fixture and 2,499 of 2,499 on the seven apps, which is
+what says the type is being read right. (e) has 112 named
+selectors with a common ancestor and the ancestor's map names 0 accesses: a receiver
+whose class is known closely enough for a direct field load is called directly too.
+
+**(c) is the one unbuilt channel that pays, and it needs dominance.** An
+`AssertAssignable` compiles to inline class-id checks that jump past the stub on the
+classes the compiler could enumerate, then `bl` to the destination type's type-testing
+stub with the instance in x0 and the `Type` in x8 (TypeTestABI), which returns only if
+the value is assignable. 449 such calls on the clean fixture; 360 name a class no other
+layout implements;
+182 sit in front of a join every in-edge of which proves the same type (the stub's own
+fallthrough, or a `cmp cid, #n` on x0's tags word accepting a subclass), and the accepted
+cids sit inside the destination class's subclass set at every one of them, 0 outside, on
+both fixtures and all six apps. Following the value through copies, spills and joins
+reaches 257 accesses on the clean fixture, 86 of which the destination's map names, all
+86 from `Field` objects (`FlexParentData.nextSibling` off a `parentData` cast, the
+`_state` of a `_Future`), 0 outside the class's geometry, and 273 to 392 on the four
+calibrated apps below 3.13 (351, 1 and 1 on kazumi, tsdm_client and FluffyChat, whose
+joins mostly fail the in-edge check);
+0 on the obf fixture, whose names are obfuscated. It is not built
+here because the proof holds on the edges after the cast and not at the value's
+definition, so it needs the flow machinery the cid channel needed: a must-analysis over
+the CFG keyed by instruction address, which `detect_dispatch` is the one-pass shape of,
+and then one more thing the textual lifter does not have. A value cast half way through
+a body prints under two spellings, `t0.field_0x14` before and `t0.nextSibling` after,
+and `_pin_mem`'s may-alias rule compares SELECTORS, so a store through either spelling
+does not pin a live read through the other. That gap exists today for a name against an
+unnamed base at the same offset (a `this.balance` read stays live across an
+`x2.field_0x8 = ...` store that the unnamed spelling would have pinned; measured, it
+changes one body on the clean fixture and none on the obf one) and a channel that names
+flow-sensitively would widen it on every site it names. Both pieces are measured and
+designed, and (c) is what remains of #240 beyond the receiver: 86 lines on the fixture,
+some hundreds per real app.
+
+**(f') is built, and it is the receiver again.** `Function::Owner` (object.cc:11358) is a
+Class, or a PatchClass whose `wrapped_class` is the class, and the lifter read only the
+first. The second owns every member a mixin application takes from its mixin and every
+member a patch file adds to a core class, 1,145 functions on the clean fixture, so
+`SemanticsAnnotationsMixin.describeSemanticsConfiguration` and
+`StringBuffer.writeCharCode` had no receiver class and nothing off `this` in them could
+be named. `fields._place_patched` takes the hop under three refusals: the function's
+StaticBit must calibrate (it does not on the two 3.11.5 apps, where every caller already
+treats every function as an instance method and the hop would add to that), its kind
+must be one whose first argument is the receiver, and where the function kept its
+signature `parameter_types[0]`, the receiver's own type written by another cluster, must
+name the wrapped class. It does on 337 of 337 over both fixtures and the five calibrated
+apps, 2.19.6 through 3.13.0, with the 42,716 Class-owned functions that also speak
+agreeing 42,716 times as the control; one disagreement places none. 397 functions on the
+clean fixture, 346 of them members of a mixin application; 37 bodies change, 103 lines,
+each a one-for-one substitution of a byte offset by the name the wrapped class's `Field`
+object carries, and `tools/quality.py`'s byte-offset row goes 53,511 to 53,463. 17
+functions on the obf fixture and 0 lines, since the names there are obfuscated too. On
+the calibrated real apps: 148 lines in 64 bodies on dev.labplus.app (3.5.4), 240 in 79 on
+uk.me.amugofjava.anytime (3.6.2) and 497 in 143 on chat.fluffy.fluffychat (3.13.0, 1,362
+functions placed), every one a substitution; 0 on the two below 3.4, which place 799 and
+761 functions but hand the receiver over on the stack, where the lifter does not call it
+`this` at all.
+
+**Two things the measurement found about the channels that shipped.** The accessor
+channel's setter rule, "stores to exactly one offset off x1 or x2", did not check that
+the base still held the receiver, and it read hand-written setters, whose name is never
+their slot's: `RenderAnimatedSize.set:reverseDuration` named the receiver's offset 44, and
+56 of the 61 offsets it named on the clean fixture came from explicit setters. That is
+fixed in #258, which reads only implicit accessors and proves their base from the entry
+convention (the paragraph above this section). And `program.static_bit` falls back, when
+no bit fits, to treating every function as an instance method: on com.predidit.kazumi one
+`ImplicitSetter` carries the bit, nothing calibrates, and 9 lines in 4 static functions
+print `this.<name>` off their first argument (`FlutterError.dumpErrorToConsole` prints
+`this._stackTrace`). That one is pre-existing and not changed here.
+
 ### 13.2 What marking a recovered name as INFERRED costs, and why nothing is marked
 
 The rule this repo holds, that output must never state what the input does not prove, is
