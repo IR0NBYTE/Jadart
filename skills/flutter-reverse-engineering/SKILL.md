@@ -148,7 +148,9 @@ will bury the answer along with your context budget.
 
 `symbols` gives the real virtual address, file offset and size of every code range, and
 `--format` writes a script that names them inside the tool. Addresses are relative to
-`_kDartIsolateSnapshotInstructions`, so a rebased load still lines up, and a script refuses
+the instructions symbol the binary exports, which `jadart info` prints as the anchor
+(`_kDartIsolateSnapshotInstructions`, or `_kDartSnapshotText` from Dart 3.13), so a
+rebased load still lines up, and a script refuses
 a binary whose bytes do not match rather than applying the wrong names. Any address jadart
 prints can go straight into another tool: `functions`, `disasm`, `lift`, `decompile` and
 `xrefs` all print the virtual address. (Older releases printed `.text+0x..`, which was

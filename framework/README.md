@@ -203,13 +203,15 @@ It emits `grammars=frozenset()` on purpose, so a generated epoch is *identified*
 refuses to parse until a binary of that release has passed the gates. An identical cid
 table does not imply an identical grammar.
 
-Dart 2.19 through 3.12 are supported now, and the diffs that got them there are worth
-knowing before adding the next one, because **only one of them changes how many bytes a
-cluster reads**. A diff of `app_snapshot.cc` alone would have reported "no drift" for all
-but the first:
+Dart 2.19 through 3.13 are supported now, and the diffs that got them there are worth
+knowing before adding the next one, because through 3.12 **only one of them changes how
+many bytes a cluster reads**. A diff of `app_snapshot.cc` alone would have reported "no
+drift" for all but the first of those. 3.13 is the other kind: it merged the vm and
+isolate snapshots, and the serializer diff shows nearly all of it (DESIGN.md section 3):
 
 | Boundary | What moved | Where it is written |
 |---|---|---|
+| 3.12/3.13 | the vm and isolate snapshots merge into one | `app_snapshot.cc`, `roots.h` |
 | 3.9/3.10 | nothing; `UnlinkedCall` and `MonomorphicSmiableCall` swap cids | `class_id.h` |
 | 3.3/3.4 | the cluster tag stops being `cid<<1\|canonical` in a uint64 and becomes an object header word | `app_snapshot.cc` `ReadCluster` |
 | 3.2/3.3 | `ObjectPool` entry byte gains `SnapshotBehaviorBits`, `TypeBits` narrows 7 -> 4 | `object_pool_builder.h` |

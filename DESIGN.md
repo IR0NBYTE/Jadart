@@ -89,9 +89,68 @@ parse the isolate one. `snapshot.images` answers which pair a container carries 
 everything past the header starts there; the symbols say where the images are and
 never how to read them, which stays the version hash's job. A library that exports
 both layouts is refused, since no engine loads the two together and picking one would
-be a guess. `info` keys the single snapshot "isolate" and has no "vm" entry, the anchor
-every address is given against is whichever instructions symbol the file exports, and
-the one check that needed a vm snapshot (G13, Tier B) says there is none.
+be a guess. `info` keys the single snapshot "isolate" and has no "vm" entry, and the
+anchor every address is given against is whichever instructions symbol the file exports.
+
+### What Dart 3.13 reads differently
+
+The symbols were the small half. Folding the vm snapshot in moved what it held into the
+program's stream, and each of these is a separate read, so each is a separate switch on
+the Epoch (versions.py) rather than one "3.13" flag. All line numbers are
+app_snapshot.cc at the 3.13.0 tag unless another file is named.
+
+- **Snapshot::Kind lost kFullCore** (snapshot.h:24), so every later kind is one lower
+  and a release AOT snapshot is kind 2, the number that meant kFullJIT. The name is
+  taken from the epoch's own enum, and a header with no epoch names a kind only where
+  both enums agree.
+- **Seven base objects, fixed** (`AddBaseObjects`, :7452): null, false, true and four
+  sentinels, where the base objects used to be the vm snapshot's whole object table.
+  G13 compares the header's count with that 7, since there is no vm header to compare.
+- **The roots' own objects are written first.** `PushRoots` (:7286) pushes ten empty
+  singletons and calls `CreateEarlyClusters` (:8901), so a real snapshot opens with
+  nine small clusters and the canonical String cluster is the tenth, not the first.
+  One of the nine is the empty ObjectPool: there are two pools now, and every
+  `pool_0x...` indexes the second. A second pool WITH entries is refused, because
+  nothing in the stream says which one the code uses.
+- **Class alloc is one count** (`ReadAllocFixedSize`, :1084). The predefined classes
+  are ordinary objects of the cluster; the predefined cid list the alloc pass used to
+  carry, which G3 compared with the fill pass, is gone.
+- **A Closure is variable length** (:5547; `UntaggedClosure`, raw_object.h:3130):
+  alloc reads a length per object and fill reads it again, then `length_and_flags`,
+  `hash`, `function` and that many data slots.
+- **The Code fill opens with two refs** (:2997), the LazyCompile and UnknownDartCode
+  stubs, which the deserializer used to take from the vm isolate.
+- **Six clusters reach an AOT snapshot for the first time**, as the targets of the
+  Roots handles: LocalVarDescriptors (:3839), ContextScope (:4106), ApiError (:4503),
+  LanguageError (:4566), UnhandledException (:4631) and UnwindError (:4694). The first
+  two are debugging data, so a product build holds only the empty singleton of each,
+  and that is all the reader accepts: one with a length is refused, because no binary
+  has shown what the source says its elements are.
+- **The roots open with 1,518 refs that are not the ObjectStore** (`ReadRoots`,
+  :7479): the Roots struct (roots.h: 302 raw roots, 1,049 handles of which the last
+  173 are the stubs, 6 API handles) and then one Class per predefined cid less the
+  eleven `IsAbsentCid` (:7175) names, 161 of them. The ObjectStore follows with 171
+  fields and no stub among them (object_store.h:432).
+- **LinkedHashBase has a cid**, 96 (class_id.h:315), so every cid from there up is
+  one higher than in 3.9 to 3.12.
+
+G3 has a replacement that is at least as sharp as what it lost. The class-table roots
+are read in cid order, and each of those Class objects states its own id in the fill
+pass, so the two must agree 161 times; they sit behind 1,357 other roots, which means a
+root run misplaced by one ref fails every one of them.
+
+What did not change, checked by diffing the two tags: the object header bitfields
+(raw_object.h, CardRememberedBit through ClassIdTag), the ObjectPool entry encoding,
+the instructions table and the data image, the dispatch table and its origin element,
+the argument registers and the entry offsets, and the Function kind list.
+
+What 3.13 support does NOT cover. The epoch claims 64-bit compressed pointers, the
+target of the one 3.13 binary there was to gate (FluffyChat's F-Droid build, arm64
+Android: Tier A 11 of 11 over 550,617 checks). An uncompressed build, iOS or arm32,
+is a known release on a target nothing has read and is refused by name. An x86_64
+build shares the grammar key and so is accepted, with no binary behind it. A
+`DART_DYNAMIC_MODULES` build would carry a Bytecode cluster, which has no grammar
+here and stops the alloc walk by name.
 
 ## 4. CID table (class_id.h)
 
@@ -726,8 +785,12 @@ writes its roots: the isolate `ObjectStore`'s pointer fields in declaration orde
 code calls, each a `Code` whose instructions-table slot already maps to a pc, so the
 root INDEX identifies the stub. The index means something only through the release's own
 `OBJECT_STORE_FIELD_LIST`, which tools/gen_objstore.py expands the way gen_cids.py
-expands the cid enum: ten distinct root runs cover the eighteen registered epochs, 244
-roots at 3.12 and 224 at 2.19.
+expands the cid enum: eleven distinct root runs cover the nineteen registered epochs, 244
+roots at 3.12 and 224 at 2.19. At 3.13 the run is 1,689, because the Roots struct and
+the class table are read ahead of the ObjectStore (section 3), and the stubs are 173
+handles of that struct rather than ObjectStore fields; gen_objstore.py assembles that
+run from roots.h, stub_code_list.h, symbol_list.h and the class-table loops in
+`ReadRoots`.
 
 THE REASON IT IS A READING AND NOT A GUESS is that the binary confirms the table twice.
 The layout states which roots are `Code`-typed and the reader checks every one of them

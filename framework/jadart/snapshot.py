@@ -41,10 +41,14 @@ MERGED_INSTRUCTIONS = "_kDartSnapshotText"
 from .stream import ReadStream
 
 DART_MAGIC = 0xDCDCF5F5
-#: Snapshot::Kind, snapshot.h. 0..3 are identical in every release jadart parses. Index 4
-#: is not (kModule was inserted there in 3.12), so anything past kFullAOT reports its
-#: number rather than a name no release binary would reach anyway.
+#: Snapshot::Kind, snapshot.h, through Dart 3.12. 0..3 are identical in every one of
+#: those releases. Index 4 is not (kModule was inserted there in 3.12), so anything past
+#: kFullAOT reports its number rather than a name no release binary would reach anyway.
 KIND = {0: "kFull", 1: "kFullCore", 2: "kFullJIT", 3: "kFullAOT"}
+#: The same enum from 3.13, which dropped kFullCore with the vm snapshot it described:
+#: every later kind is one lower, so a release AOT snapshot is kind 2, the number that
+#: meant kFullJIT before.
+KIND_MERGED = {0: "kFull", 1: "kFullJIT", 2: "kFullAOT", 3: "kModule"}
 _MAX_KIND = max(KIND)
 
 
@@ -70,7 +74,17 @@ class SnapshotHeader:
 
     @property
     def kind_name(self) -> str:
-        return KIND.get(self.kind, f"?{self.kind}")
+        """The kind by name, or `?N` where the number does not settle one.
+
+        Which enum numbers the kind depends on the release, so a header whose epoch is
+        unknown (`info --lenient`) names it only where both enums agree. Naming it from
+        the older one called the 3.13 AOT snapshot of a real app kFullJIT."""
+        if self.epoch is None:
+            name = KIND.get(self.kind)
+            agreed = name is not None and name == KIND_MERGED.get(self.kind)
+            return name if agreed else f"?{self.kind}"
+        names = KIND_MERGED if self.epoch.merged else KIND
+        return names.get(self.kind, f"?{self.kind}")
 
 
 #: magic(4) + length(8) + kind(8) + the 32-char version hash. Anything shorter is not a
@@ -260,8 +274,23 @@ def walk_isolate(path, *, full: bool = False) -> dict:
         from .fillwalk import walk_fill
         strings = sorted(set(walk_fill(st, clusters, hdr.epoch, arch=hdr.arch)
                              .strings.values()))
-    else:
+    elif clusters and clusters[0].name == "StringCid":
         strings = recover_canonical_strings(st, clusters, hdr.epoch, hdr.arch)
+    else:
+        # The canonical String cluster is not first, so its text is not at the start
+        # of the fill and reaching it means reading what is in front. That is every
+        # 3.13 snapshot: the serializer puts the roots' own small clusters ahead of
+        # everything (CreateEarlyClusters), nine of them on a real app. Returning
+        # nothing here, as this did when a first cluster was not String, would have
+        # answered a supported build with an empty pool.
+        from .fillwalk import walk_fill
+        canon = next((cl for cl in clusters
+                      if cl.name == "StringCid" and cl.canonical), None)
+        strings = []
+        if canon is not None:
+            read = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch).strings
+            strings = [read[r] for r in range(canon.start_ref, canon.stop_ref)
+                       if r in read]
     hist = Counter()
     for cl in clusters:
         hist[cl.name] += cl.count      # objects per cid, summed across clusters

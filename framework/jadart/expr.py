@@ -314,7 +314,12 @@ _UNTAGGED = ARM64.untagged
 _STUB_RE = re.compile(r"_iso_stub_(.+?)(?:Shared(?:With|Without)FPURegs)?Stub\b")
 _ALLOC_TYPE = {"Array": "List", "GrowableArray": "List", "Mint": "int", "Double": "double",
                "Float64Array": "Float64List", "Record2": "Record", "Record3": "Record",
-               "Object": "Object", "Context": "Context", "Closure": "Closure"}
+               "Object": "Object", "Context": "Context", "Closure": "Closure",
+               # Dart 3.13 sizes a closure by its captured slots and has one stub per
+               # size, GenerateAllocateClosureStub(1) to (4) (stub_code_compiler.cc).
+               # The class allocated is Closure whichever it is.
+               "Closure1": "Closure", "Closure2": "Closure", "Closure3": "Closure",
+               "Closure4": "Closure"}
 
 
 def _returns_x0(base: str) -> bool:
@@ -1792,8 +1797,8 @@ def _return_registers(blocks, entry, evidence=None, named=None, table=None) -> d
     `Function::has_unboxed_double_return`, read off `unboxed_parameters_info_`, and that
     field is compiled out of the AOT runtime and never serialized. raw_object.h keeps it
     under `!defined(DART_PRECOMPILED_RUNTIME)` and the Function cluster writes only
-    `kind_tag_` for kFullAOT, whose bits are kind, recognizer and modifiers, on all 18
-    registered releases, 2.19.0-444.2.beta to 3.12.2. So the answer comes from the code,
+    `kind_tag_` for kFullAOT, whose bits are kind, recognizer and modifiers, on all 19
+    registered releases, 2.19.0-444.2.beta to 3.13.0. So the answer comes from the code,
     and d0 needs proof:
 
       * the callers. `evidence()` says which of x0 and d0 the code after a `bl` to this

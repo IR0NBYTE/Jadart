@@ -199,7 +199,30 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
     # per-object field) of the same information, so they must agree elementwise.
     cls_clusters = by_name.get("ClassCid", [])
     pre = next((cl.predefined_cids for cl in cls_clusters if cl.predefined_cids), None)
-    if pre is None:
+    layout = getattr(hdr.epoch, "roots", None)
+    if pre is None and layout is not None and layout.class_cids:
+        # From 3.13 the alloc pass carries no cid list to compare, and the same fact is
+        # encoded somewhere else instead: the roots hold one Class per predefined cid,
+        # read in cid order (ProgramDeserializationRoots::ReadRoots), and each of those
+        # Class objects states its own id in the fill pass. They sit behind 1,357 other
+        # roots, so a root run off by a single ref puts every class on its neighbour's
+        # cid, and a wrong cid table or a wrong Class fill does the same.
+        from .objstore import class_roots
+        pairs = class_roots(image, fr, hdr.epoch) if image is not None else None
+        if pairs is None:
+            gates.append(_g("G3 class table roots vs class ids", "A", False, 0,
+                            skipped="needs the snapshot blob and its roots"))
+        elif not pairs:
+            gates.append(_g("G3 class table roots vs class ids", "A", False, 0,
+                            "the stream ends inside the root run"))
+        else:
+            ids = {ref: cid & 0xFFFFFFFF for ref, _n, cid, _s in fr.classes}
+            bad = [cid for cid, ref in pairs if ids.get(ref) != cid]
+            gates.append(_g("G3 class table roots vs class ids", "A", not bad,
+                            len(pairs),
+                            f"{len(pairs)} roots are the Class of the cid read for"
+                            + (f"; first mismatch at cid {bad[0]}" if bad else "")))
+    elif pre is None:
         gates.append(_g("G3 class-cid prefix", "A", False, 0,
                         skipped="no CLASS cluster with a predefined list"))
     else:
@@ -478,7 +501,15 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
     # own objects from num_base_objects + 1 (clusters.py, next_ref). The VM asserts the
     # equality at load with a release FATAL, so it is a format invariant, and the two
     # numbers come out of two separately parsed headers, which is what makes it a check.
-    if vm is None:
+    fixed = getattr(hdr.epoch, "base_objects", None)
+    if fixed is not None:
+        # One snapshot, so there is no vm one to chain from: the base objects are the
+        # roots AddBaseObjects names, and the header has to state that many.
+        ok = (hdr.num_base_objects == fixed)
+        gates.append(_g("G13 base objects vs fixed roots", "B", ok, 1,
+                        f"base_objects {hdr.num_base_objects} "
+                        f"{'==' if ok else '!='} the {fixed} this release fixes"))
+    elif vm is None:
         gates.append(_g("G13 base objects vs vm snapshot", "B", False, 0,
                         skipped="no vm snapshot in this container"))
     else:

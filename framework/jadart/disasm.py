@@ -150,7 +150,8 @@ class UnsupportedArch(JadartError):
 #: in snapshot.py because `info` reads it and must not import capstone to do so.
 from .snapshot import ISOLATE_INSTRUCTIONS  # noqa: E402,F401
 
-#: Instructions::kPolymorphicEntryOffsetAOT (object.h), identical in 2.19.6 and 3.12.2: how
+#: Instructions::kPolymorphicEntryOffsetAOT (object.h), identical in 2.19.6, 3.12.2 and
+#: 3.13.0: how
 #: far into the payload a Code object with a monomorphic entry has its normal entry point.
 #: Such a payload opens on the switchable-call miss handler, then the monomorphic entry,
 #: then the entry every static and dispatch-table call targets. ia32 has none in AOT, and
@@ -666,8 +667,19 @@ def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
     # Fixed ASCII out of a generated table, not a string out of the binary, so `raw` makes
     # no difference to these and they need no escaping. A symbol table that does name a
     # stub wins, because it is the same name written by the same compiler.
-    for pc, nm in stub_names(image, fr, getattr(image, "epoch", None)).items():
-        pc_to_name.setdefault(pc, nm)
+    # Through 3.12, that is. The `_iso_stub_<Name>Stub` spelling every stub rule keys on
+    # is StubCode::ForEachStub's (stub_code.cc:355 at 3.12.2), and 3.13 dropped it with
+    # the vm isolate: its ForEachStub hands the symbol namer the bare list name. So on
+    # a 3.13 build that keeps a symbol table the roots' name wins, or a stub that
+    # throws would print as an ordinary call again (#234). Read from the source: no
+    # 3.13 binary with a symbol table has been through this.
+    epoch = getattr(image, "epoch", None)
+    roots_win = bool(getattr(epoch, "merged", False))
+    for pc, nm in stub_names(image, fr, epoch).items():
+        if roots_win:
+            pc_to_name[pc] = nm
+        else:
+            pc_to_name.setdefault(pc, nm)
     for owner_ref, cr in image.code_ranges.items():
         nm = fname.get(owner_ref)
         if nm:

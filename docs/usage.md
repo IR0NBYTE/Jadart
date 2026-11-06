@@ -139,6 +139,10 @@ instructions image. That is the address IDA, Ghidra, radare2 and a debugger all 
 can be pasted straight into one. `jadart info` prints the anchor, and `info -j` carries it
 with the rule, so a caller holding only a `pc_offset` can do the arithmetic itself.
 
+A Dart 3.13 build exports one instructions image, as `_kDartSnapshotText`, and that is
+the anchor there. Read it from `info` rather than assuming either name; the scripts
+`symbols` and `hook` write already carry the one their binary exports.
+
 ```
 $ jadart info libapp.so | tail -4
 [addresses]
@@ -339,7 +343,8 @@ idat -A -S"a.py --exit" libapp.so                    # IDA, or File > Script fil
 ```
 
 **Addresses come from the export, not from `.text`.** Every offset in a script is relative
-to `_kDartIsolateSnapshotInstructions`, so a rebased load lines up on its own: an ELF
+to `_kDartIsolateSnapshotInstructions` (`_kDartSnapshotText` on Dart 3.13), so a rebased
+load lines up on its own: an ELF
 loaded at its own base, the same file at `-B 0x7000000000`, and a Ghidra import with
 `-loader-imagebase` all land on the same instruction. `.text` would not, because it also
 holds the VM instructions image in front of the isolate one; on the clean fixture that is

@@ -13,6 +13,16 @@ inserted or dropped shifts every later index, and a shifted index would name a s
 its neighbour. OBJECT_STORE_STUB_CODE_LIST beside it gives each field's stub name in the
 spelling the VM's own symbols use (`_iso_stub_<Name>Stub`, image_snapshot.cc).
 
+Dart 3.13 folded the vm snapshot into the program's, and the root run grew a prefix: the
+Roots struct (roots.h: the raw roots, the handles, the API handles) and then the class
+table, all read ahead of the ObjectStore. The stubs moved with it. They are no longer
+ObjectStore fields but `stub_handles_`, in VM_STUB_CODE_LIST order (stub_code_list.h),
+and OBJECT_STORE_STUB_CODE_LIST is gone. So for such a release the layout is assembled
+from five files, each read rather than assumed: roots.h for the struct, symbol_list.h and
+stub_code_list.h for the two arrays the handles end with, app_snapshot.cc for the order
+the three parts are read in and for which class ids have no Class to read, and class_id.h
+for the ids themselves.
+
 DEV-TIME ONLY. jadart itself stays offline and ships the generated table; nothing under
 jadart/ imports this.
 
@@ -59,13 +69,173 @@ def _macro_body(src: str, name: str) -> str:
     return re.sub(r"\\\s*\n\s*", " ", "\n".join(out))
 
 
+def _one_macro(src: str, name: str, tag: str, where: str) -> str:
+    """`_macro_body`, for a macro that must be defined exactly once in its header.
+
+    Twice means an #if picks between two lists, and taking the first would be choosing
+    a build configuration without saying so."""
+    n = src.count(f"#define {name}(")
+    if n != 1:
+        raise FetchError(f"{tag}: {where} defines {name} {n} times, so which list a "
+                         "build gets is not something this can read off the header")
+    return _macro_body(src, name)
+
+
+def _stub_list(tag: str) -> list:
+    """VM_STUB_CODE_LIST expanded, in order: the names `stub_handles_` is indexed by."""
+    src = fetch(tag, "stub_code_list.h").decode("utf-8", "replace")
+
+    def expand(name, depth=0):
+        if depth > 4:
+            raise FetchError(f"{tag}: {name} nests deeper than a stub list does")
+        body = _one_macro(src, name, tag, "stub_code_list.h").split(")", 1)[1]
+        out = []
+        for head, arg in re.findall(r"(\w+)\(\s*(\w+)\s*\)", body):
+            if head == "V":
+                out.append(arg)
+            elif arg == "V" and f"#define {head}(" in src:
+                out += expand(head, depth + 1)
+            else:
+                raise FetchError(f"{tag}: {name} holds `{head}({arg})`, which is "
+                                 "neither an entry nor a list in the same header")
+        return out
+
+    stubs = expand("VM_STUB_CODE_LIST")
+    if not stubs or len(set(stubs)) != len(stubs):
+        raise FetchError(f"{tag}: VM_STUB_CODE_LIST expanded to {len(stubs)} entries, "
+                         f"{len(set(stubs))} distinct")
+    return stubs
+
+
+def _struct(src: str, name: str, tag: str) -> str:
+    m = re.search(r"\n  struct " + name + r" \{\n(.*?)\n  \};", src, re.S)
+    if m is None:
+        raise FetchError(f"{tag}: no `struct {name}` in roots.h")
+    return m.group(1)
+
+
+def _roots_prefix(tag: str):
+    """The names of the refs ReadRoots reads ahead of the ObjectStore, or None.
+
+    None is every release through 3.12, where the roots open with the ObjectStore. From
+    3.13 ProgramDeserializationRoots::ReadRoots first fills the Roots struct, three
+    loops over `from()..to()`, `fromh()..toh()` and `fromah()..toah()`, and then the
+    class table. Each name is tagged with what it is (`raw:`, `handle:`, `symbol:`,
+    `stub:`, `api:`, `class:`), which is what the caller and --check read."""
+    snap = fetch(tag, "app_snapshot.cc").decode("utf-8", "replace")
+    m = re.search(r"class ProgramDeserializationRoots\b.*?\n  void ReadRoots\("
+                  r"Deserializer\* d\) override \{\n(.*?)\n  \}\n", snap, re.S)
+    if m is None:
+        raise FetchError(f"{tag}: no ProgramDeserializationRoots::ReadRoots")
+    body = m.group(1)
+    store = body.find("object_store_->from()")
+    if store < 0:
+        raise FetchError(f"{tag}: ReadRoots does not read the ObjectStore")
+    if "Roots::Current()" not in body[:store]:
+        return None
+    body = body[:store]
+    loops = [(body.find(f"roots->{k}()"), part)
+             for k, part in (("from", "raw"), ("fromh", "handles"), ("fromah", "api"))]
+    if min(at for at, _ in loops) < 0:
+        raise FetchError(f"{tag}: ReadRoots fills Roots, but not as three loops over "
+                         "from(), fromh() and fromah()")
+    order = [part for _at, part in sorted(loops)]
+
+    src = fetch(tag, "roots.h").decode("utf-8", "replace")
+    stubs = _stub_list(tag)
+    # One V(Name, "literal") per symbol. The literals go first, because some hold a
+    # parenthesis; then anything that is not a V( entry would be a nested list this
+    # is not counting, and a short count shifts every root after the symbols.
+    listed = re.sub(r'"(?:[^"\\]|\\.)*"', '""', _one_macro(
+        fetch(tag, "symbol_list.h").decode("utf-8", "replace"),
+        "PREDEFINED_SYMBOLS_LIST", tag, "symbol_list.h").split(")", 1)[1])
+    heads = re.findall(r"(\w+)\s*\(", listed)
+    if not heads or set(heads) != {"V"}:
+        raise FetchError(f"{tag}: PREDEFINED_SYMBOLS_LIST holds more than V() entries: "
+                         f"{sorted(set(heads) - {'V'})[:3]}")
+    symbols = len(heads)
+    sizes = {"kNumPredefinedSymbols + 256": symbols + 256, "kNumStubEntries": len(stubs)}
+
+    def members(struct, listname, pattern, tagged):
+        """One struct's roots in declaration order: its list, then its arrays."""
+        decl = _struct(src, struct, tag)
+        if decl.count(f"{listname}(DECL)") != 1:
+            raise FetchError(f"{tag}: struct {struct} does not expand {listname} once")
+        out = [f"{tagged}:{n}" for n in re.findall(
+            pattern, _one_macro(src, listname, tag, "roots.h"))]
+        after = decl[decl.index(f"{listname}(DECL)"):].split("#undef DECL", 1)[1]
+        for line in after.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("//"):
+                continue
+            arr = re.fullmatch(r"\w+ (\w+)_\[([^\]]+)\](?: = \{\})?;", line)
+            if arr is None:
+                raise FetchError(f"{tag}: struct {struct} holds `{line}` after its "
+                                 "list, which is not an array of roots")
+            base, size = arr.groups()
+            if size.isdigit():
+                n = int(size)
+            elif size in sizes:
+                n = sizes[size]
+            else:
+                raise FetchError(f"{tag}: {struct}.{base}_ is sized `{size}`, which "
+                                 "this cannot evaluate")
+            if base == "stub_handles":
+                out += [f"stub:{s}" for s in stubs]
+            else:
+                out += [f"{'symbol' if base == 'symbol_handles' else tagged}:"
+                        f"{base}[{i}]" for i in range(n)]
+        return out
+
+    parts = {
+        "raw": members("Raw", "RAW_ROOTS_LIST", r"V\(\s*\w+\s*,\s*(\w+)\s*\)", "raw"),
+        "handles": members("Internal", "HANDLE_ROOTS_LIST",
+                           r"V\(\s*\w+\s*,\s*(\w+)\s*\)", "handle"),
+        "api": members("Api", "API_HANDLE_ROOTS_LIST", r"V\(\s*(\w+)\s*\)", "api"),
+    }
+    names = [n for part in order for n in parts[part]]
+
+    # The class table: every predefined cid from kObjectCid up, in two loops that meet at
+    # kInstanceCid, less the ones IsAbsentCid says have no Class object.
+    tail = body[max(at for at, _ in loops):]
+    spans = re.findall(r"for \(intptr_t cid = (k\w+); cid < (k\w+); cid\+\+\) \{\s*"
+                       r"if \(IsAbsentCid\(cid\)\) continue;", tail)
+    if spans != [("kObjectCid", "kInstanceCid"), ("kInstanceCid", "kNumPredefinedCids")]:
+        raise FetchError(f"{tag}: the class-table loops in ReadRoots are {spans}")
+    m = re.search(r"static bool IsAbsentCid\(intptr_t cid\) \{\s*switch \(cid\) \{(.*?)"
+                  r"return true;", snap, re.S)
+    if m is None:
+        raise FetchError(f"{tag}: no IsAbsentCid switch in app_snapshot.cc")
+    absent = set(re.findall(r"case k(\w+):", m.group(1)))
+    from gen_cids import cid_names_for_tag
+    cids = cid_names_for_tag(tag)
+    by_name = {v: k for k, v in cids.items()}
+    missing = sorted(absent - set(by_name))
+    if missing or "ObjectCid" not in by_name:
+        raise FetchError(f"{tag}: IsAbsentCid names {missing}, which class_id.h does "
+                         "not define")
+    names += [f"class:{c}" for c in range(by_name["ObjectCid"], len(cids))
+              if cids[c] not in absent]
+    return names
+
+
 def layout_for_tag(tag: str) -> dict:
     """{count, codes, fields} for the AOT root run at this SDK tag.
 
     `count` is how many refs the deserializer reads, `codes` is (root index, stub name or
     None) for every Code-typed field in that run, and `fields` is the whole ordered run,
-    which --check uses to say WHERE two releases differ."""
+    which --check uses to say WHERE two releases differ. From 3.13 the run opens with
+    the Roots struct and the class table (`_roots_prefix`); `class_base` and
+    `class_cids` then say which roots are the class table and which cid each is."""
     src = fetch(tag, "object_store.h").decode("utf-8", "replace")
+    if "#define OBJECT_STORE_STUB_CODE_LIST(" not in src:
+        # No stub list beside the fields: the stubs are in Roots, or this is a header
+        # nothing here knows how to read.
+        prefix = _roots_prefix(tag)
+        if prefix is None:
+            raise FetchError(f"{tag}: object_store.h has no OBJECT_STORE_STUB_CODE_LIST "
+                             "and ReadRoots reads no Roots struct ahead of it")
+        return _merged_layout(tag, prefix, src)
     entries = _ENTRY_RE.findall(_macro_body(src, "OBJECT_STORE_FIELD_LIST"))
     if not entries:
         raise FetchError(f"{tag}: OBJECT_STORE_FIELD_LIST expanded to nothing")
@@ -81,7 +251,37 @@ def layout_for_tag(tag: str) -> dict:
     codes = tuple((i, stubs.get(names[i]))
                   for i in range(count) if entries[i][1] == "Code")
     return {"count": count, "codes": codes, "fields": tuple(names[:count]),
-            "boundary": m.group(1)}
+            "boundary": m.group(1), "class_base": -1, "class_cids": ()}
+
+
+def _merged_layout(tag: str, prefix: list, src: str) -> dict:
+    """The 3.13 root run: the prefix, then the ObjectStore fields as before.
+
+    The stubs are the prefix's `stub:` entries and nothing else. A Code-typed field in
+    the ObjectStore run would be a stub this does not know how to name, so it is
+    refused rather than left out of the set the reader checks the binary against."""
+    entries = _ENTRY_RE.findall(_macro_body(src, "OBJECT_STORE_FIELD_LIST"))
+    m = _AOT_RE.search(re.sub(r"\s+", " ", src))
+    if not entries or m is None:
+        raise FetchError(f"{tag}: object_store.h has no field list or no "
+                         "to_snapshot(kFullAOT)")
+    names = [e[2] for e in entries]
+    if m.group(1) not in names:
+        raise FetchError(f"{tag}: to_snapshot(kFullAOT) names {m.group(1)}, which is not "
+                         "a field of OBJECT_STORE_FIELD_LIST")
+    store = names.index(m.group(1)) + 1
+    typed = [e[2] for e in entries[:store] if e[1] == "Code"]
+    if typed:
+        raise FetchError(f"{tag}: the ObjectStore still holds stubs ({typed[:3]}) beside "
+                         "the ones in Roots, and this names only the latter")
+    classes = [i for i, n in enumerate(prefix) if n.startswith("class:")]
+    if classes != list(range(classes[0], len(prefix))):
+        raise FetchError(f"{tag}: the class table is not the end of the roots prefix")
+    codes = tuple((i, n[5:]) for i, n in enumerate(prefix) if n.startswith("stub:"))
+    return {"count": len(prefix) + store, "codes": codes,
+            "fields": tuple(prefix) + tuple(names[:store]), "boundary": m.group(1),
+            "class_base": classes[0],
+            "class_cids": tuple(int(prefix[i][6:]) for i in classes)}
 
 
 #: Which releases share one root run, newest first. A layout is keyed on the release
@@ -93,6 +293,7 @@ def layout_for_tag(tag: str) -> dict:
 #: from a Dart revision (Flutter 3.32.0 pins b04011c7) rather than from a release tag; the
 #: reader's agreement check is what decides whether the tag's layout fits such a binary.
 GROUPS = (
+    ("3_13", ("3.13.0",)),
     ("3_12", ("3.12.2", "3.12.0")),
     ("3_11", ("3.11.5",)),
     ("3_10", ("3.10.9",)),
@@ -114,6 +315,15 @@ def emit_group(label: str, tags, got: dict) -> str:
     """One layout as the Python literal jadart/objstore.py holds."""
     head = (f"Dart {_releases(tags)}. {got['count']} roots, ending at "
             f"`{got['boundary']}`; {len(got['codes'])} of them Code.")
+    classes = got["class_cids"]
+    if classes:
+        kinds = [n.split(":", 1)[0] for n in got["fields"][:got["class_base"]]]
+        head += (f" The first {got['class_base'] + len(classes)} are read ahead of the "
+                 f"ObjectStore: {kinds.count('raw')} raw roots, "
+                 f"{sum(kinds.count(k) for k in ('handle', 'symbol', 'stub'))} handles "
+                 f"(the stubs are the last {kinds.count('stub')} of them), "
+                 f"{kinds.count('api')} API handles and the class table, "
+                 f"{len(classes)} classes from root {got['class_base']}.")
     out = [f"#: {line}" for line in textwrap.wrap(head, 86)]
     out.append(f"_STUBS_{label}: dict[int, str] = {{")
     for i, name in got["codes"]:
@@ -121,6 +331,19 @@ def emit_group(label: str, tags, got: dict) -> str:
             out.append(f"    {i}: {name!r},")
     out.append("}")
     unnamed = tuple(i for i, name in got["codes"] if name is None)
+    if classes:
+        if unnamed:
+            raise FetchError(f"group {label}: a Roots stub with no name")
+        out.append("#: The cid each class-table root is the Class of, in the order read.")
+        rows = textwrap.wrap(", ".join(map(str, classes)), 84)
+        out.append(f"_CLASSES_{label} = (")
+        out += [f"    {row}" for row in rows]
+        out[-1] += ")"
+        out.append(f"ROOTS_{label} = RootLayout(")
+        out.append(f"    count={got['count']}, stubs=_STUBS_{label},")
+        out.append(f"    class_base={got['class_base']}, "
+                   f"class_cids=_CLASSES_{label})")
+        return "\n".join(out)
     if not unnamed:
         out.append(f"ROOTS_{label} = RootLayout(count={got['count']}, "
                    f"stubs=_STUBS_{label})")
@@ -140,8 +363,8 @@ def emit_all() -> str:
     for label, tags in GROUPS:
         got = [layout_for_tag(t) for t in tags]
         for g in got[1:]:
-            if (g["count"], g["codes"], g["boundary"]) != (
-                    got[0]["count"], got[0]["codes"], got[0]["boundary"]):
+            if any(g[k] != got[0][k] for k in ("count", "codes", "boundary",
+                                               "class_base", "class_cids")):
                 raise FetchError(f"group {label}: {tags} do not share one root run")
         parts.append(emit_group(label, tags, got[0]))
         index += [(t, f"ROOTS_{label}") for t in tags]
@@ -181,7 +404,9 @@ def main(argv=None) -> int:
             have = LAYOUTS[tag]
             stubs = {i: n for i, n in got["codes"] if n is not None}
             unnamed = frozenset(i for i, n in got["codes"] if n is None)
-            if (have.count, have.stubs, have.unnamed) == (got["count"], stubs, unnamed):
+            if (have.count, have.stubs, have.unnamed, have.class_base,
+                    have.class_cids) == (got["count"], stubs, unnamed,
+                                         got["class_base"], got["class_cids"]):
                 print(f"{tag}: ok ({got['count']} roots, {len(stubs)} named stubs)")
                 continue
             bad += 1
@@ -195,6 +420,11 @@ def main(argv=None) -> int:
             if have.unnamed != unnamed:
                 print(f"  unnamed: bundled {sorted(have.unnamed)}, "
                       f"source {sorted(unnamed)}")
+            if (have.class_base, have.class_cids) != (got["class_base"],
+                                                      got["class_cids"]):
+                print(f"  class table: bundled {len(have.class_cids)} from root "
+                      f"{have.class_base}, source {len(got['class_cids'])} from root "
+                      f"{got['class_base']}")
         return 1 if bad else 0
 
     if not args.tag:
@@ -206,7 +436,7 @@ def main(argv=None) -> int:
     print(f"Dart {args.tag}: {got['count']} AOT roots, ending at `{got['boundary']}`")
     print(f"  Code-typed fields in the run: {len(got['codes'])}")
     unnamed = [i for i, n in got["codes"] if n is None]
-    print(f"  without an OBJECT_STORE_STUB_CODE_LIST name: {len(unnamed)} {unnamed}")
+    print(f"  without a name in the release's stub list: {len(unnamed)} {unnamed}")
     first = got["codes"][0]
     print(f"  first Code field: index {first[0]} {first[1]}")
     print(f"  last Code field:  index {got['codes'][-1][0]} {got['codes'][-1][1]}")
