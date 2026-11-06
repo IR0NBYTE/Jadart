@@ -16423,73 +16423,148 @@ def test_the_generated_corpus_can_draw_a_flag_setting_alu_op():
         assert drew == want, (flags, drew)
 
 
-def test_an_accessor_names_a_slot_only_when_its_body_is_that_access():
-    # #240's population 1 is a slot whose `Field` object was tree-shaken: 9,770 of the
-    # clean fixture's 9,943 receiver field accesses sit at an offset the map cannot name.
-    # The `get:`/`set:` Function often survives, so the name is still in the snapshot.
-    #
-    # The shape is the whole proof. A getter that merely READS a slot on the way to a
-    # computed answer says nothing about that slot's name: `_HashSet.isEmpty` loads the
-    # length slot and compares it, and a looser rule named the length slot `isEmpty`,
-    # which is the wrong-name failure `fields.py` exists to prevent. jadx draws the same
-    # line, its `kotlin-metadata.getters` flag being "rename SIMPLE getters to field
-    # names". So: the body is the read, or there is no name.
-    from jadart.fields import _getter_offset, _setter_offset
+def _accessor_rows(rs):
+    return [(0x1000 + i * 4, mn, op) for i, (mn, op) in enumerate(rs)]
 
-    def rows(rs):
-        return [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rs)]
 
-    # the whole body IS the read: offset 8 of the receiver, tag bias included
-    assert _getter_offset(rows([("ldur", "x0, [x1, #7]"), ("ret", "")])) == 8
-    assert _getter_offset(rows([("ldur", "x0, [x1, #7]"), ("nop", ""),
-                                ("ret", "")])) == 8
-    # a computed getter: it loads the slot and then does something with it
-    assert _getter_offset(rows([("ldur", "x0, [x1, #7]"), ("cmp", "x0, #0"),
-                                ("cset", "x0, eq"), ("ret", "")])) is None
-    # not off the receiver, and not into the result
-    assert _getter_offset(rows([("ldur", "x0, [x3, #7]"), ("ret", "")])) is None
-    assert _getter_offset(rows([("ldur", "x5, [x1, #7]"), ("ret", "")])) is None
-    # a setter that writes one slot names it; one that writes two names neither
-    assert _setter_offset(rows([("stur", "x2, [x1, #0xf]"), ("ret", "")])) == 16
-    assert _setter_offset(rows([("stur", "x2, [x1, #0xf]"),
-                                ("stur", "x3, [x1, #7]"), ("ret", "")])) is None
-    assert _setter_offset(rows([("stur", "x2, [x4, #0xf]"), ("ret", "")])) is None
+def test_the_receiver_is_followed_from_the_entry_convention_and_nowhere_else():
+    # #258. The old setter rule took "a store off x1 or x2" for a store into the receiver,
+    # and named the slot after the setter. `RenderAnimatedSize.set:reverseDuration` loads
+    # its controller into x2 and stores into THAT, and `_DelayedDone.set:next` stores into
+    # an error it has just allocated; neither touches its receiver at the offset it wrote.
+    # The reader follows parameter 0 from where the convention puts it: x1, or the first
+    # pushed argument at entry-SP + 8 * (nargs - 1), through copies, spills and reloads.
+    if not _capstone_available():
+        _skip("  SKIP test_the_receiver_is_followed_from_the_entry_convention")
+    from jadart.fields import _receiver_accesses as acc
+    # register convention: a getter that is the load, and one that decompresses it
+    assert acc(_accessor_rows([("ldur", "x0, [x1, #7]"), ("ret", "")]), 1) == {("ld", 8)}
+    assert acc(_accessor_rows([("ldur", "w0, [x1, #0x17]"),
+                               ("add", "x0, x0, x28, lsl #32"), ("ret", "")]), 1) \
+        == {("ld", 0x18)}
+    # stack convention, frameless: a getter's receiver at [SP], a setter's at [SP + 8]
+    assert acc(_accessor_rows([("ldr", "x1, [x15]"), ("ldur", "w0, [x1, #0x17]"),
+                               ("ret", "")]), 1) == {("ld", 0x18)}
+    assert acc(_accessor_rows([("ldr", "x0, [x15]"), ("ldr", "x1, [x15, #8]"),
+                               ("stur", "w0, [x1, #0xf]"), ("ret", "")]), 2) \
+        == {("st", 0x10)}
+    # with a frame, spilled across a call and reloaded: Tween.set:end's shape
+    tween = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+             ("sub", "x15, x15, #0x10"), ("stur", "x1, [x29, #-8]"),
+             ("stur", "x2, [x29, #-0x10]"), ("blr", "x9"),
+             ("ldur", "x0, [x29, #-0x10]"), ("ldur", "x1, [x29, #-8]"),
+             ("stur", "w0, [x1, #0xf]"), ("mov", "x15, x29"),
+             ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")]
+    assert acc(_accessor_rows(tween), 2) == {("st", 0x10)}
+    # NOT the receiver: a register loaded out of it (set:reverseDuration's shape) ...
+    assert acc(_accessor_rows([("ldur", "w2, [x1, #0x67]"),
+                               ("add", "x2, x2, x28, lsl #32"),
+                               ("stur", "w22, [x2, #0x2b]"), ("ret", "")]), 2) \
+        == {("ld", 0x68)}
+    # ... the result of an allocation (set:next's shape) ...
+    assert acc(_accessor_rows([("bl", "#0x2000"), ("stur", "w2, [x0, #7]"),
+                               ("ret", "")]), 2) == set()
+    # ... x1 after a call has clobbered it, with nothing reloading it ...
+    assert acc(_accessor_rows([("bl", "#0x2000"), ("stur", "w2, [x1, #7]"),
+                               ("ret", "")]), 2) == set()
+    # ... and a register that holds the receiver on one path into a join only.
+    joined = [("cbz", "x3, #0x100c"), ("mov", "x1, x4"), ("stur", "w2, [x1, #7]"),
+              ("ret", "")]
+    assert acc(_accessor_rows(joined), 2) == set()
+    # A receiver access it cannot place is no answer at all, rather than a partial one.
+    assert acc(_accessor_rows([("ldr", "w0, [x1, x3]"), ("ret", "")]), 1) is None
+    # An offset too big for the displacement goes through a constant register.
+    assert acc(_accessor_rows([("mov", "x17, #0x15f"), ("ldr", "w0, [x1, x17]"),
+                               ("ret", "")]), 1) == {("ld", 0x160)}
+
+
+def test_a_hand_written_setter_does_not_name_the_slot_it_stores_to():
+    # #258. `set capacity(int value) { _capacity = value; ... }`: Dart forbids a field
+    # and a setter of one name in one class, so a hand-written setter's name is not its
+    # slot's. main printed `this.capacity = x2;` inside `_Channel.set:capacity`, and 56
+    # of the 61 offsets the old rule named on the clean fixture came from such setters.
+    # Every name the channel gives now has an IMPLICIT accessor of that name whose own
+    # Field is at that offset in that class.
+    _needs_capstone()
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_accessors, recover_fields
+    from jadart.program import _FUNCTION_KINDS
+    image, fr, hdr = load_instructions(CLEAN)
+    layout = recover_fields(fr, hdr.arch)
+    acc = recover_accessors(image, fr, layout)
+    assert not acc.refused, acc.refused
+    channel = next(r for r, n in layout.class_name.items() if n.startswith("_Channel@"))
+    assert (acc.by_class.get(channel) or {}).get(0x10) is None, acc.by_class.get(channel)
+    for cls in (r for r, n in layout.class_name.items() if n == "TextPainter"):
+        got = set((acc.by_class.get(cls) or {}).values())
+        assert not got & {"locale", "ellipsis"}, got
+    offset_of = {}
+    for fref, (kb, vref) in fr.field_meta.items():
+        if fr.smi_values.get(vref) is not None and not (kb >> 1) & 1:
+            offset_of[fref] = fr.smi_values[vref] * hdr.arch.compressed_word_size
+    implicit = {}
+    for ref, nr, ow, kt in fr.functions:
+        kind = _FUNCTION_KINDS[kt & 0x1F]
+        if kind in ("ImplicitGetter", "ImplicitSetter"):
+            off = offset_of.get(fr.func_data.get(ref))
+            implicit.setdefault((ow, off), set()).add(fr.names.get(nr, "")[4:])
+    named = [(cls, off, nm) for cls, offs in acc.by_class.items()
+             for off, nm in offs.items()]
+    assert len(named) == acc.added >= 5, (len(named), acc.added)
+    for cls, off, nm in named:
+        assert nm in implicit.get((cls, off), ()), (layout.class_name[cls], off, nm)
+
+
+def test_an_implicit_accessor_names_its_own_fields_slot():
+    # The positive half, and two things the old rule could not reach. An implicit
+    # accessor's `data` IS its Field (KernelLoader::GenerateFieldAccessors calls
+    # set_accessor_field), and the slots this names are the ones whose Field survives
+    # with an offset but whose name is a VM-snapshot string the isolate snapshot never
+    # writes. dart:ui's `Color` declares `final double a, r, g, b` in that order, which
+    # puts r, g and b at 0x10, 0x18 and 0x20; `_ConstantTickerModeDataListenable`'s only
+    # field is `value`, read by a getter whose body is more than the load.
+    _needs_capstone()
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_accessors, recover_fields
+    image, fr, hdr = load_instructions(CLEAN)
+    layout = recover_fields(fr, hdr.arch)
+    acc = recover_accessors(image, fr, layout)
+    by_name = {layout.class_name[c]: offs for c, offs in acc.by_class.items()}
+    assert by_name.get("Color") == {0x10: "r", 0x18: "g", 0x20: "b"}, by_name.get("Color")
+    tick = next(v for k, v in by_name.items()
+                if k.startswith("_ConstantTickerModeDataListenable@"))
+    assert tick == {0x8: "value"}, tick
+    stream = next(v for k, v in by_name.items()
+                  if k.startswith("_AsyncStarStreamController@"))
+    assert stream == {0xc: "controller", 0x10: "asyncStarBody"}, stream
 
 
 def test_the_accessor_names_agree_with_every_field_object_that_speaks():
-    # What says the channel is reading names rather than inventing them. Where the field
-    # map already names an offset the accessor has to agree, and ONE disagreement refuses
-    # the whole channel, which is the rule `recover_fields` applies to itself.
-    #
-    # The obf fixture is the other half of the argument: the accessor names are obfuscated
-    # there too, so the channel adds nothing, and a channel that invented names would add
-    # just as many there as here.
-    if not _capstone_available():
-        _skip("  SKIP test_the_accessor_names_agree_with_every_field_object_that_speaks")
+    # What says the channel reads names rather than inventing them, twice over. Where an
+    # implicit accessor's Field names itself, the two names are equal (145 of 145 on the
+    # clean fixture, 78 of 78 on the obf one); and the body reaches the receiver at the
+    # Field's own offset (84 on clean). The obf fixture names nothing, because the
+    # accessor names are obfuscated there too.
+    _needs_capstone()
     from jadart.disasm import load_instructions
     from jadart.fields import recover_accessors, recover_fields
     for lib, wants in ((CLEAN, True), (OBF, False)):
         image, fr, _h = load_instructions(lib)
         layout = recover_fields(fr, getattr(image, "arch", None))
         acc = recover_accessors(image, fr, layout)
-        assert acc.disagreed == 0 and not acc.refused, (
-            f"{lib}: {acc.refused or 'an accessor contradicted a Field object'}")
+        assert acc.disagreed == 0 and not acc.refused, f"{lib}: {acc.refused}"
+        assert acc.agreed >= 75, (lib, acc.agreed)
         if wants:
-            assert acc.agreed >= 40, (
-                f"only {acc.agreed} accessors meet a named offset, so the agreement that "
-                f"says this reads names is no longer being checked")
-            assert acc.added >= 50, f"only {acc.added} offsets named"
+            assert acc.agreed >= 140 and acc.body_agreed >= 80, (acc.agreed,
+                                                                 acc.body_agreed)
             merged = recover_fields(fr, getattr(image, "arch", None))
             assert merged.add_accessor_names(acc) == acc.added
-            # and it never takes an offset a `Field` object already named
             base = recover_fields(fr, getattr(image, "arch", None))
             for cls, offs in acc.by_class.items():
                 for off in offs:
                     assert off not in (base.by_class.get(cls) or {}), (cls, off)
         else:
-            assert acc.added == 0, (
-                f"{acc.added} names off an obfuscated build, where the accessor names "
-                f"carry nothing")
+            assert acc.added == 0, f"{acc.added} names off an obfuscated build"
 
 
 
@@ -16723,6 +16798,49 @@ def test_a_library_with_no_snapshot_symbol_is_told_what_is_true(tmp_path):
         assert cli.main(["-j", "info", str(path)]) == 2
     assert json.loads(buf.getvalue())["type"] == "ContainerError"
 
+
+def test_one_contradicted_accessor_refuses_the_whole_channel():
+    # Teeth, for both encodings. Moving one implicit accessor's Field to another slot
+    # makes its body disagree with it, and renaming one Field makes its accessor's name
+    # disagree with it; either one has to refuse every name, the rule `recover_fields`
+    # applies to an offset outside its owner.
+    _needs_capstone()
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_accessors, recover_fields
+    from jadart.program import _FUNCTION_KINDS
+    image, fr, hdr = load_instructions(CLEAN)
+    layout = recover_fields(fr, hdr.arch)
+    assert recover_accessors(image, fr, layout).added > 0
+    getter = next(ref for ref, nr, ow, kt in fr.functions
+                  if _FUNCTION_KINDS[kt & 0x1F] == "ImplicitGetter"
+                  and fr.names.get(nr, "") == "get:g"
+                  and layout.class_name.get(ow) == "Color")
+    field = fr.func_data[getter]
+    kb, vref = fr.field_meta[field]
+    # Point this one Field at the Smi of the next slot along. The Smi itself is shared by
+    # every Field at that offset, so it is the Field's ref that moves, not the number.
+    nxt = next(r for r, v in fr.smi_values.items() if v == fr.smi_values[vref] + 1)
+    fr.field_meta[field] = (kb, nxt)
+    try:
+        moved = recover_accessors(image, fr, layout)
+    finally:
+        fr.field_meta[field] = (kb, vref)
+    assert moved.disagreed == 1 and moved.added == 0 and "reaches" in moved.refused, moved
+    at = next(i for i, (ref, _n, _o) in enumerate(fr.fields)
+              if fr.names.get(_n, "") and any(fr.func_data.get(f) == ref
+                                              for f, _nr, _ow, kt in fr.functions
+                                              if _FUNCTION_KINDS[kt & 0x1F]
+                                              == "ImplicitSetter"))
+    other = next(n for _r, n, _o in fr.fields if fr.names.get(n, "")
+                 and fr.names.get(n) != fr.names.get(fr.fields[at][1]))
+    saved_field = fr.fields[at]
+    fr.fields[at] = (saved_field[0], other, saved_field[2])
+    try:
+        renamed = recover_accessors(image, fr, layout)
+    finally:
+        fr.fields[at] = saved_field
+    assert renamed.disagreed == 1 and renamed.added == 0, renamed
+    assert "names an implicit accessor after its own Field" in renamed.refused, renamed
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so

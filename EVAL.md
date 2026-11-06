@@ -244,10 +244,10 @@ Not true: that the 420 are all statics. **245 of them are instance fields**, eac
 fields of 59,160**, and **32,205 of 32,205** place inside their owner class's declared
 `instance_size` with none outside. Those are printed by name wherever the base's
 class is stated. That was `this` alone until a class's own allocation stub was read as the
-statement of what a `bl` allocates, and until a surviving accessor was read as the name of
-the slot its whole body touches (both #240): on the clean fixture the three channels clear
-1,793 of the 55,089 lines that would otherwise carry a byte offset, 1,734 of them on
-`this`.
+statement of what a `bl` allocates, and until an implicit accessor was read as the name of
+its own Field's slot where that Field's name is a VM-snapshot string (#240, #258): on the
+clean fixture the three channels clear 1,578 of the 55,089 lines that would otherwise
+carry a byte offset, 1,495 of them on `this`.
 
 Measured reach on the lifted output, corpus binary: **1,364 of 11,177** `this.field_0x`
 occurrences become names (12.2%), clearing **1,273 of 10,134** lines that carried one

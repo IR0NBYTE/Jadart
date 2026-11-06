@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 439](https://img.shields.io/badge/tests-439-brightgreen.svg)](#tests)
+[![tests: 442](https://img.shields.io/badge/tests-442-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -308,19 +308,21 @@ A field keeps its `Field` object when something still points at it: 162 of the c
 245 are the `data` of a surviving implicit getter, implicit setter, or field initializer.
 Everything the optimiser inlined away is gone, which is why the map reaches a minority of
 the accesses and not all of them: 17.1% of the `this` lines on Hacki, 18.0% on com.k.todo,
-and 16.1% on the committed clean fixture, 1,734 of the 10,758 lines that would otherwise
+and 13.9% on the committed clean fixture, 1,495 of the 10,758 lines that would otherwise
 carry a `this.field_0x`.
 
 Two further channels reach slots those `Field` objects do not, and both read a statement
 the snapshot makes rather than inferring one. A `Class` owns exactly one kind of code, its
 own allocation stub, so the `bl` that allocated a value says which class it is, which is
-what gives a base other than `this` a class at all. And a surviving `get:` or `set:` whose
-whole body IS that one access names the slot it touches, which is what jadx does with
-Kotlin getters, for the same reason: a runtime that keeps some metadata keeps it unevenly.
-Together the three take the clean fixture's byte-offset field lines from 55,089 to 53,296,
-the map 823 of them, the accessors 246 more and the allocation stubs 724 more. One
-disagreement refuses a whole channel, and on that fixture the accessors agree with the
-field map 40 times out of 40.
+what gives a base other than `this` a class at all. And an implicit getter or setter, the
+one the compiler makes for a field and names after it, still names that field's slot
+where the `Field` survives but its own name is a string only the VM snapshot holds:
+`Color`'s `r`, `g` and `b`. A hand-written setter is not read, because Dart forbids a
+field and a setter of one name in one class, so `set capacity` stores into `_capacity`.
+Together the three take the clean fixture's byte-offset field lines from 55,089 to 53,511,
+the map 823 of them, the accessors 49 more and the allocation stubs 706 more. One
+disagreement refuses a whole channel, and on that fixture the implicit accessors agree
+with the `Field` objects that name themselves 145 times out of 145.
 
 **Eighteen supported epochs today**, 2.19 through 3.12.2. This paragraph used to say
 "one, and three more identified and refused"; that was true when it was written and stopped
@@ -419,7 +421,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 439 tests
+cd framework && python3 -m pytest tests -q     # 442 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -427,7 +429,7 @@ cd framework && python3 -m pytest tests -q     # 439 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 408 of the 439 to run and the other 31 to
+clone with capstone installed, expect about 411 of the 442 to run and the other 31 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

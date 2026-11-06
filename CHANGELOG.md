@@ -13,37 +13,31 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
-- **A field whose `Field` object was tree-shaken is named by the accessor that reached
-  it.** 9,770 of the clean fixture's 9,943 receiver field accesses sit at an offset the
-  field map has no entry for, which is #240's population 1: the slot is there, its class
-  is known, and the name was dropped. It was not dropped everywhere. 969 `get:` and 208
-  `set:` Function objects survive on that build, so for some of those slots the name is
-  still in the snapshot under another key, and `fields.recover_accessors` reads it. jadx
-  does the same for the same runtime-with-metadata reason: its `kotlin-metadata.getters`
-  flag, "rename simple getters to field names", is on by default. The native decompilers
-  have no such channel, which is an asymmetry rather than an oversight, C having no
-  accessor convention: IDA offers `get_member_name(struct_id, offset)`, a lookup BY
-  offset, and Ghidra has the analyst rename the member.
+- **A field whose `Field` object survives without a readable name is named by the
+  implicit accessor the compiler made for it.** `KernelLoader::GenerateFieldAccessors`
+  makes an instance field's getter and setter as `kImplicitGetter` and `kImplicitSetter`,
+  named from the field, and sets each one's `data` to the Field itself
+  (`set_accessor_field`); `BuildGraphOfFieldAccessor` builds the body out of that Field
+  and parameter 0 alone. So the name and the slot are both the Field's, and the offset
+  is the Field's own Smi, not a reading of the code. A Field usually names itself and is
+  in the map already; `fields.recover_accessors` adds a name only where the Field's name
+  is a string the VM snapshot holds, a base object the isolate snapshot refers to and
+  never writes (`r`, `g`, `b`, `end`, `state`), while the accessor's `get:g` is written
+  into the isolate snapshot.
 
-  SIMPLE is the whole restriction, and it is where a looser rule goes wrong. A getter
-  that merely reads a slot on the way to a computed answer says nothing about that slot's
-  name: `_HashSet.isEmpty` loads the length slot and compares it, and taking the first
-  load in the body named the length slot `isEmpty`. So a getter is read only where its
-  whole body IS the read, one load off the receiver into the result register and then the
-  return, and a setter only where it stores to exactly ONE offset off the receiver. Where
-  the field map already names an offset the accessor has to agree, and on the clean
-  fixture it agrees 40 times out of 40, 17 getters and 23 setters, with 0 disagreements;
-  one disagreement refuses the whole channel, the rule `recover_fields` applies to itself.
+  Two checks against second encodings, and one contradiction of either refuses the whole
+  channel, the rule `recover_fields` applies to itself. Where the Field does name itself
+  the two names must be equal: 145 of 145 on the clean fixture, 78 of 78 on the obf one.
+  And the body, followed from the entry convention (x1, or the first pushed argument),
+  through copies, spills and reloads, must reach the receiver at the Field's offset and
+  nowhere else for a store: 84 on the clean fixture, 0 differing. A hand-written `get:`
+  or `set:` is never read; see Fixed for what reading them cost.
 
-  61 offsets over 41 classes, which takes `tools/quality.py`'s byte-offset field count
-  from 53,740 to 53,296, so 444 printed lines gain the name the program gave the slot and
-  960 export lines change, each a one-for-one substitution. Nothing else moves: the line
-  total, `regline`, `ellipsis`, `goto`, `rawasm` and `label` are identical on both
-  fixtures, `pbfuzz --census` is unchanged at 2,086 wrong reads and 0 stale, every oracle
-  pass is 0 mismatches on both, and no byte offset is printed that was not printed before.
-  The obf fixture gains 0, because its accessor names are obfuscated too: that is the
-  result rather than a failure, and a channel that invented names would have gained as
-  many there as here. Part of #240; the cid proofs it leaves are measured in DESIGN 13.1.
+  6 offsets over 3 classes on the clean fixture: `Color`'s `r`, `g` and `b`,
+  `_AsyncStarStreamController`'s `controller` and `asyncStarBody`, and
+  `_ConstantTickerModeDataListenable.value`. They take `tools/quality.py`'s byte-offset
+  field row from 54,266 to 54,217 before the allocation channel, 49 lines. The obf
+  fixture gains 0, because its accessor names are obfuscated too. Part of #240.
 - **A field of an object the body allocated is named, and the allocation says which
   class it is.** `Lifter._field` printed a recovered name only off `this`, because
   `Function.owner` was the only thing in the snapshot that stated a base's class, and
@@ -131,10 +125,11 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 - **The field-name sections say what names a field, which is three channels now and not
   one.** The README and EVAL's matching paragraph both still said a name is printed on
   `this` because `this` is the only value whose class the snapshot states, which the
-  allocation-stub and accessor channels (#240) made false. Measured on the clean fixture:
-  the three take byte-offset field lines from 55,089 to 53,296, the field map 823 of
-  them, the accessors 246 more and the allocation stubs 724 more, so 1,734 of the 10,758
-  lines that would carry a `this.field_0x` are cleared (16.1%).
+  allocation-stub and accessor channels (#240) made false. Measured on the clean fixture,
+  with the accessor channel as #258 left it: the three take byte-offset field lines from
+  55,089 to 53,511, the field map 823 of them, the accessors 49 more and the allocation
+  stubs 706 more, so 1,495 of the 10,758 lines that would carry a `this.field_0x` are
+  cleared (13.9%).
 
 ### Fixed
 
@@ -165,6 +160,38 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   libapp.so is told a snapshot starts at the offset the magic is at and that the
   symbols are what is missing; only a file with no snapshot in it is still pointed at
   libapp.so. The 3.13 epoch itself is #254. Closes #253.
+- **A hand-written setter's name is no longer printed as its field's name.** The accessor
+  channel added earlier in this release (#240) read every `get:` and `set:` Function
+  whose body was one access off x1 or x2, and named that slot after the Function. That
+  is right for an implicit accessor and wrong for a hand-written one: Dart forbids a
+  field and a setter of one name in one class, so `set capacity` stores into
+  `_capacity`. 56 of the 61 offsets it named on the clean fixture came from hand-written
+  setters, and 263 printed lines carried one of those names: `this.capacity = x2;` inside
+  `_Channel.set:capacity`, `this.ellipsis` and `this.locale` in `TextPainter` for
+  `_ellipsis` and `_locale`, 269 names in all, 43 distinct (`alignment` 33,
+  `textDirection` 27, `devicePixelRatio` 25). Its validation agreed 40 times out of 40,
+  and all 40 were implicit accessors, so it never met a case that was wrong. The store
+  rule did not ask what the base held either, so `RenderAnimatedSize.set:reverseDuration`,
+  which stores into the controller it loads, named the receiver's offset 44, and the
+  channel refused itself on all six real apps measured for #240 and named nothing there.
+  It now reads only `kImplicitGetter` and `kImplicitSetter`, takes the offset from the
+  Field the accessor's `data` points at, and checks the body against it from the entry
+  convention; see Added.
+
+  `tools/quality.py`'s byte-offset field row goes 53,296 to 53,511 on the clean fixture
+  (28.8% to 28.9%), the honest number: 263 lines lose a name and one gains one
+  (`_ConstantTickerModeDataListenable.value`, whose getter is more than the load), in 124
+  bodies, every one a one-for-one substitution, and the allocation channel names 18 lines
+  fewer because those names reached it through the field map. 262 export lines change on
+  the clean fixture (261 lose a name, 1 gains one) and none on the obf one, whose
+  `field` row stays 54,970; the line total, `regline`, `ellipsis`, `goto`, `rawasm` and
+  `label` are identical on both, `tools/pbfuzz.py --census` reads as on main (2,086
+  wrong reads, 0 stale records) and `tools/cfgcheck.py` reports 0 violations on either.
+  On the six real apps the channel no longer refuses
+  itself and names 6 to 12 offsets each: 13, 40, 126, 348, 495 and 668 printed lines
+  gain a name (xeonjia, jsdict, labplus, anytime, kazumi, tsdm_client), mostly `Color`'s
+  `r`, `g` and `b` and `Tween.end`, every one a substitution and none withdrawn. #258.
+
 - **A displacement below the base is not a negative field offset.** A pre-indexed access
   kept the heap-object tag bias and came out as `t3.field_0x-3`, which is not a field and
   not an address a reader can use: `.field_0xN` says offset N of the object the base

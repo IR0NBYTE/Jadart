@@ -1150,17 +1150,45 @@ only **107** of those classes have a field map at all, so the yield behind the s
 flow-sensitive machinery is single digits again. Most spans are tiny, 465 covering one cid
 and 122 covering two, which is an equality check written as a range.
 
-**A FOURTH PROOF, which pays and needs no flow at all: the accessor that survived.**
-Population 1 is a slot whose `Field` object was tree-shaken, and the name does not
-necessarily go with it. 969 `get:` and 208 `set:` Function objects survive on the clean
-fixture, and where one of them IS the access, a getter whose whole body is the load and
-the return or a setter that stores to exactly one receiver offset, it names that slot. 61
-offsets over 41 classes and 444 printed lines, with the agreement that says this is
-reading rather than guessing: 40 of 40 against the `Field` objects that also speak, 0
-disagreements, and 0 names on the obf build where the accessor names are obfuscated too.
-A getter that merely reads a slot on the way to a computed answer is refused, because
-taking the first load in the body named `_HashSet`'s length slot `isEmpty`. See
-`fields.recover_accessors` and #240.
+**A FOURTH PROOF, and a much smaller one than it first measured: the implicit accessor.**
+Its first version read any `get:` or `set:` Function whose body was one access off x1 or
+x2 and named that slot after the Function. 61 offsets over 41 classes on the clean
+fixture, and 56 of them came from HAND-WRITTEN setters, whose name is not their slot's:
+Dart forbids a field and a setter of one name in one class, so `_Channel.set:capacity`
+stores into `_capacity` and printed `this.capacity = x2;`, and TextPainter's paragraph
+style read `this.ellipsis` and `this.locale` for `_ellipsis` and `_locale`. 263 printed
+lines on the clean fixture carried one of those names. The check that was meant to catch
+it, agreement with the `Field` objects that also speak, agreed 40 times of 40, and all 40
+were implicit accessors, so it never looked at a case that was wrong. Its store rule did
+not ask what the base register held either: `RenderAnimatedSize.set:reverseDuration`
+loads its controller and stores into that, the rule named the receiver's offset 44, and
+the agreement check refused the whole channel on all six real apps (#258).
+
+What IS a proof is narrower. `KernelLoader::GenerateFieldAccessors` (kernel_loader.cc)
+makes an instance field's getter and setter as `kImplicitGetter` and `kImplicitSetter`,
+named from the field's own getter and setter names, and calls `set_accessor_field(field)`
+on both, so the Function's `data` is the Field; `BuildGraphOfFieldAccessor`
+(kernel_to_il.cc) builds the body out of that Field and parameter 0 and nothing else. The
+name and the slot are both the Field's, and the offset is the Field's own Smi rather than
+anything read from code. Two checks against second encodings, either of which refuses
+the channel on one contradiction: where the Field names itself the names are equal (145 of
+145 on the clean fixture, 78 of 78 on the obf one, 146 to 873 per real app, 0 differ),
+and the body, followed from the entry convention (`fields._receiver_accesses`: x1, or the
+first pushed argument at entry-SP plus eight per later argument, through copies, spills
+and reloads), reaches the receiver at the Field's offset and nowhere else for a store (84
+on the clean fixture, 81 to 671 per app, 0 differ). That is G14 extended to setters and
+to a base proved to be the receiver.
+
+Such a Field usually names itself, and is in the map already. The channel adds a name only
+where the Field's name is a string the VM snapshot holds, a base object the isolate
+snapshot refers to and never writes, while the accessor's `get:g` is in the isolate
+snapshot. 19 such Fields on the clean fixture, 6 offsets over 3 classes named (`Color`'s
+`r`, `g` and `b`, `_AsyncStarStreamController`'s `controller` and `asyncStarBody`,
+`_ConstantTickerModeDataListenable.value`), 49 printed lines, 0 on the obf fixture, and 6
+to 12 offsets on each of the six real apps, where it no longer refuses itself: 13 to 668
+printed lines per app gain a name, every one a one-for-one substitution.
+Reading the VM snapshot's strings would name those Fields directly and make this channel
+redundant. See `fields.recover_accessors`, #240 and #258.
 
 ### 13.2 What marking a recovered name as INFERRED costs, and why nothing is marked
 
