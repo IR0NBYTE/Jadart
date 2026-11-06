@@ -16423,6 +16423,75 @@ def test_the_generated_corpus_can_draw_a_flag_setting_alu_op():
         assert drew == want, (flags, drew)
 
 
+def test_an_accessor_names_a_slot_only_when_its_body_is_that_access():
+    # #240's population 1 is a slot whose `Field` object was tree-shaken: 9,770 of the
+    # clean fixture's 9,943 receiver field accesses sit at an offset the map cannot name.
+    # The `get:`/`set:` Function often survives, so the name is still in the snapshot.
+    #
+    # The shape is the whole proof. A getter that merely READS a slot on the way to a
+    # computed answer says nothing about that slot's name: `_HashSet.isEmpty` loads the
+    # length slot and compares it, and a looser rule named the length slot `isEmpty`,
+    # which is the wrong-name failure `fields.py` exists to prevent. jadx draws the same
+    # line, its `kotlin-metadata.getters` flag being "rename SIMPLE getters to field
+    # names". So: the body is the read, or there is no name.
+    from jadart.fields import _getter_offset, _setter_offset
+
+    def rows(rs):
+        return [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rs)]
+
+    # the whole body IS the read: offset 8 of the receiver, tag bias included
+    assert _getter_offset(rows([("ldur", "x0, [x1, #7]"), ("ret", "")])) == 8
+    assert _getter_offset(rows([("ldur", "x0, [x1, #7]"), ("nop", ""),
+                                ("ret", "")])) == 8
+    # a computed getter: it loads the slot and then does something with it
+    assert _getter_offset(rows([("ldur", "x0, [x1, #7]"), ("cmp", "x0, #0"),
+                                ("cset", "x0, eq"), ("ret", "")])) is None
+    # not off the receiver, and not into the result
+    assert _getter_offset(rows([("ldur", "x0, [x3, #7]"), ("ret", "")])) is None
+    assert _getter_offset(rows([("ldur", "x5, [x1, #7]"), ("ret", "")])) is None
+    # a setter that writes one slot names it; one that writes two names neither
+    assert _setter_offset(rows([("stur", "x2, [x1, #0xf]"), ("ret", "")])) == 16
+    assert _setter_offset(rows([("stur", "x2, [x1, #0xf]"),
+                                ("stur", "x3, [x1, #7]"), ("ret", "")])) is None
+    assert _setter_offset(rows([("stur", "x2, [x4, #0xf]"), ("ret", "")])) is None
+
+
+def test_the_accessor_names_agree_with_every_field_object_that_speaks():
+    # What says the channel is reading names rather than inventing them. Where the field
+    # map already names an offset the accessor has to agree, and ONE disagreement refuses
+    # the whole channel, which is the rule `recover_fields` applies to itself.
+    #
+    # The obf fixture is the other half of the argument: the accessor names are obfuscated
+    # there too, so the channel adds nothing, and a channel that invented names would add
+    # just as many there as here.
+    if not _capstone_available():
+        _skip("  SKIP test_the_accessor_names_agree_with_every_field_object_that_speaks")
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_accessors, recover_fields
+    for lib, wants in ((CLEAN, True), (OBF, False)):
+        image, fr, _h = load_instructions(lib)
+        layout = recover_fields(fr, getattr(image, "arch", None))
+        acc = recover_accessors(image, fr, layout)
+        assert acc.disagreed == 0 and not acc.refused, (
+            f"{lib}: {acc.refused or 'an accessor contradicted a Field object'}")
+        if wants:
+            assert acc.agreed >= 40, (
+                f"only {acc.agreed} accessors meet a named offset, so the agreement that "
+                f"says this reads names is no longer being checked")
+            assert acc.added >= 50, f"only {acc.added} offsets named"
+            merged = recover_fields(fr, getattr(image, "arch", None))
+            assert merged.add_accessor_names(acc) == acc.added
+            # and it never takes an offset a `Field` object already named
+            base = recover_fields(fr, getattr(image, "arch", None))
+            for cls, offs in acc.by_class.items():
+                for off in offs:
+                    assert off not in (base.by_class.get(cls) or {}), (cls, off)
+        else:
+            assert acc.added == 0, (
+                f"{acc.added} names off an obfuscated build, where the accessor names "
+                f"carry nothing")
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

@@ -160,7 +160,8 @@ def decompile(path: str, symbol: str) -> list:
     from .disasm import rebaser, cut_end
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import recover_allocations, recover_fields
+    from .fields import (recover_accessors, recover_allocations,
+                     recover_fields)
 
     from .program import static_function_refs, receiver_for
 
@@ -175,6 +176,7 @@ def decompile(path: str, symbol: str) -> list:
     returns = make_return_resolver(image)
     sels = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
+    layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout)
     out = []
     for nm, cr in ranges:

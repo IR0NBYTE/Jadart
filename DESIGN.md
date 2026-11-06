@@ -1111,7 +1111,23 @@ The ceiling is the field map's coverage, not the class attribution, and the cost
 flow-sensitive refinement the textual lifter has no place to put. The remaining 4,177
 cid sites are RANGE checks, `sub x9, x9, #0x438; cmp x9, #0x5a; b.hi`, which prove a
 contiguous span of the class hierarchy rather than one class; the common ancestor's map
-is the honest thing to read there and it is not read today.
+is the honest thing to read there and it is not read today. Scanned: 899 range checks sit
+off an extracted cid on the clean fixture, 797 have a span base that names a class, and
+only **107** of those classes have a field map at all, so the yield behind the same
+flow-sensitive machinery is single digits again. Most spans are tiny, 465 covering one cid
+and 122 covering two, which is an equality check written as a range.
+
+**A FOURTH PROOF, which pays and needs no flow at all: the accessor that survived.**
+Population 1 is a slot whose `Field` object was tree-shaken, and the name does not
+necessarily go with it. 969 `get:` and 208 `set:` Function objects survive on the clean
+fixture, and where one of them IS the access, a getter whose whole body is the load and
+the return or a setter that stores to exactly one receiver offset, it names that slot. 61
+offsets over 41 classes and 444 printed lines, with the agreement that says this is
+reading rather than guessing: 40 of 40 against the `Field` objects that also speak, 0
+disagreements, and 0 names on the obf build where the accessor names are obfuscated too.
+A getter that merely reads a slot on the way to a computed answer is refused, because
+taking the first load in the body named `_HashSet`'s length slot `isEmpty`. See
+`fields.recover_accessors` and #240.
 
 ### 13.2 What marking a recovered name as INFERRED costs, and why nothing is marked
 
