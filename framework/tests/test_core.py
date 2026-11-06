@@ -16922,14 +16922,29 @@ def _merged_elf(blob: bytes) -> bytes:
             + names + syms + blob + code)
 
 
-def _dart_3_13_snapshot(second_pool: int = 0, scope_vars: int = 0):
-    """(blob, stream, clusters) for a small Dart 3.13 program snapshot, written by hand
-    from app_snapshot.cc at 3.13.0: no 3.13 fixture can be built with the 3.12.2 SDK
-    this repository pins. It holds one cluster of everything 3.13 reads differently,
-    in the order the serializer writes them: the roots' own small clusters first, so
-    the canonical String cluster is not the first one. `second_pool` gives the empty
-    pool that many entries and `scope_vars` the empty ContextScope that many
-    variables."""
+#: The root run _dart_3_13_snapshot writes after its fill, as a layout: LazyCompile and
+#: UnknownDartCode at 1 and 3, the class table from 4, for the Classes of cids 5 and 4000.
+#: Small on purpose, and not the 3.13.0 one, which needs 1,689 roots and every predefined
+#: class; it is the same shape, read by the same code.
+def _small_roots():
+    from jadart.objstore import RootLayout
+    return RootLayout(count=6, stubs={1: "LazyCompile", 3: "UnknownDartCode"},
+                      class_base=4, class_cids=(5, 4000))
+
+
+def _dart_3_13_snapshot(second_pool: int = 0, scope_vars: int = 0, kind: int = 2,
+                        base: int = 7, closure_alloc=(0, 2), roots=None):
+    """(blob, stream, (base, objects, clusters, fill_end)) for a small Dart 3.13 program
+    snapshot, written by hand from app_snapshot.cc at 3.13.0: no 3.13 fixture can be
+    built with the 3.12.2 SDK this repository pins. It holds one cluster of everything
+    3.13 reads differently, in the order the serializer writes them: the roots' own
+    small clusters first, so the canonical String cluster is not the first one. After
+    the fill comes a root run in the shape of _small_roots, then two empty field tables.
+
+    The knobs each make one thing wrong: `second_pool` gives the empty pool entries,
+    `scope_vars` the empty ContextScope variables, `kind` and `base` the header's kind
+    and base-object count, `closure_alloc` the lengths the alloc pass states for the two
+    closures (the fill still reads 0 and 2), and `roots` the root run's refs."""
     from jadart import versions
     table = versions._EPOCHS[DART_3_13].cid_table
 
@@ -16939,7 +16954,8 @@ def _dart_3_13_snapshot(second_pool: int = 0, scope_vars: int = 0):
     refs = lambda n: _wref(1) * n                              # noqa: E731
     scalars = lambda n: _ws(0) * n                             # noqa: E731
     text = ("Foo", "Class", "bar")
-    # base objects are refs 1..7; then Mint 8, the pools 9 and 10, the strings 11..13
+    # base objects are refs 1..7; then Mint 8, the pools 9 and 10, the strings 11..13,
+    # the Classes 14..16 and, last, the three Code objects 25..27
     foo, klass_name = 11, 12
 
     def klass(cid, name, bitmap=True):
@@ -16949,6 +16965,7 @@ def _dart_3_13_snapshot(second_pool: int = 0, scope_vars: int = 0):
                 + (_wu(0) if bitmap else b""))
 
     pool = lambda n: _wu(n) + (b"\x01" + _wref(foo)) * n       # noqa: E731
+    code = lambda owner: _wu(0) + _wref(owner) + refs(5)        # noqa: E731
     alloc = [
         tag("MintCid", True) + _wu(1) + _ws(0),
         tag("ObjectPoolCid") + _wu(1) + _wu(second_pool),      # the empty pool
@@ -16956,14 +16973,14 @@ def _dart_3_13_snapshot(second_pool: int = 0, scope_vars: int = 0):
         tag("StringCid", True) + b"".join([_wu(3)] + [_wu(len(t) << 1) for t in text])
         + _wu(6) + _wu(0) + _wu(0) * 3,                        # the canonical set
         tag("ClassCid") + _wu(3),                              # ReadAllocFixedSize
-        tag("ClosureCid") + _wu(2) + _wu(0) + _wu(2),          # a length per closure
+        tag("ClosureCid") + _wu(2) + b"".join(_wu(n) for n in closure_alloc),
         tag("ContextScopeCid") + _wu(1) + _wu(scope_vars),     # the empty singletons
         tag("LocalVarDescriptorsCid") + _wu(1) + _wu(0),
         tag("ApiErrorCid") + _wu(1),
         tag("UnwindErrorCid") + _wu(1),
         tag("LanguageErrorCid") + _wu(1),
         tag("UnhandledExceptionCid") + _wu(1),
-        tag("CodeCid") + _wu(1) + _ws(0) + _wu(0),             # one code, none deferred
+        tag("CodeCid") + _wu(3) + _ws(0) * 3 + _wu(0),         # three, none deferred
     ]
     fill = [
         b"",
@@ -16979,16 +16996,21 @@ def _dart_3_13_snapshot(second_pool: int = 0, scope_vars: int = 0):
         refs(1) + b"\x01",                                     # is_user_initiated
         refs(4) + _ws(-1) + b"\x00\x02",                       # token pos, bool, kind
         refs(2),
-        _wref(7) + _wref(8) + _wu(0) + _wref(9) + refs(5),     # the two stubs, the code
+        # the LazyCompile and UnknownDartCode stubs, which are Code 26 and 27, then
+        # each code's payload info and six refs, the owner first
+        _wref(26) + _wref(27) + code(9) + code(1) + code(1),
     ]
-    stream = b"".join(alloc) + b"".join(fill)
-    objects = 7 + 1 + 2 + 3 + 3 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1
-    head = (struct.pack("<Iqq", 0xDCDCF5F5, 0, 2) + DART_3_13.encode()
+    run = roots if roots is not None else (1, 26, 1, 27, 14, 15)
+    fill_end = len(b"".join(alloc) + b"".join(fill))
+    stream = (b"".join(alloc) + b"".join(fill) + b"".join(_wref(r) for r in run)
+              + _wu(0) + _wu(0))
+    objects = 7 + 1 + 2 + 3 + 3 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 3
+    head = (struct.pack("<Iqq", 0xDCDCF5F5, 0, kind) + DART_3_13.encode()
             + b"product no-dwarf_stack_traces_mode arm64 android compressed-pointers\x00"
-            + _wu(7) + _wu(objects) + _wu(len(alloc)) + _wu(0) + _wu(0))
+            + _wu(base) + _wu(objects) + _wu(len(alloc)) + _wu(0) + _wu(0))
     blob = bytearray(head + stream)
     struct.pack_into("<q", blob, 4, len(blob) - 4)
-    return bytes(blob), stream, (7, objects, len(alloc))
+    return bytes(blob), stream, (7, objects, len(alloc), fill_end)
 
 
 def test_dart_3_13_reads_the_clusters_the_merged_snapshot_changed():
@@ -17008,7 +17030,7 @@ def test_dart_3_13_reads_the_clusters_the_merged_snapshot_changed():
     epoch = versions._EPOCHS[DART_3_13]
     arch = versions.Arch("arm64", 8, True)
     assert (epoch.name, epoch.dart, epoch.merged) == ("objectheader-3.13", "3.13.0", True)
-    _blob, stream, (base, objects, nclusters) = _dart_3_13_snapshot()
+    _blob, stream, (base, objects, nclusters, fill_end) = _dart_3_13_snapshot()
     assert base == epoch.base_objects == 7
 
     def walk(e, data=stream):
@@ -17017,19 +17039,20 @@ def test_dart_3_13_reads_the_clusters_the_merged_snapshot_changed():
         return clusters, walk_fill(st, clusters, e, arch=arch)
 
     clusters, fr = walk(epoch)
-    assert fr.end_pos == len(stream), "the fill did not consume exactly the stream"
+    assert fr.end_pos == fill_end, "the fill did not end where the roots begin"
     assert [(c.name[:-3], c.count, c.start_ref) for c in clusters] == [
         ("Mint", 1, 8), ("ObjectPool", 1, 9), ("ObjectPool", 1, 10), ("String", 3, 11),
         ("Class", 3, 14), ("Closure", 2, 17), ("ContextScope", 1, 19),
         ("LocalVarDescriptors", 1, 20), ("ApiError", 1, 21), ("UnwindError", 1, 22),
-        ("LanguageError", 1, 23), ("UnhandledException", 1, 24), ("Code", 1, 25)]
+        ("LanguageError", 1, 23), ("UnhandledException", 1, 24), ("Code", 3, 25)]
     by_name = {c.name: c for c in clusters}
     assert by_name["ClassCid"].predefined_cids is None
     assert by_name["ClassCid"].main_count == 0
     assert by_name["ClosureCid"].lengths == [0, 2]
     assert [c & 0xFFFFFFFF for _r, _n, c, _s in fr.classes] == [5, 4000, (1 << 20) + 3]
     assert set(fr.class_unboxed) == {5, 4000}, "a top-level class has no bitmap to read"
-    assert fr.codes == [(25, 9, 0)], "the code's owner is the ref after the two stubs"
+    assert fr.codes == [(25, 9, 0), (26, 1, 1), (27, 1, 2)], (
+        "a code's owner is the first ref after its payload info, past the two stubs")
     assert fr.pool == [("ref", 11), ("ref", 11)], "the global pool, and only it"
 
     # Each switch back at its 3.12 value: the stream no longer walks, or no longer ends
@@ -17041,7 +17064,7 @@ def test_dart_3_13_reads_the_clusters_the_merged_snapshot_changed():
             ended = walk(older)[1].end_pos
         except jadart.JadartError:
             continue
-        assert ended != len(stream), f"{off} changed nothing this stream can see"
+        assert ended != fill_end, f"{off} changed nothing this stream can see"
 
     # And 3.12.2 itself refuses these bytes rather than reading them some other way.
     with pytest.raises(jadart.JadartError):
@@ -17111,6 +17134,42 @@ def test_a_dart_3_13_library_reads_end_to_end(tmp_path):
     with contextlib.redirect_stdout(buf):
         assert cli.main(["classes", str(path)]) == 0
     assert "class Foo" in buf.getvalue()
+
+
+def test_a_dart_3_13_header_the_vm_would_not_load_is_refused(tmp_path):
+    """A 3.13 header is read only as what the VM would load it as: an app's AOT
+    snapshot, kind 2, with seven base objects.
+
+    The kind range check was written for the older enum, where 3 is kFullAOT. In the
+    3.13 enum 3 is kModule, so a kModule header passed it and parsed as a program, and
+    with every gate passing (#254 review). The base objects are what every ref is
+    counted from, and the VM FATALs on a count other than the one it provides; read on,
+    a count of 8 shifted every ref by one and `classes` still exited 0."""
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+
+    path = tmp_path / "libapp.so"
+    for knobs, says in (({"kind": 3}, "kind 3 (kModule)"),
+                        ({"kind": 1}, "kind 1 (kFullJIT)"),
+                        ({"kind": 0}, "kind 0 (kFull)"),
+                        ({"base": 8}, "8 base objects")):
+        blob, _stream, _counts = _dart_3_13_snapshot(**knobs)
+        path.write_bytes(_merged_elf(blob))
+        for strict in (True, False):           # --lenient knows this release too
+            with pytest.raises(jadart.InputError) as e:
+                parse_libapp(str(path), strict=strict)
+            assert says in str(e.value), (knobs, str(e.value))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert cli.main(["-j", "info", str(path)]) == 2
+        assert json.loads(buf.getvalue())["type"] == "InputError"
+
+    blob, _stream, _counts = _dart_3_13_snapshot()
+    path.write_bytes(_merged_elf(blob))
+    hdr = parse_libapp(str(path))["isolate"]
+    assert (hdr.kind_name, hdr.num_base_objects) == ("kFullAOT", 7)
 
 
 def test_dart_3_13_is_registered_for_what_was_checked_and_nothing_else():

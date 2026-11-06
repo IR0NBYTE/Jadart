@@ -49,6 +49,9 @@ KIND = {0: "kFull", 1: "kFullCore", 2: "kFullJIT", 3: "kFullAOT"}
 #: every later kind is one lower, so a release AOT snapshot is kind 2, the number that
 #: meant kFullJIT before.
 KIND_MERGED = {0: "kFull", 1: "kFullJIT", 2: "kFullAOT", 3: "kModule"}
+#: The one kind a merged-snapshot release is read as. kModule is 3 there and in range of
+#: the check below, which was written for the older enum, so it is refused by name.
+_AOT_MERGED = 2
 _MAX_KIND = max(KIND)
 
 
@@ -227,6 +230,9 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
             f"  To place this build:  python3 tools/sdk_source.py --identify "
             f"{version_hash} --tags <candidate SDK tags>")
 
+    if epoch is not None and epoch.merged:
+        _check_merged_header(which, kind, num_base_objects, epoch)
+
     first_cid = None
     if num_clusters > 0 and epoch is not None:
         tag = st.read_uint32_tag()
@@ -239,6 +245,31 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
         instr_table_len=instr_table_len,
         instr_table_rodata_offset=instr_table_rodata_offset,
         first_cluster_cid=first_cid, epoch=epoch, arch=arch)
+
+
+def _check_merged_header(which: str, kind: int, base_objects: int, epoch) -> None:
+    """Refuse a Dart 3.13 header the VM would not load as an app's AOT snapshot.
+
+    Both checks are on the header alone, so `info` refuses as well, lenient or not: the
+    release is known, and so is what it requires. The kind range check above cannot do
+    the first, since it was written for the older enum, in which 3 is kFullAOT; in this
+    one 3 is kModule, a module snapshot whose grammar jadart does not read. Through 3.12
+    kModule is 4 and that check refuses it."""
+    if kind != _AOT_MERGED:
+        raise InputError(
+            f"{which}: header declares snapshot kind {kind} "
+            f"({KIND_MERGED.get(kind, 'unnamed')}), and a Dart {epoch.dart} app's AOT "
+            f"snapshot is kind {_AOT_MERGED} ({KIND_MERGED[_AOT_MERGED]}). jadart reads "
+            f"only that kind, so it will not read this one with that grammar.")
+    # Deserializer::Deserialize FATALs when the count differs from what AddBaseObjects
+    # provided (app_snapshot.cc:9983 at 3.13.0). Read on, every ref would be off by the
+    # difference and every name would belong to a neighbour.
+    if base_objects != epoch.base_objects:
+        raise InputError(
+            f"{which}: header declares {base_objects} base objects, and a Dart "
+            f"{epoch.dart} program snapshot has exactly {epoch.base_objects} (null, "
+            f"false, true and four sentinels). The VM refuses any other count, and "
+            f"every ref would be off by the difference.")
 
 
 def walk_isolate(path, *, full: bool = False) -> dict:
