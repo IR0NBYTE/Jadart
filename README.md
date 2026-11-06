@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 456](https://img.shields.io/badge/tests-456-brightgreen.svg)](#tests)
+[![tests: 462](https://img.shields.io/badge/tests-462-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -70,28 +70,28 @@ class LicenseVault {
       return true;
     }
   }
-  checksum() {
-    var t0 = x2.field_0xc;
-    var t1 = 0;
-    var t4 = t0.field_0x8 >> 1;
-    var t5 = 0;
+  checksum(a1) {
+    var t0 = 0;
+    var t1 = a1.field_0xc;
+    var t3 = a1.field_0xc.field_0x8 >> 1;
+    var t4 = 0;
     while (true) {
-      if (t5 >= t4) break;
-      t1 = ((t1 * 31 & 0xffffffff)
-            + (t0[t5] & 0xffffffff))
+      if (t4 >= t3) break;
+      t0 = ((t0 * 31 & 0xffffffff)
+            + (t1[t4] & 0xffffffff))
            .toUnsigned(32) & 0xffffffff;
-      t5 += 1;
+      t4 += 1;
     }
-    return t1;
+    return t0;
   }
-  classify() {
-    if ((x2 >> 63) & 1 != 0) {
+  classify(a1) {
+    if ((a1 >> 63) & 1 != 0) {
       return "invalid";
     } else {
-      if (x2 < 0x28) {
+      if (a1 < 0x28) {
         return "weak";
       } else {
-        if (x2 < 0x50) {
+        if (a1 < 0x50) {
           return "fair";
         } else {
           return "strong";
@@ -111,11 +111,17 @@ Each one shows a real property of the format:
   survive: the string `balance` is not in the binary at all. Some fields do survive with
   their offsets and those are printed by name; see [Limits](#limits) for which and how many.
 - `withdraw`'s parameter shows up as the constant `250`. The program's only call is
-  `_vault.withdraw(250)`, so that is what the compiled code contains. Jadart shows you
-  the compiled program, not the source you wish it were.
+  `_vault.withdraw(250)`, so that is what the compiled code contains, and `withdraw()`
+  lists no argument because the body never reads one. Jadart shows you the compiled
+  program, not the source you wish it were.
+- `score` is `a1`: the argument register it arrived in, x2, counted from the receiver's
+  slot, which is also its position in a call's printed list. The body reads it before
+  writing it, so it is an argument by the calling convention the call sites are already
+  read with. Its Dart name and type are not in the binary, so neither is invented.
 - The comparison flipped: `amount > balance` compiled to `balance < 250`, and Jadart
   prints what the branch actually tests.
-- A `t` name is a value the lifter proved; a bare `x2` is one it could not, and 10.5% of
+- A `t` name is a value the lifter proved and an `a` name is an argument still holding
+  what the function was entered with; a bare `x2` is one it could not prove, and 6.7% of
   the clean fixture's lifted lines still carry one. Nothing is spelled better than it is
   known.
 
@@ -185,7 +191,7 @@ Full walkthroughs: [docs/usage.md](docs/usage.md). Per-command help: `jadart <cm
 | 1 | per-function arm64 with direct call targets named and ObjectPool constants resolved to their string or function, including far pool loads (`add xD, x27, #hi; ldr [xD, #lo]`) | unresolved pool slots print their raw offset |
 | 2 | `if`/`else` and loops reconstructed as pseudo-Dart from the CFG, using forward and post-dominators, plus a Cifuentes follow node for the 38.5% of conditionals whose arms each end in their own `return` and so post-dominate at the virtual exit | 1,414 of 8,194 functions (17.3%) print at least one `goto`, and 201 of them hold a region that is genuinely irreducible, where no `goto`-free rendering exists at all. `tools/cfgcheck.py` reads the structured tree back as a program and checks, for every block in the image, that the rendering claims exactly the successors the CFG has |
 | 3 | expressions, by abstract interpretation over the register file: field load/store, arithmetic, `bool`/`null`/int constants, element access, compound `-=`, `return <expr>`, and scalar floating point (including int-to-double and double-to-int conversions, and `math.max`) | any instruction the lifter doesn't model prints as its arm64 line |
-| 3.1 | call arguments from the callee's register arity, read at the target address and so not dependent on the callee having a recovered name (`benchWithdraw(t8, (x1.field_0x8 >> 1) ~/ 2)`). A call whose result is read gets that result named, so the value can be followed to its use | the stack convention, an arguments descriptor, and a target outside the image print `(...)` rather than a guess |
+| 3.1 | call arguments from the callee's register arity, read at the target address and so not dependent on the callee having a recovered name (`benchWithdraw(t8, (x1.field_0x8 >> 1) ~/ 2)`). A call whose result is read gets that result named, so the value can be followed to its use. The function being lifted is read the same way: an argument register its body reads before writing is named by its slot, `a1`, and the signature lists them, `checksum(a1)`, which takes the clean fixture's lines carrying a bare register from 19,446 to 12,289 | the stack convention, an arguments descriptor, and a target outside the image print `(...)` rather than a guess, at the call and in the signature alike |
 | 3.2 | VM runtime stubs rendered as source operations: `throw`, `throw NullCastError()`, `new List()`. A stub is identified by its index in the snapshot's object-store roots, so this works on a plain `--release` build, which keeps no symbol and no `Function` for one: 76 stubs named on each fixture, taking the clean image's `(...)` calls from 9,196 to 5,139. A `Class` owns exactly one kind of code, its own allocation stub, so the `bl` that allocated a value says which class it is: 3,848 of the clean fixture's 4,425 `new` sites print a class. Pure machinery is stripped so it never reaches output: frame setup, the stack-overflow check, the write barrier, type tests, and the Smi box-or-tag idiom, which surfaces as a bogus `if (x != x)` if you leave it in | anything else stays a named `bl` |
 | 3.3 | virtual and interface calls attributed to a receiver plus a stable selector offset, `x1.sel_0xb34(...)`. 2,580 of the clean fixture's 3,333 dispatch sites recover both (77.4%) | the rest print `(dynamic call)` |
 | 3.4 | that offset resolved to a **source selector name**: `x2.toString()`, `x2.addListener(...)`. 133 selectors on the clean corpus, naming 23.5% of the dispatch sites that have a recovered offset | names need two agreeing classes, an untied vote AND an offset no other function is known to be placed at, so the rest keep `sel_0x<off>` |
@@ -429,7 +435,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 456 tests
+cd framework && python3 -m pytest tests -q     # 462 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -437,7 +443,7 @@ cd framework && python3 -m pytest tests -q     # 456 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 424 of the 456 to run and the other 32 to
+clone with capstone installed, expect about 429 of the 462 to run and the other 33 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

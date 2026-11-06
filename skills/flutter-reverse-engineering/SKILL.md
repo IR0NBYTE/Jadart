@@ -43,6 +43,9 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | You see | It means | Do not say |
 |---|---|---|
 | `x2`, `x19`, `r4` | a machine register whose value was not reconstructed | "the counter", "the index" |
+| `a1`, `a3` | what the function was entered with in that argument register (x2, x5): the slot, not the parameter's name, type or position in the Dart signature | "the amount", "the second parameter" |
+| `f(...)` in a signature | a function whose argument list was not read: a descriptor, the stack, or a double | "takes no arguments" |
+| `f()`, `f(a1, a3)` in a signature | the argument registers the body reads; a parameter it never reads is not listed | "takes no arguments", "takes two parameters" |
 | `field_0x8` | an instance field at byte offset 8; its name was not recovered | "the `balance` field" |
 | `(...)` | a call whose arguments were not reconstructed | "called with the user id" |
 | `pool_0x1234` | an object pool slot that resolved to no name | "the HTTP client" |
@@ -85,12 +88,13 @@ Two examples, so the distinction is concrete.
 > **Right:** "It calls an unresolved pool target, with arguments the tool did not
 > reconstruct. Resolving it needs `jadart xrefs` or a dynamic trace."
 
-> Body: `if (x2 > this.field_0x8) { return false; }`
+> Body: `if (a1 > this.field_0x8) { return false; }`
 >
 > **Wrong:** "If the amount exceeds the balance it fails."
-> **Right:** "It compares an unreconstructed register against the field at offset 8 and
-> returns false when greater. The field name is not in the snapshot; `jadart classes` will
-> say whether the owning class declares a name for offset 8."
+> **Right:** "It compares its second register argument against the field at offset 8 and
+> returns false when greater. Neither name is in the snapshot; `jadart classes` will say
+> whether the owning class declares a name for offset 8, and the argument's name would
+> need the source or a caller that says what it passes."
 
 The second one matters most, because it is the tempting case. The structure is fully
 recovered and only the names are missing, so a plausible story is easy to tell. Tell the

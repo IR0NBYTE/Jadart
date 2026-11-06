@@ -558,7 +558,7 @@ fixture.
 |---|---|---|
 | wall clock, whole image | 5.75 s `lift`, 4.55 s `export` | 12.8 s analyze, 21.0 s with `--decompile` |
 | code ranges rendered | 8,194 | 8,194 |
-| lines of pseudocode | 185,227 | 261,039 |
+| lines of pseudocode | 184,060 | 261,039 |
 | field accesses printed | 71,036, of which 2,693 by name | 71,068, of which 0 by name |
 | named (class, offset) pairs in the field map | 2,019 over 504 classes | 1,987 instance slots over 1,917 classes |
 | dispatch sites | 3,333, 2,580 with receiver and offset (77.4%) | 3,425, 2,319 with an offset (67.7%) |
@@ -580,27 +580,33 @@ three bodies below have a right answer rather than a plausible one.
 
 `withdraw`, source `if (amount > balance) return false; balance -= amount; return
 true;`. Both tools get it right, and AOTopsy reads better: it puts the positive branch
-first, it prints 250 in decimal, and it names the incoming argument. jadart prints `if
-(this.field_0x8 < 0xfa)` with the inverted test and the hex literal, though it does name
-the receiver `this` where AOTopsy calls it `accumulator`.
+first and it prints 250 in decimal. jadart prints `if (this.field_0x8 < 0xfa)` with the
+inverted test and the hex literal, though it does name the receiver `this` where AOTopsy
+calls it `accumulator`.
 
 `classify`, a four-way comparison chain returning string literals. Both correct. AOTopsy
-prints the bounds as 40 and 80, jadart as 0x28 and 0x50.
+prints the bounds as 40 and 80, jadart as 0x28 and 0x50. Both name the argument by the
+register it arrived in, `arg1` and `a1`, the same slot. The two differ on when the name
+holds: AOTopsy seeds every argument register with a name at entry (`seedEntryState`,
+ssa.go) and a block no edge reaches again (`runFixpoint`), and `benchComputeChecksum`
+below reads `arg2` for an x3 the body overwrote at 0x1eeccc, an instruction its lifter
+has no case for; jadart prints the name only while the register has been written on no
+path to the line, which `tools/irfuzz.py --args` scores against the CPU.
 
 `checksum`, source `acc = (acc * 31 + b) & 0xffffffff` over a list. jadart recovers the
 loop and the accumulator:
 
 ```
-var t0 = x1.field_0xc;
-var t1 = 0;
-var t4 = t0.field_0x8 >> 1;
-var t5 = 0;
+var t0 = 0;
+var t2 = a0.field_0xc;
+var t3 = a0.field_0xc.field_0x8 >> 1;
+var t4 = 0;
 while (true) {
-  if (t5 >= t4) break;
-  t1 = ((t1 & 0xffffffff) * 31 + (t0[t5] & 0xffffffff)).toUnsigned(32) & 0xffffffff;
-  t5 += 1;
+  if (t4 >= t3) break;
+  t0 = ((t0 & 0xffffffff) * 31 + (t2[t4] & 0xffffffff)).toUnsigned(32) & 0xffffffff;
+  t4 += 1;
 }
-return t1;
+return t0;
 ```
 
 AOTopsy returns 0 from the first comparison, loses the accumulator, the multiply, the

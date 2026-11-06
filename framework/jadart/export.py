@@ -307,8 +307,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     arity = make_arity_resolver(image) if tier >= 3 else None
     returns = make_return_resolver(image) if tier >= 3 else None
     selectors = recover_selectors(image, fr, hdr) if tier >= 3 else None
-    from .program import static_function_refs, receiver_for
-    static_refs = static_function_refs(fr)
+    from .program import EntryNames
+    entry = EntryNames(image, fr, hdr.epoch, arity) if tier >= 3 else None
     layout = recover_fields(fr, getattr(image, "arch", None))
     layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout) if tier >= 3 else None
@@ -347,12 +347,14 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
             cr = image.code_ranges[ref]
             cut = truncated_by(cr, dis)
             note = f", TRUNCATED: {len(dis)} of {len(dis) + cut} instructions" if cut else ""
-            out.append(f"  {disp}() {{  // {addr_label(image, cr.pc_offset)}, "
+            # As program.decompile_class: the tier 3 body's own names, else empty.
+            params = entry.params(cr) if entry is not None else ""
+            out.append(f"  {disp}({params}) {{  // {addr_label(image, cr.pc_offset)}, "
                        f"{cr.size} bytes{note}")
             if tier >= 3:
                 ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
                 out.extend(lift_function(ann, pool_map,
-                                         receiver=receiver_for(ref, static_refs),
+                                         receiver=entry.names(cr),
                                          arity=arity, indent="  ", depth=2,
                                          selectors=selectors,
                                          arch=getattr(image, "arch", None),
