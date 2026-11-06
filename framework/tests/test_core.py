@@ -17090,16 +17090,17 @@ def test_dart_3_13_reads_the_clusters_the_merged_snapshot_changed():
     assert "ContextScope of length 1" in str(e.value)
 
 
-def test_a_dart_3_13_library_reads_end_to_end(tmp_path):
+def test_a_dart_3_13_library_reads_end_to_end(tmp_path, monkeypatch):
     """The same snapshot inside the container a 3.13 build ships: one data symbol, one
     text symbol, no vm snapshot. This is what runs on a checkout with no real 3.13 app.
 
     It stops at the commands that read the stream. The blob has no data image behind
     it, so there is no instructions table for the others to find."""
     import contextlib
+    import dataclasses
     import io
     import json
-    from jadart import cli
+    from jadart import cli, versions
     from jadart.program import recover_program
     from jadart.snapshot import parse_libapp_with_anchor, walk_isolate
 
@@ -17124,6 +17125,13 @@ def test_a_dart_3_13_library_reads_end_to_end(tmp_path):
     # quick path used to answer "no strings" whenever it was not the first.
     assert walk_isolate(str(path))["strings"] == ["Foo", "Class", "bar"]
     assert walk_isolate(str(path), full=True)["strings"] == ["Class", "Foo", "bar"]
+    # Only on a 3.13 epoch, though. An older one keeps the quick path's answer for a
+    # first cluster that is not String, which is none, so a crafted pre-3.13 file is
+    # read as before.
+    older = dataclasses.replace(hdr.epoch, merged=False)
+    monkeypatch.setitem(versions._EPOCHS, DART_3_13, older)
+    assert walk_isolate(str(path))["strings"] == []
+    monkeypatch.setitem(versions._EPOCHS, DART_3_13, hdr.epoch)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -17313,10 +17321,14 @@ def test_dart_3_13_is_registered_for_what_was_checked_and_nothing_else():
     feats = "product no-dwarf_stack_traces_mode arm64 android compressed-pointers"
     got = versions.resolve(DART_3_13, feats)
     assert got.epoch is epoch and str(got.arch) == "arm64/compressed-pointers"
-    for target in ("arm64 ios", "arm android"):
+    for target, arch in (("arm64 ios", "arm64"), ("arm android", "arm")):
         with pytest.raises(versions.UnsupportedTarget) as e:
             versions.resolve(DART_3_13, f"product {target} no-compressed-pointers")
-        assert "objectheader-3.13" in str(e.value) and "3.13.0" in str(e.value)
+        # The reason is the missing evidence, not a missing reader: the uncompressed
+        # grammar is the one every older epoch uses on iOS and arm32.
+        assert (f"No {arch}/uncompressed-pointers build of Dart 3.13.0 has passed the "
+                f"acceptance gates") in str(e.value), str(e.value)
+        assert "RODataDeserializationCluster" not in str(e.value)
     assert versions.known_epochs()[-1] is epoch, "3.13.0 is the newest release registered"
 
     # The cid table is 3.12's with LinkedHashBase given a cid at 96 and everything from

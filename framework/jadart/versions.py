@@ -467,6 +467,8 @@ _MERGED_BASE_OBJECTS = 7
 #: (word size, compressed), so it lets an x64 android 3.13 build in as well, as it does
 #: for every other epoch, with no 3.13 binary of that architecture behind it.
 _GRAMMARS = {"objectheader-3.13": frozenset({(8, True)})}
+#: Every target any epoch's grammar covers.
+_ALL_GRAMMARS = frozenset({(8, True), (8, False), (4, False)})
 #: SnapshotBehavior entered the ObjectPool entry byte in 3.3, and before that the entry's
 #: tagged flag came first.
 _PRE_BEHAVIOUR = frozenset({"cidcanonical-2.19", "cidcanonical-3.0", "cidcanonical-3.1",
@@ -502,7 +504,7 @@ for _h, (_name, _dart, _table, _td0, _tdv, _imm) in _IDENTIFIED.items():
         td_int8_cid=_td0, td_byte_data_view_cid=_tdv, td_stride=4,
         roots=LAYOUTS.get(_dart),
         grammars=(frozenset() if _name in _UNVALIDATED else
-                  _GRAMMARS.get(_name, frozenset({(8, True), (8, False), (4, False)}))),
+                  _GRAMMARS.get(_name, _ALL_GRAMMARS)),
         notes=(f"Dart {_dart}: identified, but the cluster grammar has not passed the "
                f"acceptance gates on a real binary yet" if _name in _UNVALIDATED else
                f"Dart {_dart}: one snapshot per library. The reads that differ from "
@@ -537,6 +539,19 @@ def resolve(version_hash: str, features: str) -> Profile | None:
             f"cluster grammar, so there is nothing to parse it with. Deriving one means "
             f"working out this release's per-cluster ReadAlloc deltas and confirming them "
             f"with `--verify` on a binary built by that SDK.")
+    if arch.grammar_key not in epoch.grammars and arch.grammar_key in _ALL_GRAMMARS:
+        # A grammar jadart has, held back for this release: nothing built by it for
+        # this target has been through the gates yet (_GRAMMARS). Blaming the pointer
+        # model, as the message below does, would say the reading is missing when what
+        # is missing is the evidence.
+        gated = ", ".join(f"{w * 8}-bit {'compressed' if c else 'uncompressed'}"
+                          for w, c in sorted(epoch.grammars))
+        raise UnsupportedTarget(
+            f"epoch {epoch.name} (dart {epoch.dart}) is supported for {gated} pointers "
+            f"only, and this is {arch}. No {arch} build of Dart {epoch.dart} has passed "
+            f"the acceptance gates, so jadart will not claim to read one. Adding it "
+            f"means listing the target in versions._GRAMMARS and seeing `jadart verify` "
+            f"pass on a real one.")
     if arch.grammar_key not in epoch.grammars:
         supported = ", ".join(f"{w * 8}-bit {'compressed' if c else 'uncompressed'}"
                               for w, c in sorted(epoch.grammars))

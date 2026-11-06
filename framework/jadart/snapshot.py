@@ -305,15 +305,16 @@ def walk_isolate(path, *, full: bool = False) -> dict:
         from .fillwalk import walk_fill
         strings = sorted(set(walk_fill(st, clusters, hdr.epoch, arch=hdr.arch)
                              .strings.values()))
-    elif clusters and clusters[0].name == "StringCid":
+    elif not hdr.epoch.merged or (clusters and clusters[0].name == "StringCid"):
+        # Through 3.12 the canonical String cluster is always first, and a snapshot
+        # where it is not gets the empty answer it always got.
         strings = recover_canonical_strings(st, clusters, hdr.epoch, hdr.arch)
     else:
-        # The canonical String cluster is not first, so its text is not at the start
-        # of the fill and reaching it means reading what is in front. That is every
-        # 3.13 snapshot: the serializer puts the roots' own small clusters ahead of
-        # everything (CreateEarlyClusters), nine of them on a real app. Returning
-        # nothing here, as this did when a first cluster was not String, would have
-        # answered a supported build with an empty pool.
+        # From 3.13 the canonical String cluster is not first, so its text is not at
+        # the start of the fill and reaching it means reading what is in front: the
+        # serializer puts the roots' own small clusters ahead of everything
+        # (CreateEarlyClusters), nine of them on a real app. Returning nothing here,
+        # as the branch above does, would answer a supported build with an empty pool.
         from .fillwalk import walk_fill
         canon = next((cl for cl in clusters
                       if cl.name == "StringCid" and cl.canonical), None)
