@@ -221,7 +221,9 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
             gates.append(_g("G3 class table roots vs class ids", "A", not bad,
                             len(pairs),
                             f"{len(pairs)} roots are the Class of the cid read for"
-                            + (f"; first mismatch at cid {bad[0]}" if bad else "")))
+                            if not bad else
+                            f"{len(bad)} of {len(pairs)} roots are not the Class of "
+                            f"the cid read for them; first at cid {bad[0]}"))
     elif pre is None:
         gates.append(_g("G3 class-cid prefix", "A", False, 0,
                         skipped="no CLASS cluster with a predefined list"))
@@ -261,6 +263,33 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
                     if total and not bad else
                     (f"{len(bad)} disagreements; first: {bad[0]}" if bad else ""),
                     skipped="" if total else "no String cluster read by the fill pass"))
+
+    # G17: a sized object's length is encoded twice, from 3.13
+    # A Closure, a ContextScope and a LocalVarDescriptors each state their length in the
+    # alloc pass and again at the head of their fill, the way a String does, and the fill
+    # sizes its reads by its own copy. So the stream stays in step whatever the alloc
+    # copy says, and only comparing the two notices one that lies.
+    if getattr(hdr.epoch, "fill_sized", None):
+        total17, bad17 = 0, []
+        for cl in clusters:
+            fill = fr.sized_lengths.get(cl.index)
+            if fill is None:
+                continue
+            alloc = cl.lengths or []
+            total17 += min(len(alloc), len(fill))
+            if len(alloc) != len(fill):
+                bad17.append(f"cluster {cl.index}: alloc has {len(alloc)} lengths, fill "
+                             f"read {len(fill)}")
+                continue
+            bad17 += [f"cluster {cl.index} ({cl.name[:-3]}) object {i}: alloc {a}, "
+                      f"fill {f}" for i, (a, f) in enumerate(zip(alloc, fill)) if a != f]
+        gates.append(_g("G17 sized alloc/fill lengths", "A", total17 > 0 and not bad17,
+                        total17,
+                        f"{total17} closures, scopes and descriptors agree on their "
+                        f"length in both passes" if total17 and not bad17 else
+                        (f"{len(bad17)} disagreements; first: {bad17[0]}"
+                         if bad17 else ""),
+                        skipped="" if total17 or bad17 else "no sized cluster"))
 
     # G4b: the same pinning for RO-data strings
     # Uncompressed targets have no stream-based String cluster, so G4 can't run and the
@@ -494,6 +523,31 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
                             + (f"; {bad15} disagree" if bad15 else ""),
                             skipped="" if checked15
                             else "no getter on a compressed target to read a width from"))
+
+    # G16: the stub table agrees with the Code fill about where two stubs are
+    # From 3.13 the Code fill opens with the LazyCompile and UnknownDartCode stubs by ref,
+    # and the roots hold the same two Code objects at the indexes the release's stub list
+    # gives those names. A table generated from the wrong list, one stub inserted or lost
+    # or the run starting one slot off, moves at least one of them, and the names the
+    # lifter prints for every stub after it would belong to a neighbour.
+    if getattr(hdr.epoch, "code_stub_refs", False):
+        from .objstore import stub_anchors
+        anchors = stub_anchors(image, fr, hdr.epoch)
+        if anchors is None:
+            gates.append(_g("G16 stub roots vs Code fill refs", "A", False, 0,
+                            skipped="needs the snapshot blob, its roots and a Code "
+                                    "cluster"))
+        else:
+            bad16 = [f"{n} root {i} holds ref {r}, the fill read {f}"
+                     for n, i, r, f in anchors if r != f]
+            gates.append(_g("G16 stub roots vs Code fill refs", "A",
+                            bool(anchors) and not bad16, len(anchors),
+                            f"{', '.join(sorted({n for n, *_ in anchors}))} are the "
+                            f"roots the stub list puts them at" if anchors and not bad16
+                            else (f"{len(bad16)} of {len(anchors)} disagree; first: "
+                                  f"{bad16[0]}" if bad16 else
+                                  "the layout names neither stub, or the stream ends "
+                                  "inside the root run")))
 
     # ---- Tier B ------------------------------------------------------------------------
     # G13: the isolate snapshot's base objects are the vm snapshot's objects. The two

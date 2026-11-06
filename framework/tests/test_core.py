@@ -17053,6 +17053,8 @@ def test_dart_3_13_reads_the_clusters_the_merged_snapshot_changed():
     assert set(fr.class_unboxed) == {5, 4000}, "a top-level class has no bitmap to read"
     assert fr.codes == [(25, 9, 0), (26, 1, 1), (27, 1, 2)], (
         "a code's owner is the first ref after its payload info, past the two stubs")
+    assert fr.code_stub_refs == [(26, 27)]
+    assert fr.sized_lengths == {5: [0, 2], 6: [0], 7: [0]}
     assert fr.pool == [("ref", 11), ("ref", 11)], "the global pool, and only it"
 
     # Each switch back at its 3.12 value: the stream no longer walks, or no longer ends
@@ -17172,6 +17174,81 @@ def test_a_dart_3_13_header_the_vm_would_not_load_is_refused(tmp_path):
     assert (hdr.kind_name, hdr.num_base_objects) == ("kFullAOT", 7)
 
 
+def _gates_3_13(hdr_base: int = 7, epoch=None, **knobs):
+    """run_gates over _dart_3_13_snapshot(**knobs) with _small_roots for a layout, and
+    the image and header a real file would give, cut to what the gates read."""
+    import dataclasses
+    from types import SimpleNamespace
+    from jadart import versions
+    from jadart.clusters import walk_alloc
+    from jadart.fillwalk import walk_fill
+    from jadart.stream import ReadStream
+    from jadart.verify import run_gates
+
+    e = epoch or dataclasses.replace(versions._EPOCHS[DART_3_13], roots=_small_roots())
+    blob, _stream, (base, objects, nclusters, _end) = _dart_3_13_snapshot(**knobs)
+    arch = versions.Arch("arm64", 8, True)
+    st = ReadStream(blob, 52)
+    st.read_cstring()
+    for _ in range(5):
+        st.read_unsigned()
+    clusters = walk_alloc(st, base, objects, nclusters, epoch=e, arch=arch)
+    fr = walk_fill(st, clusters, e, arch=arch)
+    image = SimpleNamespace(data=blob, first_code=0, pcs=[0, 16, 32], text=bytes(48))
+    hdr = SimpleNamespace(epoch=e, arch=arch, num_objects=objects,
+                          num_base_objects=hdr_base, instr_table_len=3)
+    gates = {g.gate.split()[0]: g for g in run_gates(clusters, fr, hdr, image=image)}
+    return gates, image, fr, e
+
+
+def test_the_dart_3_13_gates_run_without_a_real_app():
+    """The four gates 3.13 changed or added, each with a case that has to fail.
+
+    They ran only on FluffyChat, which CI does not have, so putting any of them back
+    as it was left every test green there (#254 review). The layout is _small_roots
+    rather than the 3.13.0 one, whose run is 1,689 refs and every predefined class
+    long; the gates read either the same way."""
+    import dataclasses
+    from jadart.objstore import RootLayout, stub_names
+
+    gates, image, fr, e = _gates_3_13()
+    ran = [g for g in gates.values() if g.tier == "A" and not g.skipped]
+    assert all(g.passed for g in ran), [(g.gate, g.detail) for g in ran if not g.passed]
+    want = {"G3": ("G3 class table roots vs class ids", 2),
+            "G16": ("G16 stub roots vs Code fill refs", 2),
+            "G17": ("G17 sized alloc/fill lengths", 4),
+            "G13": ("G13 base objects vs fixed roots", 1)}
+    for key, (name, checks) in want.items():
+        g = gates[key]
+        assert (g.gate, g.checks, g.passed, g.skipped) == (name, checks, True, ""), g
+    assert stub_names(image, fr, e) == {16: "_iso_stub_LazyCompileStub",
+                                        32: "_iso_stub_UnknownDartCodeStub"}
+
+    # G3: the class-table roots in the wrong order. The message counts them.
+    g = _gates_3_13(roots=(1, 26, 1, 27, 15, 14))[0]["G3"]
+    assert not g.passed and g.detail == (
+        "2 of 2 roots are not the Class of the cid read for them; first at cid 5")
+
+    # G16: a stub list with the two names the Code fill reads in each other's place,
+    # and one with a stub more ahead of them. Either moves a stub onto a neighbour's
+    # root, the gate fails, and the stubs are not named at all rather than wrongly.
+    for stubs in ({1: "UnknownDartCode", 3: "LazyCompile"},
+                  {1: "Extra", 2: "LazyCompile", 3: "UnknownDartCode"}):
+        layout = RootLayout(count=6, stubs=stubs, class_base=4, class_cids=(5, 4000))
+        moved = dataclasses.replace(e, roots=layout)
+        gates, image, fr, _e = _gates_3_13(epoch=moved)
+        assert not gates["G16"].passed and "disagree" in gates["G16"].detail, stubs
+        assert stub_names(image, fr, moved) == {}, stubs
+
+    # G17: the alloc pass says the second closure holds 3, and the fill reads 2. The
+    # fill sizes its reads by its own copy, so nothing else notices.
+    g = _gates_3_13(closure_alloc=(0, 3))[0]["G17"]
+    assert not g.passed and "alloc 3, fill 2" in g.detail, g.detail
+
+    # G13: seven base objects, and a header stating eight.
+    assert not _gates_3_13(hdr_base=8)[0]["G13"].passed
+
+
 def test_dart_3_13_is_registered_for_what_was_checked_and_nothing_else():
     """The epoch claims arm64 and x64 compressed, the grammar the one real binary has.
 
@@ -17252,9 +17329,11 @@ def test_dart_3_13_passes_the_gates_on_a_real_app():
     ran = [g for g in rep.tier_a if not g.skipped]
     bad = [g.gate for g in ran if not g.passed]
     assert rep.supported and not bad, f"Tier A gates failed: {bad}"
-    assert len(ran) == 11, [g.gate for g in rep.tier_a if g.skipped]
-    g3 = next(g for g in ran if g.gate.startswith("G3"))
-    assert (g3.gate, g3.checks) == ("G3 class table roots vs class ids", 161)
+    assert len(ran) == 13, [g.gate for g in rep.tier_a if g.skipped]
+    checks = {g.gate: g.checks for g in ran}
+    assert checks["G3 class table roots vs class ids"] == 161
+    assert checks["G16 stub roots vs Code fill refs"] == 2
+    assert checks["G17 sized alloc/fill lengths"] == 456      # 454 closures, 2 empties
     tier_b = [g for g in rep.gates if g.tier == "B"]
     assert len(tier_b) == 3 and all(g.passed and not g.skipped for g in tier_b)
 

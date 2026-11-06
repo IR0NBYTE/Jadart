@@ -106,6 +106,42 @@ def class_roots(image, fr, epoch):
         return []
 
 
+#: The stubs CodeDeserializationCluster::ReadFill names by ref ahead of its objects from
+#: 3.13 on, in the order it reads them (app_snapshot.cc:2997 at 3.13.0).
+FILL_STUBS = ("LazyCompile", "UnknownDartCode")
+
+
+def stub_anchors(image, fr, epoch):
+    """[(name, root index, ref that root holds, ref the Code fill read)], or None.
+
+    The two stubs the Code fill names are also two of the roots, at the indexes the
+    release's VM_STUB_CODE_LIST gives them (1,228 and 1,350 at 3.13.0, one of them the
+    last of the run). The fill and the roots are written by different code from
+    different places, so an insertion, a removal or a shifted start in the stub list a
+    layout was generated from puts at least one of them on the wrong ref. What it cannot
+    see is two stubs swapped between them; that order is the release's own list, which
+    tools/gen_objstore.py --check re-derives.
+
+    None when there is nothing to compare: no layout, no blob, a fill that did not reach
+    the roots, or a release whose Code fill names no stub. Empty when the layout names
+    neither stub or the stream ends inside the run, which is a failure, not an absence."""
+    layout = getattr(epoch, "roots", None) if epoch is not None else None
+    pairs = getattr(fr, "code_stub_refs", None)
+    if (layout is None or not pairs or image is None or not image.data
+            or fr.end_pos <= 0):
+        return None
+    at = {name: i for i, name in layout.stubs.items()}
+    if any(name not in at for name in FILL_STUBS):
+        return []
+    st = ReadStream(image.data, fr.end_pos)
+    try:
+        roots = [st.read_ref_id() for _ in range(max(at[n] for n in FILL_STUBS) + 1)]
+    except TruncatedSnapshot:
+        return []
+    return [(name, at[name], roots[at[name]], pair[k])
+            for pair in pairs for k, name in enumerate(FILL_STUBS)]
+
+
 def stub_names(image, fr, epoch) -> dict:
     """pc_offset -> `_iso_stub_<Name>Stub` for every runtime stub the roots name.
 
@@ -136,6 +172,16 @@ def stub_names(image, fr, epoch) -> dict:
     for i, ref in enumerate(roots):
         if (ref in pc_by_ref) != (i in codes):
             return {}
+    # From 3.13 the Code fill names two stubs by ref as well, and the roots have to hold
+    # the same refs where the layout puts those names (stub_anchors). This is what binds
+    # the names to the positions: the check above is satisfied by any permutation of a
+    # run whose every slot is a Code.
+    if getattr(fr, "code_stub_refs", None):
+        at = {name: i for i, name in layout.stubs.items()}
+        for pair in fr.code_stub_refs:
+            for name, ref in zip(FILL_STUBS, pair):
+                if name not in at or roots[at[name]] != ref:
+                    return {}
     return {pc_by_ref[roots[i]]: f"_iso_stub_{name}Stub"
             for i, name in layout.stubs.items()}
 
