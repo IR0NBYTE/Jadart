@@ -525,6 +525,229 @@ that is a release of its own and an app published from it carries that hash for 
 app in 48 rather than four. Refusing it by name, with the `--identify` line that would
 place it, is still the correct behaviour rather than a gap to close by guessing.
 
+## The field in November 2026, re-measured on the same bytes
+
+The table at the top of this file was run in Phase 0. Three things about it have
+expired, and one of them is the tool every row was scored against.
+
+**unflutter's upstream is gone.** `zboralski/unflutter`, the Go snapshot analyzer those
+rows were measured against, has been removed by its author. A community continuation
+sits at `KristijanZic/unflutter`, and the maintained successor is `BroNils/aotopsy`, a
+fork that adds x86_64, a decompiler, whole-program type inference and Frida export. The
+unflutter rows stay as a record of what was measured then, because they cannot be re-run
+from the source they were measured against.
+
+**Two tools emit pseudo-Dart now.** Taxonomy item 4 below said every tool stops at
+annotated assembly or Ghidra C. That was true when it was written and is false now:
+AOTopsy writes a `.dart` file per function, and `caverav/flutterdec` (Rust,
+0.1.0-alpha.2) writes `.dartpseudo`. The claim that survives measurement is narrower and
+it is the one below about selector names.
+
+**Blutter is unchanged in shape:** Android arm64 only, and a per-version Dart SDK
+compile.
+
+### AOTopsy, head to head on the committed fixtures
+
+Built from `main` on 2026-11-06 with `go build ./cmd/aotopsy`, which takes 3.2 s and
+needs nothing but a Go toolchain, then run on the same two fixtures jadart is measured
+on. Every number below is from one run of each tool over every code range of the clean
+fixture.
+
+| axis | jadart 1.3.0 | AOTopsy |
+|---|---|---|
+| wall clock, whole image | 5.75 s `lift`, 4.55 s `export` | 12.8 s analyze, 21.0 s with `--decompile` |
+| code ranges rendered | 8,194 | 8,194 |
+| lines of pseudocode | 185,227 | 261,039 |
+| field accesses printed | 71,036, of which 2,693 by name | 71,068, of which 0 by name |
+| named (class, offset) pairs in the field map | 2,019 over 504 classes | 1,987 instance slots over 1,917 classes |
+| dispatch sites | 3,333, 2,580 with receiver and offset (77.4%) | 3,425, 2,319 with an offset (67.7%) |
+| dispatch sites given a SOURCE NAME | 607, from 133 decoded selectors | 0 |
+| allocations naming their class | 3,848 of 4,425 `new` sites | 0 of 918 `AllocateObject` sites |
+| `goto` lines | 5,493 (3.0%) in 1,414 of 8,194 functions | 31,500 (12.1%) |
+| code the renderer leaves out | none, and `tools/cfgcheck.py` checks every rendered edge against the CFG for every block in the image | 5,223 `code omitted by the structured walk` notes, 8,322 orphan-block notes |
+| iOS / Mach-O | parses an App.framework dylib: 2,248 classes, 8,153 members, 11,169 strings, and lifts its bodies | `error: open: elfx: not an ELF file`, exit 1 |
+| exceptions over both fixtures | 0 over 16,382 ranges | 0 over 16,382 ranges |
+
+Field accesses are counted with the same regex on both sides, over the lifted body of
+every range. That the two totals land within 32 of each other on 71,000 accesses is the
+check that they are looking at the same thing.
+
+### What that looks like on a function whose source is public
+
+`vault_logic`'s `LicenseVault` is an app with the Dart source in the repository, so the
+three bodies below have a right answer rather than a plausible one.
+
+`withdraw`, source `if (amount > balance) return false; balance -= amount; return
+true;`. Both tools get it right, and AOTopsy reads better: it puts the positive branch
+first, it prints 250 in decimal, and it names the incoming argument. jadart prints `if
+(this.field_0x8 < 0xfa)` with the inverted test and the hex literal, though it does name
+the receiver `this` where AOTopsy calls it `accumulator`.
+
+`classify`, a four-way comparison chain returning string literals. Both correct. AOTopsy
+prints the bounds as 40 and 80, jadart as 0x28 and 0x50.
+
+`checksum`, source `acc = (acc * 31 + b) & 0xffffffff` over a list. jadart recovers the
+loop and the accumulator:
+
+```
+var t0 = x1.field_0xc;
+var t1 = 0;
+var t4 = t0.field_0x8 >> 1;
+var t5 = 0;
+while (true) {
+  if (t5 >= t4) break;
+  t1 = ((t1 & 0xffffffff) * 31 + (t0[t5] & 0xffffffff)).toUnsigned(32) & 0xffffffff;
+  t5 += 1;
+}
+return t1;
+```
+
+AOTopsy returns 0 from the first comparison, loses the accumulator, the multiply, the
+mask and the element read, and marks the rest omitted:
+
+```
+while (true) {
+  block_2:;
+  if (0 >= arg2) { return 0; }
+  else if (classId(arg1.f11) << 1 != 188) { block_6:; continue; }
+  else { goto block_6; }
+}
+// --- code omitted by the structured walk, shown verbatim ---
+```
+
+That is the shape of the whole comparison. AOTopsy renders a body more pleasantly where
+it renders one; jadart recovers more of what the body does.
+
+### The real-app result, which goes the other way
+
+The fixtures above are one app we wrote. FluffyChat's current F-Droid build
+(`chat.fluffy.fluffychat`, a 26.1 MB `libapp.so` pulled by `tools/appsweep.py`) is an app
+neither tool was tuned on, and it is Dart 3.13.0. AOTopsy parses it: 88,618 functions,
+10,679 classes, 12 s. jadart refuses it. The refusal is correct rather than a bug, since
+3.13 is past the newest registered epoch, but on the version-reach axis the competitor is
+ahead today for anything built with the current Flutter stable.
+
+Two separate things stop us and both are bounded. The epoch is unregistered (hash
+`0451907c2eaa8467e848c0067bfe8ed4`). And 3.13 changed the container: that build exports
+`_kDartSnapshotData` and `_kDartSnapshotText`, where every earlier release exported
+`_kDartVmSnapshotData`, `_kDartIsolateSnapshotData` and their instruction pairs, and the
+`.so` has no `.symtab` at all, only those three in `.dynsym`. `jadart info` survives it
+because it falls through to the magic scan and reports the unknown epoch by name, while
+`verify`, `classes`, `decompile` and `export` ask for `_kDartIsolateSnapshotData` directly
+and refuse with `no symbol '_kDartIsolateSnapshotData' in this ELF. If this is a Flutter
+app, the snapshot is in libapp.so, not here`, which is the wrong reason for a file that is
+libapp.so.
+
+Seven snapshots were pulled for this section with `tools/appsweep.py`, out of 199 Flutter
+apps a partial probe of F-Droid's largest packages turned up. jadart identifies six of the
+seven and refuses only FluffyChat; AOTopsy identifies all seven. Where both identify a
+build they agree on the era and differ on the label: we name the stable release we
+registered the hash under (3.11.5, 3.5.4, 3.3.4, 2.19.6), AOTopsy names the era (3.11.0,
+3.5.0, 3.3.0, 2.19.0). Neither is wrong, because one format hash covers several patch
+releases.
+
+On the six it reads, jadart's acceptance gates pass on every one: Tier A 11 of 11 and
+Tier B 3 of 3 on each, between 120,163 and 364,740 byte-exact checks per app and 1,257,569
+in total, with no failures. These are apps nobody here compiled, across five Dart
+versions.
+
+The output comparison also holds away from our own fixture. On `kzs.th000.tsdm_client`
+(Dart 3.11.5, 16 MB, 48,906 functions), the two tools agree on the shape of the image and
+split the same way they do on FluBench:
+
+| axis | jadart | AOTopsy |
+|---|---|---|
+| lines, whole image | 857,974 in 98 s | 1,306,702 in 143 s |
+| lines carrying an unnamed value | 66,037 (7.7%) | 429,316 (32.9%) |
+| lines carrying an unnamed field | 274,186 (32.0%) | 246,001 (18.8%), none named |
+| `goto` lines | 18,951 (2.2%), in 10.7% of functions | 145,533 (11.1%) |
+| dispatch sites | 16,630, 8,073 with receiver and offset (48.5%) | 16,961, 6,455 with an offset (38.1%) |
+| dispatch sites named | 1,524, from 893 decoded selectors | 0 |
+| code left out of the rendering | none | 27,525 notes |
+
+### Refusal behaviour, which is the axis this file was started for
+
+Five malformed inputs built from the clean fixture (truncated at half, truncated after
+the header, 256 KiB of the payload XOR 0xff, empty, ELF header only): both tools refuse
+all five, neither crashes and neither hangs. jadart exits 2 with a typed message,
+AOTopsy exits 1 with an error. The DoS and untyped-failure half of the threat model is a
+draw.
+
+An unregistered version hash is not. Relabel the clean fixture with a hash no registry
+holds and jadart refuses before parsing, naming the hash, the span it supports and the
+command that would place the build (exit 2). AOTopsy picks a grammar anyway and dies
+inside the fill pass, `cluster 332 (String CID 93): string 17/23 data: stream:
+unexpected end of data` (exit 1), on bytes that are in fact Dart 3.12.2: the fallback it
+chose does not fit the file it was handed. `aotopsy doctor` on the same file prints
+`Support: OK` with an empty Dart version, which is the one answer in this comparison
+that is actively misleading. Neither tool emits a fabricated object graph, so the
+outcome is the same and the difference is the quality of the refusal.
+
+Relabel it as a different grammar era instead (3.12.2 bytes carrying the 2.19.6 hash)
+and both refuse with the offending cluster named: jadart `no alloc pattern for cid 2
+(FreeListElement) under epoch cidcanonical-2.19`, AOTopsy `cluster 34 (CID 2): unknown
+fill kind 21`. Relabel it within an era (the 3.10 hash) and both parse, both report the
+version the label claims, and jadart's gates pass 11 of 11 Tier A and 3 of 3 Tier B over
+66,323 checks. That is the honest result rather than a miss: the version label is read
+from the file, and where two epochs share a grammar for the clusters an app uses,
+nothing in the bytes contradicts it.
+
+One defect to report upstream: AOTopsy's pseudocode prints the raw tagged displacement
+as its field token, so `balance`, which its own `classes.jsonl` records at byte offset
+8, prints as `.f7`, and an array's first element at offset 16 prints as `.f15`. The two
+outputs cannot be cross-referenced without knowing to add one.
+
+### What AOTopsy has that jadart does not
+
+x86_64 decompilation, a claimed span of Dart 2.10 through 3.13 against our 18 epochs
+from 2.19, IDA, Ghidra, Frida, SARIF and DOT export, behavioural keyword classification,
+a function-fingerprint dictionary for unnamed code, and an import path for darter's
+output on older versions. Its name-recovery agreement against each build's own ELF
+`.symtab` is reported as 90.2% over 44 ground-truth builds, which is a measurement
+jadart does not have an equivalent of.
+
+Three things in its renderer are better than ours and are worth taking: an incoming
+argument prints as `arg0` where we print `x2`, a comparison against an untagged constant
+prints in decimal where we print hex, and the positive arm of a two-way branch comes
+first. None of them changes what is recovered; all three change how much of it a reader
+can hold.
+
+### flutterdec, read rather than run
+
+`caverav/flutterdec` (Rust, 7 crates, 123 dependencies, 0.1.0-alpha.2) advertises
+readable pseudo-Dart with named Flutter selectors for Android arm64. The naming is not a
+dispatch table decode: `crates/flutterdec-decompiler/src/helpers/selector_table/` holds
+329 lines of hardcoded selector tables (`FLUTTER_SELECTORS`, `DART_CORE_SELECTORS` and
+four more), and `classify_standard_selector` normalises a string it already has and
+looks it up in them. It can therefore label a call whose name is already present as a
+string and cannot name a selector that is not in its tables. It was not built or run
+here, because a Rust toolchain is a 1.5 GB llvm download on this host; what is stated
+above is from its source.
+
+### Blutter, and what it costs to get an answer out of it
+
+Not run. The setup, measured from its README and `blutter.py` rather than guessed: a
+C++20 compiler (g++ 13 or clang 16 and up), `cmake`, `ninja`, `pkg-config`, `icu4c`,
+`capstone`, `pyelftools` and `requests`, and then, for any Dart version whose `blutter`
+executable is not already built, an automatic checkout and compile of the matching Dart
+SDK. It also needs `libflutter.so` next to `libapp.so`, because that is where it reads
+the version from; a bare snapshot needs `--dart-version <version>_<os>_<arch>` supplied
+by hand. Our fixtures ship `libapp.so` alone, which is the common case for an iOS build,
+a split APK, or a snapshot pulled out of an archive, and it is the case Blutter cannot
+start from unaided.
+
+### How to reproduce this section
+
+```bash
+git clone --depth 1 https://github.com/BroNils/aotopsy && cd aotopsy
+go build ./cmd/aotopsy
+LIB=<jadart>/flubench/artifacts/clean/lib/arm64-v8a/libapp.so
+./aotopsy $LIB --out /tmp/aot --decompile --all -q
+find /tmp/aot/dart -name '*.dart' -exec cat {} + | grep -c 'dispatchCall(selector:'
+cd <jadart> && .venv/bin/jadart lift $LIB benchComputeChecksum
+.venv/bin/python framework/tools/quality.py $LIB
+```
+
 ## Failure taxonomy (the gaps a new tool must cover)
 
 1. Version-ID: silent fallback (unflutter) -> confidently-wrong output or
@@ -536,13 +759,17 @@ place it, is still the correct behaviour rather than a gap to close by guessing.
 3. Obfuscation: names are gone from the snapshot; no tool recovers them (only
    string xrefs survive to locate a function). Semantic renaming is open (could
    use cross-build diffing or an offline LLM; a research bet).
-4. Decompilation: every tool stops at (annotated) assembly or Ghidra-C; none
-   emit Dart or structured pseudo-Dart. This is the headline gap (C4). CLOSED by
-   Jadart Tier 2 (control flow) + Tier 3 (expressions): `libapp.so` -> named
-   pseudo-Dart statements. Tier 3.4 additionally names virtual calls from the
-   serialized dispatch table, which not even Blutter decodes. Field names remain
-   impossible (AOT strips them); that is a property of the format, not a tool gap.
-5. Scope: Blutter is Android-arm64 only; iOS is unsupported across the board. CLOSED for
+4. Decompilation: in Phase 0 every tool stopped at (annotated) assembly or
+   Ghidra-C. That is no longer the field: AOTopsy and flutterdec both emit
+   pseudo-Dart as of 2026 (see the section above, which measures AOTopsy's against
+   ours on the same bytes). What no tool does is resolve a virtual call to its
+   source selector name out of the serialized dispatch table: AOTopsy recovers the
+   offset for 2,319 of 3,425 sites and names none, flutterdec matches known names
+   from a hardcoded table, Blutter prints `GDT[cid_x0 + 0x4778]()`. Field names are
+   not impossible either, as this file said: 2,693 of the clean fixture's 71,036
+   field accesses are printed by name from three channels (#240).
+5. Scope: Blutter is Android-arm64 only, AOTopsy is ELF only and refuses an iOS
+   dylib, flutterdec is Android arm64 only, so iOS is unsupported elsewhere. CLOSED for
    the snapshot layer by Jadart: Mach-O containers are read, and the uncompressed-pointer
    grammar iOS uses (RODataDeserializationCluster, identifier pool in the RO data image) is
    implemented and passes 8/8 gates. The corpus objection turned out to be false, since
@@ -552,10 +779,15 @@ place it, is still the correct behaviour rather than a gap to close by guessing.
 
 ## Pending
 
-- A Blutter backend and a setup-cost writeup, to fill the Blutter rows above.
+- A Blutter run, to fill the Blutter rows above. Its setup cost is measured in the
+  section above; what is missing is the output.
 - A multi-Dart-version sweep of the other tools, to fill the version-robustness axis.
-  Running unflutter across the corpus is also what measures its silent fallback.
+  AOTopsy claims 2.10 through 3.13 over 93 sample builds; only its 3.12 behaviour is
+  measured here.
 - A Ghidra-plus-scripts backend, for the pseudocode column.
+- A real-app comparison. Both tools agree closely on the committed fixtures, which are
+  one app we wrote; the apps in `tools/appsweep.py`'s F-Droid set are the ones neither
+  tool was tuned on.
 
 Each of these is scoped in [CONTRIBUTING.md](CONTRIBUTING.md) and needs no Jadart internals.
 
