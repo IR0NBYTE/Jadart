@@ -98,6 +98,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   eq/ne branch on the clean fixture and 535 field accesses sit off the proven receiver
   on the proven edge, of which the field map names 17. See DESIGN section 13.
 
+### Changed
+
+- **Every countable claim in the README was re-measured against this commit.** Each was
+  true when it was written, none of them is gated, and the page itself describes that
+  failure mode two sections further down. What had drifted: the goto fallback (19.2% of
+  functions, now 1,414 of 8,194 at 17.3%), the share of conditionals whose arms each end
+  in their own return (36%, now 38.5%), the Tier 0 member count (5,756, now 5,779), the
+  dispatch sites that recover both a receiver and an offset (about 74%, now 2,580 of
+  3,333 at 77.4%), the pipeline's exception-free range count (over 9,000, now the two
+  fixtures' 16,382 with 0 exceptions), and the tests a fresh clone runs (around 177, now
+  about 405 of 436). The showcase printed bare machine registers through `checksum`'s
+  loop, which a run today names `t0` to `t5`. The 7.8% irreducible figure had no
+  measurement behind it: 201 of the clean fixture's 8,194 functions (2.5%) hold a
+  retreating edge whose target does not dominate it, and all 201 emit a goto, so none of
+  them is a graph the structurer could have rendered without one.
+- **The field-name sections say what names a field, which is three channels now and not
+  one.** The README and EVAL's matching paragraph both still said a name is printed on
+  `this` because `this` is the only value whose class the snapshot states, which the
+  allocation-stub and accessor channels (#240) made false. Measured on the clean fixture:
+  the three take byte-offset field lines from 55,089 to 53,296, the field map 823 of
+  them, the accessors 246 more and the allocation stubs 724 more, so 1,734 of the 10,758
+  lines that would carry a `this.field_0x` are cleared (16.1%).
+
 ### Fixed
 
 - **A displacement below the base is not a negative field offset.** A pre-indexed access

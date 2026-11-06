@@ -71,14 +71,18 @@ class LicenseVault {
     }
   }
   checksum() {
+    var t0 = x2.field_0xc;
+    var t1 = 0;
+    var t4 = t0.field_0x8 >> 1;
+    var t5 = 0;
     while (true) {
-      if (x4 >= x3) break;
-      x0 = (x0 * 31 & 0xffffffff)
-           + (x1[x4] & 0xffffffff)
-           & 0xffffffff;
-      x4 += 1;
+      if (t5 >= t4) break;
+      t1 = ((t1 * 31 & 0xffffffff)
+            + (t0[t5] & 0xffffffff))
+           .toUnsigned(32) & 0xffffffff;
+      t5 += 1;
     }
-    return x0;
+    return t1;
   }
   classify() {
     if ((x2 >> 63) & 1 != 0) {
@@ -111,6 +115,9 @@ Each one shows a real property of the format:
   the compiled program, not the source you wish it were.
 - The comparison flipped: `amount > balance` compiled to `balance < 250`, and Jadart
   prints what the branch actually tests.
+- A `t` name is a value the lifter proved; a bare `x2` is one it could not, and 10.5% of
+  the clean fixture's lifted lines still carry one. Nothing is spelled better than it is
+  known.
 
 ## How it fits together
 
@@ -174,13 +181,13 @@ Full walkthroughs: [docs/usage.md](docs/usage.md). Per-command help: `jadart <cm
 
 | tier | what you get | honest fallback |
 |------|--------------|-----------------|
-| 0 | class / method / field skeleton with the resolved superclass hierarchy (`FluBenchApp extends StatelessWidget`). 1843 named classes, 5756 members, 9013 strings on the clean corpus | classes whose names were stripped keep their structure |
+| 0 | class / method / field skeleton with the resolved superclass hierarchy (`FluBenchApp extends StatelessWidget`). 1843 named classes, 5779 members, 9013 strings on the clean corpus | classes whose names were stripped keep their structure |
 | 1 | per-function arm64 with direct call targets named and ObjectPool constants resolved to their string or function, including far pool loads (`add xD, x27, #hi; ldr [xD, #lo]`) | unresolved pool slots print their raw offset |
-| 2 | `if`/`else` and loops reconstructed as pseudo-Dart from the CFG, using forward and post-dominators, plus a Cifuentes follow node for the 36% of conditionals whose arms each end in their own `return` and so post-dominate at the virtual exit | 19.2% of functions still emit at least one `goto`, against 7.8% that are genuinely irreducible. `tools/cfgcheck.py` reads the structured tree back as a program and checks, for every block in the image, that the rendering claims exactly the successors the CFG has |
+| 2 | `if`/`else` and loops reconstructed as pseudo-Dart from the CFG, using forward and post-dominators, plus a Cifuentes follow node for the 38.5% of conditionals whose arms each end in their own `return` and so post-dominate at the virtual exit | 1,414 of 8,194 functions (17.3%) print at least one `goto`, and 201 of them hold a region that is genuinely irreducible, where no `goto`-free rendering exists at all. `tools/cfgcheck.py` reads the structured tree back as a program and checks, for every block in the image, that the rendering claims exactly the successors the CFG has |
 | 3 | expressions, by abstract interpretation over the register file: field load/store, arithmetic, `bool`/`null`/int constants, element access, compound `-=`, `return <expr>`, and scalar floating point (including int-to-double and double-to-int conversions, and `math.max`) | any instruction the lifter doesn't model prints as its arm64 line |
 | 3.1 | call arguments from the callee's register arity, read at the target address and so not dependent on the callee having a recovered name (`benchWithdraw(t8, (x1.field_0x8 >> 1) ~/ 2)`). A call whose result is read gets that result named, so the value can be followed to its use | the stack convention, an arguments descriptor, and a target outside the image print `(...)` rather than a guess |
-| 3.2 | VM runtime stubs rendered as source operations: `throw`, `throw NullCastError()`, `new List()`. A stub is identified by its index in the snapshot's object-store roots, so this works on a plain `--release` build, which keeps no symbol and no `Function` for one: 76 stubs named on each fixture, taking the clean image's `(...)` calls from 9,196 to 5,139. Pure machinery is stripped so it never reaches output: frame setup, the stack-overflow check, the write barrier, type tests, and the Smi box-or-tag idiom, which surfaces as a bogus `if (x != x)` if you leave it in | anything else stays a named `bl` |
-| 3.3 | virtual and interface calls attributed to a receiver plus a stable selector offset, `x1.sel_0xb34(...)`. About 74% of dispatch sites recover both | the rest print `(dynamic call)` |
+| 3.2 | VM runtime stubs rendered as source operations: `throw`, `throw NullCastError()`, `new List()`. A stub is identified by its index in the snapshot's object-store roots, so this works on a plain `--release` build, which keeps no symbol and no `Function` for one: 76 stubs named on each fixture, taking the clean image's `(...)` calls from 9,196 to 5,139. A `Class` owns exactly one kind of code, its own allocation stub, so the `bl` that allocated a value says which class it is: 3,848 of the clean fixture's 4,425 `new` sites print a class. Pure machinery is stripped so it never reaches output: frame setup, the stack-overflow check, the write barrier, type tests, and the Smi box-or-tag idiom, which surfaces as a bogus `if (x != x)` if you leave it in | anything else stays a named `bl` |
+| 3.3 | virtual and interface calls attributed to a receiver plus a stable selector offset, `x1.sel_0xb34(...)`. 2,580 of the clean fixture's 3,333 dispatch sites recover both (77.4%) | the rest print `(dynamic call)` |
 | 3.4 | that offset resolved to a **source selector name**: `x2.toString()`, `x2.addListener(...)`. 133 selectors on the clean corpus, naming 23.5% of the dispatch sites that have a recovered offset | names need two agreeing classes, an untied vote AND an offset no other function is known to be placed at, so the rest keep `sel_0x<off>` |
 
 Two things sit outside the tier ladder and matter a lot in practice.
@@ -218,7 +225,7 @@ classes, and an offset claimed by two different names is dropped.
 | iOS / macOS arm64 | Mach-O 64 | uncompressed | supported, every applicable Tier-A gate |
 | Android arm32 (`armeabi-v7a`) | ELF32 | uncompressed | Tiers 1 and 2 decode; Tier 3 refuses |
 
-**Eighteen registered format epochs**, Dart 2.19.6 through 3.12.2, across fourteen grammar
+**Eighteen registered format epochs**, Dart 2.19 through 3.12.2, across fourteen grammar
 families. Two are beta builds, because Flutter's beta channel pins a Dart release of its
 own and an app published from it carries that hash forever. An unregistered release fails
 loud with the hash and the command that would identify it.
@@ -286,7 +293,7 @@ What is false is the generalisation that followed. Of those 420 `Field` objects 
 INSTANCE fields, not statics, and each records its own byte offset (`Smi::New(
 Field::TargetOffsetOf(field))`, app_snapshot.cc:2238). Across the 44 cached third-party
 apps it is 36,555 instance fields of 59,160. So Jadart prints the name where the snapshot
-supplies one and the receiver's class is known, and the offset everywhere else:
+supplies one and the base's class is known, and the offset everywhere else:
 
 ```
 $ jadart classes libapp.so -f PointerEvent
@@ -299,11 +306,23 @@ class PointerEvent extends ... {
 
 A field keeps its `Field` object when something still points at it: 162 of the corpus's
 245 are the `data` of a surviving implicit getter, implicit setter, or field initializer.
-Everything the optimiser inlined away is gone, which is why this reaches 12.6% of the
-lines that carry a `this.field_0x` on the corpus binary, 17.1% on Hacki, 18.0% on
-com.k.todo and 19.2% on Immich, and not all of them.
+Everything the optimiser inlined away is gone, which is why the map reaches a minority of
+the accesses and not all of them: 17.1% of the `this` lines on Hacki, 18.0% on com.k.todo,
+and 16.1% on the committed clean fixture, 1,734 of the 10,758 lines that would otherwise
+carry a `this.field_0x`.
 
-**Eighteen supported epochs today**, 2.19.6 through 3.12.2. This paragraph used to say
+Two further channels reach slots those `Field` objects do not, and both read a statement
+the snapshot makes rather than inferring one. A `Class` owns exactly one kind of code, its
+own allocation stub, so the `bl` that allocated a value says which class it is, which is
+what gives a base other than `this` a class at all. And a surviving `get:` or `set:` whose
+whole body IS that one access names the slot it touches, which is what jadx does with
+Kotlin getters, for the same reason: a runtime that keeps some metadata keeps it unevenly.
+Together the three take the clean fixture's byte-offset field lines from 55,089 to 53,296,
+the map 823 of them, the accessors 246 more and the allocation stubs 724 more. One
+disagreement refuses a whole channel, and on that fixture the accessors agree with the
+field map 40 times out of 40.
+
+**Eighteen supported epochs today**, 2.19 through 3.12.2. This paragraph used to say
 "one, and three more identified and refused"; that was true when it was written and stopped
 being true without being updated, which is the failure mode a README has and a test does
 not. Nothing is currently identified-but-refused (`versions._UNVALIDATED` is empty). One
@@ -326,8 +345,9 @@ the app's own functions stay anonymous, because no reference contains them.
 
 **Arguments and unmodelled instructions are marked, not invented.** Calls using the stack
 convention print `(...)`. Any instruction the lifter doesn't model prints as arm64. The
-whole annotate, strip, CFG, structure, lift pipeline runs with **zero exceptions over 9000
-code ranges** across the clean build, the obfuscated build, and a real third-party app.
+whole annotate, strip, CFG, structure, lift pipeline runs with **zero exceptions over
+16,382 code ranges**, the clean build's 8,194 and the obfuscated build's 8,188, and over a
+real third-party app.
 
 
 ## Using it from a coding agent
@@ -407,7 +427,8 @@ cd framework && python3 -m pytest tests -q     # 436 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect around 177 to run.
+clone with capstone installed, expect about 405 of the 436 to run and the other 31 to
+skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs
 the suite with no Flutter install. Tests whose fixture is missing skip and say which one.
