@@ -17249,6 +17249,57 @@ def test_the_dart_3_13_gates_run_without_a_real_app():
     assert not _gates_3_13(hdr_base=8)[0]["G13"].passed
 
 
+def test_a_dart_3_13_stub_is_named_by_its_symbol_only_where_the_roots_agree(monkeypatch):
+    """3.13 symbol tables spell a stub `stub X` where 3.12 wrote `stub _iso_stub_XStub`
+    (StubCode::ForEachStub lost the object-store branch that supplied it), so a
+    symbolized 3.13 build would hide every stub from the lifter's rules. The symbol is
+    spelled the lifter's way, and it has to agree with the roots: where they differ
+    the layout is wrong for this binary, and the compiler's names stand alone.
+
+    Through 3.12 nothing changes: a symbol wins and the roots fill the gaps."""
+    from types import SimpleNamespace
+    from jadart import disasm, versions
+    from jadart.expr import _classify_stub
+
+    fr = SimpleNamespace(functions=[], strings={}, names={})
+
+    def names(epoch, symbols, roots):
+        monkeypatch.setattr(disasm, "stub_names", lambda _i, _f, _e: dict(roots))
+        image = SimpleNamespace(symbol_names=symbols, code_ranges={}, epoch=epoch)
+        return disasm.function_name_by_pc(image, fr)
+
+    e313 = versions._EPOCHS[DART_3_13]
+    throw, null, rng = ("_iso_stub_ThrowStub", "_iso_stub_NullErrorSharedWithFPURegsStub",
+                        "_iso_stub_RangeErrorSharedWithFPURegsStub")
+    # no symbol table, which is every release build so far: the roots' names
+    assert names(e313, {}, {0x10: throw}) == {0x10: throw}
+    # a symbol table that agrees, beside a function symbol it does not touch
+    assert names(e313, {0x10: "stub Throw", 0x40: "Foo.bar"}, {0x10: throw}) == {
+        0x10: throw, 0x40: "Foo.bar"}
+    # no roots to compare with: the symbols, spelled so a throw is still a throw
+    got = names(e313, {0x10: "stub NullErrorSharedWithFPURegs (#2)"}, {})
+    assert got == {0x10: null} and _classify_stub(got[0x10]) == ("throw_err", "NullError")
+    # the roots put NullError where the compiler wrote RangeError: the roots are wrong
+    # for this binary, so none of their names is used
+    assert names(e313, {0x10: "stub RangeErrorSharedWithFPURegs"},
+                 {0x10: null, 0x20: throw}) == {0x10: rng}
+    # a stub the roots do not have, and a stub where the compiler wrote a function
+    assert names(e313, {0x10: "stub Throw", 0x30: "stub ReThrow"}, {0x10: throw}) == {
+        0x10: throw, 0x30: "_iso_stub_ReThrowStub"}
+    assert names(e313, {0x10: "Foo.bar"}, {0x10: throw, 0x20: null}) == {0x10: "Foo.bar"}
+
+    e312 = versions._EPOCHS[KNOWN_HASH]
+    assert names(e312, {0x10: "stub _iso_stub_ThrowStub"},
+                 {0x10: "_iso_stub_ReThrowStub", 0x20: throw}) == {
+        0x10: "stub _iso_stub_ThrowStub", 0x20: throw}
+
+    # 3.13 sizes a closure by its captured slots and has a stub per size; each still
+    # allocates a Closure, and 3.12's single stub reads as it did.
+    for n in range(1, 5):
+        assert _classify_stub(f"_iso_stub_AllocateClosure{n}Stub") == ("alloc", "Closure")
+    assert _classify_stub("_iso_stub_AllocateClosureStub") == ("alloc", "Closure")
+
+
 def test_dart_3_13_is_registered_for_what_was_checked_and_nothing_else():
     """The epoch claims arm64 and x64 compressed, the grammar the one real binary has.
 
