@@ -100,6 +100,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **EVAL.md re-measures the field, because the tool it was scored against no longer
+  exists.** `zboralski/unflutter`, the backend every row of the Phase 0 comparison used,
+  has been removed by its author; the maintained successor is `BroNils/aotopsy`, a fork
+  that adds x86_64, a decompiler and Frida export, and `caverav/flutterdec` is a second
+  new entrant that emits pseudo-Dart. So taxonomy item 4, that every other tool stops at
+  assembly or Ghidra C, is no longer true and says so. AOTopsy was built and run on the
+  same two fixtures: it renders the same 8,194 ranges in 261,039 lines against our
+  185,227, sees 71,068 field accesses against our 71,036 and names none of them against
+  our 2,693, recovers a selector offset for 2,319 of 3,425 dispatch sites against our
+  2,580 of 3,333 and names none against our 607, prints 31,500 goto lines against our
+  5,493, and leaves 5,223 bodies partly unrendered where we leave none. It refuses an
+  iOS dylib that we parse. On the real apps it is the other way around: FluffyChat's
+  current F-Droid build is Dart 3.13.0, which AOTopsy reads and we refuse, and the
+  section says so rather than leaving the axis unmeasured.
+
 - **Every countable claim in the README was re-measured against this commit.** Each was
   true when it was written, none of them is gated, and the page itself describes that
   failure mode two sections further down. What had drifted: the goto fallback (19.2% of
