@@ -137,7 +137,8 @@ class-id-indexed virtual/interface dispatch) renders as `receiver.sel_0x<off>(..
 an opaque `(dynamic call)`. The lifter traces the class-id load (`ubfx cid,[recv,#-1]`), the
 per-selector offset added to it, and the `[x21, idx]` table load back to the receiver register
 and the offset; the offset is stable program-wide, so it identifies the selector. Over the
-corpus ~74% of dispatch sites recover both the receiver and the offset.
+corpus ~74% of dispatch sites recover both the receiver and the offset, and 2,580 of the
+clean fixture's 3,333 (77.4%).
 
 ## Tier 3.4: virtual-call selector NAMES (a capability no public tool has)
 
@@ -241,8 +242,12 @@ Not true: that the 420 are all statics. **245 of them are instance fields**, eac
 `Smi::New(Field::TargetOffsetOf(field))` - its own byte offset in compressed words
 (app_snapshot.cc:2238). Across the 44 cached third-party apps it is **36,555 instance
 fields of 59,160**, and **32,205 of 32,205** place inside their owner class's declared
-`instance_size` with none outside. Those are printed by name on `this`, and by offset
-everywhere else, because `this` is the only value whose class the snapshot states.
+`instance_size` with none outside. Those are printed by name wherever the base's
+class is stated. That was `this` alone until a class's own allocation stub was read as the
+statement of what a `bl` allocates, and until a surviving accessor was read as the name of
+the slot its whole body touches (both #240): on the clean fixture the three channels clear
+1,793 of the 55,089 lines that would otherwise carry a byte offset, 1,734 of them on
+`this`.
 
 Measured reach on the lifted output, corpus binary: **1,364 of 11,177** `this.field_0x`
 occurrences become names (12.2%), clearing **1,273 of 10,134** lines that carried one
