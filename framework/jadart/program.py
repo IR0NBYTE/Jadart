@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from .stream import ReadStream
 from .macho import open_container
 from . import versions, cids as C
-from .snapshot import parse_blob, UnknownEpoch
+from .snapshot import images, parse_blob, UnknownEpoch
 from .clusters import walk_alloc
 from .fillwalk import walk_fill
 
@@ -216,7 +216,8 @@ def recover_program(path) -> Program:
     resolve names/owners/fields/superclasses. Fail-loud on unknown epoch or desync."""
     from .source import read_binary
     src = read_binary(path)
-    blob = open_container(src.data).symbol_bytes("_kDartIsolateSnapshotData")
+    container = open_container(src.data)
+    blob = container.symbol_bytes(images(container, src.label).data)
     hdr = parse_blob(blob, "isolate", strict=True)
     if hdr.epoch is None:
         raise UnknownEpoch(f"unknown epoch for {src.label}")

@@ -16492,6 +16492,238 @@ def test_the_accessor_names_agree_with_every_field_object_that_speaks():
                 f"carry nothing")
 
 
+
+# The two symbol layouts a library names its snapshot with (#253).
+
+#: A hash no release reproduces, for a header that has to be refused for its epoch.
+_NO_SUCH_EPOCH = b"0" * 28 + b"0253"
+
+
+def _merged_layout(d: bytes, version_hash: bytes = None) -> bytes:
+    """The clean fixture as a Dart 3.13 container names it: the program's two images
+    under _kDartSnapshotData and _kDartSnapshotText, and no vm symbol. Each name sits
+    once in .dynstr, and the new spelling is shorter, so it is written over the old one
+    in place and the symbol table needs no other change."""
+    out = bytearray(d)
+    for old, new in ((b"_kDartIsolateSnapshotData", b"_kDartSnapshotData"),
+                     (b"_kDartIsolateSnapshotInstructions", b"_kDartSnapshotText"),
+                     (b"_kDartVmSnapshotData", b"_kGoneVmSnapshotData"),
+                     (b"_kDartVmSnapshotInstructions", b"_kGoneVmSnapshotInstructions")):
+        assert d.count(old + b"\x00") == 1, old
+        at = d.index(old + b"\x00")
+        out[at:at + len(new) + 1] = new + b"\x00"
+    if version_hash is not None:
+        from jadart.elf import Elf
+        e = Elf(d)
+        at = e.va_to_offset(e.symbols["_kDartIsolateSnapshotData"].value)
+        out[at + 20:at + 52] = version_hash
+    return bytes(out)
+
+
+def _merged_macho(header: bytes) -> bytes:
+    """A Mach-O that exports the merged pair: one __TEXT segment whose __const holds
+    `header` and whose __text holds a word of code, and an LC_SYMTAB naming both."""
+    names = b"\x00_kDartSnapshotData\x00_kDartSnapshotText\x00"
+    code = b"\xc0\x03\x5f\xd6" * 4
+    seg = 72 + 2 * 80
+    body = 32 + seg + 24
+    at_const, at_text = body, body + len(header)
+    at_sym = at_text + len(code)
+    at_str = at_sym + 2 * 16
+    va = 0x4000
+
+    def section(name, addr, size, off):
+        return (name.ljust(16, b"\x00") + b"__TEXT".ljust(16, b"\x00")
+                + struct.pack("<QQI", addr, size, off) + bytes(28))
+
+    out = struct.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 6, 2, seg + 24, 0, 0)
+    out += struct.pack("<II", 0x19, seg) + b"__TEXT".ljust(16, b"\x00")
+    out += struct.pack("<QQQQIIII", va, 0x4000, 0, at_sym, 5, 5, 2, 0)
+    out += section(b"__const", va + at_const, len(header), at_const)
+    out += section(b"__text", va + at_text, len(code), at_text)
+    out += struct.pack("<IIIIII", 0x02, 24, at_sym, 2, at_str, len(names))
+    assert len(out) == body
+    out += header + code
+    out += struct.pack("<IBBHQ", 1, 0x0F, 1, 0, va + at_const)
+    out += struct.pack("<IBBHQ", 20, 0x0F, 2, 0, va + at_text)
+    return out + names
+
+
+def test_a_merged_layout_library_is_refused_for_its_epoch_by_every_command(tmp_path):
+    # Dart 3.13 writes one snapshot, exported as _kDartSnapshotData and
+    # _kDartSnapshotText. `info` found it by its magic and named the unknown epoch, and
+    # every other command asked for _kDartIsolateSnapshotData by name and refused with
+    # "the snapshot is in libapp.so, not here" about the libapp.so (#253). The reason a
+    # file cannot be read is one thing, whichever command is asked.
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+    from jadart.disasm import load_instructions
+    from jadart.program import recover_program
+    from jadart.snapshot import walk_isolate
+    from jadart.stream import ReadStream
+    from jadart.verify import verify_file
+
+    path = tmp_path / "libapp.so"
+    path.write_bytes(_merged_layout(open(CLEAN, "rb").read(), _NO_SUCH_EPOCH))
+    out = tmp_path / "out"
+
+    for door in (parse_libapp, recover_program, load_instructions, walk_isolate,
+                 verify_file, jadart.program, jadart.verify, jadart.strings):
+        with pytest.raises(UnknownEpoch):
+            door(str(path))
+
+    said = {}
+    for argv in (["info"], ["verify"], ["classes"], ["libraries"], ["functions"],
+                 ["strings"], ["symbols"], ["selectors"], ["constants"], ["ffi"],
+                 ["decompile", "BenchAccount"], ["lift", "benchWithdraw"],
+                 ["disasm", "benchWithdraw"], ["hook", "benchWithdraw"],
+                 ["xrefs", "benchWithdraw"], ["export", "-o", str(out)]):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["-j", argv[0], str(path), *argv[1:]])
+        doc = json.loads(buf.getvalue())
+        assert (rc, doc["type"], doc["exit"]) == (2, "UnknownEpoch", 2), (argv, doc)
+        said[argv[0]] = doc["error"]
+    assert len(set(said.values())) == 1, said
+    assert _NO_SUCH_EPOCH.decode() in said["info"] and "not here" not in said["info"]
+    assert not out.exists(), "export wrote something for a file it refused"
+
+    # The same on the Mach-O side, where the pair is spelled the same way.
+    d = open(CLEAN, "rb").read()
+    blob = jadart.elf.Elf(d).symbol_bytes("_kDartIsolateSnapshotData")
+    st = ReadStream(blob, 52)
+    st.read_cstring()
+    header = bytearray(blob[:st.pos]) + bytes([0x80] * 5)
+    struct.pack_into("<q", header, 4, len(header))
+    header[20:52] = _NO_SUCH_EPOCH
+    dylib = tmp_path / "App"
+    dylib.write_bytes(_merged_macho(bytes(header)))
+    for door in (parse_libapp, recover_program, load_instructions):
+        with pytest.raises(UnknownEpoch):
+            door(str(dylib))
+    from jadart.snapshot import parse_libapp_with_anchor
+    heads, anchor = parse_libapp_with_anchor(str(dylib), strict=False)
+    assert list(heads) == ["isolate"] and heads["isolate"].epoch is None
+    assert (anchor["symbol"], anchor["container"], anchor["size"]) == (
+        "_kDartSnapshotText", "macho", 16)
+
+
+def test_a_merged_layout_library_is_read_through_the_merged_pair(tmp_path):
+    # The symbols say where the two images are and the version hash says how to read
+    # them, so the fixture's own snapshot under the 3.13 names reads as it always did,
+    # and every address is given against the symbol this file exports: a Frida script
+    # that resolved _kDartIsolateSnapshotInstructions in such a library would find
+    # nothing to hook.
+    import dataclasses
+    from jadart import hooks, interop
+    from jadart.disasm import load_instructions
+    from jadart.program import recover_program
+    from jadart.snapshot import parse_libapp_with_anchor
+    from jadart.verify import verify_file
+
+    path = tmp_path / "libapp.so"
+    path.write_bytes(_merged_layout(open(CLEAN, "rb").read()))
+
+    real, real_anchor = parse_libapp_with_anchor(CLEAN)
+    got, anchor = parse_libapp_with_anchor(str(path))
+    assert list(got) == ["isolate"], "one snapshot, and it is the program's"
+    assert got["isolate"] == real["isolate"]
+    assert anchor == dict(real_anchor, symbol="_kDartSnapshotText")
+
+    was = recover_program(CLEAN)
+    now = recover_program(str(path))
+    assert now.classes == was.classes and now.strings == was.strings
+
+    old_image, old_fr, _hdr = load_instructions(CLEAN)
+    image, fr, hdr = load_instructions(str(path))
+    assert image.anchor_symbol == "_kDartSnapshotText"
+    assert old_image.anchor_symbol == "_kDartIsolateSnapshotInstructions"
+    # symbol_names maps the image's own start to the symbol that names it, so it
+    # differs by exactly that spelling; everything else is the same image.
+    for f in dataclasses.fields(image):
+        if f.name not in ("anchor_symbol", "symbol_names"):
+            assert getattr(image, f.name) == getattr(old_image, f.name), f.name
+    assert fr.codes == old_fr.codes and fr.functions == old_fr.functions
+
+    info = interop.binary_info(image, hdr, "libapp.so")
+    assert info["anchor"]["symbol"] == info["runtime_symbol"] == "_kDartSnapshotText"
+    syms = interop.code_symbols(image, fr, hdr)
+    chosen, problems = hooks.select(syms, ["benchWithdraw"])
+    assert not problems
+    planned = hooks.plan(image, hdr, fr, chosen)
+    for text in (hooks.render_frida(image, hdr, fr, syms, planned, "libapp.so", "t"),
+                 interop.render_r2(image, hdr, syms, "libapp.so", "t"),
+                 interop.render_ghidra(image, hdr, syms, "libapp.so", "t"),
+                 interop.render_ida(image, hdr, syms, "libapp.so", "t")):
+        assert "_kDartSnapshotText" in text
+        assert "_kDartIsolateSnapshotInstructions" not in text
+
+    # The gates still pass, and the one that needs a vm snapshot says there is none.
+    rep = verify_file(str(path))
+    assert rep.supported
+    g13 = next(g for g in rep.gates if g.gate.startswith("G13"))
+    assert g13.skipped == "no vm snapshot in this container"
+
+
+def test_a_library_with_no_snapshot_symbol_is_told_what_is_true(tmp_path):
+    # "If this is a Flutter app, the snapshot is in libapp.so, not here" was said to
+    # every file the isolate symbol was missing from, and for two of these three it
+    # was false: a stripped libapp.so IS the file, and so is one that names its
+    # snapshot both ways.
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+    from jadart.disasm import load_instructions
+    from jadart.errors import ContainerError, MissingSymbol
+    from jadart.program import recover_program
+    from jadart.snapshot import walk_isolate
+
+    d = open(CLEAN, "rb").read()
+    path = tmp_path / "libapp.so"
+
+    def refused(kind, *doors):
+        errors = []
+        for door in doors or (recover_program, load_instructions, walk_isolate):
+            with pytest.raises(kind) as e:
+                door(str(path))
+            errors.append(str(e.value))
+        assert len(set(errors)) == 1, errors
+        return errors[0]
+
+    # Its section headers gone, the fixture has no symbols and still holds the
+    # snapshot: the header is readable from the magic, the images are not locatable.
+    bare = bytearray(d)
+    struct.pack_into("<HHH", bare, 0x3A, 0, 0, 0)
+    path.write_bytes(bare)
+    assert list(parse_libapp(str(path))) == ["blob0", "blob1"]
+    said = refused(MissingSymbol)
+    assert "a Dart snapshot starts at file offset 0x340" in said, said
+    assert "not here" not in said and "_kDartSnapshotData" in said
+
+    # A library with no snapshot at all is the one case the old hint was right about.
+    path.write_bytes(_minimal_elf64())
+    said = refused(MissingSymbol)
+    assert "no Dart snapshot here" in said and "libapp.so" in said, said
+
+    # Both layouts at once: the vm symbol kept, the isolate pair renamed. No engine
+    # loads the two families together, so which snapshot is the program is not in the
+    # file, and `info` refuses it as well.
+    both = bytearray(_merged_layout(d))
+    at = both.index(b"_kGoneVmSnapshotData\x00")
+    both[at:at + 21] = b"_kDartVmSnapshotData\x00"
+    path.write_bytes(both)
+    said = refused(ContainerError, recover_program, load_instructions, walk_isolate,
+                   parse_libapp)
+    assert "exports both snapshot layouts" in said, said
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["-j", "info", str(path)]) == 2
+    assert json.loads(buf.getvalue())["type"] == "ContainerError"
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

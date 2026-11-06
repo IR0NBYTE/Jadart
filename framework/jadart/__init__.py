@@ -98,7 +98,9 @@ __all__ = [
 
 
 def header(path: str) -> dict:
-    """{"vm": SnapshotHeader, "isolate": SnapshotHeader}: release, target, counts."""
+    """{"vm": SnapshotHeader, "isolate": SnapshotHeader}: release, target, counts.
+
+    A Dart 3.13 library holds one snapshot, keyed "isolate", and has no "vm" entry."""
     return parse_libapp(_resolve(path))
 
 

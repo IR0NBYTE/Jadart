@@ -30,7 +30,6 @@ import json
 import re
 from dataclasses import dataclass
 
-from .disasm import ISOLATE_INSTRUCTIONS
 from .errors import InputError
 from .fill import NAME_CUT, visible  # hooks imports visible from here too
 
@@ -118,7 +117,7 @@ def code_symbols(image, fr, hdr, sigs: str | None = None, notes: list | None = N
     answer to give and that is raised instead."""
     if image.anchor_va is None:
         raise InputError(
-            f"this binary has no {ISOLATE_INSTRUCTIONS} symbol, so there is no anchor to "
+            f"this binary has no {image.anchor_symbol} symbol, so there is no anchor to "
             f"give addresses against")
     from .disasm import function_name_by_pc
     from .program import build_program, static_bit, _FUNCTION_KINDS
@@ -212,7 +211,7 @@ def code_symbols(image, fr, hdr, sigs: str | None = None, notes: list | None = N
         raise InputError(
             f"all {dropped} code ranges this snapshot declares start outside the "
             f"{len(image.text)}-byte instructions image that "
-            f"{ISOLATE_INSTRUCTIONS} covers, so none of them has an address in this "
+            f"{image.anchor_symbol} covers, so none of them has an address in this "
             f"binary")
     if dropped and notes is not None:
         notes.append(f"{dropped} of {dropped + len(out)} code ranges start outside the "
@@ -230,11 +229,11 @@ def binary_info(image, hdr, label: str) -> dict:
         "dart": hdr.epoch.dart if hdr.epoch is not None else "",
         "epoch": hdr.epoch.name if hdr.epoch is not None else "",
         "version_hash": hdr.version_hash,
-        "anchor": {"symbol": ISOLATE_INSTRUCTIONS, "va": image.anchor_va,
+        "anchor": {"symbol": image.anchor_symbol, "va": image.anchor_va,
                    "file_offset": image.anchor_file_offset, "size": len(image.text)},
         # dlsym on Apple prepends the underscore itself, so the runtime name drops it
-        "runtime_symbol": (ISOLATE_INSTRUCTIONS[1:] if image.container == "macho"
-                           else ISOLATE_INSTRUCTIONS),
+        "runtime_symbol": (image.anchor_symbol[1:] if image.container == "macho"
+                           else image.anchor_symbol),
     }
 
 
@@ -367,7 +366,7 @@ def render_r2(image, hdr, syms: list, label: str, version: str) -> str:
     each test is computed again before the `q!!` that stops the script. Every name on a command line
     is the reduced one; the Dart name as written goes in as a base64 comment."""
     info = binary_info(image, hdr, label)
-    flag = ("sym." if image.container == "macho" else "obj.") + ISOLATE_INSTRUCTIONS
+    flag = ("sym." if image.container == "macho" else "obj.") + image.anchor_symbol
     named = [s for s in syms if s.name]
     lines = [f"# {h}" for h in _header("radare2", info, len(syms), len(named), version)]
     # The binary radare2 has to open is the shared object, never the apk, ipa or directory
@@ -533,7 +532,7 @@ def ghidra_entry(sym: CodeSymbol) -> str:
 def render_ghidra(image, hdr, syms: list, label: str, version: str) -> str:
     info = binary_info(image, hdr, label)
     named = sum(1 for s in syms if s.name)
-    data = {"anchor": ISOLATE_INSTRUCTIONS, "checks": _checks(image, syms),
+    data = {"anchor": image.anchor_symbol, "checks": _checks(image, syms),
             "syms": [{"off": s.pc_offset, "size": s.size,
                       "name": ghidra_name(s) if s.name else "",
                       "cmt": _comment(s) if s.name else "", "entry": s.entry_offset or 0,
@@ -656,7 +655,7 @@ if "--exit" in getattr(idc, "ARGV", []):
 def render_ida(image, hdr, syms: list, label: str, version: str) -> str:
     info = binary_info(image, hdr, label)
     named = sum(1 for s in syms if s.name)
-    data = {"anchor": ISOLATE_INSTRUCTIONS, "checks": _checks(image, syms),
+    data = {"anchor": image.anchor_symbol, "checks": _checks(image, syms),
             "syms": [{"off": s.pc_offset, "size": s.size,
                       "name": safe_name(s, "dart_") if s.name else "",
                       "cmt": _comment(s) if s.name else "", "entry": s.entry_offset or 0,

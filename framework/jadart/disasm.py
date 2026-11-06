@@ -189,6 +189,9 @@ class InstrImage:
     # `.text+pc_offset` label names code that far into the WRONG image. `anchor_va +
     # pc_offset` is the virtual address a disassembler shows. Checked on 58 ELF builds and
     # an iOS dylib, 546,037 ranges, against the container's own section headers.
+    # The symbol is the one this container exports (snapshot.images): a Dart 3.13
+    # library has a single instructions image under _kDartSnapshotText, and a script
+    # that resolves the pre-3.13 name at run time finds nothing there.
     anchor_symbol: str = ISOLATE_INSTRUCTIONS
     anchor_va: int = None
     anchor_file_offset: int = None
@@ -205,7 +208,7 @@ def load_instructions(path):
 
     `path` is anything source.open_source accepts: a binary, a directory, an APK or IPA,
     or a Source already read out of one."""
-    from .snapshot import parse_blob
+    from .snapshot import images, parse_blob
     from .clusters import walk_alloc
     from .fillwalk import walk_fill
     from .source import read_binary
@@ -213,9 +216,12 @@ def load_instructions(path):
     src = read_binary(path)
     raw = src.data
     elf = open_container(raw)
-    data = elf.symbol_bytes("_kDartIsolateSnapshotData")
-    text = elf.symbol_bytes(ISOLATE_INSTRUCTIONS)
+    names = images(elf, src.label)
+    data = elf.symbol_bytes(names.data)
+    # The header before the instructions image: an unknown epoch is the reason this
+    # file cannot be read, and it is the one `info` gives, whatever else is missing.
     hdr = parse_blob(data, "isolate", strict=True)
+    text = elf.symbol_bytes(names.instructions)
     # Snapshot::length() is the STORED int64 plus kMagicSize: the magic is excluded from the
     # written size (snapshot.h "Excluding the magic value from the size written in the buffer").
     # Rounding the raw stored value instead lands the data image 64 bytes early whenever
@@ -270,9 +276,9 @@ def load_instructions(path):
 
     # backfill real names from the ELF symbol table, if present (dwarf_stack_traces_mode)
     from .symbols import pc_name_map
-    symbol_names = pc_name_map(elf, len(text))
+    symbol_names = pc_name_map(elf, len(text), names.instructions)
 
-    anchor = elf.symbols.get(ISOLATE_INSTRUCTIONS)
+    anchor = elf.symbols.get(names.instructions)
     anchor_va = anchor.value if anchor is not None else None
     anchor_off = elf.va_to_offset(anchor_va) if anchor_va is not None else None
 
@@ -294,7 +300,7 @@ def load_instructions(path):
     return InstrImage(text=text, pcs=pcs, first_code=first_code, code_ranges=ranges,
                       all_ranges=all_ranges, symbol_names=symbol_names,
                       data=data, data_length=header_length, arch=hdr.arch,
-                      epoch=hdr.epoch,
+                      epoch=hdr.epoch, anchor_symbol=names.instructions,
                       anchor_va=anchor_va, anchor_file_offset=anchor_off,
                       container="macho" if type(elf).__name__ == "MachO64" else "elf",
                       entry_offsets=entry_offsets), fr, hdr

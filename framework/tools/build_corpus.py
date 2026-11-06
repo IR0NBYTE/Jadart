@@ -223,7 +223,9 @@ def observed_hash(path: str) -> str:
     """The version hash actually carried by a built binary."""
     sys.path.insert(0, FRAMEWORK)
     from jadart.macho import open_container
-    data = open_container(open(path, "rb").read()).symbol_bytes("_kDartIsolateSnapshotData")
+    from jadart.snapshot import images
+    container = open_container(open(path, "rb").read())
+    data = container.symbol_bytes(images(container, path).data)
     return data[20:52].decode("ascii", "replace")
 
 

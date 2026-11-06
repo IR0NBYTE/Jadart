@@ -44,9 +44,11 @@ uint32 tag, decodes cid, dispatches.
 A SerializationCluster (:158) is one bucket of same-cid objects; ~51 subclasses in this
 checkout, each with a mirror DeserializationCluster.
 
-## 3. The four images
+## 3. The images: four through Dart 3.12, two from 3.13
 
-ELF symbols `_kDart{Vm,Isolate}Snapshot{Data,Instructions}`:
+Through Dart 3.12 a library holds two snapshots, the vm one and the isolate one, each a
+data image and an instructions image. ELF and Mach-O name them alike,
+`_kDart{Vm,Isolate}Snapshot{Data,Instructions}`:
 - Data images = the clustered stream above (.rodata). VM data = VM-global/shared objects +
   predefined-class scaffolding. Isolate data = the app object graph (classes, functions,
   libraries, constants, closures, types).
@@ -59,6 +61,37 @@ ELF symbols `_kDart{Vm,Isolate}Snapshot{Data,Instructions}`:
 This split is why disassembly and object recovery are two problems: the code lives in
 .text (Instructions), the names/pool/classes live in .rodata (Data), joined by offsets +
 the ObjectPool.
+
+Dart 3.13 writes ONE snapshot, so a library holds two images, `_kDartSnapshotData` and
+`_kDartSnapshotText`. It is the isolate snapshot with the vm one folded into it, not a
+third kind of thing, and the evidence is the writer rather than the names:
+
+- `FullSnapshotWriter` takes one data stream and one `ImageWriter` where it took a vm
+  and an isolate one of each, `WriteVMSnapshot` and both `VM*Roots` classes are gone,
+  and `WriteFullSnapshot` is a single call to `WriteProgramSnapshot`
+  (app_snapshot.cc at 3.13.0, :10050 and :10154; 3.12.2 has them at :9873, :6911 and
+  :7044).
+- What is left still reads its header, its clusters and its roots the way an isolate
+  snapshot does. Its base objects are no longer the vm snapshot's object table but
+  seven fixed roots, null, false, true and four sentinels (`AddBaseObjects`, :7452).
+- `runtime/include/dart_api.h` at 3.13.0 defines `kSnapshotData*Symbol` and
+  `kSnapshotText*Symbol` and no vm or isolate name, and `ImageWriter::SectionSymbol`
+  (image_snapshot.cc:702) returns the Asm spelling for every container it writes. So
+  the Mach-O side renames too. That half is read from the source: no 3.13 Mach-O has
+  been through jadart.
+- Measured on the one 3.13 binary here (FluffyChat's F-Droid build, version hash
+  0451907c2eaa8467e848c0067bfe8ed4, which is the 3.13.0 tag): `.dynsym` holds those two
+  symbols and `_kDartSnapshotBuildId`, the snapshot magic occurs once in the file, at
+  the data symbol, and the header states 7 base objects.
+
+What that does to the reader is small, because jadart never read the vm snapshot to
+parse the isolate one. `snapshot.images` answers which pair a container carries and
+everything past the header starts there; the symbols say where the images are and
+never how to read them, which stays the version hash's job. A library that exports
+both layouts is refused, since no engine loads the two together and picking one would
+be a guess. `info` keys the single snapshot "isolate" and has no "vm" entry, the anchor
+every address is given against is whichever instructions symbol the file exports, and
+the one check that needed a vm snapshot (G13, Tier B) says there is none.
 
 ## 4. CID table (class_id.h)
 

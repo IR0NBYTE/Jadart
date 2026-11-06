@@ -138,6 +138,33 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A Dart 3.13 library is refused for its epoch by every command, not for a symbol it
+  never had.** Dart 3.13 writes one snapshot where every release before it wrote a vm
+  and an isolate one, and exports it as `_kDartSnapshotData` and `_kDartSnapshotText`
+  (DESIGN 3). `info` reached the header through the magic scan and named the unknown
+  epoch. Every other command asked the container for `_kDartIsolateSnapshotData` by
+  name and answered `no symbol '_kDartIsolateSnapshotData' in this ELF. If this is a
+  Flutter app, the snapshot is in libapp.so, not here`, about the libapp.so itself. On
+  FluffyChat's current F-Droid build (26.1 MB, Dart 3.13.0) that was 15 of the 16
+  commands; all 16 now exit 2 with the one `UnknownEpoch` text, and `export` writes
+  nothing.
+
+  `snapshot.images` says which of the two layouts a container carries, and
+  `load_instructions`, `recover_program`, `walk_isolate` and `tools/build_corpus.py`
+  start from it. The symbols only locate the images; the grammar still comes from the
+  version hash, so a renamed symbol cannot select a parse. A library exporting both
+  layouts is refused rather than read one way. `info` keys the single snapshot
+  `isolate` and reports its instructions symbol as the anchor, and the Frida, IDA,
+  Ghidra and radare2 scripts name the anchor the file exports instead of a constant:
+  a script that resolved `_kDartIsolateSnapshotInstructions` in a 3.13 library would
+  find nothing. No output byte changes on a library from 3.12 or earlier: the 15
+  command outputs, a hook script and the whole `export` tree of each fixture (328 and
+  312 files) compare equal to main's.
+
+  The refusal for a file with neither layout now says what is true of it. A stripped
+  libapp.so is told a snapshot starts at the offset the magic is at and that the
+  symbols are what is missing; only a file with no snapshot in it is still pointed at
+  libapp.so. The 3.13 epoch itself is #254. Closes #253.
 - **A displacement below the base is not a negative field offset.** A pre-indexed access
   kept the heap-object tag bias and came out as `t3.field_0x-3`, which is not a field and
   not an address a reader can use: `.field_0xN` says offset N of the object the base

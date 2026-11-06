@@ -14,7 +14,7 @@ header, version epoch (fail-loud), counts, and the first cluster's cid.
 """
 from __future__ import annotations
 
-from .errors import InputError, JadartError, MissingSymbol
+from .errors import ContainerError, InputError, JadartError, MissingSymbol
 
 import struct
 from dataclasses import dataclass
@@ -22,10 +22,22 @@ from dataclasses import dataclass
 from . import versions
 from .macho import open_container
 
-#: The exported symbol the isolate instructions image starts at. Every address jadart
-#: prints is this plus a pc_offset. Dart 3.13 renames it (_kDartSnapshotText); no
-#: registered epoch is that new yet.
+#: The symbols a library names its snapshot images with: two layouts, and the release
+#: decides which. Through Dart 3.12 a library holds two snapshots, the vm one and the
+#: isolate one, each a data image and an instructions image, four symbols in all. Dart
+#: 3.13 writes one snapshot and so one pair (`kSnapshotDataAsmSymbol` and
+#: `kSnapshotTextAsmSymbol`, runtime/include/dart_api.h at 3.13.0; the vm and isolate
+#: definitions are gone from that header). The Asm spellings are what ImageWriter's
+#: SectionSymbol returns for every container it writes (image_snapshot.cc), so a
+#: Mach-O carries the same two names as an ELF.
+VM_DATA = "_kDartVmSnapshotData"
+ISOLATE_DATA = "_kDartIsolateSnapshotData"
+#: Where the isolate instructions image starts, through 3.12. Every address jadart
+#: prints is the instructions symbol plus a pc_offset; which symbol that is comes from
+#: `images` below, never from this constant alone.
 ISOLATE_INSTRUCTIONS = "_kDartIsolateSnapshotInstructions"
+MERGED_DATA = "_kDartSnapshotData"
+MERGED_INSTRUCTIONS = "_kDartSnapshotText"
 from .stream import ReadStream
 
 DART_MAGIC = 0xDCDCF5F5
@@ -77,6 +89,63 @@ _MAX_FEATURES = 4096
 #: and the scan for a stripped binary refuses a third rather than parsing every hit,
 #: which cost a copy of the rest of the file for each one (#99).
 _SNAPSHOTS = 2
+
+
+@dataclass(frozen=True)
+class Images:
+    """The two symbols that locate a program's snapshot in one container.
+
+    They say WHERE the images are and nothing about how to read them: the grammar comes
+    from the version hash in the header, as it does for every other release, so a
+    renamed symbol can never select a parse."""
+    data: str            # the clustered stream, then the RO data image
+    instructions: str    # the machine code; every pc_offset is relative to it
+    merged: bool         # one snapshot (3.13 and later), not a vm and an isolate one
+
+
+_SEPARATE = Images(ISOLATE_DATA, ISOLATE_INSTRUCTIONS, merged=False)
+_MERGED = Images(MERGED_DATA, MERGED_INSTRUCTIONS, merged=True)
+
+
+def _layout(container, label: str):
+    """Which of the two symbol layouts `container` carries, or None for neither.
+
+    Carrying both is refused. No toolchain writes that: the engine that loads the file
+    looks up one family or the other, so which snapshot is the program depends on a
+    reader jadart cannot see, and picking one would be a guess."""
+    syms = container.symbols
+    separate = [n for n in (VM_DATA, ISOLATE_DATA, ISOLATE_INSTRUCTIONS) if n in syms]
+    merged = [n for n in (MERGED_DATA, MERGED_INSTRUCTIONS) if n in syms]
+    if separate and merged:
+        raise ContainerError(
+            f"{label}: exports both snapshot layouts, {separate[0]} (Dart through 3.12) "
+            f"and {merged[0]} (3.13 and later). A library carries one of them, so "
+            f"jadart will not guess which snapshot is the program.")
+    return _SEPARATE if separate else _MERGED if merged else None
+
+
+def images(container, label: str = "this file") -> Images:
+    """The symbols holding the program's snapshot, or the reason there are none.
+
+    Every command that reads past the header starts here. Asking for the isolate
+    symbol by name refused a Dart 3.13 library, which exports the merged pair, with
+    "the snapshot is in libapp.so, not here" about the libapp.so itself (#253)."""
+    found = _layout(container, label)
+    if found is not None:
+        return found
+    wanted = f"{ISOLATE_DATA} (Dart through 3.12) or {MERGED_DATA} (3.13 and later)"
+    at = container.find_snapshot_magic(limit=1)
+    if at:
+        raise MissingSymbol(
+            f"{label}: a Dart snapshot starts at file offset 0x{at[0]:x}, but the "
+            f"file exports neither {wanted}, so nothing says where its data and "
+            f"instructions images are. `jadart info` reads the header from the magic "
+            f"alone; every other command needs the symbols.")
+    raise MissingSymbol(
+        f"{label}: no Dart snapshot here. The file exports neither {wanted} and the "
+        f"snapshot magic is nowhere in it. In a Flutter app the snapshot is in "
+        f"libapp.so (Android) or the App binary (iOS), not in the engine or a plugin "
+        f"library.")
 
 
 def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeader:
@@ -176,7 +245,7 @@ def walk_isolate(path, *, full: bool = False) -> dict:
     from .source import read_binary
     src = read_binary(path)
     elf = open_container(src.data)
-    blob = elf.symbol_bytes("_kDartIsolateSnapshotData")
+    blob = elf.symbol_bytes(images(elf, src.label).data)
     hdr = parse_blob(blob, "isolate", strict=True)
     if hdr.epoch is None:
         raise UnknownEpoch(f"unknown epoch for {src.label}")
@@ -201,7 +270,11 @@ def walk_isolate(path, *, full: bool = False) -> dict:
 
 
 def parse_libapp(path, *, strict: bool = True) -> dict[str, SnapshotHeader]:
-    """Parse both snapshots (vm + isolate) from a libapp.so.
+    """Parse every snapshot header in a libapp.so, keyed "vm" and "isolate".
+
+    A Dart 3.13 library holds one snapshot, which is the program's, so it is keyed
+    "isolate" and there is no "vm" entry: `header(path)["isolate"]` means the same
+    thing on every release.
 
     `path` is a libapp.so, a directory, an APK or IPA, or a Source already read out of
     one. A container is read in place, never unpacked; see source.py."""
@@ -219,10 +292,13 @@ def parse_libapp_with_anchor(path, *, strict: bool = True):
     src = read_binary(path)
     data = src.data
     elf = open_container(data)
-    anchor = _anchor_from(elf)
+    layout = _layout(elf, src.label)
+    anchor = _anchor_from(elf, layout)
     out: dict[str, SnapshotHeader] = {}
-    for which, sym in (("vm", "_kDartVmSnapshotData"),
-                       ("isolate", "_kDartIsolateSnapshotData")):
+    named = () if layout is None else (
+        (("isolate", layout.data),) if layout.merged
+        else (("vm", VM_DATA), ("isolate", layout.data)))
+    for which, sym in named:
         try:
             blob = elf.symbol_bytes(sym)
         except MissingSymbol:
@@ -251,20 +327,21 @@ def parse_libapp_with_anchor(path, *, strict: bool = True):
     return out, anchor
 
 
-def _anchor_from(elf):
-    """Where the isolate instructions image sits, read off the container it came from.
+def _anchor_from(elf, layout):
+    """Where the program's instructions image sits, read off the container it came from.
 
-    The symbol name lives here rather than being imported from disasm.py: that module
+    The symbol names live here rather than being imported from disasm.py: that module
     imports capstone, which costs 8 MB of RSS, and `info` does not disassemble anything.
-    disasm.py re-exports this name so there is still one definition of it."""
-    sym = elf.symbols.get(ISOLATE_INSTRUCTIONS)
+    disasm.py re-exports the pre-3.13 name so there is still one definition of it."""
+    name = layout.instructions if layout is not None else None
+    sym = elf.symbols.get(name) if name else None
     if sym is None:
         return None
     try:
         # ELF records the size; Mach-O leaves it 0 and derives it by copying the image, so
         # only pay that where there is no recorded size.
-        size = sym.size or len(elf.symbol_bytes(ISOLATE_INSTRUCTIONS))
-        return {"symbol": ISOLATE_INSTRUCTIONS, "va": sym.value,
+        size = sym.size or len(elf.symbol_bytes(name))
+        return {"symbol": name, "va": sym.value,
                 "file_offset": elf.va_to_offset(sym.value), "size": size,
                 "container": "macho" if type(elf).__name__ == "MachO64" else "elf"}
     except JadartError:
