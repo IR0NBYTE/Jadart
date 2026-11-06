@@ -13,6 +13,37 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
+- **A field whose `Field` object was tree-shaken is named by the accessor that reached
+  it.** 9,770 of the clean fixture's 9,943 receiver field accesses sit at an offset the
+  field map has no entry for, which is #240's population 1: the slot is there, its class
+  is known, and the name was dropped. It was not dropped everywhere. 969 `get:` and 208
+  `set:` Function objects survive on that build, so for some of those slots the name is
+  still in the snapshot under another key, and `fields.recover_accessors` reads it. jadx
+  does the same for the same runtime-with-metadata reason: its `kotlin-metadata.getters`
+  flag, "rename simple getters to field names", is on by default. The native decompilers
+  have no such channel, which is an asymmetry rather than an oversight, C having no
+  accessor convention: IDA offers `get_member_name(struct_id, offset)`, a lookup BY
+  offset, and Ghidra has the analyst rename the member.
+
+  SIMPLE is the whole restriction, and it is where a looser rule goes wrong. A getter
+  that merely reads a slot on the way to a computed answer says nothing about that slot's
+  name: `_HashSet.isEmpty` loads the length slot and compares it, and taking the first
+  load in the body named the length slot `isEmpty`. So a getter is read only where its
+  whole body IS the read, one load off the receiver into the result register and then the
+  return, and a setter only where it stores to exactly ONE offset off the receiver. Where
+  the field map already names an offset the accessor has to agree, and on the clean
+  fixture it agrees 40 times out of 40, 17 getters and 23 setters, with 0 disagreements;
+  one disagreement refuses the whole channel, the rule `recover_fields` applies to itself.
+
+  61 offsets over 41 classes, which takes `tools/quality.py`'s byte-offset field count
+  from 53,740 to 53,296, so 444 printed lines gain the name the program gave the slot and
+  960 export lines change, each a one-for-one substitution. Nothing else moves: the line
+  total, `regline`, `ellipsis`, `goto`, `rawasm` and `label` are identical on both
+  fixtures, `pbfuzz --census` is unchanged at 2,086 wrong reads and 0 stale, every oracle
+  pass is 0 mismatches on both, and no byte offset is printed that was not printed before.
+  The obf fixture gains 0, because its accessor names are obfuscated too: that is the
+  result rather than a failure, and a channel that invented names would have gained as
+  many there as here. Part of #240; the cid proofs it leaves are measured in DESIGN 13.1.
 - **A field of an object the body allocated is named, and the allocation says which
   class it is.** `Lifter._field` printed a recovered name only off `this`, because
   `Function.owner` was the only thing in the snapshot that stated a base's class, and

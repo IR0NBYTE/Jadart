@@ -291,7 +291,8 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     from .cfg import render_function
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors, ORIGIN_ELEMENT_ARM64
-    from .fields import recover_allocations, recover_fields
+    from .fields import (recover_accessors, recover_allocations,
+                     recover_fields)
     from .program import build_program
 
     _check_outdir(outdir)
@@ -309,6 +310,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     from .program import static_function_refs, receiver_for
     static_refs = static_function_refs(fr)
     layout = recover_fields(fr, getattr(image, "arch", None))
+    layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout) if tier >= 3 else None
 
     methods: dict = {}

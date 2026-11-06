@@ -40,6 +40,7 @@ name is wrong.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field as _dcfield
 
 #: Field::StaticBit, object.h:4938-4940. `ConstBit` is bit 0 with no explicit position and
@@ -86,6 +87,23 @@ class FieldLayout:
         """{byte offset -> field name} for a class ref, empty when nothing is known."""
         m = self.by_class.get(class_ref)
         return {} if not m else {off: fi.name for off, fi in m.items()}
+
+    def add_accessor_names(self, acc) -> int:
+        """Merge accessor-derived names in, under the offsets the map has no entry for.
+
+        Never over an entry a `Field` object put there: where both speak they agree, and
+        `recover_accessors` refuses the whole channel if they ever do not, so this adds
+        and does not overwrite (#240)."""
+        added = 0
+        for cls, offs in acc.by_class.items():
+            m = self.by_class.setdefault(cls, {})
+            for off, name in offs.items():
+                if off in m:
+                    continue
+                m[off] = FieldInfo(name=name, owner=self.class_name.get(cls, ""),
+                                   offset=off, inherited=False, unboxed=False)
+                added += 1
+        return added
 
     def for_function(self, func_ref) -> dict:
         """{byte offset -> field name} for the receiver of `func_ref`.
@@ -379,3 +397,159 @@ def recover_allocations(image, fr, layout: FieldLayout) -> AllocLayout:
                            refused=f"{out.disagreed} allocation stubs carry a class id "
                                    f"their owner Class does not")
     return out
+
+
+# --------------------------------------------------------------------------------------
+# A field whose `Field` object was tree-shaken, named by the accessor that survived.
+
+#: The load a getter that IS a field read performs, and the store a setter performs: off
+#: the receiver register, which is x1 in a getter and x1 or x2 in a setter, into or out of
+#: the result register. `canon` is not available here, so the spellings are matched as the
+#: disassembler prints them.
+_ACC_LOAD = re.compile(r"^(?:x0|w0|d0), \[(x1|x2)(?:, #(-?(?:0x[0-9a-f]+|\d+)))?\]$")
+_ACC_STORE = re.compile(r"^(?:[xwdsq]\d+), \[(x1|x2)(?:, #(-?(?:0x[0-9a-f]+|\d+)))?\]$")
+
+#: How many instructions an accessor may be and still be read. A getter that IS the field
+#: read is two, the load and the return; a setter carries the write barrier as well, and
+#: every one on both 3.12.2 fixtures is well inside this.
+_MAX_ACCESSOR_WORDS = 48
+
+
+def _acc_off(m) -> int:
+    """The byte offset the matched access names: the displacement plus the tag bias."""
+    return (int(m.group(2), 0) if m.group(2) else 0) + 1
+
+
+@dataclass
+class AccessorNames:
+    """{class ref: {byte offset: name}} read out of `get:`/`set:` function bodies."""
+    by_class: dict = _dcfield(default_factory=dict)
+    #: Counters, so a caller can say what happened rather than only what worked.
+    agreed: int = 0            # the map already had the offset, under the same name
+    disagreed: int = 0         # ...under a different one, which refuses the channel
+    added: int = 0
+    declined: int = 0
+    refused: str = ""
+
+
+def recover_accessors(image, fr, layout: FieldLayout) -> AccessorNames:
+    """Name a slot from the accessor that reaches it, where its `Field` object is gone.
+
+    A `Field` can be tree-shaken while the `get:` or `set:` Function that reaches its slot
+    survives, and then the slot's name is still in the snapshot, just somewhere else.
+    9,770 of the clean fixture's 9,943 receiver field accesses sit at an offset the map
+    has no entry for, which is #240's population 1, and 969 `get:` and 208 `set:`
+    functions survive on that same build.
+
+    THE SHAPE IS THE PROOF, and it has to be exact. A getter that merely READS a slot on
+    the way to a computed answer says nothing about that slot's name: `_HashSet.isEmpty`
+    loads the length slot and compares it, so a looser rule named the length slot
+    `isEmpty`, which is the wrong-name failure this file exists to prevent. A getter is
+    therefore read only where its whole body IS the read, one load off the receiver into
+    the result register and then the return, and a setter only where its body stores to
+    EXACTLY ONE offset off the receiver. jadx draws the same line for the same reason: its
+    `kotlin-metadata.getters` flag, "rename simple getters to field names", is on by
+    default, and SIMPLE is the whole restriction.
+
+    The native decompilers have no such channel, which is an asymmetry rather than an
+    oversight: C has no accessor convention, so IDA offers `get_member_name(struct_id,
+    offset)`, a lookup BY offset, and Ghidra has the analyst rename the member. It exists
+    here because a Dart AOT snapshot keeps named Function objects for accessors long after
+    it has dropped the `Field`.
+
+    WHAT SAYS IT IS RIGHT. Where the map already names the offset the accessor has to
+    agree, and on the clean fixture it agrees 40 times out of 40, 17 getters and 23
+    setters, with 0 disagreements. ONE disagreement refuses the whole channel, which is
+    the rule `recover_fields` applies to itself: an accessor whose offset contradicts a
+    `Field` object means one of the two readings is wrong, and neither is worth printing
+    until it is known which.
+
+    Tier 3 only, and empty without a disassembler, because the field map itself is stdlib
+    and this reads compiled bodies. 61 offsets over 41 classes on the clean fixture, which
+    takes `tools/quality.py`'s byte-offset field count from 53,740 to 53,296, so 444
+    printed lines gain the name the program gave the slot. 0 on the obf fixture, where the
+    accessor names are obfuscated too: that is the result and not a failure, and it is
+    also what says the channel reads names rather than inventing them."""
+    out = AccessorNames()
+    arch = getattr(image, "arch", None)
+    if arch is None or getattr(arch, "name", None) != "arm64":
+        out.refused = "the accessor reader runs on arm64 only"
+        return out
+    try:
+        from .disasm import disassemble_range
+    except Exception:                                  # pragma: no cover
+        out.refused = "no disassembler, so no accessor body to read"
+        return out
+
+    want = {}
+    for ref, name_ref, owner, _k in fr.functions:
+        nm = fr.names.get(name_ref, "")
+        if owner not in layout.class_name:
+            continue
+        if nm.startswith("get:"):
+            want[ref] = ("get", nm[4:], owner)
+        elif nm.startswith("set:"):
+            want[ref] = ("set", nm[4:], owner)
+    if not want:
+        return out
+
+    found: dict = {}
+    for ref, (kind, name, owner) in sorted(want.items()):
+        cr = getattr(image, "code_ranges", {}).get(ref)
+        if cr is None or not (0 < cr.size <= 4 * _MAX_ACCESSOR_WORDS):
+            out.declined += 1
+            continue
+        try:
+            dis = disassemble_range(image, cr)
+        except Exception:
+            out.declined += 1
+            continue
+        if not dis:
+            out.declined += 1
+            continue
+        off = _getter_offset(dis) if kind == "get" else _setter_offset(dis)
+        if off is None:
+            out.declined += 1
+            continue
+        known = layout.by_class.get(owner) or {}
+        if off in known:
+            if known[off].name == name:
+                out.agreed += 1
+                continue
+            return AccessorNames(
+                disagreed=1,
+                refused=(f"{layout.class_name.get(owner, owner)} offset {off} is "
+                         f"`{known[off].name}` in the field map and `{name}` in its "
+                         f"accessor, so one of the two readings is wrong"))
+        if found.get((owner, off), name) != name:
+            found[(owner, off)] = None          # two accessors, two names, no answer
+            out.declined += 1
+            continue
+        found[(owner, off)] = name
+
+    for (owner, off), name in sorted(found.items()):
+        if name is None:
+            continue
+        out.by_class.setdefault(owner, {})[off] = name
+        out.added += 1
+    return out
+
+
+def _getter_offset(dis):
+    """The offset a getter whose whole body IS one field read reads, or None."""
+    body = [(r[1], r[2]) for r in dis if r[1] != "nop"]
+    if len(body) != 2 or body[1][0] != "ret" or body[0][0] not in ("ldur", "ldr"):
+        return None
+    m = _ACC_LOAD.match(body[0][1])
+    return None if m is None else _acc_off(m)
+
+
+def _setter_offset(dis):
+    """The one offset a setter stores to off the receiver, or None if it is not one."""
+    offs = set()
+    for r in dis:
+        if r[1].startswith(("stur", "str")):
+            m = _ACC_STORE.match(r[2])
+            if m is not None:
+                offs.add(_acc_off(m))
+    return offs.pop() if len(offs) == 1 else None

@@ -69,7 +69,7 @@ def measure(path):
                                build_pool_map, function_name_by_pc)
     from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
-    from jadart.fields import recover_allocations, recover_fields
+    from jadart.fields import recover_accessors, recover_allocations, recover_fields
     from jadart.program import static_function_refs, receiver_for
 
     image, fr, hdr = load_instructions(path)
@@ -80,6 +80,7 @@ def measure(path):
     returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
+    layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout)
 
     c = dict(functions=0, lines=0, regline=0, field=0, ellipsis=0, goto=0,
