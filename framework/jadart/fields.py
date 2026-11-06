@@ -400,76 +400,78 @@ def recover_allocations(image, fr, layout: FieldLayout) -> AllocLayout:
 
 
 # --------------------------------------------------------------------------------------
-# A field whose `Field` object was tree-shaken, named by the accessor that survived.
+# A slot whose `Field` object survived without a readable name, named by its accessor.
 
-#: The load a getter that IS a field read performs, and the store a setter performs: off
-#: the receiver register, which is x1 in a getter and x1 or x2 in a setter, into or out of
-#: the result register. `canon` is not available here, so the spellings are matched as the
-#: disassembler prints them.
-_ACC_LOAD = re.compile(r"^(?:x0|w0|d0), \[(x1|x2)(?:, #(-?(?:0x[0-9a-f]+|\d+)))?\]$")
-_ACC_STORE = re.compile(r"^(?:[xwdsq]\d+), \[(x1|x2)(?:, #(-?(?:0x[0-9a-f]+|\d+)))?\]$")
-
-#: How many instructions an accessor may be and still be read. A getter that IS the field
-#: read is two, the load and the return; a setter carries the write barrier as well, and
-#: every one on both 3.12.2 fixtures is well inside this.
+#: How many instructions an accessor may be and still be read. An implicit getter is two
+#: to fourteen, a setter carries the write barrier and sometimes a covariance check, and
+#: every one on both 3.12.2 fixtures is well inside this. It also bounds the CFG and the
+#: fixpoint below, since the words come out of the file.
 _MAX_ACCESSOR_WORDS = 48
 
-
-def _acc_off(m) -> int:
-    """The byte offset the matched access names: the displacement plus the tag bias."""
-    return (int(m.group(2), 0) if m.group(2) else 0) + 1
+#: The two kinds whose name the compiler derives from the field and whose body it builds
+#: from that field alone (see `recover_accessors`), and how many arguments each takes.
+_ACCESSOR_ARGS = {"ImplicitGetter": 1, "ImplicitSetter": 2}
 
 
 @dataclass
 class AccessorNames:
-    """{class ref: {byte offset: name}} read out of `get:`/`set:` function bodies."""
+    """{class ref: {byte offset: name}} read out of implicit accessors."""
     by_class: dict = _dcfield(default_factory=dict)
     #: Counters, so a caller can say what happened rather than only what worked.
-    agreed: int = 0            # the map already had the offset, under the same name
-    disagreed: int = 0         # ...under a different one, which refuses the channel
+    agreed: int = 0            # the accessor's Field names itself, and the same way
+    body_agreed: int = 0       # the body reaches the receiver at the Field's own offset
+    disagreed: int = 0         # either of those contradicted, which refuses the channel
     added: int = 0
     declined: int = 0
     refused: str = ""
 
 
 def recover_accessors(image, fr, layout: FieldLayout) -> AccessorNames:
-    """Name a slot from the accessor that reaches it, where its `Field` object is gone.
+    """Name a slot whose `Field` object survives but whose name does not read, from the
+    implicit accessor the compiler made for that Field.
 
-    A `Field` can be tree-shaken while the `get:` or `set:` Function that reaches its slot
-    survives, and then the slot's name is still in the snapshot, just somewhere else.
-    9,770 of the clean fixture's 9,943 receiver field accesses sit at an offset the map
-    has no entry for, which is #240's population 1, and 969 `get:` and 208 `set:`
-    functions survive on that same build.
+    WHERE THE NAME IS. `KernelLoader::GenerateFieldAccessors` (kernel_loader.cc) makes an
+    instance field's getter and setter as `kImplicitGetter` and `kImplicitSetter`
+    Functions named `get:` and `set:` plus the field's own name, and calls
+    `set_accessor_field(field)` on each, so the Function's `data` IS the Field
+    (`Function::accessor_field`, object.cc). `FlowGraphBuilder::BuildGraphOfFieldAccessor`
+    (kernel_to_il.cc) then builds the whole body from that Field: load it off parameter
+    0, or store parameter 1 into it. So an implicit accessor names exactly one slot, its
+    own Field's, and the offset comes from the Field object, not from the code.
 
-    THE SHAPE IS THE PROOF, and it has to be exact. A getter that merely READS a slot on
-    the way to a computed answer says nothing about that slot's name: `_HashSet.isEmpty`
-    loads the length slot and compares it, so a looser rule named the length slot
-    `isEmpty`, which is the wrong-name failure this file exists to prevent. A getter is
-    therefore read only where its whole body IS the read, one load off the receiver into
-    the result register and then the return, and a setter only where its body stores to
-    EXACTLY ONE offset off the receiver. jadx draws the same line for the same reason: its
-    `kotlin-metadata.getters` flag, "rename simple getters to field names", is on by
-    default, and SIMPLE is the whole restriction.
+    Such a Field usually names itself and is already in the map. Where it does not, its
+    name is a string the VM snapshot holds, a base object the isolate snapshot refers to
+    and never writes (`end`, `start`, `state`, `r`, `g`, `b`), while the accessor's name
+    `get:g` is written into the isolate snapshot. All 19 such Fields on the clean fixture
+    are that case, and that is the whole of this channel's reach.
 
-    The native decompilers have no such channel, which is an asymmetry rather than an
-    oversight: C has no accessor convention, so IDA offers `get_member_name(struct_id,
-    offset)`, a lookup BY offset, and Ghidra has the analyst rename the member. It exists
-    here because a Dart AOT snapshot keeps named Function objects for accessors long after
-    it has dropped the `Field`.
+    WHAT IT USED TO DO, AND WHY THAT WAS A GUESS (#258). This read every `get:` and `set:`
+    Function whatever its kind, and took the one offset its body touched. A HAND-WRITTEN
+    setter's name is not its slot's: Dart forbids a field and a setter of one name in one
+    class, so `set capacity` stores into `_capacity`, and 56 of the 61 offsets this named
+    on the clean fixture came from such setters, `this.capacity`, `this.locale` and
+    `this.ellipsis` among them. Its store rule did not ask what the base register held
+    either, so `RenderAnimatedSize.set:reverseDuration`, which stores into the controller
+    it loads, named the receiver's offset 44, and the agreement check below refused the
+    channel on all six real apps measured for #240. Its 40 agreements were all implicit.
 
-    WHAT SAYS IT IS RIGHT. Where the map already names the offset the accessor has to
-    agree, and on the clean fixture it agrees 40 times out of 40, 17 getters and 23
-    setters, with 0 disagreements. ONE disagreement refuses the whole channel, which is
-    the rule `recover_fields` applies to itself: an accessor whose offset contradicts a
-    `Field` object means one of the two readings is wrong, and neither is worth printing
-    until it is known which.
+    WHAT SAYS IT IS RIGHT. Two checks, each against a second encoding, and ONE
+    contradiction of either refuses the whole channel, the rule `recover_fields` applies
+    to itself:
 
-    Tier 3 only, and empty without a disassembler, because the field map itself is stdlib
-    and this reads compiled bodies. 61 offsets over 41 classes on the clean fixture, which
-    takes `tools/quality.py`'s byte-offset field count from 53,740 to 53,296, so 444
-    printed lines gain the name the program gave the slot. 0 on the obf fixture, where the
-    accessor names are obfuscated too: that is the result and not a failure, and it is
-    also what says the channel reads names rather than inventing them."""
+      * where the Field's own name DOES read, it has to be the accessor's name with the
+        prefix taken off. 145 of 145 on the clean fixture, 78 of 78 on the obf one.
+      * the body, read from the entry convention by `_receiver_accesses`, has to reach
+        the receiver at the Field's own offset and nowhere else for a store (a getter: a
+        load there and nothing else). That is G14 extended to setters and to a base that
+        is proved to be the receiver rather than assumed to be x1.
+
+    A body that cannot be read that way, an accessor whose Code was deduplicated into
+    another Function's, a Field with no offset or an offset outside its owner, and an
+    accessor whose owner is not the Field's owner are declined, not guessed.
+
+    Tier 3 only, arm64 only, and empty without a disassembler, because the field map
+    itself is stdlib and this reads compiled bodies."""
     out = AccessorNames()
     arch = getattr(image, "arch", None)
     if arch is None or getattr(arch, "name", None) != "arm64":
@@ -480,76 +482,273 @@ def recover_accessors(image, fr, layout: FieldLayout) -> AccessorNames:
     except Exception:                                  # pragma: no cover
         out.refused = "no disassembler, so no accessor body to read"
         return out
+    from .program import _KIND_INDEX
+    kinds = {_KIND_INDEX[k]: k for k in _ACCESSOR_ARGS}
 
-    want = {}
-    for ref, name_ref, owner, _k in fr.functions:
-        nm = fr.names.get(name_ref, "")
-        if owner not in layout.class_name:
-            continue
-        if nm.startswith("get:"):
-            want[ref] = ("get", nm[4:], owner)
-        elif nm.startswith("set:"):
-            want[ref] = ("set", nm[4:], owner)
-    if not want:
-        return out
+    cws, hw = arch.compressed_word_size, arch.instance_header_words
+    cls_cid = {ref: cid & 0xFFFFFFFF for ref, _n, cid, _s in fr.classes}
 
+    def owner_class(ref):
+        if ref in cls_cid:
+            return ref
+        w = fr.patch_class.get(ref)
+        return w if w in cls_cid else None
+
+    field_of = {ref: (name_ref, owner) for ref, name_ref, owner in fr.fields}
+    entries = getattr(image, "entry_offsets", None) or {}
     found: dict = {}
-    for ref, (kind, name, owner) in sorted(want.items()):
+    for ref, name_ref, owner, kt in sorted(fr.functions):
+        kind = kinds.get(kt & 0x1F)
+        if kind is None:
+            continue
+        nm = fr.names.get(name_ref, "")
+        prefix = "get:" if kind == "ImplicitGetter" else "set:"
+        data = fr.func_data.get(ref, -1)
+        if not nm.startswith(prefix) or data not in field_of or data not in fr.field_meta:
+            out.declined += 1
+            continue
+        name = nm[len(prefix):]
+        kind_bits, value_ref = fr.field_meta[data]
+        word = fr.smi_values.get(value_ref)
+        if (kind_bits >> _STATIC_BIT) & 1 or word is None:
+            out.declined += 1
+            continue
+        fname_ref, fowner = field_of[data]
+        fname = fr.names.get(fname_ref, "")
+        if fname:
+            if fname != name:
+                return AccessorNames(disagreed=1, refused=(
+                    f"`{nm}` accesses the Field `{fname}`, and the compiler names an "
+                    f"implicit accessor after its own Field"))
+            out.agreed += 1
+        cls = owner_class(fowner)
+        if cls is None or owner_class(owner) != cls:
+            out.declined += 1
+            continue
+        sizes = fr.class_sizes.get(cls_cid[cls])
+        if sizes is None or not (hw <= word < sizes[1]):
+            return AccessorNames(disagreed=1, refused=(
+                f"the Field `{nm}` accesses places outside its own class's instance"))
+        off = word * cws
         cr = getattr(image, "code_ranges", {}).get(ref)
         if cr is None or not (0 < cr.size <= 4 * _MAX_ACCESSOR_WORDS):
-            out.declined += 1
+            out.declined += 1               # no Code of its own: deduplicated
             continue
+        skip = entries.get(cr.pc_offset, 0)
         try:
-            dis = disassemble_range(image, cr)
+            dis = disassemble_range(image, cr) if skip is not None else None
         except Exception:
-            out.declined += 1
-            continue
+            dis = None
         if not dis:
             out.declined += 1
             continue
-        off = _getter_offset(dis) if kind == "get" else _setter_offset(dis)
-        if off is None:
+        got = _receiver_accesses([r for r in dis if r[0] >= cr.pc_offset + skip],
+                                 _ACCESSOR_ARGS[kind])
+        if got is None:
             out.declined += 1
             continue
-        known = layout.by_class.get(owner) or {}
-        if off in known:
-            if known[off].name == name:
-                out.agreed += 1
-                continue
-            return AccessorNames(
-                disagreed=1,
-                refused=(f"{layout.class_name.get(owner, owner)} offset {off} is "
-                         f"`{known[off].name}` in the field map and `{name}` in its "
-                         f"accessor, so one of the two readings is wrong"))
-        if found.get((owner, off), name) != name:
-            found[(owner, off)] = None          # two accessors, two names, no answer
+        loads = {o for k, o in got if k == "ld" and o > 0}     # 0 is the header word
+        stores = {o for k, o in got if k == "st" and o > 0}
+        reached = stores if kind == "ImplicitSetter" else loads
+        if reached and off not in reached:
+            return AccessorNames(disagreed=1, refused=(
+                f"`{nm}` reaches the receiver at {sorted(reached)} and its Field is at "
+                f"{off}, so one of the two readings is wrong"))
+        if reached != {off} or (kind == "ImplicitGetter" and stores - {off}):
             out.declined += 1
             continue
-        found[(owner, off)] = name
+        out.body_agreed += 1
+        if off in (layout.by_class.get(cls) or {}):
+            continue                        # the Field named itself: nothing to add
+        if found.get((cls, off), name) != name:
+            found[(cls, off)] = None        # two accessors, two names, no answer
+            continue
+        found[(cls, off)] = name
 
-    for (owner, off), name in sorted(found.items()):
+    for (cls, off), name in sorted(found.items()):
         if name is None:
+            out.declined += 1
             continue
-        out.by_class.setdefault(owner, {})[off] = name
+        out.by_class.setdefault(cls, {})[off] = name
         out.added += 1
     return out
 
 
-def _getter_offset(dis):
-    """The offset a getter whose whole body IS one field read reads, or None."""
-    body = [(r[1], r[2]) for r in dis if r[1] != "nop"]
-    if len(body) != 2 or body[1][0] != "ret" or body[0][0] not in ("ldur", "ldr"):
+def _receiver_accesses(dis, nargs: int):
+    """{("ld" | "st", byte offset)} for the accesses `dis` makes through the receiver, or
+    None where that cannot be said.
+
+    Read from the entry CONVENTION and nothing else. The receiver is parameter 0, and a
+    function takes it either in x1 (the register convention, `kCpuRegistersForArgs`) or
+    on the stack, the first of `nargs` pushed arguments and so at entry-SP plus 8 *
+    (nargs - 1): `ldr x1, [x15, #8]` in a frameless setter, `[x29, #0x18]` after the
+    frame is built. Compiled code reads neither home under the other convention, since
+    neither holds anything there, so both are taken as the receiver at entry.
+
+    A must-analysis over the body's CFG: a register holds the receiver at an instruction
+    only if it does on every path there. It follows the value through `mov`, through a
+    spill to a frame slot and the reload after a call, and through SP and FP moving by
+    known amounts; any other write of a register forgets it, and a call forgets the
+    registers a call may clobber. An access through a receiver register with an index or
+    a writeback it cannot read makes the answer None, because a receiver access this
+    cannot place could be the one that matters. `dis` is (addr, mn, op) from the entry
+    calls land on, so a monomorphic entry's class check is not part of it."""
+    from .cfg import TRAPS, build_cfg
+    from .expr import ARM64, use_target
+    with use_target(ARM64):
+        return _receiver_walk([(a, mn, op, "") for a, mn, op in dis], nargs, build_cfg,
+                              TRAPS)
+
+
+def _receiver_walk(rows, nargs, build_cfg, traps):
+    from . import expr as E
+    blocks, entry = build_cfg(rows, traps=traps)
+    if not blocks or entry not in blocks:
         return None
-    m = _ACC_LOAD.match(body[0][1])
-    return None if m is None else _acc_off(m)
+    # (receiver registers, entry-relative stack addresses holding it, SP and FP as
+    # entry-relative offsets or None, registers holding a known constant)
+    start = (frozenset({"x1"}), frozenset({8 * (nargs - 1)}), 0, None, ())
+    preds = {a: [] for a in blocks}
+    for a, b in blocks.items():
+        for s in b.succ:
+            if s in preds:
+                preds[s].append(a)
+    acc, bad = set(), []
+
+    def meet(x, y):
+        return (x[0] & y[0], x[1] & y[1], x[2] if x[2] == y[2] else None,
+                x[3] if x[3] == y[3] else None, tuple(sorted(set(x[4]) & set(y[4]))))
+
+    def step(state, mn, op, record):
+        regs, homes, sp, fp = set(state[0]), set(state[1]), state[2], state[3]
+        consts = dict(state[4])
+        ops = E._split_ops(op)
+
+        def kill(defs):
+            nonlocal sp, fp
+            for d in defs:
+                regs.discard(d)
+                consts.pop(d, None)
+                if d == "x15":
+                    sp = None
+                elif d == "x29":
+                    fp = None
+
+        if mn in E._LOADS or mn in E._STORES:
+            got = E._addr(ops)
+            if got is None or got[1] is E._BAD_POST:
+                kill(E._def_use(mn, op)[0])
+                if got is not None and record and any(r in regs for r in E._regs(ops)):
+                    bad.append(mn)
+                return _pack(regs, homes, sp, fp, consts)
+            (base, disp, index, _scale, wb), post = got
+            load = mn in E._LOADS
+            vals = [E.canon(o) for o in ops[:2 if mn in ("ldp", "ldpsw", "stp") else 1]]
+            width = 4 if ops[0].strip()[:1] in ("w", "s") else 8
+            if base in ("x15", "x29") and index is None:
+                at = sp if base == "x15" else fp
+                at = None if at is None else at + (0 if post else disp)
+                for i, r in enumerate(vals):
+                    if at is None:
+                        if load:
+                            kill((r,))
+                        else:
+                            homes.clear()          # a store this cannot place
+                        continue
+                    a = at + i * width
+                    if load:
+                        kill((r,))
+                        if width == 8 and a in homes:
+                            regs.add(r)
+                    else:
+                        homes -= {h for h in homes if a - 8 < h < a + width}
+                        if width == 8 and r in regs:
+                            homes.add(a)
+            else:
+                if base in regs and record:
+                    if wb or post:
+                        bad.append(mn)
+                    elif index is None:
+                        acc.add(("ld" if load else "st", disp + 1))
+                    elif index in consts and not _scale:
+                        acc.add(("ld" if load else "st", consts[index] + disp + 1))
+                    else:
+                        bad.append(mn)
+                if load:
+                    kill(vals)
+            if wb or post:
+                step_by = disp if wb else post
+                if base == "x15":
+                    sp = None if sp is None else sp + step_by
+                elif base == "x29":
+                    fp = None if fp is None else fp + step_by
+                else:
+                    kill((base,))
+            return _pack(regs, homes, sp, fp, consts)
+        if mn in ("mov", "movz") and len(ops) == 2:
+            d, s = E.canon(ops[0]), E.canon(ops[1])
+            k = E._imm(ops[1]) if ops[1].strip().startswith("#") else None
+            was = s in regs
+            nsp = sp if s == "x15" else fp if s == "x29" else None
+            kill((d,))
+            if d == "x29":
+                fp = nsp
+            elif d == "x15":
+                sp = nsp
+            if k is not None:
+                consts[d] = k
+            elif was and ops[0].strip()[:1] == "x" and ops[1].strip()[:1] == "x":
+                regs.add(d)
+            return _pack(regs, homes, sp, fp, consts)
+        if (mn in ("add", "sub") and len(ops) == 3 and ops[2].strip().startswith("#")
+                and E.canon(ops[0]) in ("x15", "x29")):
+            s, k = E.canon(ops[1]), E._imm(ops[2])
+            src = sp if s == "x15" else fp if s == "x29" else None
+            v = None if src is None or k is None else src + (k if mn == "add" else -k)
+            kill((E.canon(ops[0]),))
+            if E.canon(ops[0]) == "x15":
+                sp = v
+            else:
+                fp = v
+            return _pack(regs, homes, sp, fp, consts)
+        # A call clobbers what a call may (expr._A64_CLOBBERS); the frame slots it leaves,
+        # because a spill slot is this frame's own and a callee writes below its SP.
+        kill(E._def_use(mn, op)[0])
+        return _pack(regs, homes, sp, fp, consts)
+
+    IN, OUT = {entry: start}, {}
+    work, rounds = [entry], 0
+    while work:
+        rounds += 1
+        if rounds > 64 * len(blocks):
+            return None
+        a = work.pop()
+        st = IN[a]
+        for (_ia, mn, op, _n) in blocks[a].insns:
+            st = step(st, mn, op, False)
+        if OUT.get(a) == st:
+            continue
+        OUT[a] = st
+        for s in blocks[a].succ:
+            if s not in blocks:
+                continue
+            ins = [OUT[p] for p in preds[s] if p in OUT]
+            new = ins[0]
+            for x in ins[1:]:
+                new = meet(new, x)
+            if s == entry:
+                new = meet(new, start)
+            if IN.get(s) != new:
+                IN[s] = new
+                work.append(s)
+    for a in sorted(blocks):
+        st = IN.get(a)
+        if st is None:
+            continue                         # unreachable from the entry
+        for (_ia, mn, op, _n) in blocks[a].insns:
+            st = step(st, mn, op, True)
+    return None if bad else acc
 
 
-def _setter_offset(dis):
-    """The one offset a setter stores to off the receiver, or None if it is not one."""
-    offs = set()
-    for r in dis:
-        if r[1].startswith(("stur", "str")):
-            m = _ACC_STORE.match(r[2])
-            if m is not None:
-                offs.add(_acc_off(m))
-    return offs.pop() if len(offs) == 1 else None
+def _pack(regs, homes, sp, fp, consts):
+    return frozenset(regs), frozenset(homes), sp, fp, tuple(sorted(consts.items()))
