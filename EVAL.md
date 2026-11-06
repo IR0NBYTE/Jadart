@@ -643,7 +643,7 @@ Each was taken from the 3.13.0 tag and then held to the gates on this binary.
 |---|---|---|
 | code ranges | 88,618 | 88,618, at the same 88,618 addresses |
 | classes | 10,713 | 10,679 |
-| acceptance gates | Tier A 11 of 11, Tier B 3 of 3, 550,617 checks, in 0.8 s | has none |
+| acceptance gates | Tier A 13 of 13, Tier B 3 of 3, 551,075 checks, in 0.8 s | has none |
 | whole image to source | 1,102,633 lines in 125 s, 403 MB peak | not run here |
 
 Where the two differ it is a filter or a boundary, not a parse. The 34 classes only we
@@ -669,9 +669,10 @@ name the stable release we registered the hash under (3.11.5, 3.5.4, 3.3.4, 2.19
 AOTopsy names the era (3.11.0, 3.5.0, 3.3.0, 2.19.0). Neither is wrong, because one
 format hash covers several patch releases.
 
-On all seven, jadart's acceptance gates pass: Tier A 11 of 11 and Tier B 3 of 3 on each,
-between 120,163 and 550,617 byte-exact checks per app and 1,808,186 in total, with no
-failures. These are apps nobody here compiled, across six Dart versions.
+On all seven, jadart's acceptance gates pass: Tier B 3 of 3 on each and Tier A 11 of 11
+on the six older ones, 13 of 13 on the 3.13 one, which has two gates of its own (DESIGN
+3); between 120,163 and 551,075 byte-exact checks per app and 1,808,644 in total, with
+no failures. These are apps nobody here compiled, across six Dart versions.
 
 The output comparison also holds away from our own fixture. On `kzs.th000.tsdm_client`
 (Dart 3.11.5, 16 MB, 48,906 functions), the two tools agree on the shape of the image and

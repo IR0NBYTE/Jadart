@@ -102,10 +102,13 @@ app_snapshot.cc at the 3.13.0 tag unless another file is named.
 - **Snapshot::Kind lost kFullCore** (snapshot.h:24), so every later kind is one lower
   and a release AOT snapshot is kind 2, the number that meant kFullJIT. The name is
   taken from the epoch's own enum, and a header with no epoch names a kind only where
-  both enums agree.
+  both enums agree. A 3.13 header of any other kind is refused before anything is
+  read: kModule is 3 in this enum, inside the range check written for the older one,
+  where 3 is kFullAOT and kModule is 4.
 - **Seven base objects, fixed** (`AddBaseObjects`, :7452): null, false, true and four
   sentinels, where the base objects used to be the vm snapshot's whole object table.
-  G13 compares the header's count with that 7, since there is no vm header to compare.
+  The VM FATALs on any other count (:9983), and so does the header parse here, since
+  every ref is numbered from it; G13 records the comparison.
 - **The roots' own objects are written first.** `PushRoots` (:7286) pushes ten empty
   singletons and calls `CreateEarlyClusters` (:8901), so a real snapshot opens with
   nine small clusters and the canonical String cluster is the tenth, not the first.
@@ -139,6 +142,27 @@ are read in cid order, and each of those Class objects states its own id in the 
 pass, so the two must agree 161 times; they sit behind 1,357 other roots, which means a
 root run misplaced by one ref fails every one of them.
 
+Two gates are new, and run only on a 3.13 snapshot. G16 binds the generated stub table
+to the binary: the Code fill names the LazyCompile and UnknownDartCode stubs by ref, and
+the roots must hold those refs at the indexes the stub list gives those names, 1,228
+and 1,350. A table with a stub inserted or lost anywhere ahead of either, or a run
+starting one slot off, fails it, and then no stub is named at all, since a name on a
+neighbour prints `throw RangeError()` for a null check. Two stubs swapped between the
+anchors would pass: nothing jadart reads in the binary tells two throwing stubs apart,
+so their order rests on tools/gen_objstore.py --check reading it from the source, as
+the object-store order did through 3.12. G17 compares the length each Closure,
+ContextScope and LocalVarDescriptors states in the alloc pass with the one its fill
+reads, the way G4 does for a String; the fill sizes itself by its own copy and stays in
+step whatever the alloc copy says, so nothing else would notice.
+
+A symbol table does not name a 3.13 stub the way the lifter reads one. Through 3.12 the
+namer wrote `stub _iso_stub_<Name>Stub` for the stubs a program calls, a spelling
+StubCode::ForEachStub supplied for the object-store ones (stub_code.cc:355 at 3.12.2);
+3.13 has no object-store stubs and writes `stub <Name>`. On a 3.13 build that keeps a
+symbol table, such a symbol is spelled the lifter's way and has to agree with the
+roots, or the roots' names are dropped and the compiler's stand alone. No 3.13 build
+with a symbol table has been seen, so that rule is read from the source.
+
 What did not change, checked by diffing the two tags: the object header bitfields
 (raw_object.h, CardRememberedBit through ClassIdTag), the ObjectPool entry encoding,
 the instructions table and the data image, the dispatch table and its origin element,
@@ -146,7 +170,7 @@ the argument registers and the entry offsets, and the Function kind list.
 
 What 3.13 support does NOT cover. The epoch claims 64-bit compressed pointers, the
 target of the one 3.13 binary there was to gate (FluffyChat's F-Droid build, arm64
-Android: Tier A 11 of 11 over 550,617 checks). An uncompressed build, iOS or arm32,
+Android: Tier A 13 of 13 over 551,075 checks). An uncompressed build, iOS or arm32,
 is a known release on a target nothing has read and is refused by name. An x86_64
 build shares the grammar key and so is accepted, with no binary behind it. A
 `DART_DYNAMIC_MODULES` build would carry a Bytecode cluster, which has no grammar

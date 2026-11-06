@@ -49,12 +49,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
     (`ERA_3_13`, from `tools/gen_cids.py`).
 
   `verify` decided when it was right. On FluffyChat's F-Droid build (26.1 MB, the only
-  3.13 binary there was) Tier A is 11 of 11 and Tier B 3 of 3 over 550,617 checks,
+  3.13 binary there was) Tier A is 13 of 13 and Tier B 3 of 3 over 551,075 checks,
   the stream ending on the exact byte. The G3 gate lost what it compared, since the
   alloc pass no longer lists the predefined cids, and has a replacement: the 161
   class-table roots are read in cid order, each Class states its own id in the fill
   pass, and they sit behind 1,357 other roots, so a root run off by one ref fails all
-  161. G13 compares the header's base objects with the seven the release fixes.
+  161. Two Tier-A gates are new and run only on 3.13. G16 binds the generated stub
+  table to the binary: the Code fill names the LazyCompile and UnknownDartCode stubs by
+  ref, and the roots must hold those refs where the stub list puts those names, so a
+  table with a stub inserted or lost ahead of either fails, and then no stub is named.
+  G17 compares the 456 lengths a Closure, ContextScope or LocalVarDescriptors states in
+  each pass. G13 compares the header's base objects with the seven the release fixes.
 
   Against AOTopsy on the same file: 88,618 code ranges at the same 88,618 addresses,
   and the same owning class on every one of the 79,575 it gives an owner for. It lists
@@ -66,11 +71,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
   What it does not claim. 64-bit compressed pointers only, the target of that one
   binary: an iOS or arm32 3.13 build is refused by name, and an x86_64 one shares the
-  grammar key with nothing behind it. Three shapes no binary has shown are refused
+  grammar key with nothing behind it. A header the VM would not load as an app's AOT
+  snapshot is refused before anything is read: any kind but kFullAOT, kModule included,
+  and any base-object count but seven. Three shapes no binary has shown are refused
   rather than read on the source's word: a ContextScope or LocalVarDescriptors with
-  anything in it, and a second ObjectPool with entries. No 3.13 fixture can be built
-  with the 3.12.2 SDK this repository pins, so CI reads a hand-written 3.13 snapshot
-  and the real-app test skips there.
+  anything in it, and a second ObjectPool with entries. Two stubs swapped between
+  G16's anchors would pass every gate; their order is the source's, which
+  `tools/gen_objstore.py --check` re-derives. On a build that keeps a symbol table, a
+  stub's `stub X` symbol is spelled `_iso_stub_XStub` for the lifter and has to agree
+  with the roots or the roots' names are dropped; no such 3.13 build has been seen. No
+  3.13 fixture can be built with the 3.12.2 SDK this repository pins, so CI reads a
+  hand-written 3.13 snapshot and the real-app test skips there.
 
   No output byte changes on an older release: 15 command outputs and the export tree
   of both fixtures, and 7 command outputs on each of six real apps from 2.19.6 to
