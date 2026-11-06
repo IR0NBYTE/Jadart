@@ -17,6 +17,11 @@ that rule would truncate the image to its first function. An extent instead runs
 end of its section, tightened only by the next `_kDart*` boundary symbol in that section.
 That gives exact extents for the data blobs (VmSnapshotData ends where IsolateSnapshotData
 begins) and the full image for the instructions.
+
+Dart 3.13 writes one snapshot under `_kDartSnapshotData` and `_kDartSnapshotText` in both
+containers (snapshot.py). The boundary rule above already covers those names, since it
+keys on the `kDart` prefix, but it is read from the SDK and not measured: no 3.13 Mach-O
+has been through this reader.
 """
 from __future__ import annotations
 
@@ -165,9 +170,7 @@ class MachO64:
     def symbol_bytes(self, name: str) -> bytes:
         sym = self.symbols.get(name)
         if sym is None:
-            raise MissingSymbol(
-                f"no symbol {name!r} in this Mach-O. If this is a Flutter app, the "
-                f"snapshot is in the App binary, not here.")
+            raise MissingSymbol(f"no symbol {name!r} in this Mach-O")
         sec = self._section_of(sym.value)
         if sec is None:
             raise ContainerError(

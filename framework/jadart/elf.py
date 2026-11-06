@@ -237,11 +237,12 @@ class Elf:
         # ContainerError, not KeyError. Three callers reach this outside open_container's
         # own try, so a KeyError here escaped the library as an untyped failure on the
         # commonest mistake there is: pointing the tool at libflutter.so.
+        # It says only what it knows. Which file a snapshot is in is snapshot.images'
+        # to say: it knows both symbol layouts, and the hint that used to sit here told
+        # the reader of a Dart 3.13 libapp.so to go and find libapp.so (#253).
         sym = self.symbols.get(name)
         if sym is None:
-            raise MissingSymbol(
-                f"no symbol {name!r} in this ELF. If this is a Flutter app, the snapshot "
-                f"is in libapp.so, not here.")
+            raise MissingSymbol(f"no symbol {name!r} in this ELF")
         off = self.va_to_offset(sym.value)
         end = off + sym.size
         if off < 0 or end > len(self.data):

@@ -19,16 +19,18 @@ from .elf import Elf64
 ISO_INSTR = "_kDartIsolateSnapshotInstructions"
 
 
-def instr_image_va(elf: Elf64):
-    s = elf.symbols.get(ISO_INSTR)
+def instr_image_va(elf: Elf64, anchor: str = ISO_INSTR):
+    """Where the instructions image starts. `anchor` is the symbol this container
+    names it with (snapshot.images); the default is the pre-3.13 one."""
+    s = elf.symbols.get(anchor)
     return s.value if s else None
 
 
-def pc_name_map(elf: Elf64, image_len: int) -> dict:
+def pc_name_map(elf: Elf64, image_len: int, anchor: str = ISO_INSTR) -> dict:
     """pc_offset -> qualified name for every function symbol whose entry lies inside the
     isolate instructions image. Keyed on the exact entry offset, so it lines up with the
     code ranges jadart recovers. Empty when the .so has no usable symbol table (stripped)."""
-    base = instr_image_va(elf)
+    base = instr_image_va(elf, anchor)
     if base is None:
         return {}
     out = {}
@@ -41,8 +43,8 @@ class CoveringNames:
     """Resolve an arbitrary pc_offset to the symbol that covers it (entry <= pc < entry+size).
     Used to attribute a mid-function address (e.g. a constant load) to its function."""
 
-    def __init__(self, elf: Elf64, image_len: int):
-        base = instr_image_va(elf)
+    def __init__(self, elf: Elf64, image_len: int, anchor: str = ISO_INSTR):
+        base = instr_image_va(elf, anchor)
         self._base = base
         self._starts, self._items = [], []
         if base is not None:

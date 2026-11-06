@@ -627,16 +627,18 @@ neither tool was tuned on, and it is Dart 3.13.0. AOTopsy parses it: 88,618 func
 3.13 is past the newest registered epoch, but on the version-reach axis the competitor is
 ahead today for anything built with the current Flutter stable.
 
-Two separate things stop us and both are bounded. The epoch is unregistered (hash
+Two separate things stopped us and both were bounded. The epoch is unregistered (hash
 `0451907c2eaa8467e848c0067bfe8ed4`). And 3.13 changed the container: that build exports
 `_kDartSnapshotData` and `_kDartSnapshotText`, where every earlier release exported
 `_kDartVmSnapshotData`, `_kDartIsolateSnapshotData` and their instruction pairs, and the
-`.so` has no `.symtab` at all, only those three in `.dynsym`. `jadart info` survives it
+`.so` has no `.symtab` at all, only those three in `.dynsym`. `jadart info` survived it
 because it falls through to the magic scan and reports the unknown epoch by name, while
-`verify`, `classes`, `decompile` and `export` ask for `_kDartIsolateSnapshotData` directly
-and refuse with `no symbol '_kDartIsolateSnapshotData' in this ELF. If this is a Flutter
-app, the snapshot is in libapp.so, not here`, which is the wrong reason for a file that is
-libapp.so.
+15 of the 16 commands asked for `_kDartIsolateSnapshotData` directly and refused with
+`no symbol '_kDartIsolateSnapshotData' in this ELF. If this is a Flutter app, the
+snapshot is in libapp.so, not here`, which was the wrong reason for a file that is
+libapp.so. That half is fixed (#253): the reader knows both symbol layouts (DESIGN 3)
+and all 16 commands now give the refusal `info` gives, exit 2 and the unknown epoch by
+name. The epoch is what is left.
 
 Seven snapshots were pulled for this section with `tools/appsweep.py`, out of 199 Flutter
 apps a partial probe of F-Droid's largest packages turned up. jadart identifies six of the

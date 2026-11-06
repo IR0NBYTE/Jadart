@@ -89,7 +89,8 @@ libapp.so / App
   |
   +- elf.py / macho.py      open_container() picks ELF64 or Mach-O, fail-loud.
   |                         Locates _kDartVmSnapshotData, _kDartIsolateSnapshotData and
-  |                         _kDartIsolateSnapshotInstructions.
+  |                         _kDartIsolateSnapshotInstructions, or the single pair a
+  |                         Dart 3.13 library exports (snapshot.images).
   +- snapshot.py            magic, length, kind, version hash, features, counts.
   +- versions.py            (hash, arch, pointer model) -> Profile, or refuse.
   +- clusters.py            ALLOC pass: per-cid read patterns, dense ref ids.

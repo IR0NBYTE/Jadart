@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import re
 
-from .disasm import ISOLATE_INSTRUCTIONS
 from .errors import InputError
 from .interop import binary_info, visible, _shown, _shown_name, _checks
 
@@ -205,7 +204,9 @@ def render_frida(image, hdr, fr, syms: list, hooks: list, label: str, version: s
     plan()'s output for the functions to hook."""
     info = binary_info(image, hdr, label)
     data = {
-        "anchor": ISOLATE_INSTRUCTIONS,
+        # The symbol this binary exports, which the script resolves at run time: a
+        # Dart 3.13 library has no _kDartIsolateSnapshotInstructions to find.
+        "anchor": image.anchor_symbol,
         "checks": _checks(image, syms),
         "cid": {"shift": HEADER_CID_SHIFT, "mask": (1 << HEADER_CID_BITS) - 1},
         "classes": _classes(fr, hdr),
@@ -219,7 +220,7 @@ def render_frida(image, hdr, fr, syms: list, hooks: list, label: str, version: s
         f"Dart {info['dart']} ({info['epoch']}), {info['arch']}.",
         "Run: frida -U -f <package> -l <this file>  (Frida 16.7 or later, or 17)",
         "The hooks only log. Each one is placed at the address calls land on, found from "
-        f"{ISOLATE_INSTRUCTIONS} in libapp.so, after its bytes are checked.",
+        f"{image.anchor_symbol} in libapp.so, after its bytes are checked.",
     ]
     header = ["// " + re.sub(r"[^\x20-\x7e]", "?", line) for line in header]
     body = _FRIDA.replace("{data}", json.dumps(data, ensure_ascii=True,
