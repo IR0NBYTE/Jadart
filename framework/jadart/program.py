@@ -144,15 +144,45 @@ def static_function_refs(fr) -> frozenset:
     return frozenset(r for r, _n, _o, kt in fr.functions if (kt >> b) & 1)
 
 
-def receiver_for(func_ref: int, static_refs: frozenset) -> dict:
-    """The lifter's `receiver` argument: x1 holds `this` only for an instance method.
+def instance_function_refs(fr) -> frozenset:
+    """Refs of the Functions that take a receiver: every Function the static bit leaves
+    clear, and every Function where the bit does not calibrate, the fallback
+    static_function_refs describes.
+
+    Only a Function is ever in it. A range whose Code has some other owner, or no Code at
+    all, is the code of no Function this snapshot still describes, so nothing in it says
+    the range takes a receiver (#259)."""
+    static = static_function_refs(fr)
+    return frozenset(r for r, _n, _o, _kt in fr.functions if r not in static)
+
+
+def receiver_for(owner_ref: int, *, instance_refs: frozenset) -> dict:
+    """The lifter's `receiver` argument: x1 holds `this` only where the code is an
+    instance method's. `owner_ref` is the owner of the range's Code (CodeRange.owner_ref)
+    and `instance_refs` is instance_function_refs(fr). It is keyword-only because it
+    replaced a positional set of the STATIC functions: a caller still handing that over
+    by position fails here rather than giving every static function `this` (#259).
 
     Passing `{"x1": "this"}` unconditionally printed a receiver that does not exist in
     every static and top-level function, roughly 450 of them on the corpus binary,
     across about 1,900 output lines. x1 there is the first real parameter, so the rendered
     code attributed a field access to a `this` the function was never handed.
-    """
-    return {} if func_ref in static_refs else {"x1": "this"}
+
+    Asking only whether the owner was static still printed `this` wherever the owner was
+    not a Function at all, and an obfuscated build discards most of them. On the obf
+    fixture 6,421 ranges have no Code object and 185 a Smi in place of a dropped
+    Function; on both fixtures 921 are owned by a Class (allocation stubs), 339 and 338
+    by a type (type-testing stubs) and 85 by null (the VM's stubs). `benchCheckSecret`, a
+    top-level function, printed `this.sel_0x0(...)` on obf and `x1.sel_0x0(...)` on
+    clean. Whether such a range takes a receiver is not stated, so x1 stays a register.
+
+    Nothing else in the snapshot proves it for them either. The dispatch table only
+    holds instance methods, but AOT shares one Code between functions whose instructions
+    match, and 2 of its 2,563 targets on the clean fixture are owned by a static
+    closure: 0x2b5900 is a `return NULL;` that static functions, constructors and
+    closures share. The monomorphic-entry flag marks only instance code, but its 78 Code
+    objects all have a Function owner on both fixtures, so it adds no range."""
+    return {"x1": "this"} if owner_ref in instance_refs else {}
 
 
 class EntryNames:
@@ -194,7 +224,7 @@ class EntryNames:
         arch = getattr(getattr(image, "arch", None), "name", None)
         tgt = TARGETS.get(arch) if arch in LIFTABLE_ARCHS else None
         self._arity = arity
-        self._static = static_function_refs(fr)
+        self._instance = instance_function_refs(fr)
         self._owners, self._discarded = _function_code(image, fr, epoch)
         #: No registers where the target is not one tier 3 lifts or the release has no
         #: register convention, and then the resolver is never asked.
@@ -217,7 +247,7 @@ class EntryNames:
 
     def names(self, cr) -> dict:
         """{register: name} for the code range `cr`."""
-        names = receiver_for(cr.owner_ref, self._static)
+        names = receiver_for(cr.owner_ref, instance_refs=self._instance)
         for reg in self._read(cr)[1]:
             names.setdefault(reg, f"a{self._regs.index(reg)}")
         return names
@@ -413,7 +443,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     if signote:
         lines.append(f"// {signote}")
     lines.append(head + " {")
-    # class members receive `this` in x1 (Dart AOT: the receiver is the first argument)
+    # an instance method receives `this` in x1, the first argument (receiver_for)
     arity = make_arity_resolver(image) if lvl >= 3 else None
     entry = EntryNames(image, fr, hdr.epoch, arity) if lvl >= 3 else None
     returns = make_return_resolver(image) if lvl >= 3 else None

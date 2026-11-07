@@ -3718,7 +3718,7 @@ def test_arm32_target_table_is_right_where_it_is_checkable():
     from jadart import expr as E
     from jadart.disasm import (load_instructions, disassemble_range, build_pool_map,
                                function_name_by_pc)
-    from jadart.program import static_function_refs, receiver_for
+    from jadart.program import instance_function_refs, receiver_for
 
     assert E.ARM32.roles["r10"] == "THR" and E.ARM32.consts_base == "THR"
     assert E.ARM32.consts == {0x34: "null", 0x38: "true", 0x3c: "false"}
@@ -3732,10 +3732,9 @@ def test_arm32_target_table_is_right_where_it_is_checkable():
     pc = next(pc for pc, n in pc_to_name.items() if n == "benchWithdraw")
     cr = next(c for c in image.all_ranges if c.pc_offset == pc)
     ann = _ann(image, disassemble_range(image, cr), pc_to_name, pool_map)
+    recv = receiver_for(cr.owner_ref, instance_refs=instance_function_refs(fr))
     with E.use_target(E.ARM32):
-        body = "\n".join(E._lift_function(
-            ann, pool_map, receiver_for(cr.owner_ref, static_function_refs(fr)),
-            None, "  ", 1, None))
+        body = "\n".join(E._lift_function(ann, pool_map, recv, None, "  ", 1, None))
     # `bool benchWithdraw(int amount) { if (amount > balance) return false;
     #                                   balance -= amount; return true; }`
     assert "return false;" in body, body
@@ -7171,12 +7170,64 @@ def test_this_is_not_bound_for_a_static_function():
     """`receiver={'x1': 'this'}` was passed unconditionally, so ~450 static and top-level
     functions printed a receiver they were never handed; x1 there is the first real
     parameter, so field accesses were attributed to a `this` that does not exist."""
-    from jadart.program import receiver_for
-    assert receiver_for(7, frozenset({7})) == {}
-    assert receiver_for(7, frozenset({9})) == {"x1": "this"}
-    # An unresolvable bit must fall back to treating functions as instance methods, never
-    # to guessing: an empty set means "nothing is known to be static".
-    assert receiver_for(7, frozenset()) == {"x1": "this"}
+    import types
+    from jadart.program import instance_function_refs, receiver_for
+    assert receiver_for(7, instance_refs=frozenset({9})) == {}
+    assert receiver_for(9, instance_refs=frozenset({9})) == {"x1": "this"}
+    # An unresolvable bit falls back to treating every FUNCTION as an instance method,
+    # never to guessing which is which. Two RegularFunctions are no witness for the bit.
+    fr = types.SimpleNamespace(functions=[(1, 0, 0, 0), (2, 0, 0, 1 << 16)])
+    assert instance_function_refs(fr) == frozenset({1, 2})
+    assert receiver_for(2, instance_refs=instance_function_refs(fr)) == {"x1": "this"}
+    # ...and never to code no Function owns (#259).
+    assert receiver_for(-1, instance_refs=instance_function_refs(fr)) == {}
+    assert receiver_for(3, instance_refs=instance_function_refs(fr)) == {}
+
+
+def test_this_is_not_bound_where_no_function_owns_the_code():
+    """`benchCheckSecret` is top-level (flubench/app/lib/constructs.dart:16). The clean
+    build keeps its Function, whose static bit says x1 is no receiver; the obf build
+    discards its Code, so the range has no owner at all, and since the receiver was
+    decided by asking whether the owner was static, which a missing owner never is, it
+    printed `this.sel_0x0(...)` (#259). Nothing in that range says it takes one."""
+    if not _capstone_available():
+        _skip("test_this_is_not_bound_where_no_function_owns_the_code (no capstone)")
+    import jadart
+    obf = [f["body"] for f in jadart.decompile(OBF, "isolate+0xa2618")]
+    clean = [f["body"] for f in jadart.decompile(CLEAN, "benchCheckSecret")]
+    # The same instructions, so the same body, whatever name the argument is given.
+    assert obf == clean and len(obf) == 1, (obf, clean)
+    assert obf[0][-1].endswith('.sel_0x0("FLUBENCH{str_literal_compare}");'), obf
+    assert not any(re.search(r"\bthis\b", ln) for ln in obf[0]), obf
+    # An instance method keeps its receiver, which is what the rule is for.
+    body = jadart.decompile(CLEAN, "benchWithdraw")[0]["body"]
+    assert any(ln.startswith("this.field_0x8 -= ") for ln in body), body
+
+
+def test_only_a_function_without_the_static_bit_is_handed_this():
+    """The rule over every range of both fixtures, as every surface asks it: `this` for a
+    range whose Code a non-static Function owns, and for nothing else. 1,345 ranges of
+    the clean fixture have another owner (a Class, a type or null, the stubs) and 7,950
+    of the obf one, which adds the 6,421 with no Code object and the 185 whose owner is
+    the Smi left for a dropped Function."""
+    from jadart.disasm import load_instructions
+    from jadart.program import (instance_function_refs, receiver_for,
+                                static_function_refs)
+    for path, others in ((CLEAN, 1345), (OBF, 7950)):
+        image, fr, _h = load_instructions(path)
+        funcs = {r for r, _n, _o, _k in fr.functions}
+        static = static_function_refs(fr)
+        inst = instance_function_refs(fr)
+        assert inst == funcs - static and static
+        n = 0
+        for cr in image.all_ranges:
+            got = receiver_for(cr.owner_ref, instance_refs=inst)
+            if cr.owner_ref in funcs:
+                assert got == ({} if cr.owner_ref in static else {"x1": "this"}), cr
+            else:
+                assert got == {}, cr
+                n += 1
+        assert n == others, (path, n)
 
 
 def test_type_class_id_shift_follows_the_nullability_width():
@@ -17898,8 +17949,10 @@ def test_discarded_code_on_an_obfuscated_build_is_still_a_functions():
             continue
         assert cr.pc_offset in below, cr
         names = entry.names(cr)
-        assert set(names.values()) <= {"this", "a1", "a2", "a3", "a4", "a5"}, names
-        named += any(v != "this" for v in names.values())
+        # No Function owns these, so nothing says x1 is a receiver: it is `a0` where the
+        # body reads it, never `this` (#259).
+        assert set(names.values()) <= {"a0", "a1", "a2", "a3", "a4", "a5"}, names
+        named += bool(names)
     assert named >= 1500, named
 
 
