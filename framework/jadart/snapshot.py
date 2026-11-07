@@ -42,15 +42,19 @@ from .stream import ReadStream
 
 DART_MAGIC = 0xDCDCF5F5
 #: Snapshot::Kind, snapshot.h, through Dart 3.12. 0..3 are identical in every one of
-#: those releases. Index 4 is not (kModule was inserted there in 3.12), so anything past
+#: those releases. Index 4 is not (kModule was inserted there in 3.11), so anything past
 #: kFullAOT reports its number rather than a name no release binary would reach anyway.
 KIND = {0: "kFull", 1: "kFullCore", 2: "kFullJIT", 3: "kFullAOT"}
 #: The same enum from 3.13, which dropped kFullCore with the vm snapshot it described:
 #: every later kind is one lower, so a release AOT snapshot is kind 2, the number that
 #: meant kFullJIT before.
 KIND_MERGED = {0: "kFull", 1: "kFullJIT", 2: "kFullAOT", 3: "kModule"}
-#: The one kind a merged-snapshot release is read as. kModule is 3 there and in range of
-#: the check below, which was written for the older enum, so it is refused by name.
+#: kFullAOT by its number in each enum, the one kind jadart reads. Any other kind is
+#: another stream: app_snapshot.cc names kFullAOT on 51 lines at 3.12.2, and a kind
+#: without code has no RO data image (Snapshot::DataImage, snapshot.h:82 at 3.12.2).
+#: kFullAOT is the fourth entry, snapshot.h:28, at every registered release from
+#: 2.19.0-444.2.beta to 3.12.2, and the third, snapshot.h:27, at 3.13.0.
+_AOT = 3
 _AOT_MERGED = 2
 _MAX_KIND = max(KIND)
 
@@ -230,8 +234,8 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
             f"  To place this build:  python3 tools/sdk_source.py --identify "
             f"{version_hash} --tags <candidate SDK tags>")
 
-    if epoch is not None and epoch.merged:
-        _check_merged_header(which, kind, num_base_objects, epoch)
+    if epoch is not None:
+        _check_header(which, kind, num_base_objects, epoch)
 
     first_cid = None
     if num_clusters > 0 and epoch is not None:
@@ -247,20 +251,25 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
         first_cluster_cid=first_cid, epoch=epoch, arch=arch)
 
 
-def _check_merged_header(which: str, kind: int, base_objects: int, epoch) -> None:
-    """Refuse a Dart 3.13 header the VM would not load as an app's AOT snapshot.
+def _check_header(which: str, kind: int, base_objects: int, epoch):
+    """Refuse a header the VM would not load as an app's AOT snapshot.
 
-    Both checks are on the header alone, so `info` refuses as well, lenient or not: the
-    release is known, and so is what it requires. The kind range check above cannot do
-    the first, since it was written for the older enum, in which 3 is kFullAOT; in this
-    one 3 is kModule, a module snapshot whose grammar jadart does not read. Through 3.12
-    kModule is 4 and that check refuses it."""
-    if kind != _AOT_MERGED:
+    The checks are on the header alone, so `info` refuses as well, lenient or not: the
+    release is known, and so is what it requires. The range check above is all a header
+    from an unknown release gets, since which enum numbers its kind is not known. It
+    passes every kind up to kFullAOT, so through 3.12 a kFull, kFullCore or kFullJIT
+    header was read with the AOT grammar and passed verify (#260), and at 3.13 so did
+    kModule, which is 3 there. Both headers are checked, the vm one and the isolate one:
+    an app's AOT build writes kFullAOT into each."""
+    names, aot = (KIND_MERGED, _AOT_MERGED) if epoch.merged else (KIND, _AOT)
+    if kind != aot:
         raise InputError(
             f"{which}: header declares snapshot kind {kind} "
-            f"({KIND_MERGED.get(kind, 'unnamed')}), and a Dart {epoch.dart} app's AOT "
-            f"snapshot is kind {_AOT_MERGED} ({KIND_MERGED[_AOT_MERGED]}). jadart reads "
-            f"only that kind, so it will not read this one with that grammar.")
+            f"({names.get(kind, 'unnamed')}), and a Dart {epoch.dart} app's AOT "
+            f"snapshot is kind {aot} ({names[aot]}). jadart reads only that kind, so it "
+            f"will not read this one with that grammar.")
+    if not epoch.merged:
+        return
     # Deserializer::Deserialize FATALs when the count differs from what AddBaseObjects
     # provided (app_snapshot.cc:9983 at 3.13.0). Read on, every ref would be off by the
     # difference and every name would belong to a neighbour.
