@@ -13,6 +13,86 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
+- **An incoming argument is named by the register it arrived in.** The body printed an
+  argument as the machine register it came in, `if (x2 < 0x28)`, while the pass every
+  call site asks for a callee's arity had already read that x2 as the function's second
+  register argument. Now `program.EntryNames` hands the lifter the same map the receiver
+  already rode in on, `{"x1": "this", "x2": "a1"}`, built from three facts the binary
+  states: the release passes fixed parameters in registers (Dart 3.4 on, which the
+  snapshot hash pins), the code is a Dart function's of a kind the VM does not always call
+  through the stack (its `Function`, the Smi the precompiler leaves for a dropped one, or
+  a table entry below `first_entry_with_code`, which `DiscardCodeObjects` only does to a
+  function's Code), and the body reads the register before it writes it (`entry_args`,
+  the live set `entry_arity` was already computing). Compiled Dart reads no register it
+  was not handed, so such a register holds what the caller left there, and in a register
+  of `kCpuRegistersForArgs` that is an argument. `aN` says which register and nothing
+  more: slot N of x1, x2, x3, x5, x6, x7, which is also the value's position in a direct
+  call's printed list. Not a Dart name or type, neither of which the snapshot keeps for
+  these, and not a position in the Dart parameter list, since a double rides in a V
+  register beside them. jadx's fallback is the same shape, `rN` for a parameter with no
+  debug name (NameGen.java); AOTopsy's `arg1` is the same slot.
+
+  Whether a register STILL holds the argument at a use is decided the way it always was
+  for `this`: `Lifter._leaf` prints the name only while the state map has never recorded
+  the register on any path, and every write, call clobber, disagreeing join, loop forget
+  and goto meet records it. Two places did not. A block no path from the entry reaches
+  was handed an empty map, so a catch block's x1, the stack trace, printed `this`:
+  `_run`'s `_list2(x0, this)` on the clean fixture, 1 line on each fixture, now
+  `(x0, x1)`. A type-testing stub was taken to give every register back where it keeps
+  four (`TypeTestABI::kPreservedAbiRegisters`), so x3, x5, x6 and x7 now go bare after
+  one, and so does any of them holding a copy of a name, `mov x5, x2` or a reload of a
+  spilled argument. And the Mint slow path the box-or-tag strip cuts calls a stub that
+  uses x1 as its temporary (`AllocateMintABI::kTempReg`), so x1 is recorded where the
+  strip cuts it. No line on either fixture reads such a register there; a crafted body
+  can, and printed `a1`, `a3` or `this` for it. The leading run of
+  argument registers is what a call list needs, but a name can skip a slot: `classify`
+  never touches `this`, reads x2, and is `classify(a1)`; 253 counted ranges on the
+  clean fixture read a register past a gap. Checked against the snapshot where it still
+  says: 428 functions keep their `FunctionType` and resolve, the highest register read is
+  never past `num_fixed_parameters` on any of them, and in the 11 that read past a gap it
+  is exactly the last. Of the 1,075 ranges of the stack-calling kinds the pass counts a
+  register for none. Where it declines, an arguments descriptor (372 ranges), stack
+  arguments only (1,559) or a double in a V register (226), nothing is named.
+
+  The signature lists what the body reads, `checksum(a1)`, without the receiver;
+  `withdraw()` reads no argument, and `f(...)` is a list the lifter did not read, the
+  spelling a call to it already prints. `jadart lift` prints the same list in its header
+  and `-j` carries it as `params`, as does `jadart.decompile()`.
+
+  Measured with `tools/quality.py`: lines carrying a bare machine register fall from
+  19,446 to 12,289 on the clean fixture (10.5% to 6.7%) and from 18,269 to 11,929 on
+  the obfuscated one (9.9% to 6.5%); 2,251 of the clean fixture's 8,194 ranges and
+  2,004 of the obfuscated one's get a name past `this`, on 8,481 and 7,516 lines.
+  `ellipsis`, `goto`, `rawasm` and `label` are identical. The line total falls 185,227
+  to 184,060 and the byte-offset field count 53,463 to 52,626 (54,970 to 54,152 on obf)
+  for one reason: a value spelled off an argument's name does not go stale when the
+  register is reused, so it is not written out first. 6,138 ranges are byte-identical,
+  1,594 change by the name alone on 5,117 lines, and 462 are restructured: declined
+  frame reads fall 5,141 to 4,328, a spilled argument's reload,
+  `var t7 = (FP - 24).field_0x1;`, now reading the argument, where the slot held the
+  bare register before and the fallback read it back as itself; `var tN =`
+  declarations fall 35,359 to 34,364; the rest is the same statement spelled with a
+  different temporary boundary, `(t3 >> 1)` as `t3`. `jadart export` changes 260 of
+  323 files on the clean fixture, 3,036 signature lines of which 1,112 become `(...)`
+  and 1,924 list a name; on the obfuscated one only 163 signatures change, to `(...)`,
+  since its surviving `Function`s are the closures and dispatchers. A register live
+  into a loop that still holds what the function was entered with now reads by its
+  entry name in the loop too, `var t0 = a1;` and `if (t1 < a3)` where it printed the
+  register: 117 lines in 39 ranges on the clean fixture, 37 of them the `var` that
+  starts a loop and the rest reads inside one, 48 of the 117 `this`.
+
+  `tools/irfuzz.py --args` lifts the generated graphs with the six argument registers
+  named and scores each name as its register's entry value: 0 mismatches over 2,000
+  graphs in each of `--cfg`, `--cfg --nested`, `--cfg --flags`, `--cfgmem`, `--cfgmem
+  --nested` and `--cfgmem --seed-outputs --nested`, 1,272 to 1,887 bodies printing a
+  name per run. The three `--cfg` runs leave no printed expression undecidable, where
+  without the flag the bare registers left up to 28,150; the three `--cfgmem` runs
+  leave 90,826 to 125,324, against 75,952 to 184,389 without it. Put a
+  loop's forget back and 200 graphs disagree 19 times; the join meet, 6 in 600; the
+  merge record, 6 in 600 with memory; without the flag all three read 0. Every other
+  oracle is unchanged on both fixtures: `irfuzz --corpus` 0 mismatches, `pbfuzz` 0
+  disagreements and its census identical, `cfgcheck` 0 violations. Closes #255.
+
 - **A method a `PatchClass` owns names the fields of `this`.** `Function.owner` is a
   Class or a PatchClass, and `Function::Owner` (object.cc:11358) resolves the second to
   the class it wraps. The lifter read only the first, so every member a mixin
@@ -207,6 +287,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **A signature line says what the body reads.** `name() {` meant nothing; it now
+  lists the argument registers the body reads by their names, `benchWithdraw(a1) {`,
+  stays `()` where it reads none, and is `(...)` where the list was not read, at tier 3
+  only. Tiers 1 and 2 print the machine's registers and keep their empty brackets.
+  `jadart lift`'s header comment carries the same list, `// benchWithdraw(a1)  0x1eebac
+  (36 bytes)`, and its `-j` output and `jadart.decompile()` gain a `params` string.
+  That is an addition to the interface this file's version number covers, the shape
+  of `--json` and a re-exported function, so it is a minor release; nothing is
+  removed or renamed.
+- `expr.entry_args` and `make_arity_resolver(...).args` give the registers a function
+  reads its arguments from, from the same pass and cache as the count. `receiver_for`
+  is unchanged and `EntryNames` builds on it; every lift call site now goes through
+  `EntryNames` (#255).
 - **`info --lenient` names a snapshot kind only where the number settles it.** The
   kind enum is numbered differently from Dart 3.13, so on a hash no epoch holds the
   number alone does not say which kind it is: 0 is `kFull` either way and 1 to 3 now

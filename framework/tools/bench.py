@@ -76,13 +76,13 @@ from jadart.disasm import (load_instructions, disassemble_range, annotate,
                            build_pool_map, function_name_by_pc)
 from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
 from jadart.dispatch import recover_selectors
-from jadart.program import static_function_refs, receiver_for
+from jadart.program import EntryNames
 
 image, fr, hdr = load_instructions(sys.argv[1])
 pc_to_name = function_name_by_pc(image, fr)
 pool_map = build_pool_map(fr, getattr(image, "arch", None))
-static_refs = static_function_refs(fr)
 arity = make_arity_resolver(image)
+entry = EntryNames(image, fr, hdr.epoch, arity)
 returns = make_return_resolver(image)
 selectors = recover_selectors(image, fr, hdr)
 h, n, lines = hashlib.sha256(), 0, 0
@@ -92,7 +92,7 @@ for cr in image.all_ranges:
         continue
     ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
     body = lift_function(ann, pool_map,
-                         receiver=receiver_for(cr.owner_ref, static_refs),
+                         receiver=entry.names(cr),
                          arity=arity, selectors=selectors, returns=returns,
                          arch=getattr(image, "arch", None))
     n += 1

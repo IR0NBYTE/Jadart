@@ -155,7 +155,10 @@ def decompile(path: str, symbol: str) -> list:
     `_onPressed@19445826`, whose suffix nobody can guess), or an address (`0xfea30`),
     AOT emits closures anonymously and they are regularly the interesting function.
 
-    Returns [{"name", "pc_offset", "size", "body": [str, ...]}, ...]."""
+    Returns [{"name", "pc_offset", "size", "params", "body": [str, ...]}, ...].
+    `params` is the list a signature prints for the function, the names its body reads
+    its register arguments by (program.EntryNames.params): `"a1, a2"`, `""` where it
+    reads none, `"..."` where the list is not read."""
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                          function_name_by_pc, build_pool_map)
     from .branches import row_kinds
@@ -165,16 +168,16 @@ def decompile(path: str, symbol: str) -> list:
     from .fields import (recover_accessors, recover_allocations,
                      recover_fields)
 
-    from .program import static_function_refs, receiver_for
+    from .program import EntryNames
 
     image, fr, hdr = load_instructions(_resolve(path))
-    static_refs = static_function_refs(fr)
     ranges = named_ranges(image, fr, symbol)
     if not ranges:
         return []
     pc_to_name = function_name_by_pc(image, fr)
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     arity = make_arity_resolver(image)
+    entry = EntryNames(image, fr, hdr.epoch, arity)
     returns = make_return_resolver(image)
     sels = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
@@ -191,11 +194,12 @@ def decompile(path: str, symbol: str) -> list:
                              # method and something else entirely in a static one, so
                              # hardcoding it renames a live value after the fact, a
                              # guess printed as a fact, which is the one thing this tool
-                             # does not do. `receiver_for` is what the CLI, `export` and
-                             # `program` all use; this was the only caller that did not,
+                             # does not do. `EntryNames` is what the CLI, `export` and
+                             # `program` all use, and it takes the receiver from
+                             # `receiver_for`; this was the only caller that did not,
                              # and it differed from them on 403 functions and 1,534 lines
                              # of the corpus binary.
-                             receiver=receiver_for(cr.owner_ref, static_refs),
+                             receiver=entry.names(cr),
                              arity=arity, selectors=sels,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
@@ -203,6 +207,7 @@ def decompile(path: str, symbol: str) -> list:
                              show=rebaser(image), cut_end=cut_end(cr, dis),
                              returns=returns)
         out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
+                    "params": entry.params(cr),
                     "body": [ln.strip() for ln in body]})
     return out
 

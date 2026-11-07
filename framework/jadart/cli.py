@@ -305,9 +305,9 @@ def cmd_lift(args) -> int:
     if signote and not getattr(args, "json", False):
         print(comment(f"// {signote}"))
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
-    from .program import static_function_refs, receiver_for
-    static_refs = static_function_refs(fr)
+    from .program import EntryNames
     arity = make_arity_resolver(image)
+    entry = EntryNames(image, fr, hdr.epoch, arity)
     returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
@@ -320,19 +320,23 @@ def cmd_lift(args) -> int:
             continue
         body = lift_function(annotate(dis, pc_to_name, pool_map,
                                       kinds=row_kinds(image, dis)), pool_map,
-                             receiver=receiver_for(cr.owner_ref, static_refs),
+                             receiver=entry.names(cr),
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
                              allocs=allocs,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
                              returns=returns)
+        # The names the body reads its arguments by, so no `a1` in it goes undeclared.
+        params = entry.params(cr)
         if getattr(args, "json", False):
             out.append({"name": nm, "pc_offset": cr.pc_offset,
                         "va": va_of(image, cr.pc_offset), "size": cr.size,
-                        "instructions": len(dis), "body": [ln.strip() for ln in body]})
+                        "instructions": len(dis), "params": params,
+                        "body": [ln.strip() for ln in body]})
             continue
-        print(comment(f"// {nm}  {addr_label(image, cr.pc_offset)}  ({cr.size} bytes)"))
+        print(comment(f"// {nm}({params})  {addr_label(image, cr.pc_offset)}  "
+                      f"({cr.size} bytes)"))
         for ln in body:
             print(ln)
         print()
@@ -871,7 +875,7 @@ def cmd_ffi(args) -> int:
     from .dispatch import recover_selectors
     from .fields import (recover_accessors, recover_allocations,
                      recover_fields)
-    from .program import static_function_refs, receiver_for
+    from .program import EntryNames
     try:
         image, fr, hdr = load_instructions(args.libapp)
     except JadartError as e:
@@ -890,8 +894,8 @@ def cmd_ffi(args) -> int:
     bodies: dict = {}
     if by_fn:
         pc_to_name, _note = names_with_signatures(image, fr, getattr(args, "sigs", None))
-        static_refs = static_function_refs(fr)
         arity = make_arity_resolver(image)
+        entry = EntryNames(image, fr, hdr.epoch, arity)
         returns = make_return_resolver(image)
         selectors = recover_selectors(image, fr, hdr)
         layout = recover_fields(fr, getattr(image, "arch", None))
@@ -905,7 +909,7 @@ def cmd_ffi(args) -> int:
             try:
                 body = lift_function(annotate(dis, pc_to_name, pool,
                                               kinds=row_kinds(image, dis)), pool,
-                                     receiver=receiver_for(cr.owner_ref, static_refs),
+                                     receiver=entry.names(cr),
                                      arity=arity, selectors=selectors,
                                      arch=getattr(image, "arch", None),
                                      fields=layout.for_function(cr.owner_ref),

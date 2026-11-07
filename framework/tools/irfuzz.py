@@ -244,15 +244,19 @@ def main() -> int:
     ap.add_argument("--flags", action="store_true",
                     help="with --cfg: draw the flag-setting ALU forms too, whose value "
                          "no other corpus here contains (#239)")
+    ap.add_argument("--args", action="store_true",
+                    help="with --cfg or --cfgmem: lift with the six argument registers "
+                         "named, and score each name as the value its register came in "
+                         "with (#255)")
     a = ap.parse_args()
     if a.cfg is not None:
         return run_cfg(a.cfg, max(a.trials // 4, 25), a.seed, a.verbose, a.nested,
-                       flags=a.flags)
+                       flags=a.flags, args=a.args)
     if a.mem is not None:
         return run_mem(a.mem, max(a.trials // 4, 25), a.seed, a.verbose)
     if a.cfgmem is not None:
         return run_cfgmem(a.cfgmem, max(a.trials // 4, 25), a.seed, a.verbose,
-                          seed_outs=a.seed_outputs, nested=a.nested)
+                          seed_outs=a.seed_outputs, nested=a.nested, args=a.args)
     if a.fp:
         return run_fp(a.fp, a.runs, max(a.trials // 4, 25), a.seed, a.verbose)
     rc = run(a.trials, a.seed, a.verbose)
@@ -1275,6 +1279,13 @@ _FUZZ_OUT = tuple(range(0, 7))       # the only destinations
 #: The loop counter, written by nothing else so a generated back edge is guaranteed to
 #: retire. Readable as a source like any other output register.
 _FUZZ_CTR = 7
+#: `--args`: the names a body is lifted with where `jadart` reads its arity (#255), for
+#: all six argument registers. Every one of them is an OUTPUT here, so the generated code
+#: writes them, on some paths and not others, in loops and round gotos: a name printed
+#: where the register no longer holds what it came in with evaluates to the entry value
+#: and disagrees with the CPU. Without the flag a read of one before any write prints
+#: the bare register and declines, so the question is never asked.
+_ARG_NAMES = {"x1": "a0", "x2": "a1", "x3": "a2", "x5": "a3", "x6": "a4", "x7": "a5"}
 
 #: (mnemonic template, encoder). Every word these build is checked against capstone before
 #: a single trial runs, for the reason CASES is: a harness that fuzzes a different
@@ -1822,7 +1833,7 @@ def _reachable(blocks, entry):
 
 
 def run_cfg(count: int, trials: int, seed: int, verbose: bool,
-            nested: bool = False, flags: bool = False) -> int:
+            nested: bool = False, flags: bool = False, args: bool = False) -> int:
     import ast
     uc_mod = _unicorn()
     if uc_mod is None:
@@ -1844,7 +1855,7 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool,
     lr = a64.UC_ARM64_REG_X30
     rng = random.Random(seed)
     failures = checked = skipped = executed = 0
-    withgoto = joins = loops = 0
+    withgoto = joins = loops = named = 0
 
     for _case in range(count):
         words = (_gen_nested(rng) if nested
@@ -1860,10 +1871,11 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool,
         joins += sum(1 for b in blocks
                      if sum(1 for o in blocks if b in blocks[o].succ) > 1)
         stmts = structure(blocks, entry)
-        lif = Lifter(blocks, entry=entry)
+        lif = Lifter(blocks, entry=entry, receiver=_ARG_NAMES if args else None)
         lif.labels = label_targets(stmts)
         st = State()
         lines, _falls = lif.walk(stmts, st, "  ", 0)
+        named += any(re.search(r"\ba[0-5]\b", ln) for ln in lines)
         if lif.labels:
             withgoto += 1
         if any(t <= a for a in blocks for t in blocks[a].succ):
@@ -1917,6 +1929,8 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool,
         for _ in range(trials):
             env = {f"x{i}": trial_rng.getrandbits(64) for i in range(31)}
             env["xzr"] = 0
+            if args:
+                env.update({name: env[r] for r, name in _ARG_NAMES.items()})
             mu = Uc(ARCH, MODE)
             mu.mem_map(BASE, 0x2000)
             mu.mem_write(BASE, code)
@@ -1996,7 +2010,8 @@ def run_cfg(count: int, trials: int, seed: int, verbose: bool,
     print(f"\n{count} generated control-flow graphs ({joins} joins, {withgoto} needing a "
           f"goto, {loops} with a back edge), {checked} printed expressions evaluated, "
           f"{executed} register results from RUNNING the printed body, "
-          f"{skipped} undecidable, {failures} mismatches")
+          f"{skipped} undecidable, {failures} mismatches"
+          + (f"; {named} bodies print an argument name" if args else ""))
     return 1 if failures else 0
 
 
@@ -2264,7 +2279,7 @@ def cfgmem_program(seed: int, index: int, seed_outs: bool = True,
 
 def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
                seed_outs: bool = False, nested: bool = False,
-               progs: list = None) -> int:
+               progs: list = None, args: bool = False) -> int:
     uc_mod = _unicorn()
     if uc_mod is None:
         print("SKIP: unicorn is not installed")
@@ -2285,7 +2300,7 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
     lr = a64.UC_ARM64_REG_X30
     rng = random.Random(seed)
     failures = checked = memchecked = skipped = 0
-    joins = loops = withgoto = scored = 0
+    joins = loops = withgoto = scored = named = 0
 
     # `progs`: run THESE programs instead of drawing any, for a gate that names the
     # case it is about rather than the seed it was found at (`cfgmem_program`).
@@ -2304,10 +2319,11 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
             continue
         stmts = structure(blocks, entry)
         with use_target(ARM64):
-            lif = Lifter(blocks, entry=entry)
+            lif = Lifter(blocks, entry=entry, receiver=_ARG_NAMES if args else None)
             lif.labels = label_targets(stmts)
             st = State()
             lines, _falls = lif.walk(stmts, st, "  ", 0)
+            named += any(re.search(r"\ba[0-5]\b", ln) for ln in lines)
             # The state at the RETURN, not at the end of the walk. `structure` emits blocks
             # in an order that is not a path, so with a goto in the graph the last block
             # printed is not the one the function leaves from, and the register map the
@@ -2365,6 +2381,10 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
             env = {k: v for k, v in seeded.items()
                    if not (k[1:].isdigit() and int(k[1:]) <= _FUZZ_CTR)}
             env["xzr"] = 0
+            if args:
+                # An argument's name IS a claim about the entry state, the one thing a
+                # bare register above is not, so it is bound and scored.
+                env.update({name: seeded[r] for r, name in _ARG_NAMES.items()})
             slots = {d: trial_rng.getrandbits(64) for d in _MEM_DISPS}
             mu = Uc(ARCH, MODE)
             mu.mem_map(BASE, 0x2000)
@@ -2432,7 +2452,8 @@ def run_cfgmem(count: int, trials: int, seed: int, verbose: bool,
           f"({joins} joins, {loops} with a back "
           f"edge, {withgoto} needing a goto), {scored} interpreted, {checked} "
           f"printed expressions and {memchecked} field values evaluated, {skipped} "
-          f"undecidable, {failures} mismatches")
+          f"undecidable, {failures} mismatches"
+          + (f"; {named} bodies print an argument name" if args else ""))
     return 1 if failures else 0
 
 

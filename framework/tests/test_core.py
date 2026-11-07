@@ -629,7 +629,8 @@ def test_tier3_decompile_view_reads_as_dart():
     from jadart.program import decompile_class
     out = decompile_class(CLEAN, "BenchAccount")      # default tier=3
     assert "Tier 3 expressions" in out
-    assert "this.field_0x8 -= x2;" in out             # receiver aliased to `this`
+    # receiver `this`, amount `a1` (#255)
+    assert "this.field_0x8 -= a1;" in out
     assert "return false;" in out and "return true;" in out
     assert "L0:" not in out
 
@@ -2157,13 +2158,13 @@ def test_export_writes_a_browsable_tree():
         body = open(own).read()
         assert "// lib: package:flubench_corpus/constructs.dart" in body
         assert "class BenchAccount" in body
-        assert "this.field_0x8 -= x2;" in body, "method bodies should be lifted"
+        assert "this.field_0x8 -= a1;" in body, "method bodies should be lifted"
         # and a `ret` asks the function's callers which register comes back (#115):
         # getAsTranslation's own code cannot say, its callers read x0, not the d0 that
         # the path to its `return null` last compared.
         mu = open(os.path.join(out, "sources", "flutter", "src", "painting",
                                "matrix_utils.dart")).read()
-        got = re.search(r"getAsTranslation\(\) \{[^\n]*\n(.*?)\n  \}", mu, re.S)
+        got = re.search(r"getAsTranslation\([^)]*\) \{[^\n]*\n(.*?)\n  \}", mu, re.S)
         assert got and "return d0;" not in got.group(1), got and got.group(1)
         assert re.search(r"return t\d+;", got.group(1)), got.group(1)
         # dart: libraries land under dart/. Which ones survive depends on what the app
@@ -4633,7 +4634,7 @@ def test_the_callers_of_real_functions_say_what_they_return():
         assert cli.main(["lift", CLEAN, "0x19b324"]) == 0
     made, rets = made_and_returned(out.getvalue().splitlines())
     assert rets == [f"return {made[-1]};", "return NULL;"], rets
-    body = re.search(r"getAsTranslation\(\) \{[^\n]*\n(.*?)\n  \}",
+    body = re.search(r"getAsTranslation\([^)]*\) \{[^\n]*\n(.*?)\n  \}",
                      decompile_class(CLEAN, "MatrixUtils"), re.S)
     made, rets = made_and_returned(body.group(1).splitlines())
     assert rets == [f"return {made[-1]};", "return NULL;"], rets
@@ -17559,7 +17560,7 @@ def test_a_method_owned_by_a_patch_class_is_given_the_class_it_wraps():
     assert "this.field_0x58" not in body, body
     # A slot of the same object whose Field was tree-shaken keeps its offset, and so does
     # every base that is not the receiver: the hop names a class, not a register.
-    assert "x2.field_0x18 = this._explicitChildNodes@" in body, body
+    assert "a1.field_0x18 = this._explicitChildNodes@" in body, body
 
 
 def test_a_patch_owner_is_followed_only_for_a_function_that_takes_a_receiver():
@@ -17689,6 +17690,250 @@ def test_parameter_types_is_read_from_the_slot_each_release_keeps_it_in():
         assert ep.ftype_params_index == (3 if early else 4), (ep.name, ep.dart)
         seen.add(early)
     assert seen == {True, False}
+
+
+# -- incoming arguments named by the register they arrived in (#255) ----------------
+
+def _rows(rows):
+    """(addr, mn, op, note) from (mn, op) or (mn, op, note) rows, from address 0."""
+    return [(i * 4, r[0], r[1], r[2] if len(r) > 2 else "") for i, r in enumerate(rows)]
+
+
+def test_an_incoming_argument_is_named_by_the_register_it_arrived_in():
+    """The body read its arguments as the registers they came in, `if (x2 > ...)`, while
+    the arity pass already knew x2 was the second register argument. The source is in
+    flubench/app/lib/constructs.dart, so each name below has a right answer."""
+    if not _capstone_available():
+        _skip("test_an_incoming_argument_is_named_by_the_register_it_arrived_in"
+              " (no capstone)")
+    got = {f["name"]: f for f in jadart.decompile(CLEAN, "benchWithdraw")}
+    f = got["benchWithdraw"]                   # bool benchWithdraw(int amount)
+    assert f["params"] == "a1", f
+    assert "if (a1 > this.field_0x8) {" in f["body"], f["body"]
+    assert "this.field_0x8 -= a1;" in f["body"], f["body"]
+    # a static function's first register argument is a0, not `this`
+    f = jadart.decompile(CLEAN, "benchCheckSecret")[0]       # (String input)
+    assert f["params"] == "a0" and f["body"] == [
+        'return a0.sel_0x0("FLUBENCH{str_literal_compare}");'], f
+    f = jadart.decompile(CLEAN, "benchMakePair")[0]          # (int id, String name)
+    assert f["params"] == "a0, a1", f
+    # a generic function takes its arguments on the stack: no register is named and the
+    # list says it was not read, the spelling a call whose list is not read already has
+    f = jadart.decompile(CLEAN, "benchFirstOrDefault")[0]
+    assert f["params"] == "...", f
+    assert not any(re.search(r"\ba[0-5]\b", ln) for ln in f["body"]), f["body"]
+    # ...and the names are declared where the body is shown
+    from jadart.program import decompile_class
+    out = decompile_class(CLEAN, "BenchAccount")
+    assert "  benchWithdraw(a1) {  //" in out, out
+    assert "if (a1 > this.field_0x8) {" in out, out
+    # The other tiers print the machine's registers, so their brackets stay empty.
+    assert "  benchWithdraw() {  //" in decompile_class(CLEAN, "BenchAccount", tier=2)
+
+
+def test_entry_args_reads_past_a_gap_and_declines_with_the_count():
+    """`entry_arity` counts the LEADING run of argument registers read on entry, because a
+    call site prints a list and a list cannot skip a slot. A name can: a register read
+    before any write holds what the caller left in it whether or not the one before it
+    was read. `classify(int score)` never touches `this`, so its count is 0 and x2 is
+    still its argument. Every reason the count has to decline holds for the names."""
+    from jadart.expr import entry_arity, entry_args
+    ann = _rows([("ldur", "x0, [x2, #7]"), ("ldur", "x3, [x3, #7]"),
+                 ("add", "x0, x0, x3"), ("ret", "")])
+    assert entry_arity(ann) == 0 and entry_args(ann) == ("x2", "x3")
+    ann = _rows([("ldur", "x0, [x1, #7]"), ("ldur", "x2, [x2, #7]"),
+                 ("add", "x0, x0, x2"), ("ret", "")])
+    assert entry_arity(ann) == 2 and entry_args(ann) == ("x1", "x2")
+    ann = _rows([("ldur", "x0, [x1, #7]"), ("ldur", "x4, [x4, #7]"),   # ARGS_DESC_REG
+                 ("add", "x0, x0, x4"), ("ret", "")])
+    assert entry_arity(ann) is None and entry_args(ann) == ()
+    if not _capstone_available():
+        _skip("test_entry_args_reads_past_a_gap_and_declines_with_the_count"
+              " (no capstone)")
+    # On the fixture: an instance method that reads x2 and never `this` is named a1 all
+    # the same, and its signature lists it. 101 such methods on this build.
+    from jadart.disasm import load_instructions
+    from jadart.expr import make_arity_resolver
+    from jadart.program import EntryNames, static_function_refs
+    image, fr, hdr = load_instructions(CLEAN)
+    arity = make_arity_resolver(image)
+    entry = EntryNames(image, fr, hdr.epoch, arity)
+    statics = static_function_refs(fr)
+    owners = {ref for ref, _n, _o, _k in fr.functions} - statics
+    gap = [cr for cr in image.all_ranges
+           if cr.owner_ref in owners and arity(cr.pc_offset) == 0
+           and arity.args(cr.pc_offset) == ("x2",)]
+    assert len(gap) >= 100, len(gap)
+    for cr in gap:
+        assert entry.names(cr) == {"x1": "this", "x2": "a1"}, (cr, entry.names(cr))
+        assert entry.params(cr) == "a1"
+
+
+def test_a_name_holds_only_while_the_register_holds_what_it_came_in_with():
+    """The one defect this must never ship: an argument's name on a register that no
+    longer holds the argument. The name rides the receiver alias, so a register the walk
+    has recorded on ANY path, written, clobbered by a call, dropped at a join, forgotten
+    at a loop, reads as the lifter always read it: bare, or by a fresh name."""
+    from jadart.expr import lift_function
+    names = {"x1": "this", "x2": "a1", "x5": "a3"}
+
+    def lift(rows, **kw):
+        return "\n".join(lift_function(_rows(rows), receiver=names, **kw))
+    # rewritten on the straight line: the value that was moved in
+    assert lift([("mov", "x2, x5"), ("ldur", "x0, [x2, #7]"), ("ret", "")]) == (
+        "  return a3.field_0x8;")
+    # rewritten on one arm of a join: bare after it
+    body = lift([("cbz", "x3, #0xc"), ("mov", "x2, x5"), ("b", "#0xc"),
+                 ("ldur", "x0, [x2, #7]"), ("ret", "")])
+    assert "x2.field_0x8" in body and "a1" not in body, body
+    # destroyed by a call: a fresh name for a value nobody knows, never the argument
+    body = lift([("bl", "#0x100", "  ; -> foo"), ("ldur", "x0, [x2, #7]"), ("ret", "")])
+    assert "return t0.field_0x8;" in body and "a1" not in body, body
+    # ...unless it was spilled before the call and reloaded after it, which is what the
+    # compiler does with an argument it needs on both sides
+    body = lift([("stur", "x2, [x29, #-8]"), ("bl", "#0x100", "  ; -> foo"),
+                 ("ldur", "x2, [x29, #-8]"), ("ldur", "x0, [x2, #7]"), ("ret", "")])
+    assert body.endswith("  return a1.field_0x8;"), body
+    # rewritten by a loop: the carried name starts from the argument, and after the loop
+    # the register reads as that name, never as the argument
+    body = lift([("ldur", "x0, [x2, #7]"), ("add", "x2, x2, #8"), ("subs", "x3, x3, #1"),
+                 ("b.ne", "#0x0"), ("ldur", "x0, [x2, #7]"), ("ret", "")])
+    assert "var t0 = a1;" in body and "return t0.field_0x8;" in body, body
+    assert "a1.field" not in body, body
+    # A block no path from the entry reaches is handed no entry name. A catch block is
+    # entered with the exception in x0 and the stack trace in x1, and `_run` on the
+    # clean fixture printed `_list2(x0, this)` for the two of them.
+    body = lift([("mov", "x0, x2"), ("bl", "#0x100", "  ; -> _iso_stub_ThrowStub"),
+                 ("brk", "#0"), ("ldur", "x0, [x2, #7]"), ("ret", "")])
+    assert "throw a1;" in body and "return x2.field_0x8;" in body, body
+    body = lift([("bl", "#0x100", "  ; -> _iso_stub_ThrowStub"), ("brk", "#0"),
+                 ("ldur", "x0, [x1, #7]"), ("ret", "")])
+    assert "return x1.field_0x8;" in body and "this" not in body, body
+    # A type-testing stub hands back x0, x1, x2 and x8 and nothing else
+    # (TypeTestABI::kPreservedAbiRegisters), so x5 after one is not the argument.
+    body = lift([("bl", "#0x100", "  ; -> _iso_stub_DefaultTypeTestStub"),
+                 ("ldur", "x0, [x5, #7]"), ("ret", "")])
+    assert body == "  return x5.field_0x8;", body
+    body = lift([("bl", "#0x100", "  ; -> _iso_stub_DefaultTypeTestStub"),
+                 ("ldur", "x0, [x1, #7]"), ("ldur", "x3, [x2, #7]"),
+                 ("add", "x0, x0, x3"), ("ret", "")])
+    assert body == "  return this.field_0x8 + a1.field_0x8;", body
+    # ...and the same holds for a register that came to hold a name some other way: a
+    # copy of an argument, a reload of one from its frame slot, or a copy of `this`.
+    tts = ("bl", "#0x100", "  ; -> _iso_stub_DefaultTypeTestStub")
+    for rows, reg in (([("mov", "x5, x2"), tts], "x5"),
+                      ([("stur", "x5, [x29, #-8]"), ("bl", "#0x200", "  ; -> foo"),
+                        ("ldur", "x5, [x29, #-8]"), tts], "x5"),
+                      ([("mov", "x3, x1"), tts], "x3")):
+        body = lift(rows + [("ldur", f"x0, [{reg}, #7]"), ("ret", "")])
+        assert body.endswith(f"  return {reg}.field_0x8;"), body
+    # A box-or-tag check is lifted down its fast path, and the Mint path it cuts calls a
+    # stub whose fast path uses x1 as its temporary (AllocateMintABI::kTempReg), so x1
+    # past the join is not `this`.
+    body = lift([("sbfiz", "x0, x2, #1, #0x1f"), ("cmp", "x2, x0, asr #1"),
+                 ("b.eq", "#0x14"),
+                 ("bl", "#0x100",
+                  "  ; -> _iso_stub_AllocateMintSharedWithoutFPURegsStub"),
+                 ("stur", "x2, [x0, #7]"), ("ldur", "x0, [x1, #7]"), ("ret", "")])
+    assert body.endswith("  return x1.field_0x8;") and "this" not in body, body
+
+
+def test_no_argument_is_named_where_the_code_is_not_a_dart_functions():
+    """A name rests on three facts: the release passes arguments in registers, the code
+    is a function's of a kind the VM calls that way, and the body reads the register
+    before writing it. Take any one away and the register stays bare."""
+    if not _capstone_available():
+        _skip("test_no_argument_is_named_where_the_code_is_not_a_dart_functions"
+              " (no capstone)")
+    import types
+    from jadart.disasm import load_instructions
+    from jadart.expr import make_arity_resolver
+    from jadart.hooks import STACK_KINDS
+    from jadart.program import EntryNames, _FUNCTION_KINDS
+    image, fr, hdr = load_instructions(CLEAN)
+    arity = make_arity_resolver(image)
+    entry = EntryNames(image, fr, hdr.epoch, arity)
+    kind = {ref: _FUNCTION_KINDS[kt & 0x1F] for ref, _n, _o, kt in fr.functions}
+    classes = {ref for ref, *_ in fr.classes}
+    named = stack = other = 0
+    for cr in image.all_ranges:
+        has = any(v != "this" for v in entry.names(cr).values())
+        named += has
+        if cr.owner_ref in kind and kind[cr.owner_ref] in STACK_KINDS:
+            stack += 1
+            assert not has, (cr, kind[cr.owner_ref])       # closures, dispatchers, ...
+        elif cr.owner_ref not in kind:
+            other += 1
+            assert not has, cr                              # allocation and type stubs
+            assert cr.owner_ref in classes or cr.owner_ref in fr.types or (
+                "_iso_stub_" in (image.symbol_names or {}).get(cr.pc_offset, "")
+                or cr.owner_ref != -1), cr
+    assert named >= 2000 and stack >= 1000 and other >= 1300, (named, stack, other)
+    # the release: before 3.4 nothing arrives in a register
+    old = types.SimpleNamespace(dart="3.3.4", cid_table=hdr.epoch.cid_table)
+    cr = next(c for c in image.all_ranges if c.owner_ref in kind
+              and entry.params(c) == "a1")
+    assert EntryNames(image, fr, old, arity).names(cr) == {"x1": "this"}
+    assert EntryNames(image, fr, old, arity).params(cr) == "..."
+    # a resolver with no `args` (a test's lambda) names nothing and lists nothing
+    assert EntryNames(image, fr, hdr.epoch, lambda pc: 2).names(cr) == {"x1": "this"}
+
+
+def test_discarded_code_on_an_obfuscated_build_is_still_a_functions():
+    """`--obfuscate` drops the Function and keeps its Code with no owner. Only a Dart
+    function's Code is discarded (precompiler.cc, DiscardCodeObjects), so those ranges
+    are named too, and they are exactly the table entries below first_entry_with_code."""
+    if not _capstone_available():
+        _skip("test_discarded_code_on_an_obfuscated_build_is_still_a_functions"
+              " (no capstone)")
+    from jadart.disasm import load_instructions
+    from jadart.expr import make_arity_resolver
+    from jadart.program import EntryNames
+    image, fr, hdr = load_instructions(OBF)
+    entry = EntryNames(image, fr, hdr.epoch, make_arity_resolver(image))
+    below = set(image.pcs[:image.first_code])
+    named = 0
+    for cr in image.all_ranges:
+        if cr.owner_ref != -1:
+            continue
+        assert cr.pc_offset in below, cr
+        names = entry.names(cr)
+        assert set(names.values()) <= {"this", "a1", "a2", "a3", "a4", "a5"}, names
+        named += any(v != "this" for v in names.values())
+    assert named >= 1500, named
+
+
+def test_irfuzz_scores_an_argument_name_as_the_value_the_register_came_in_with():
+    """`tools/irfuzz.py --args` lifts the generated graphs with the six argument registers
+    named and binds each name to the register's entry value, so a name printed where the
+    register no longer holds it disagrees with the CPU. Without the flag such a read
+    prints the bare register and declines, so the oracle never asked. The teeth: put a
+    loop's forget back and the same graphs disagree."""
+    if not _capstone_available():
+        _skip("test_irfuzz_scores_an_argument_name_as_the_value_the_register_came_in_"
+              "with")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import irfuzz
+    from jadart import expr
+    if irfuzz._unicorn() is None:
+        _skip("test_irfuzz_scores_an_argument_name_as_the_value_the_register_came_in_"
+              "with (no unicorn)")
+    assert irfuzz.run_cfg(200, 25, 1, False, args=True) == 0, "argument names disagree"
+    orig = expr.Lifter._render_loop
+
+    def leaky(self, header, body, st, indent, depth):
+        out = orig(self, header, body, st, indent, depth)
+        for r in list(st.reg):
+            if r in self.alias and st.reg[r].text == r:
+                del st.reg[r]               # the loop wrote it; forget that it did
+        return out
+    expr.Lifter._render_loop = leaky
+    try:
+        assert irfuzz.run_cfg(200, 25, 1, False, args=True) != 0, (
+            "a register the loop rewrote read as the argument and the oracle did not see")
+    finally:
+        expr.Lifter._render_loop = orig
+
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
