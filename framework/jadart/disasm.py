@@ -40,7 +40,7 @@ from .macho import open_container
 from .branches import code_target, printed_number
 from .objstore import stub_names
 from .fill import quoted
-from .stream import ReadStream
+from .stream import ReadStream, TruncatedSnapshot
 from . import versions
 
 
@@ -114,7 +114,8 @@ def _string_header_size(word: int, slot: int) -> int:
 
 
 def parse_instructions_table(data: bytes, header_length: int, itro: int,
-                            arch=None) -> tuple[list[int], int]:
+                            arch=None, symbol: str = "the data symbol"
+                            ) -> tuple[list[int], int]:
     """Return (pc_offsets, first_entry_with_code). pc_offsets[i] is the instruction
     offset for instructions-table entry i (image-base relative).
 
@@ -123,14 +124,31 @@ def parse_instructions_table(data: bytes, header_length: int, itro: int,
     where HASH_IN_OBJECT_HEADER puts the hash in the spare half of the tags word, against
     `[tags 4][hash 4][length 4]` on 32-bit. Everything after the header is identical,
     the same four-word preamble and the same eight-byte entries, so only this offset
-    varies, and getting it wrong reads a length of zero rather than failing."""
+    varies, and getting it wrong reads a length of zero rather than failing.
+
+    `data` is `symbol`'s bytes, sized by the container, and the offsets come from the
+    snapshot header, so nothing makes the one hold the other. Both the preamble and the
+    `length` entries are bounded against it before they are read (#256): the clean
+    fixture with the symbol cut to 938,140 bytes, its header's own length, exited 3 with
+    a struct.error. On the two fixtures and the seven app-sweep libraries the table ends
+    138,752 to 949,280 bytes before the symbol does."""
     word = arch.word_size if arch else 8
     slot = arch.compressed_word_size if arch else 8
     str_header = _string_header_size(word, slot)
     di_start = _round_up(header_length, 64)          # data image alignment (>= 2.19)
-    payload = di_start + itro + str_header
+    at = di_start + itro
+    payload = at + str_header
+    if payload + 16 > len(data):
+        raise TruncatedSnapshot(
+            f"{symbol}: the symbol is {len(data)} bytes, and its snapshot header puts "
+            f"the InstructionsTable at {at}..{payload + 16}, past the symbol's end.")
     _canon, length, first_code, _pad = struct.unpack_from("<IIII", data, payload)
     off = payload + 16
+    end = off + length * 8
+    if end > len(data):
+        raise TruncatedSnapshot(
+            f"{symbol}: the symbol is {len(data)} bytes, and the InstructionsTable at "
+            f"{at} declares {length} entries, which end at {end}, past the symbol's end.")
     pcs = [struct.unpack_from("<I", data, off + i * 8)[0] for i in range(length)]
     return pcs, first_code
 
@@ -238,7 +256,8 @@ def load_instructions(path):
     fr = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch)
 
     pcs, first_code = parse_instructions_table(data, header_length,
-                                               hdr.instr_table_rodata_offset, hdr.arch)
+                                               hdr.instr_table_rodata_offset, hdr.arch,
+                                               symbol=names.data)
 
     # Function sizes are the gap to the NEXT table entry, across ALL entries, not just
     # the ones whose Code object we recovered. Using only retained entries made each
