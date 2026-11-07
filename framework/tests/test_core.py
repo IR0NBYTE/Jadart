@@ -17182,6 +17182,79 @@ def test_a_dart_3_13_header_the_vm_would_not_load_is_refused(tmp_path):
     assert (hdr.kind_name, hdr.num_base_objects) == ("kFullAOT", 7)
 
 
+def test_a_data_symbol_that_ends_before_its_instructions_table_is_refused(
+        tmp_path, clean_loaded):
+    """The InstructionsTable is read out of the data symbol's bytes, at offsets the
+    snapshot header gives, and nothing bounded the one by the other. The clean fixture
+    with _kDartIsolateSnapshotData's st_size cut from 1,142,672 to 938,140, the
+    header's own Snapshot::length(), still parses its header, and `verify` and
+    `functions` exited 3 with a struct.error from parse_instructions_table (#256). Each
+    cut is a typed failure now that names the symbol."""
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+    from jadart.disasm import load_instructions
+    from jadart.elf import Elf
+    from jadart.stream import TruncatedSnapshot
+
+    d = open(CLEAN, "rb").read()
+    sym = Elf(d).symbols["_kDartIsolateSnapshotData"]
+    # st_value then st_size, side by side in the symbol's .dynsym entry
+    record = struct.pack("<QQ", sym.value, sym.size)
+    assert d.count(record) == 1
+    at = d.index(record) + 8
+
+    def cut(size):
+        out = bytearray(d)
+        struct.pack_into("<Q", out, at, size)
+        path = tmp_path / f"cut-{size}.so"
+        path.write_bytes(out)
+        return str(path)
+
+    def refused(path, said):
+        with pytest.raises(TruncatedSnapshot) as e:
+            load_instructions(path)
+        assert str(e.value) == said
+        for cmd in ("verify", "functions"):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.main(["-j", cmd, path])
+            doc = json.loads(buf.getvalue())
+            assert (rc, doc["type"], doc["error"]) == (2, "TruncatedSnapshot", said), (
+                cmd, doc)
+
+    # The data image starts at 938,176, the table object at 938,240 and its 8,194
+    # entries end at 1,003,824. Cut before the four-word preamble, after it and before
+    # the last entry, and a byte short of the end.
+    name = "_kDartIsolateSnapshotData: the symbol is"
+    assert sym.size == 1142672
+    refused(cut(938140), f"{name} 938140 bytes, and its snapshot header puts the "
+                         f"InstructionsTable at 938240..938272, past the symbol's end.")
+    for size in (938300, 1003823):
+        refused(cut(size), f"{name} {size} bytes, and the InstructionsTable at 938240 "
+                           f"declares 8194 entries, which end at 1003824, past the "
+                           f"symbol's end.")
+    # `info` reads only the header, which is all there.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["-j", "info", cut(938140)]) == 0
+    # A symbol that ends where the table does holds all of it.
+    image, _fr, _hdr = load_instructions(cut(1003824))
+    assert (image.pcs, image.first_code) == (clean_loaded[0].pcs,
+                                            clean_loaded[0].first_code)
+
+    # A Dart 3.13 library names its data symbol _kDartSnapshotData, and the one this
+    # writes has no data image behind the stream, so its table starts past the end.
+    blob, _stream, _counts = _dart_3_13_snapshot()
+    path = tmp_path / "libapp.so"
+    path.write_bytes(_merged_elf(blob))
+    start = (len(blob) + 63) & ~63
+    refused(str(path), f"_kDartSnapshotData: the symbol is {len(blob)} bytes, and its "
+                       f"snapshot header puts the InstructionsTable at "
+                       f"{start}..{start + 32}, past the symbol's end.")
+
+
 def _gates_3_13(hdr_base: int = 7, epoch=None, **knobs):
     """run_gates over _dart_3_13_snapshot(**knobs) with _small_roots for a layout, and
     the image and header a real file would give, cut to what the gates read."""

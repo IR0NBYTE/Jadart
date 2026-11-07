@@ -256,6 +256,31 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A data symbol that ends before its InstructionsTable is refused, not a crash.**
+  `parse_instructions_table` read the table out of the data symbol's bytes at the offset
+  the snapshot header gives, `roundUp(Snapshot::length(), 64)` plus
+  `instructions_table_rodata_offset`, then `length` entries after it, and checked neither
+  against the symbol. The clean fixture with `_kDartIsolateSnapshotData`'s `st_size` cut
+  from 1,142,672 to 938,140, three bytes of the file, still parses its header, and
+  `verify` and `functions` exited 3 with `unpack_from requires a buffer of at least
+  938272 bytes`, the wording for a bug in jadart. The four-word preamble and the
+  `length * 8` bytes of entries are now bounded against the symbol before either is
+  read, and a short one is a `TruncatedSnapshot`, exit 2, that names it:
+  `_kDartIsolateSnapshotData: the symbol is 938140 bytes, and its snapshot header puts
+  the InstructionsTable at 938240..938272, past the symbol's end.` A Dart 3.13 library
+  is named by its `_kDartSnapshotData`, and a crafted table offset or `length` that runs
+  past the symbol is refused by the same two checks. `info` reads only the header and
+  still exits 0.
+
+  The bound is exact. A symbol that ends where the table does, 1,003,824 bytes on the
+  clean fixture and 11,490,928 on FluffyChat (3.13.0), verifies with the same gates and
+  check counts as the whole one, and the clean fixture's `functions` output is byte for
+  byte the same; a byte less is refused. On the two fixtures and the seven app-sweep
+  libraries, 2.19.6 to 3.13.0, the table ends 138,752 to 949,280 bytes before the
+  symbol does, and all nine load as before. AOTopsy refuses the 938,140 cut with exit 1,
+  `instrtable: data too short for table at offset 938240 (need 938272, have 938140)`,
+  without naming the symbol. Closes #256.
+
 - **A Dart 3.13 library is refused for its epoch by every command, not for a symbol it
   never had.** Dart 3.13 writes one snapshot where every release before it wrote a vm
   and an isolate one, and exports it as `_kDartSnapshotData` and `_kDartSnapshotText`
