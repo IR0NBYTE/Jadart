@@ -34,6 +34,7 @@ STRING = "string"            # U count; per-obj U (length<<1 | is_two_byte); +CS
 CODE = "code"                # U count; count x I32; U deferred; deferred x I32
 MINT = "mint"                # U count; count x I64
 CLASS = "class"              # predefined_count U; predefined x ReadCid(I32); new_count U
+                             # (one count from 3.13: epoch.class_alloc_predefined)
 RODATA = "rodata"            # U count; per-obj U delta (<< kObjectAlignmentLog2); +CSL.
                              # Uncompressed-pointer targets only; the objects live in the
                              # RO data image and their ReadFill is EMPTY.
@@ -50,10 +51,11 @@ _CSL_NAMES = ("TypeArgumentsCid", "TypeCid", "FunctionTypeCid", "RecordTypeCid",
 # unknown one fails loud. Type/FunctionType/RecordType/TypeParameter/String/TypeArguments
 # additionally carry a canonical-set tail (_CSL_CIDS) applied on top.
 #
-# This is the 3.12.2 profile. Two clusters differ from SDK main: Class alloc reads
-# predefined_count + predefined x ReadCid(int32) + new_count, and Closure alloc is fixed
-# (main added a per-object length in 3.13). Drift like that is what the epoch table exists
-# to carry.
+# This is the 3.12.2 profile. Two clusters differ in 3.13: Class alloc reads
+# predefined_count + predefined x ReadCid(int32) + new_count here and one count there,
+# and Closure alloc is fixed here and carries a per-object length there. Both are
+# switches on the Epoch (class_alloc_predefined, closure_sized) rather than rows of
+# these sets, which name what a class is and not which release it is.
 _FIXED_NAMES = frozenset({
     "PatchClassCid", "TypeParametersCid", "FunctionCid", "ClosureDataCid",
     "FfiTrampolineDataCid", "FieldCid", "ScriptCid", "LibraryCid", "NamespaceCid",
@@ -70,7 +72,7 @@ _FIXED_NAMES = frozenset({
     "FinalizerCid", "NativeFinalizerCid", "FinalizerEntryCid", "SuspendStateCid",
     "ReceivePortCid", "SendPortCid", "CapabilityCid", "TransferableTypedDataCid",
     "UserTagCid", "PointerCid", "DynamicLibraryCid",
-    "ClosureCid",   # FIXED in 3.12.2 (main added a per-object length in 3.13)
+    "ClosureCid",   # FIXED through 3.12; VARIABLE where epoch.closure_sized (3.13)
     "TypeCid", "FunctionTypeCid", "RecordTypeCid", "TypeParameterCid",  # + CSL tail
 })
 _VARIABLE_NAMES = frozenset({
@@ -90,7 +92,7 @@ class _Routing:
     """Cid-keyed dispatch derived from one epoch's cid numbering."""
 
     __slots__ = ("switch", "ffi_instance", "rodata_always", "rodata_root_only",
-                 "instance_cid", "names", "csl_cids")
+                 "instance_cid", "closure_cid", "names", "csl_cids")
 
     def __init__(self, table):
         self.names = table.names
@@ -119,6 +121,7 @@ class _Routing:
         self.rodata_root_only = frozenset(table.cid(n) for n in (
             "StringCid", "OneByteStringCid", "TwoByteStringCid"))
         self.instance_cid = table.cid("InstanceCid")
+        self.closure_cid = table.cid("ClosureCid")
         self.csl_cids = frozenset(table.cid(n) for n in _CSL_NAMES)
 
 
@@ -205,6 +208,11 @@ def _pattern_for(cid: int, epoch, arch=None, is_root_unit: bool = True) -> str:
     if cid in r.ffi_instance:
         return INSTANCE
     p = r.switch.get(cid)
+    if cid == r.closure_cid and epoch.closure_sized:
+        # ClosureDeserializationCluster::ReadAlloc at 3.13.0: a count, then a length
+        # per object. The length sizes the closure's data slots, so the fill reads it
+        # again; no canonical-set tail, which only the six _CSL_NAMES clusters have.
+        return VARIABLE
     if p is None:
         raise AllocError(
             f"no alloc pattern for cid {cid} ({r.names.get(cid, '?')}) under epoch "
@@ -238,6 +246,20 @@ def walk_alloc(st: ReadStream, num_base_objects: int, num_objects: int,
         pattern = _pattern_for(cid, epoch, arch, is_root_unit)
         alloc_start = st.pos
         lengths = None
+
+        if pattern == CLASS and not epoch.class_alloc_predefined:
+            # 3.13: ReadAllocFixedSize. The predefined classes are objects of this
+            # cluster like any other, so there is no cid list here and the fill reads
+            # every class the one way (main_count 0 selects that in _fill_class).
+            count = st.read_unsigned()
+            start_ref = next_ref
+            next_ref += count
+            clusters.append(Cluster(
+                index=i, cid=cid, canonical=canon, immutable=imm, pattern=pattern,
+                name=_names.get(cid, f"cid{cid}"),
+                count=count, start_ref=start_ref, stop_ref=next_ref,
+                alloc_start=alloc_start, alloc_end=st.pos, lengths=None))
+            continue
 
         if pattern == CLASS:
             # predefined_count; (v2.10 heuristic: if > NUM_PREDEFINED_CIDS it was a total

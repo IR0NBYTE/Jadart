@@ -42,9 +42,11 @@ Version coverage, measured. `tools/sdk_source.py` computes the snapshot hash any
 about 2.5 MiB over HTTP, with no clone and no VM build. Predicted and observed hashes have
 agreed on every corpus build, so a release can be identified before any binary of it exists.
 
-**Dart 2.19.6 through 3.12.2 are supported**: eighteen registered format epochs across
-fourteen grammar families, each gated on a real binary, and each also gated on a 32-bit
-build of that release. Two of the eighteen are beta builds, because Flutter's beta channel
+**Dart 2.19.6 through 3.13.0 are supported**: nineteen registered format epochs across
+fifteen grammar families, each gated on a real binary. Every one through 3.12.2 is also
+gated on a 32-bit build of that release. 3.13.0 is not: it is gated on one Android arm64
+app, so it claims 64-bit compressed pointers and refuses an iOS or arm32 build by name.
+Two of the nineteen are beta builds, because Flutter's beta channel
 pins a Dart release of its own and an app published from it carries that hash for ever. `jadart --version` prints the
 registry, oldest first, with the targets each epoch covers.
 

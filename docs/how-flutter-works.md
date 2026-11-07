@@ -114,6 +114,10 @@ The two isolate blobs are the target. `strings libapp.so` already reaches the li
 the first one, which is why a hardcoded API key in a Flutter app is not hidden at all.
 Everything harder lives in the structure around them.
 
+From Dart 3.13 there are two blobs, not four: `_kDartSnapshotData` and
+`_kDartSnapshotText`. The VM-level objects and stubs are written into the app's own
+snapshot, so one data image and one instructions image carry everything.
+
 ---
 
 ## 4. Inside the snapshot: clusters

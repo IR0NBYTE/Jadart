@@ -31,18 +31,18 @@ from .errors import InputError
 from .interop import binary_info, visible, _shown, _shown_name, _checks
 
 #: Function kinds MaxNumberOfParametersInRegisters returns 0 for (object.cc, 3.4.0 to
-#: 3.12.2): the VM calls them through the stack whatever their signature.
+#: 3.13.0): the VM calls them through the stack whatever their signature.
 STACK_KINDS = frozenset({
     "ClosureFunction", "ImplicitClosureFunction", "FieldInitializer", "MethodExtractor",
     "NoSuchMethodDispatcher", "InvokeFieldDispatcher", "IrregexpFunction",
     "DynamicInvocationForwarder", "FfiTrampoline"})
 
-#: DartCallingConvention::kCpuRegistersForArgs on arm64, 3.4.0 to 3.12.2.
+#: DartCallingConvention::kCpuRegistersForArgs on arm64, 3.4.0 to 3.13.0.
 ARG_REGISTERS = ("x1", "x2", "x3", "x5", "x6", "x7")
 
 #: Where an object header keeps the class id: UntaggedObject::ClassIdTag is bits 12 to 31
-#: (SizeTag is 4 bits from bit 8) in raw_object.h for 2.19.6, 3.0.6, 3.3.4, 3.4.4, 3.8.1
-#: and 3.12.2. That is the layout in memory, not the snapshot stream's.
+#: (SizeTag is 4 bits from bit 8) in raw_object.h for 2.19.6, 3.0.6, 3.3.4, 3.4.4, 3.8.1,
+#: 3.12.2 and 3.13.0. That is the layout in memory, not the snapshot stream's.
 HEADER_CID_SHIFT, HEADER_CID_BITS = 12, 20
 
 

@@ -74,8 +74,8 @@ class Program:
 # carries the index in its low five bits, so this is per-release data in principle:
 # inserting a kind renumbers everything after it, and the cid table proves the SDK does
 # that between releases. In practice it has not moved. raw_object.h was fetched for every
-# one of the 18 registered releases, 2.19.0-444.2.beta through 3.12.2, and all 18 declare
-# exactly this list. When a release newer than 3.12 is registered, repeat that check:
+# one of the 19 registered releases, 2.19.0-444.2.beta through 3.13.0, and all 19 declare
+# exactly this list. When a release newer than 3.13 is registered, repeat that check:
 #
 #   from tools.sdk_source import fetch
 #   re.findall(r"V\((\w+)\)", fetch(tag, "raw_object.h").decode())  # inside the macro

@@ -14,7 +14,7 @@ the tool, not the AOT optimizer (see FINDINGS.md, Phase 0).
 ## Tool comparison (on the Dart 3.12.2 arm64 corpus)
 
 The comparison below is run on one epoch so the tools are measured against the same bytes;
-Jadart's own coverage is eighteen epochs and four targets, measured further down.
+Jadart's own coverage is nineteen epochs and four targets, measured further down.
 
 | tool | build | classes | functions | strings | decompiles? | offline | version-ID |
 |------|-------|---------|-----------|---------|-------------|---------|-----------|
@@ -618,40 +618,61 @@ while (true) {
 That is the shape of the whole comparison. AOTopsy renders a body more pleasantly where
 it renders one; jadart recovers more of what the body does.
 
-### The real-app result, which goes the other way
+### The real-app result, and the release that was missing
 
 The fixtures above are one app we wrote. FluffyChat's current F-Droid build
 (`chat.fluffy.fluffychat`, a 26.1 MB `libapp.so` pulled by `tools/appsweep.py`) is an app
-neither tool was tuned on, and it is Dart 3.13.0. AOTopsy parses it: 88,618 functions,
-10,679 classes, 12 s. jadart refuses it. The refusal is correct rather than a bug, since
-3.13 is past the newest registered epoch, but on the version-reach axis the competitor is
-ahead today for anything built with the current Flutter stable.
+neither tool was tuned on, and it is Dart 3.13.0, the current Flutter stable. AOTopsy
+parses it: 88,618 functions, 10,679 classes, 12 s. When this section was first measured
+jadart refused it, correctly, since no epoch held its hash, and on the version-reach
+axis the competitor was ahead for anything built today.
 
-Two separate things stopped us and both were bounded. The epoch is unregistered (hash
-`0451907c2eaa8467e848c0067bfe8ed4`). And 3.13 changed the container: that build exports
-`_kDartSnapshotData` and `_kDartSnapshotText`, where every earlier release exported
-`_kDartVmSnapshotData`, `_kDartIsolateSnapshotData` and their instruction pairs, and the
-`.so` has no `.symtab` at all, only those three in `.dynsym`. `jadart info` survived it
-because it falls through to the magic scan and reports the unknown epoch by name, while
-15 of the 16 commands asked for `_kDartIsolateSnapshotData` directly and refused with
-`no symbol '_kDartIsolateSnapshotData' in this ELF. If this is a Flutter app, the
-snapshot is in libapp.so, not here`, which was the wrong reason for a file that is
-libapp.so. That half is fixed (#253): the reader knows both symbol layouts (DESIGN 3)
-and all 16 commands now give the refusal `info` gives, exit 2 and the unknown epoch by
-name. The epoch is what is left.
+Two separate things stopped us and both are closed. 3.13 changed the container: that
+build exports `_kDartSnapshotData` and `_kDartSnapshotText`, where every earlier release
+exported `_kDartVmSnapshotData`, `_kDartIsolateSnapshotData` and their instruction
+pairs, and the `.so` has no `.symtab` at all, only those three in `.dynsym`. `jadart
+info` survived it by falling through to the magic scan, while 15 of the 16 commands
+asked for `_kDartIsolateSnapshotData` directly and refused with `no symbol
+'_kDartIsolateSnapshotData' in this ELF. If this is a Flutter app, the snapshot is in
+libapp.so, not here`, the wrong reason for a file that is libapp.so (#253). And the
+epoch was unregistered, hash `0451907c2eaa8467e848c0067bfe8ed4` (#254). Nine things in
+the stream differ from 3.12; DESIGN.md section 3 lists them with their source lines.
+Each was taken from the 3.13.0 tag and then held to the gates on this binary.
+
+| on FluffyChat, Dart 3.13.0 | jadart | AOTopsy |
+|---|---|---|
+| code ranges | 88,618 | 88,618, at the same 88,618 addresses |
+| classes | 10,713 | 10,679 |
+| acceptance gates | Tier A 13 of 13, Tier B 3 of 3, 551,075 checks, in 0.8 s | has none |
+| whole image to source | 1,102,633 lines in 125 s, 403 MB peak | not run here |
+
+Where the two differ it is a filter or a boundary, not a parse. The 34 classes only we
+list are the ones whose instance size is zero, the variable-length VM classes such as
+`_OneByteString`, `_List` and the typed-data lists: AOTopsy's class listing skips
+those (`internal/analysis/class_layouts.go:112`), and every one of the 10,679 it does
+list is in ours under the same class id and the same name. Of the 88,618 ranges,
+AOTopsy gives an owning class for 79,575 and we give the same owner for every one of
+them. One range differs in size, the last: ours runs to the end of the instructions
+image, 88 bytes of which the final 12 are trap padding after the `ret`, and AOTopsy's
+stops at 52, inside the body.
+
+The cost on a real app this size, each a fresh process: `info` 0.05 s and 60 MB,
+`classes` 0.7 s and 211 MB, `symbols` 1.0 s and 289 MB, one class decompiled 1.3 to
+1.8 s and 321 MB, `functions` 5.7 s and 558 MB, which is the peak of any command, and
+the whole export above, 2,572 libraries and 83,330 methods. A second export wrote the
+same 2,577 files byte for byte.
 
 Seven snapshots were pulled for this section with `tools/appsweep.py`, out of 199 Flutter
-apps a partial probe of F-Droid's largest packages turned up. jadart identifies six of the
-seven and refuses only FluffyChat; AOTopsy identifies all seven. Where both identify a
-build they agree on the era and differ on the label: we name the stable release we
-registered the hash under (3.11.5, 3.5.4, 3.3.4, 2.19.6), AOTopsy names the era (3.11.0,
-3.5.0, 3.3.0, 2.19.0). Neither is wrong, because one format hash covers several patch
-releases.
+apps a partial probe of F-Droid's largest packages turned up. Both tools identify all
+seven. Where both identify a build they agree on the era and differ on the label: we
+name the stable release we registered the hash under (3.11.5, 3.5.4, 3.3.4, 2.19.6),
+AOTopsy names the era (3.11.0, 3.5.0, 3.3.0, 2.19.0). Neither is wrong, because one
+format hash covers several patch releases.
 
-On the six it reads, jadart's acceptance gates pass on every one: Tier A 11 of 11 and
-Tier B 3 of 3 on each, between 120,163 and 364,740 byte-exact checks per app and 1,257,569
-in total, with no failures. These are apps nobody here compiled, across five Dart
-versions.
+On all seven, jadart's acceptance gates pass: Tier B 3 of 3 on each and Tier A 11 of 11
+on the six older ones, 13 of 13 on the 3.13 one, which has two gates of its own (DESIGN
+3); between 120,163 and 551,075 byte-exact checks per app and 1,808,644 in total, with
+no failures. These are apps nobody here compiled, across six Dart versions.
 
 The output comparison also holds away from our own fixture. On `kzs.th000.tsdm_client`
 (Dart 3.11.5, 16 MB, 48,906 functions), the two tools agree on the shape of the image and
@@ -701,8 +722,9 @@ outputs cannot be cross-referenced without knowing to add one.
 
 ### What AOTopsy has that jadart does not
 
-x86_64 decompilation, a claimed span of Dart 2.10 through 3.13 against our 18 epochs
-from 2.19, IDA, Ghidra, Frida, SARIF and DOT export, behavioural keyword classification,
+x86_64 decompilation, a claimed span of Dart 2.10 through 3.13 against our 19 epochs
+from 2.19 to 3.13, IDA, Ghidra, Frida, SARIF and DOT export, behavioural keyword
+classification,
 a function-fingerprint dictionary for unnamed code, and an import path for darter's
 output on older versions. Its name-recovery agreement against each build's own ELF
 `.symtab` is reported as 90.2% over 44 ground-truth builds, which is a measurement
@@ -724,7 +746,9 @@ four more), and `classify_standard_selector` normalises a string it already has 
 looks it up in them. It can therefore label a call whose name is already present as a
 string and cannot name a selector that is not in its tables. It was not built or run
 here, because a Rust toolchain is a 1.5 GB llvm download on this host; what is stated
-above is from its source.
+above is from its source. That source also says it stops before Dart 3.13:
+`crates/flutterdec-loader/src/lib.rs:223` asks for the four pre-3.13 snapshot symbols
+by name and fails with `missing symbol` on a library that exports the merged pair.
 
 ### Blutter, and what it costs to get an answer out of it
 
@@ -737,6 +761,15 @@ the version from; a bare snapshot needs `--dart-version <version>_<os>_<arch>` s
 by hand. Our fixtures ship `libapp.so` alone, which is the common case for an iOS build,
 a split APK, or a snapshot pulled out of an archive, and it is the case Blutter cannot
 start from unaided.
+
+Nor does it reach Dart 3.13, at the checkout read here (4a60ac6).
+`extract_dart_info.py:20`
+takes the version hash from `_kDartVmSnapshotData`, which a 3.13 library does not
+export, and `blutter/src/ElfHelper.cpp:118` to `:139` requires all four pre-3.13
+symbols by the names the SDK's own `dart_api.h` defines, which the 3.13 header no
+longer does. Its design runs the matching Dart VM over the two snapshots, one through
+`Dart_Initialize` and one through `Dart_CreateIsolateGroup`, so a single merged
+snapshot is a change to that design rather than a new table.
 
 ### How to reproduce this section
 
@@ -757,7 +790,10 @@ cd <jadart> && .venv/bin/jadart lift $LIB benchComputeChecksum
 2. Version reach: unflutter hand-codes each format (caps documented at 3.10.7;
    3.11/3.12 only for exact hashes); Blutter recompiles the SDK per version.
    FIX: version-parameterized grammar with auto-generated cid/field skeletons
-   (DESIGN.md section 7).
+   (DESIGN.md section 7). Dart 3.13 was the test of that: it merged the vm and
+   isolate snapshots, nine things in the stream changed, and each became a switch
+   or a generated table, placed by diffing the release's source and settled by the
+   gates on a real app (DESIGN.md section 3). What it left open is in Pending.
 3. Obfuscation: names are gone from the snapshot; no tool recovers them (only
    string xrefs survive to locate a function). Semantic renaming is open (could
    use cross-build diffing or an offline LLM; a research bet).
@@ -784,8 +820,13 @@ cd <jadart> && .venv/bin/jadart lift $LIB benchComputeChecksum
 - A Blutter run, to fill the Blutter rows above. Its setup cost is measured in the
   section above; what is missing is the output.
 - A multi-Dart-version sweep of the other tools, to fill the version-robustness axis.
-  AOTopsy claims 2.10 through 3.13 over 93 sample builds; only its 3.12 behaviour is
-  measured here.
+  AOTopsy claims 2.10 through 3.13 over 93 sample builds; only its 3.12 behaviour, and
+  its counts on one 3.13 app, are measured here.
+- More Dart 3.13 binaries. The epoch is gated on one Android arm64 app. An iOS or
+  arm32 build of 3.13 is refused until one has been through `verify`, an x86_64 one
+  shares the grammar key and has no binary behind it, and the committed fixtures stay
+  3.12.2 until the pinned SDK moves, so CI covers 3.13 with a hand-written snapshot
+  and not a real one.
 - A Ghidra-plus-scripts backend, for the pseudocode column.
 - A real-app comparison. Both tools agree closely on the committed fixtures, which are
   one app we wrote; the apps in `tools/appsweep.py`'s F-Droid set are the ones neither

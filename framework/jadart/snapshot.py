@@ -41,10 +41,17 @@ MERGED_INSTRUCTIONS = "_kDartSnapshotText"
 from .stream import ReadStream
 
 DART_MAGIC = 0xDCDCF5F5
-#: Snapshot::Kind, snapshot.h. 0..3 are identical in every release jadart parses. Index 4
-#: is not (kModule was inserted there in 3.12), so anything past kFullAOT reports its
-#: number rather than a name no release binary would reach anyway.
+#: Snapshot::Kind, snapshot.h, through Dart 3.12. 0..3 are identical in every one of
+#: those releases. Index 4 is not (kModule was inserted there in 3.12), so anything past
+#: kFullAOT reports its number rather than a name no release binary would reach anyway.
 KIND = {0: "kFull", 1: "kFullCore", 2: "kFullJIT", 3: "kFullAOT"}
+#: The same enum from 3.13, which dropped kFullCore with the vm snapshot it described:
+#: every later kind is one lower, so a release AOT snapshot is kind 2, the number that
+#: meant kFullJIT before.
+KIND_MERGED = {0: "kFull", 1: "kFullJIT", 2: "kFullAOT", 3: "kModule"}
+#: The one kind a merged-snapshot release is read as. kModule is 3 there and in range of
+#: the check below, which was written for the older enum, so it is refused by name.
+_AOT_MERGED = 2
 _MAX_KIND = max(KIND)
 
 
@@ -70,7 +77,17 @@ class SnapshotHeader:
 
     @property
     def kind_name(self) -> str:
-        return KIND.get(self.kind, f"?{self.kind}")
+        """The kind by name, or `?N` where the number does not settle one.
+
+        Which enum numbers the kind depends on the release, so a header whose epoch is
+        unknown (`info --lenient`) names it only where both enums agree. Naming it from
+        the older one called the 3.13 AOT snapshot of a real app kFullJIT."""
+        if self.epoch is None:
+            name = KIND.get(self.kind)
+            agreed = name is not None and name == KIND_MERGED.get(self.kind)
+            return name if agreed else f"?{self.kind}"
+        names = KIND_MERGED if self.epoch.merged else KIND
+        return names.get(self.kind, f"?{self.kind}")
 
 
 #: magic(4) + length(8) + kind(8) + the 32-char version hash. Anything shorter is not a
@@ -213,6 +230,9 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
             f"  To place this build:  python3 tools/sdk_source.py --identify "
             f"{version_hash} --tags <candidate SDK tags>")
 
+    if epoch is not None and epoch.merged:
+        _check_merged_header(which, kind, num_base_objects, epoch)
+
     first_cid = None
     if num_clusters > 0 and epoch is not None:
         tag = st.read_uint32_tag()
@@ -225,6 +245,31 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
         instr_table_len=instr_table_len,
         instr_table_rodata_offset=instr_table_rodata_offset,
         first_cluster_cid=first_cid, epoch=epoch, arch=arch)
+
+
+def _check_merged_header(which: str, kind: int, base_objects: int, epoch) -> None:
+    """Refuse a Dart 3.13 header the VM would not load as an app's AOT snapshot.
+
+    Both checks are on the header alone, so `info` refuses as well, lenient or not: the
+    release is known, and so is what it requires. The kind range check above cannot do
+    the first, since it was written for the older enum, in which 3 is kFullAOT; in this
+    one 3 is kModule, a module snapshot whose grammar jadart does not read. Through 3.12
+    kModule is 4 and that check refuses it."""
+    if kind != _AOT_MERGED:
+        raise InputError(
+            f"{which}: header declares snapshot kind {kind} "
+            f"({KIND_MERGED.get(kind, 'unnamed')}), and a Dart {epoch.dart} app's AOT "
+            f"snapshot is kind {_AOT_MERGED} ({KIND_MERGED[_AOT_MERGED]}). jadart reads "
+            f"only that kind, so it will not read this one with that grammar.")
+    # Deserializer::Deserialize FATALs when the count differs from what AddBaseObjects
+    # provided (app_snapshot.cc:9983 at 3.13.0). Read on, every ref would be off by the
+    # difference and every name would belong to a neighbour.
+    if base_objects != epoch.base_objects:
+        raise InputError(
+            f"{which}: header declares {base_objects} base objects, and a Dart "
+            f"{epoch.dart} program snapshot has exactly {epoch.base_objects} (null, "
+            f"false, true and four sentinels). The VM refuses any other count, and "
+            f"every ref would be off by the difference.")
 
 
 def walk_isolate(path, *, full: bool = False) -> dict:
@@ -260,8 +305,24 @@ def walk_isolate(path, *, full: bool = False) -> dict:
         from .fillwalk import walk_fill
         strings = sorted(set(walk_fill(st, clusters, hdr.epoch, arch=hdr.arch)
                              .strings.values()))
-    else:
+    elif not hdr.epoch.merged or (clusters and clusters[0].name == "StringCid"):
+        # Through 3.12 the canonical String cluster is always first, and a snapshot
+        # where it is not gets the empty answer it always got.
         strings = recover_canonical_strings(st, clusters, hdr.epoch, hdr.arch)
+    else:
+        # From 3.13 the canonical String cluster is not first, so its text is not at
+        # the start of the fill and reaching it means reading what is in front: the
+        # serializer puts the roots' own small clusters ahead of everything
+        # (CreateEarlyClusters), nine of them on a real app. Returning nothing here,
+        # as the branch above does, would answer a supported build with an empty pool.
+        from .fillwalk import walk_fill
+        canon = next((cl for cl in clusters
+                      if cl.name == "StringCid" and cl.canonical), None)
+        strings = []
+        if canon is not None:
+            read = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch).strings
+            strings = [read[r] for r in range(canon.start_ref, canon.stop_ref)
+                       if r in read]
     hist = Counter()
     for cl in clusters:
         hist[cl.name] += cl.count      # objects per cid, summed across clusters

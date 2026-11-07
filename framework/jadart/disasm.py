@@ -150,7 +150,8 @@ class UnsupportedArch(JadartError):
 #: in snapshot.py because `info` reads it and must not import capstone to do so.
 from .snapshot import ISOLATE_INSTRUCTIONS  # noqa: E402,F401
 
-#: Instructions::kPolymorphicEntryOffsetAOT (object.h), identical in 2.19.6 and 3.12.2: how
+#: Instructions::kPolymorphicEntryOffsetAOT (object.h), identical in 2.19.6, 3.12.2 and
+#: 3.13.0: how
 #: far into the payload a Code object with a monomorphic entry has its normal entry point.
 #: Such a payload opens on the switchable-call miss handler, then the monomorphic entry,
 #: then the entry every static and dispatch-table call targets. ia32 has none in AOT, and
@@ -666,13 +667,57 @@ def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
     # Fixed ASCII out of a generated table, not a string out of the binary, so `raw` makes
     # no difference to these and they need no escaping. A symbol table that does name a
     # stub wins, because it is the same name written by the same compiler.
-    for pc, nm in stub_names(image, fr, getattr(image, "epoch", None)).items():
-        pc_to_name.setdefault(pc, nm)
+    # Through 3.12, that is. On 3.13 the two are compared instead (merged_stub_names).
+    epoch = getattr(image, "epoch", None)
+    roots = stub_names(image, fr, epoch)
+    if getattr(epoch, "merged", False):
+        pc_to_name.update(merged_stub_names(image.symbol_names or {}, roots))
+    else:
+        for pc, nm in roots.items():
+            pc_to_name.setdefault(pc, nm)
     for owner_ref, cr in image.code_ranges.items():
         nm = fname.get(owner_ref)
         if nm:
             pc_to_name[cr.pc_offset] = nm      # snapshot name wins over ELF backfill
     return pc_to_name
+
+
+#: How a Dart 3.13 symbol table names a stub: `stub <Name>`, with ` (#N)` appended
+#: when the namer has seen the name before (ImageWriter::SnapshotTextObjectNamer,
+#: image_snapshot.cc:1269 and EnsureUniqueName at 3.13.0). Through 3.12 the same namer
+#: wrote `stub _iso_stub_<Name>Stub` for the stubs a program's code calls, because
+#: StubCode::ForEachStub supplied that spelling for the object-store ones
+#: (stub_code.cc:355 at 3.12.2). 3.13 moved every stub into Roots and that branch went
+#: with it, so the namer gets the bare list name.
+_SYMBOL_STUB = re.compile(r"stub ([A-Za-z0-9_]+)(?: \(#\d+\))?")
+
+
+def merged_stub_names(symbols: dict, roots: dict) -> dict:
+    """pc_offset -> `_iso_stub_<Name>Stub` on a Dart 3.13 build, from the symbol table
+    and the roots together.
+
+    A symbol `stub X` is the compiler's own statement that the code there is stub X, so
+    it is spelled the way the lifter's stub rules read it, which they could not do with
+    the bare name: a stub that throws would print as an ordinary call again (#234).
+    The roots name the same stubs from the stub list a layout was generated from, and
+    the two have to agree: every pc the roots name and the symbol table names at all
+    must be that stub there, and every stub the symbol table names must be one the
+    roots name. One disagreement means the layout does not describe this binary, and
+    then the symbol table's names stand alone, since the compiler wrote them for it.
+    A build with no symbol table (every release build seen so far) gets the roots'.
+    Read from the source: no 3.13 binary with a symbol table has been through this."""
+    said = {}
+    for pc, nm in symbols.items():
+        m = _SYMBOL_STUB.fullmatch(nm)
+        if m:
+            said[pc] = f"_iso_stub_{m.group(1)}Stub"
+    if not roots:
+        return said
+    if any(pc in symbols and said.get(pc) != nm for pc, nm in roots.items()):
+        return said
+    if any(pc not in roots for pc in said):
+        return said
+    return dict(roots)
 
 
 def _imm_from(op: str, reg: str):

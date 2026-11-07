@@ -24,6 +24,79 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   is a string the VM snapshot holds, a base object the isolate snapshot refers to and
   never writes (`r`, `g`, `b`, `end`, `state`), while the accessor's `get:g` is written
   into the isolate snapshot.
+- **Dart 3.13, the current Flutter stable, is a registered epoch.** Hash
+  `0451907c2eaa8467e848c0067bfe8ed4` is the 3.13.0 tag (`tools/sdk_source.py
+  --identify`), which makes nineteen epochs over fifteen grammar families. It is the
+  release that merged the vm and isolate snapshots into one (DESIGN 3), and nine
+  things in the stream changed with that. Each is its own switch on the Epoch or a
+  generated table, taken from the 3.13.0 source:
+
+  - `Snapshot::Kind` lost kFullCore, so an AOT snapshot is kind 2. `info` names the
+    kind from the epoch's own enum.
+  - The base objects are seven fixed roots, not the vm snapshot's object table.
+  - The roots' own objects are written first, so nine small clusters sit ahead of the
+    canonical String cluster, and there are two ObjectPools: the empty one, then the
+    one the code indexes.
+  - Class alloc is a single count, a Closure carries a length in both passes, and the
+    Code fill opens with two stub refs.
+  - LocalVarDescriptors, ContextScope, ApiError, LanguageError, UnhandledException
+    and UnwindError reach an AOT snapshot for the first time.
+  - The roots open with 1,518 refs ahead of the ObjectStore: the Roots struct and
+    the class table. The runtime stubs are 173 handles in that struct now, named by
+    `VM_STUB_CODE_LIST`, so `tools/gen_objstore.py` reads roots.h and the lists it
+    names, and `--check` re-derives the 3.13 layout with the other eighteen.
+  - `LinkedHashBase` has a cid, 96, which moves every cid from there up by one
+    (`ERA_3_13`, from `tools/gen_cids.py`).
+
+  `verify` decided when it was right. On FluffyChat's F-Droid build (26.1 MB, the only
+  3.13 binary there was) Tier A is 13 of 13 and Tier B 3 of 3 over 551,075 checks,
+  the stream ending on the exact byte. The G3 gate lost what it compared, since the
+  alloc pass no longer lists the predefined cids, and has a replacement: the 161
+  class-table roots are read in cid order, each Class states its own id in the fill
+  pass, and they sit behind 1,357 other roots, so a root run off by one ref fails all
+  161. Two Tier-A gates are new and run only on 3.13. G16 binds the generated stub
+  table to the binary: the Code fill names the LazyCompile and UnknownDartCode stubs by
+  ref, and the roots must hold those refs where the stub list puts those names, so a
+  table with a stub inserted or lost ahead of either fails, and then no stub is named.
+  G17 compares the 456 lengths a Closure, ContextScope or LocalVarDescriptors states in
+  each pass. G13 compares the header's base objects with the seven the release fixes.
+
+  Against AOTopsy on the same file: 88,618 code ranges at the same 88,618 addresses,
+  and the same owning class on every one of the 79,575 it gives an owner for. It lists
+  10,679 classes to our 10,713; the 34 are the zero-size VM classes its listing skips,
+  and all 10,679 are in ours under the same id and name. All 173 stubs are named, a
+  stub named as a throw has no `ret` in its body, and a whole `export` is 2,572
+  libraries, 83,330 methods and 1,102,633 lines in 125 s at a 403 MB peak, the same
+  bytes on a second run. `functions` is the peak of any command, 558 MB.
+
+  What it does not claim. 64-bit compressed pointers only, the target of that one
+  binary: an iOS or arm32 3.13 build is refused by name, and an x86_64 one shares the
+  grammar key with nothing behind it. A header the VM would not load as an app's AOT
+  snapshot is refused before anything is read: any kind but kFullAOT, kModule included,
+  and any base-object count but seven. Three shapes no binary has shown are refused
+  rather than read on the source's word: a ContextScope or LocalVarDescriptors with
+  anything in it, and a second ObjectPool with entries. Two stubs swapped between
+  G16's anchors would pass every gate; their order is the source's, which
+  `tools/gen_objstore.py --check` re-derives. On a build that keeps a symbol table, a
+  stub's `stub X` symbol is spelled `_iso_stub_XStub` for the lifter and has to agree
+  with the roots or the roots' names are dropped; no such 3.13 build has been seen. No
+  3.13 fixture can be built with the 3.12.2 SDK this repository pins, so CI reads a
+  hand-written 3.13 snapshot and the real-app test skips there.
+
+  No output byte changes on an older release: 15 command outputs and the export tree
+  of both fixtures, and 7 command outputs on each of six real apps from 2.19.6 to
+  3.11.5, compare equal to main's. Closes #254.
+- **A field whose `Field` object was tree-shaken is named by the accessor that reached
+  it.** 9,770 of the clean fixture's 9,943 receiver field accesses sit at an offset the
+  field map has no entry for, which is #240's population 1: the slot is there, its class
+  is known, and the name was dropped. It was not dropped everywhere. 969 `get:` and 208
+  `set:` Function objects survive on that build, so for some of those slots the name is
+  still in the snapshot under another key, and `fields.recover_accessors` reads it. jadx
+  does the same for the same runtime-with-metadata reason: its `kotlin-metadata.getters`
+  flag, "rename simple getters to field names", is on by default. The native decompilers
+  have no such channel, which is an asymmetry rather than an oversight, C having no
+  accessor convention: IDA offers `get_member_name(struct_id, offset)`, a lookup BY
+  offset, and Ghidra has the analyst rename the member.
 
   Two checks against second encodings, and one contradiction of either refuses the whole
   channel, the rule `recover_fields` applies to itself. Where the Field does name itself
@@ -94,6 +167,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **`info --lenient` names a snapshot kind only where the number settles it.** The
+  kind enum is numbered differently from Dart 3.13, so on a hash no epoch holds the
+  number alone does not say which kind it is: 0 is `kFull` either way and 1 to 3 now
+  print as `?1` to `?3`, where they printed the pre-3.13 name. That name was wrong on
+  the first real 3.13 app, a release AOT snapshot reported as `kFullJIT`. A registered
+  epoch is unaffected.
+- **The quick path of `snapshot.walk_isolate` reads the canonical strings wherever
+  their cluster is.** It returned an empty list whenever the first cluster was not
+  String, which is every 3.13 snapshot. Through 3.12 a canonical String cluster is
+  always first, so nothing changes there.
 - **EVAL.md re-measures the field, because the tool it was scored against no longer
   exists.** `zboralski/unflutter`, the backend every row of the Phase 0 comparison used,
   has been removed by its author; the maintained successor is `BroNils/aotopsy`, a fork

@@ -29,7 +29,8 @@ from .errors import JadartError
 
 from dataclasses import dataclass, field
 
-from .cidtables import ERA_2_19, ERA_3_0, ERA_3_1, ERA_3_4, ERA_3_6, ERA_3_9, CidTable
+from .cidtables import (ERA_2_19, ERA_3_0, ERA_3_1, ERA_3_4, ERA_3_6, ERA_3_9, ERA_3_13,
+                        CidTable)
 from .objstore import LAYOUTS, RootLayout
 
 
@@ -223,6 +224,34 @@ class Epoch:
     # Library declares fifteen pointers and serializes ten. So the base table holds the
     # 3.2+ shape and an older epoch states its differences here.
     fill_overrides: dict = field(default_factory=dict)
+    # Clusters whose objects carry a length and a run of refs that length sizes, as
+    # fillwalk._fill_sized reads them. Empty before 3.13, the first release whose AOT
+    # snapshots hold a sized Closure, a ContextScope or a LocalVarDescriptors (see
+    # _FILL_SIZED below).
+    fill_sized: dict = field(default_factory=dict)
+    # Four switches for what Dart 3.13 changed when it folded the vm snapshot into
+    # the program's (DESIGN 3), separate because each is a separate read:
+    #
+    # merged          one snapshot per library and no vm one. The header's
+    #                 Snapshot::Kind is numbered without kFullCore (snapshot.h), the
+    #                 base objects are `base_objects` fixed roots rather than the vm
+    #                 snapshot's object table, and the roots open with the Roots struct
+    #                 and the class table before the ObjectStore.
+    # class_alloc_predefined
+    #                 ClassDeserializationCluster::ReadAlloc reads a predefined count,
+    #                 that many cids and then the new-class count. From 3.13 the
+    #                 predefined classes are written like any other and it is
+    #                 ReadAllocFixedSize, one count.
+    # closure_sized   a Closure is variable length: ReadAlloc reads a length per
+    #                 object and ReadFill reads it again before the refs it sizes.
+    # code_stub_refs  CodeDeserializationCluster::ReadFill opens with two ref ids,
+    #                 the LazyCompile and UnknownDartCode stubs, which used to come
+    #                 from the vm isolate.
+    merged: bool = False
+    base_objects: int | None = None
+    class_alloc_predefined: bool = True
+    closure_sized: bool = False
+    code_stub_refs: bool = False
     # (word_size, compressed) combinations this epoch's cluster grammar covers.
     # Declaring it lets an unsupported target be rejected instead of mis-parsed.
     grammars: frozenset = frozenset({(8, True)})
@@ -312,6 +341,13 @@ _IDENTIFIED = {
                                          ERA_3_1, 113, 169, 0),
     "501ef5cbd64ca70b6b42672346af6a8a": ("cidcanonical-2.19", "2.19.0-444.2.beta",
                                          ERA_2_19, 113, 169, 0),
+    # 3.13 writes one snapshot per library, with LinkedHashBase at cid 96 pushing the
+    # typed-data range up by one. Its tag word is 3.12's: the header bitfields in
+    # raw_object.h, CardRememberedBit through ClassIdTag, are identical at 3.12.2 and
+    # 3.13.0. What it reads differently is in the Epoch switches (`merged` and the
+    # three beside it) and _FILL_SIZED.
+    "0451907c2eaa8467e848c0067bfe8ed4": ("objectheader-3.13", "3.13.0", ERA_3_13,
+                                         113, 169, 7),
 }
 
 #: Carried by a real app in the sweep and still not placed. Bracketed rather than guessed:
@@ -376,6 +412,63 @@ _FILL_OVERRIDES = {
         "TypeRefCid": (2, [], -1, -1),
     },
 }
+#: The scalar and ref shapes 3.13 reads that no earlier AOT snapshot holds. Through 3.12
+#: these objects lived in the vm snapshot, which jadart never walks; 3.13 writes them into
+#: the one snapshot as the targets of its Roots handles (roots.h, HANDLE_ROOTS_LIST), so a
+#: real app carries a cluster of each. Read from app_snapshot.cc and raw_object.h at
+#: 3.13.0: ApiError and UnwindError are `message`, the second with its
+#: is_user_initiated bool; LanguageError is previous_error through formatted_message, a
+#: token position, a bool and an int8; UnhandledException is exception and stacktrace.
+#: Kept off the base table so an older epoch still refuses one of these rather than
+#: read it with a layout nobody checked there.
+_FILL_OVERRIDES["objectheader-3.13"] = {
+    "ApiErrorCid": (1, [], -1, -1),
+    "UnwindErrorCid": (1, [_B], -1, -1),
+    "LanguageErrorCid": (4, [_T, _B, _B], -1, -1),
+    "UnhandledExceptionCid": (2, [], -1, -1),
+}
+
+#: Clusters whose objects open with a length that sizes a run of refs, keyed on the
+#: family: name -> (scalars after the length, fixed refs, refs per element). All three
+#: are ReadFromTo(obj, length) in app_snapshot.cc at 3.13.0.
+#:
+#: Closure is length_and_flags, hash and function, then `length` data slots
+#: (raw_object.h, COMPRESSED_VARIABLE_POINTER_FIELDS after `function`). The one real
+#: app holds 454 of them, 434 of length 1 and 20 of length 2, which is enough to pin
+#: both numbers: no other fixed and per-element count reads the same total. Any other
+#: length is that line extended, on the source's word.
+#:
+#: ContextScope and LocalVarDescriptors have None for the per-element count, which
+#: means only an EMPTY one is read. Both are debugging data the precompiler drops, so
+#: a product AOT snapshot holds exactly the empty singleton of each, there as a Roots
+#: handle, and that is all any binary here has shown: the length, and for ContextScope
+#: the is_implicit bool behind it. The source says what a longer one would hold (ten
+#: pointers per ContextScope variable; a name per LocalVarDescriptors entry and then
+#: five scalars each), but nothing has checked a byte of that, so one with a length
+#: is refused rather than read on the source's word.
+_FILL_SIZED = {
+    "objectheader-3.13": {
+        "ClosureCid": ([], 3, 1),
+        "ContextScopeCid": ([_B], 0, None),
+        "LocalVarDescriptorsCid": ([], 0, None),
+    },
+}
+#: One snapshot per library, from 3.13 (DESIGN 3). The class alloc, the Closure length
+#: and the Code cluster's two stub refs all arrived with it and are switched separately
+#: on the Epoch, so a later release that moves one of them moves one line here.
+_MERGED = frozenset({"objectheader-3.13"})
+#: ProgramDeserializationRoots::AddBaseObjects at 3.13.0: null, false, true and the four
+#: sentinels.
+_MERGED_BASE_OBJECTS = 7
+#: The targets a family's grammar has passed the gates on, where that is not all three.
+#: 3.13 is here because the one 3.13 binary there is to check against is arm64 android:
+#: nothing has read an uncompressed (iOS, arm32) 3.13 snapshot, and claiming those on
+#: the strength of this one would be the guess the gates exist to prevent. The key is
+#: (word size, compressed), so it lets an x64 android 3.13 build in as well, as it does
+#: for every other epoch, with no 3.13 binary of that architecture behind it.
+_GRAMMARS = {"objectheader-3.13": frozenset({(8, True)})}
+#: Every target any epoch's grammar covers.
+_ALL_GRAMMARS = frozenset({(8, True), (8, False), (4, False)})
 #: SnapshotBehavior entered the ObjectPool entry byte in 3.3, and before that the entry's
 #: tagged flag came first.
 _PRE_BEHAVIOUR = frozenset({"cidcanonical-2.19", "cidcanonical-3.0", "cidcanonical-3.1",
@@ -399,15 +492,24 @@ for _h, (_name, _dart, _table, _td0, _tdv, _imm) in _IDENTIFIED.items():
         num_predefined_cids=_table.num_predefined,
         objpool_has_behavior=(_name not in _PRE_BEHAVIOUR),
         fill_overrides=_FILL_OVERRIDES.get(_name, {}),
+        fill_sized=_FILL_SIZED.get(_name, {}),
+        merged=(_name in _MERGED),
+        base_objects=(_MERGED_BASE_OBJECTS if _name in _MERGED else None),
+        class_alloc_predefined=(_name not in _MERGED),
+        closure_sized=(_name in _MERGED),
+        code_stub_refs=(_name in _MERGED),
         objpool_tagged_first=(_name in _TAGGED_FIRST),
         record_has_field_names=(_name == "cidcanonical-2.19"),
         type_class_id_shift=(4 if _name in _WIDE_NULLABILITY else 3),
         td_int8_cid=_td0, td_byte_data_view_cid=_tdv, td_stride=4,
         roots=LAYOUTS.get(_dart),
-        grammars=(frozenset() if _name in _UNVALIDATED
-                  else frozenset({(8, True), (8, False), (4, False)})),
+        grammars=(frozenset() if _name in _UNVALIDATED else
+                  _GRAMMARS.get(_name, _ALL_GRAMMARS)),
         notes=(f"Dart {_dart}: identified, but the cluster grammar has not passed the "
                f"acceptance gates on a real binary yet" if _name in _UNVALIDATED else
+               f"Dart {_dart}: one snapshot per library. The reads that differ from "
+               f"3.12.2 are taken from the {_dart} source, then gated on a real binary"
+               if _name in _MERGED else
                f"Dart {_dart}: AOT cluster grammar verified identical to 3.12.2 by source "
                f"diff, then gated on a real binary"),
     )
@@ -437,6 +539,19 @@ def resolve(version_hash: str, features: str) -> Profile | None:
             f"cluster grammar, so there is nothing to parse it with. Deriving one means "
             f"working out this release's per-cluster ReadAlloc deltas and confirming them "
             f"with `--verify` on a binary built by that SDK.")
+    if arch.grammar_key not in epoch.grammars and arch.grammar_key in _ALL_GRAMMARS:
+        # A grammar jadart has, held back for this release: nothing built by it for
+        # this target has been through the gates yet (_GRAMMARS). Blaming the pointer
+        # model, as the message below does, would say the reading is missing when what
+        # is missing is the evidence.
+        gated = ", ".join(f"{w * 8}-bit {'compressed' if c else 'uncompressed'}"
+                          for w, c in sorted(epoch.grammars))
+        raise UnsupportedTarget(
+            f"epoch {epoch.name} (dart {epoch.dart}) is supported for {gated} pointers "
+            f"only, and this is {arch}. No {arch} build of Dart {epoch.dart} has passed "
+            f"the acceptance gates, so jadart will not claim to read one. Adding it "
+            f"means listing the target in versions._GRAMMARS and seeing `jadart verify` "
+            f"pass on a real one.")
     if arch.grammar_key not in epoch.grammars:
         supported = ", ".join(f"{w * 8}-bit {'compressed' if c else 'uncompressed'}"
                               for w, c in sorted(epoch.grammars))

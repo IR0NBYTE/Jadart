@@ -147,6 +147,16 @@ class FillResult:
     # target_offset_ is in, so the two index each other directly.
     class_unboxed: dict = field(default_factory=dict)     # class_id -> unboxed-fields bitmap
     class_state: dict = field(default_factory=dict)       # class_id -> Class::state_bits
+    #: From 3.13, per Code cluster: the LazyCompile and UnknownDartCode stubs by ref, as
+    #: the fill reads them ahead of the cluster's objects. The roots hold the same two
+    #: refs at the positions the release's stub list gives those names, which is what
+    #: ties the generated stub table to this binary (objstore.stub_anchors).
+    code_stub_refs: list = field(default_factory=list)
+    #: From 3.13, cluster index -> the lengths the FILL pass read for a sized cluster
+    #: (Closure, ContextScope, LocalVarDescriptors), in order. The alloc pass read the
+    #: same lengths into Cluster.lengths, and nothing else ties the two: the fill reads
+    #: its own and stays in step whatever the alloc said, so G17 compares them.
+    sized_lengths: dict = field(default_factory=dict)
     _names: object = field(default=None, repr=False, compare=False)
 
     @property
@@ -224,7 +234,10 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     class_library: dict = {}
     libraries: list = []
     meta = {"field": {}, "patch": {}, "fdata": {}}
+    code_stub_refs: list = []
+    sized_lengths: dict = {}
     instr_index = [0]      # running instructions-table index across Code clusters
+    pools_with_entries = 0
     rodata_text = _ROText()  # RO data offset -> its String, decoded once per fill (#91)
     boundary = epoch.num_predefined_cids or epoch.cid_table.num_predefined
     # The base table is the 3.2+ shape; an older epoch supplies only what it differs by.
@@ -257,10 +270,24 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
             for _ in range(n):
                 st.read_int()          # Read<double> = Read64 varint
         elif name == "CodeCid":
-            _fill_code(st, cl, codes, instr_index, code_payload_info)
+            pair = _fill_code(st, cl, codes, instr_index, code_payload_info,
+                              epoch.code_stub_refs)
+            if pair is not None:
+                code_stub_refs.append(pair)
         elif name == "ObjectPoolCid":
-            _fill_object_pool(st, cl, pool, epoch.objpool_has_behavior,
-                              epoch.objpool_tagged_first)
+            pools_with_entries += _fill_object_pool(
+                st, cl, pool, epoch.objpool_has_behavior, epoch.objpool_tagged_first)
+            if epoch.merged and pools_with_entries > 1:
+                # `pool` is read as THE pool, the one PP points at, and every
+                # `pool_0x...` is an index into it. 3.13 also writes the empty pool
+                # the vm snapshot used to hold, ahead of it and with no entries (0 and
+                # 81,174 on a real app). Entries in a second one would shift every
+                # index after them, and nothing here says which pool is the global one.
+                raise FillError(
+                    f"cluster #{cl.index} brings the ObjectPools with entries to "
+                    f"{pools_with_entries}. A Dart {epoch.dart} program snapshot "
+                    f"holds the global pool and the empty one, so jadart will not "
+                    f"guess which of these the code indexes.")
         elif name in ("ArrayCid", "ImmutableArrayCid"):
             for i in range(n):
                 ln = st.read_unsigned()
@@ -306,6 +333,10 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                     count = shape & 0xFFFF
                 for _ in range(count):
                     st.read_ref_id()
+        elif name in epoch.fill_sized:
+            # Ahead of _INLINE_BYTES and _refs on purpose: LocalVarDescriptors and
+            # Closure are in those tables with the shape an older release gives them.
+            sized_lengths[cl.index] = _fill_sized(st, cl, epoch.fill_sized[name])
         elif name in _INLINE_BYTES:
             for _ in range(n):
                 ln = st.read_unsigned()
@@ -341,7 +372,8 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       classes=classes, types=types, codes=codes, pool=pool, end_pos=st.pos,
                       code_first_ref=code_first, func_code_index=func_code_index,
                       class_sizes=class_sizes, class_unboxed=class_unboxed,
-                      class_state=class_state,
+                      class_state=class_state, code_stub_refs=code_stub_refs,
+                      sized_lengths=sized_lengths,
                       string_lengths=string_lengths,
                       class_library=class_library,
                       library_urls={r: (strings.get(u) or strings.get(n) or '')
@@ -566,8 +598,42 @@ def _fill_instance(st, cl, arch=None):
                 st.read_ref_id()
 
 
-def _fill_code(st, cl, codes, instr_index, payload_info=None):
+def _fill_sized(st, cl, spec):
+    """A cluster whose objects each state a length that sizes a run of their refs.
+
+    `spec` is (scalars after the length, fixed refs, refs per element), from
+    versions._FILL_SIZED; None for the last means only an empty object has a checked
+    grammar. The length comes from the file and drives the loop, which cannot outrun
+    it: every ref read takes at least one byte off the stream, and that raises
+    TruncatedSnapshot at its end. Returns the lengths read, for G17."""
+    head, fixed, per = spec
+    lengths = []
+    for _ in range(cl.count):
+        length = st.read_unsigned()
+        lengths.append(length)
+        if per is None and length:
+            raise FillError(
+                f"cluster #{cl.index} holds a {cl.name[:-3]} of length {length} at "
+                f"0x{st.pos:x}. The only one a product AOT snapshot has shown is the "
+                f"empty one, so there is no checked grammar for its elements and "
+                f"jadart will not read them on the source's word.")
+        for op in head:
+            _scalar(st, op)
+        for _ in range(fixed + (per or 0) * length):
+            st.read_ref_id()
+    return lengths
+
+
+def _fill_code(st, cl, codes, instr_index, payload_info=None, stub_refs=False):
+    """Read one Code cluster's fill. Returns the two stub refs a 3.13 one opens with,
+    or None for an older release, which writes none."""
     disc = cl.discarded or [False] * cl.count
+    pair = None
+    if stub_refs:
+        # 3.13: the LazyCompile and UnknownDartCode stubs by ref, once per cluster and
+        # ahead of its objects (CodeDeserializationCluster::ReadFill). Through 3.12 the
+        # deserializer took both from the vm isolate and nothing was written here.
+        pair = (st.read_ref_id(), st.read_ref_id())
     for i in range(cl.count):
         cluster_index = -1
         if i < cl.main_count:
@@ -588,11 +654,16 @@ def _fill_code(st, cl, codes, instr_index, payload_info=None):
                 owner_ref = r
         if cluster_index >= 0:
             codes.append((cl.start_ref + i, owner_ref, cluster_index))
+    return pair
 
 
 def _fill_object_pool(st, cl, pool, has_behavior: bool = True, tagged_first: bool = False):
+    """Append every entry of this cluster's pools to `pool`; returns how many of the
+    pools had any."""
+    nonempty = 0
     for _ in range(cl.count):
         length = st.read_unsigned()
+        nonempty += bool(length)
         for _ in range(length):
             bits = st.byte()
             if not has_behavior:
@@ -632,3 +703,4 @@ def _fill_object_pool(st, cl, pool, has_behavior: bool = True, tagged_first: boo
                 pool.append(("empty", 0))
             else:
                 raise FillError(f"objpool bad behavior {behavior} bits 0x{bits:02x}")
+    return nonempty

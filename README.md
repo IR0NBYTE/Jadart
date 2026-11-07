@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 442](https://img.shields.io/badge/tests-442-brightgreen.svg)](#tests)
+[![tests: 449](https://img.shields.io/badge/tests-449-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -225,10 +225,14 @@ classes, and an offset claimed by two different names is dropped.
 | iOS / macOS arm64 | Mach-O 64 | uncompressed | supported, every applicable Tier-A gate |
 | Android arm32 (`armeabi-v7a`) | ELF32 | uncompressed | Tiers 1 and 2 decode; Tier 3 refuses |
 
-**Eighteen registered format epochs**, Dart 2.19 through 3.12.2, across fourteen grammar
+**Nineteen registered format epochs**, Dart 2.19 through 3.13.0, across fifteen grammar
 families. Two are beta builds, because Flutter's beta channel pins a Dart release of its
 own and an app published from it carries that hash forever. An unregistered release fails
 loud with the hash and the command that would identify it.
+
+Dart 3.13 is the newest, and it is registered for 64-bit compressed pointers only. That
+is the target of the one 3.13 binary there was to gate it on, an Android arm64 app; a
+3.13 build for iOS or arm32 is refused by name until one has been through `verify`.
 
 Detail and reasoning: [docs/support.md](docs/support.md).
 
@@ -324,7 +328,7 @@ the map 823 of them, the accessors 49 more and the allocation stubs 706 more. On
 disagreement refuses a whole channel, and on that fixture the implicit accessors agree
 with the `Field` objects that name themselves 145 times out of 145.
 
-**Eighteen supported epochs today**, 2.19 through 3.12.2. This paragraph used to say
+**Nineteen supported epochs today**, 2.19 through 3.13.0. This paragraph used to say
 "one, and three more identified and refused"; that was true when it was written and stopped
 being true without being updated, which is the failure mode a README has and a test does
 not. Nothing is currently identified-but-refused (`versions._UNVALIDATED` is empty). One
@@ -421,7 +425,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 442 tests
+cd framework && python3 -m pytest tests -q     # 449 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -429,7 +433,7 @@ cd framework && python3 -m pytest tests -q     # 442 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 411 of the 442 to run and the other 31 to
+clone with capstone installed, expect about 417 of the 449 to run and the other 32 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs
