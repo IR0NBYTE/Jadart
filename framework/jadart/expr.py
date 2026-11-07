@@ -2940,6 +2940,11 @@ class Lifter:
         #: were printed, and a value holding one of those still has to go stale with the
         #: memory it reads.
         self._alloc_bases: set = set()
+        #: Every recovered name `_field` has printed at each byte offset in this walk,
+        #: off any base. `_covers` asks it, because a store and a live read of one slot
+        #: can be spelled one by name and one by offset, and the may-alias rule compares
+        #: spellings.
+        self._named_at: dict = {}
         # Block addresses a goto refers to; the renderer defines each exactly once.
         self.labels: set = set()
         self._labelled: set = set()
@@ -4508,10 +4513,15 @@ class Lifter:
             # live, and those are one address whenever the argument is the receiver. 700
             # store sites in 286 of the 8,194 functions in the 3.12.2 clean build, against
             # 1,146 for the exact case, and covering them cost 356 more lines, 0.2%.
-            # Every covered spelling's selector too, for the same reason as `pat`.
+            # Every covered spelling's selector too, for the same reason as `pat`, and
+            # `_covers` gives both kinds of spelling a slot has, its name and its offset.
+            # Not off THR or PP: the same offset is the same slot only where the two bases
+            # may be one object, and the thread and the object pool are not Dart objects
+            # at all, so no store through a base the lifter tracks can write them.
             sels = [sel.group(0)] + [m.group(0) for m in
                                      (_FIELD_LHS.search(x) for x in also) if m]
-            alias = re.compile("(?:" + "|".join(re.escape(x) for x in sels)
+            alias = re.compile(r"(?<!\bTHR)(?<!\bPP)(?:"
+                               + "|".join(re.escape(x) for x in sels)
                                + r")(?![0-9a-fA-F])")
         elif "[" in loc:
             # An element store off a base whose index is not a literal reaches any element
@@ -4615,6 +4625,17 @@ class Lifter:
             # Not below the object: `byte_off` carries the tag bias, so 8 is the first
             # offset with a whole word under it.
             out.append(self._field(base_v, byte_off - 8, 16).text)
+        # And the slot under its OTHER kind of spelling. A name and a byte offset are two
+        # texts for one slot, and which one a read prints depends on what was known about
+        # its base, not on where it reads: `this.balance` and `x2.field_0x8` are the same
+        # address whenever x2 is the receiver, and a store through either left a live
+        # read through the other standing. So every one-word slot the write lands on is
+        # spelled both ways, by offset and by every name this walk has printed there.
+        base = _wrap(base_v, P_POST)
+        if byte_off:
+            out += [f"{base}.field{w}_0x{byte_off:x}" for w in ("", "1", "2")]
+        for off in (byte_off, byte_off + 8) if width == 16 else (byte_off,):
+            out += [f"{base}.{n}" for n in sorted(self._named_at.get(off, ()))]
         return tuple(out)
 
     def _field(self, base_v: V, byte_off: int, width: int = 8) -> V:
@@ -4666,6 +4687,7 @@ class Lifter:
                     else self._alloc_field(base_v.text, byte_off, width))
         if name:
             tag = "." + name
+            self._named_at.setdefault(byte_off, set()).add(name)
         elif width not in (4, 8):
             tag = f".field{width}_0x{byte_off:x}"
         else:
