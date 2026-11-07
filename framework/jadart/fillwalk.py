@@ -133,6 +133,12 @@ class FillResult:
     #: disassembler label placed there is on code normal calls never execute.
     code_payload_info: dict = field(default_factory=dict)
     func_data: dict = field(default_factory=dict)         # Function ref -> its `data` ref
+    #: Function ref -> its `signature` ref, and FunctionType ref -> its `parameter_types`
+    #: Array ref. An instance function's first parameter type is its receiver's, written
+    #: by another cluster than the function's owner, which is what lets fields.py check a
+    #: PatchClass owner against something that is not the PatchClass (#240).
+    func_signature: dict = field(default_factory=dict)
+    ftype_params: dict = field(default_factory=dict)
     smi_values: dict = field(default_factory=dict)        # Mint/Smi ref -> the int it holds
     # A const list's ELEMENTS, which the fill pass was already reading and throwing away.
     # Dart puts every const data table in one of these, a keystream, an S-box, a lookup
@@ -233,7 +239,8 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     class_state: dict = {}
     class_library: dict = {}
     libraries: list = []
-    meta = {"field": {}, "patch": {}, "fdata": {}}
+    meta = {"field": {}, "patch": {}, "fdata": {}, "fsig": {}, "ftparams": {},
+            "epoch": epoch}
     code_stub_refs: list = []
     sized_lengths: dict = {}
     instr_index = [0]      # running instructions-table index across Code clusters
@@ -381,6 +388,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       field_meta=meta["field"], patch_class=meta["patch"],
                       code_payload_info=code_payload_info,
                       func_data=meta["fdata"],
+                      func_signature=meta["fsig"], ftype_params=meta["ftparams"],
                       arrays=arrays,
                       smi_values={cl.start_ref + i: v
                                   for cl in clusters if cl.mint_values
@@ -480,12 +488,20 @@ def _fill_refs(st, cl, spec, functions, fields, func_code_index=None,
     is_func = (cl.name == "FunctionCid")
     is_field = (cl.name == "FieldCid")
     is_patch = (cl.name == "PatchClassCid")
+    # FunctionType's `parameter_types`, whose slot moved at 3.1 (Epoch.ftype_params_index)
+    # Asked of the epoch only where there is a FunctionType to read.
+    params_at = (meta["epoch"].ftype_params_index
+                 if meta is not None and cl.name == "FunctionTypeCid" else -1)
     for i in range(cl.count):
-        name_ref = owner_ref = first_ref = data_ref = -1
+        name_ref = owner_ref = first_ref = data_ref = sig_ref = -1
         for j in range(num_refs):
             r = st.read_ref_id()
             if j == 0:
                 first_ref = r
+            if j == 2:
+                sig_ref = r             # Function's 3rd ref is `signature`
+            if j == params_at:
+                meta["ftparams"][cl.start_ref + i] = r
             if j == 3:
                 data_ref = r            # Function's 4th ref is `data`; for an implicit
                                         # accessor that is the Field it accesses
@@ -521,6 +537,8 @@ def _fill_refs(st, cl, spec, functions, fields, func_code_index=None,
                 func_code_index[cl.start_ref + i] = code_index
             if meta is not None and data_ref != -1:
                 meta["fdata"][cl.start_ref + i] = data_ref
+            if meta is not None and sig_ref != -1:
+                meta["fsig"][cl.start_ref + i] = sig_ref
         elif is_field:
             fields.append((cl.start_ref + i, name_ref, owner_ref))
             if meta is not None:

@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 449](https://img.shields.io/badge/tests-449-brightgreen.svg)](#tests)
+[![tests: 455](https://img.shields.io/badge/tests-455-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -312,7 +312,7 @@ A field keeps its `Field` object when something still points at it: 162 of the c
 245 are the `data` of a surviving implicit getter, implicit setter, or field initializer.
 Everything the optimiser inlined away is gone, which is why the map reaches a minority of
 the accesses and not all of them: 17.1% of the `this` lines on Hacki, 18.0% on com.k.todo,
-and 13.9% on the committed clean fixture, 1,495 of the 10,758 lines that would otherwise
+and 14.9% on the committed clean fixture, 1,598 of the 10,758 lines that would otherwise
 carry a `this.field_0x`.
 
 Two further channels reach slots those `Field` objects do not, and both read a statement
@@ -323,10 +323,14 @@ one the compiler makes for a field and names after it, still names that field's 
 where the `Field` survives but its own name is a string only the VM snapshot holds:
 `Color`'s `r`, `g` and `b`. A hand-written setter is not read, because Dart forbids a
 field and a setter of one name in one class, so `set capacity` stores into `_capacity`.
-Together the three take the clean fixture's byte-offset field lines from 55,089 to 53,511,
-the map 823 of them, the accessors 49 more and the allocation stubs 706 more. One
-disagreement refuses a whole channel, and on that fixture the implicit accessors agree
-with the `Field` objects that name themselves 145 times out of 145.
+Together the three take the clean fixture's byte-offset field lines from 55,089 to 53,463,
+the map 871 of them, the accessors 49 more and the allocation stubs 706 more. The map's
+share includes the methods a `PatchClass` owns, what a mixin application takes from its
+mixin and what a patch file adds to a core class, whose receiver class is the class the
+`PatchClass` wraps (`Function::Owner`): 397 functions and 103 lines on that fixture. One
+disagreement refuses a whole channel: on that fixture the implicit accessors agree with
+the `Field` objects that name themselves 145 times out of 145, and the wrapped class
+agrees with the receiver type the function's own signature declares 25 times out of 25.
 
 **Nineteen supported epochs today**, 2.19 through 3.13.0. This paragraph used to say
 "one, and three more identified and refused"; that was true when it was written and stopped
@@ -425,7 +429,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 449 tests
+cd framework && python3 -m pytest tests -q     # 455 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -433,7 +437,7 @@ cd framework && python3 -m pytest tests -q     # 449 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 417 of the 449 to run and the other 32 to
+clone with capstone installed, expect about 423 of the 455 to run and the other 32 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

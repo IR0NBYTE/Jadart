@@ -37,6 +37,12 @@ method whose owner class resolves is one such base, and `recover_allocations` be
 second. Everything else stays `field_0x8`, because a name attributed to the wrong class is
 worse than an offset: the reader can see that an offset is opaque and cannot see that a
 name is wrong.
+
+WHICH CLASS `this` IS. `Function::Owner` (object.cc:11358) answers it in two steps: the
+owner is a Class, or it is a PatchClass and the class is the one it wraps. The second
+step is what places a method whose script is not its class's, which is every member a
+mixin application takes from its mixin and every member a patch file adds to a core
+class, and `_place_patched` below takes it under three refusals of its own.
 """
 from __future__ import annotations
 
@@ -82,6 +88,12 @@ class FieldLayout:
     out_of_range: int = 0      # ...and the ones that were not, which refuse the whole map
     no_owner: int = 0          # owner ref is neither a Class nor a PatchClass we resolved
     refused: str = ""          # non-empty when the map is deliberately empty
+    #: Functions whose owner is a PatchClass (`_place_patched`), counted the same way.
+    patched: int = 0           # ...given the class their PatchClass wraps, for `this`
+    patch_declined: int = 0    # ...static, or of a kind whose first argument is not it
+    patch_agreed: int = 0      # ...whose own signature names that same class as receiver
+    patch_disagreed: int = 0   # ...whose signature names another, which refuses them all
+    patch_refused: str = ""    # non-empty when none of them was placed, and why
 
     def for_class(self, class_ref) -> dict:
         """{byte offset -> field name} for a class ref, empty when nothing is known."""
@@ -206,7 +218,98 @@ def recover_fields(fr, arch) -> FieldLayout:
         if m:
             out.by_class[ref] = m
     out.func_owner = {ref: ow for ref, _n, ow, _kt in fr.functions if ow in cls_cid}
+    _place_patched(fr, out, cls_cid)
     return out
+
+
+#: The kinds of Function whose first argument is an instance of the class they belong to,
+#: by the SDK's own definition of the kind (raw_object.h FOR_EACH_RAW_FUNCTION_KIND): a
+#: method, an accessor, a generative constructor, and the implicit accessors "for instance
+#: fields". A closure's first argument is the closure, and a dispatcher or forwarder takes
+#: its arguments off the stack, so none of those is here; a static method or a factory is
+#: excluded by its StaticBit rather than by its kind.
+_RECEIVER_KINDS = ("RegularFunction", "GetterFunction", "SetterFunction", "Constructor",
+                   "ImplicitGetter", "ImplicitSetter")
+
+
+def _place_patched(fr, out: FieldLayout, cls_cid: dict) -> None:
+    """Give a method whose owner is a PatchClass the class that PatchClass wraps.
+
+    `Function.owner` is a Class or a PatchClass, and `Function::Owner` (object.cc:11358 at
+    3.12.2, :11109 at 3.13.0)
+    resolves the second to `wrapped_class` (`patched_class` through 3.1, the same first
+    ref). A PatchClass owns a member whose script is not its class's. On the clean 3.12.2
+    fixture 1,145 functions have one, and of the 397 this places 346 belong to a mixin
+    application, whose members come out of the mixin's own file
+    (`SemanticsAnnotationsMixin.describeSemanticsConfiguration`, the bindings), and 43 to
+    a core class a patch file adds to (`StringBuffer`). Reading the owner as a Class only
+    left all of them with no receiver class, so nothing off `this` in them could be
+    named. `recover_fields` already takes this hop for `Field.owner`, and dispatch.py for
+    the class a table row belongs to; this is the third reader and the same fact.
+
+    THREE REFUSALS, because the hop is a statement about `this` and not only about an
+    owner:
+
+      * the function has to BE an instance function. Its StaticBit is calibrated per
+        snapshot (program.static_bit) and that can fail, in which case nothing here says
+        which functions take a receiver and none is placed. Two of the seven real apps
+        measured for #240 are in that state, both 3.11.5.
+      * its kind has to be one whose first argument is the receiver (`_RECEIVER_KINDS`).
+      * and where the function still carries its signature, the signature has to agree.
+        `FunctionType.parameter_types[0]` of an instance function is the receiver's own
+        type, serialised by the FunctionType cluster and resolved through `Type`'s class
+        id, so it shares nothing with `PatchClass.wrapped_class` but the answer. Measured
+        over both fixtures and five real apps (2.19.6, 3.3.4, 3.5.4, 3.6.2, 3.12.2,
+        3.13.0): 337 of 337 agree, 0 disagree, and the 42,716 functions a Class owns that
+        say it too agree 42,716 times, which is the control. ONE disagreement places none,
+        the rule `recover_fields` applies to an offset outside its owner: every hop was
+        read the same way.
+
+    A function this declines keeps `for_function() == {}`, which is what it had."""
+    wrapped = fr.patch_class
+    cand = [(ref, wrapped[ow], kt) for ref, _n, ow, kt in fr.functions
+            if ow not in cls_cid and wrapped.get(ow) in cls_cid]
+    if not cand:
+        return
+    from .program import _KIND_INDEX, static_bit
+    sb = static_bit(fr)
+    if sb is None:
+        out.patch_refused = ("the static bit of Function.kind_tag does not calibrate on "
+                             "this snapshot, so nothing says which functions take a "
+                             "receiver")
+        return
+    kinds = frozenset(_KIND_INDEX[k] for k in _RECEIVER_KINDS)
+    by_cid = {cid: ref for ref, cid in cls_cid.items()}
+    placed = {}
+    for ref, cls, kt in cand:
+        if (kt >> sb) & 1 or (kt & 0x1F) not in kinds:
+            out.patch_declined += 1
+            continue
+        said = _receiver_type_class(fr, ref, by_cid)
+        if said is not None:
+            if said == cls:
+                out.patch_agreed += 1
+            else:
+                out.patch_disagreed += 1
+        placed[ref] = cls
+    if out.patch_disagreed:
+        out.patch_refused = (f"{out.patch_disagreed} functions owned by a PatchClass "
+                             f"declare a receiver of another class than the one it wraps")
+        return
+    out.func_owner.update(placed)
+    out.patched = len(placed)
+
+
+def _receiver_type_class(fr, func_ref, by_cid: dict):
+    """The class a function's own signature gives its first parameter, or None.
+
+    None where the signature did not survive, which is most functions in a release build,
+    or where the first parameter is not a `Type` naming a class this snapshot has."""
+    params = fr.arrays.get(fr.ftype_params.get(fr.func_signature.get(func_ref, -1), -1))
+    if not params:
+        return None
+    cid = fr.types.get(params[0])
+    return None if cid is None else by_cid.get(cid & 0xFFFFFFFF)
 
 
 # --------------------------------------------------------------------------------------

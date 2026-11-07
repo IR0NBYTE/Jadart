@@ -17444,6 +17444,179 @@ def test_dart_3_13_passes_the_gates_on_a_real_app():
     assert function_name_by_pc(image, fr)[throw] == "_iso_stub_ThrowStub"
 
 
+
+# -- #240: the class `this` is, for a method whose owner is a PatchClass --
+
+def _patch_owned(fr, lay):
+    """(ref, name, wrapped class ref, kind_tag) of every Function a PatchClass owns."""
+    classes = set(lay.class_name)
+    return [(ref, fr.names.get(nr, ""), fr.patch_class[ow], kt)
+            for ref, nr, ow, kt in fr.functions
+            if ow not in classes and fr.patch_class.get(ow) in classes]
+
+
+def test_a_method_owned_by_a_patch_class_is_given_the_class_it_wraps():
+    # `Function.owner` is a Class or a PatchClass, and `Function::Owner` (object.cc:11358)
+    # resolves the second to the class it wraps. A PatchClass owns a member whose script
+    # is not its class's: what a mixin application takes from its mixin, and what a patch
+    # file adds to a core class. Reading the owner as a Class only left those methods
+    # with no receiver class, so nothing off `this` in them could carry a name.
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_fields
+    image, fr, hdr = load_instructions(CLEAN)
+    lay = recover_fields(fr, hdr.arch)
+    owned = _patch_owned(fr, lay)
+    # SemanticsAnnotationsMixin's own source says what the slot is: `late bool
+    # _container`, read by describeSemanticsConfiguration, whose owner is a PatchClass.
+    ref, cls = next((ref, cls) for ref, nm, cls, _kt in owned
+                    if nm == "describeSemanticsConfiguration"
+                    and "SemanticsAnnotationsMixin" in lay.class_name[cls])
+    names = lay.for_function(ref)
+    assert names.get(0x58, "").startswith("_container@"), names
+    assert lay.patch_refused == "", lay.patch_refused
+    assert lay.patched >= 350, lay.patched
+    placed = [f for f in owned if f[0] in lay.func_owner]
+    assert len(placed) == lay.patched, (len(placed), lay.patched)
+    assert all(lay.func_owner[r] == c for r, _n, c, _kt in placed)
+    _needs_capstone()                   # the layout half above is stdlib; the body is not
+    cr = image.code_ranges[ref]
+    at = f"{image.anchor_va + cr.pc_offset:#x}"
+    body = "\n".join(jadart.decompile(CLEAN, at)[0]["body"])
+    assert "this._container@" in body and "this._explicitChildNodes@" in body, body
+    assert "this.field_0x58" not in body, body
+    # A slot of the same object whose Field was tree-shaken keeps its offset, and so does
+    # every base that is not the receiver: the hop names a class, not a register.
+    assert "x2.field_0x18 = this._explicitChildNodes@" in body, body
+
+
+def test_a_patch_owner_is_followed_only_for_a_function_that_takes_a_receiver():
+    # The hop is a statement about `this`, so it needs the function to have one. A static
+    # method or a factory says so in its StaticBit; a closure's first argument is the
+    # closure and a forwarder takes its arguments off the stack, which the kind says.
+    from jadart.disasm import load_instructions
+    from jadart.fields import _RECEIVER_KINDS, recover_fields
+    from jadart.program import _FUNCTION_KINDS, static_bit
+    for lib in (CLEAN, OBF):
+        image, fr, hdr = load_instructions(lib)
+        lay = recover_fields(fr, hdr.arch)
+        sb = static_bit(fr)
+        assert sb is not None
+        declined = 0
+        for ref, _nm, _cls, kt in _patch_owned(fr, lay):
+            takes = (not (kt >> sb) & 1) and _FUNCTION_KINDS[kt & 0x1F] in _RECEIVER_KINDS
+            assert (ref in lay.func_owner) == takes, (lib, ref, kt)
+            assert bool(lay.for_function(ref)) <= takes, (lib, ref)
+            declined += not takes
+        assert declined == lay.patch_declined and declined >= 600, (lib, declined)
+
+
+def test_no_patch_owner_is_followed_where_the_static_bit_does_not_calibrate():
+    # The refusal that two of six real apps take. `program.static_bit` solves for the bit
+    # and returns None when no single bit fits its witnesses; every caller then treats
+    # every function as an instance method, which is the direction that prints a
+    # receiver's field name off a static function's first argument. The hop must not add
+    # to that: with no bit there is nothing saying which functions take a receiver.
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_fields
+    from jadart.program import _KIND_INDEX, static_bit
+    image, fr, hdr = load_instructions(CLEAN)
+    good = recover_fields(fr, hdr.arch)
+    assert any(good.for_function(r) for r, *_ in _patch_owned(fr, good)), (
+        "nothing is placed with the bit calibrated, so the refusal below says nothing")
+    sb = static_bit(fr)
+    at = next(i for i, (_r, _n, _o, kt) in enumerate(fr.functions)
+              if (kt & 0x1F) == _KIND_INDEX["ImplicitGetter"])
+    saved = fr.functions[at]
+    fr.functions[at] = saved[:3] + (saved[3] | (1 << sb),)   # one witness contradicts it
+    try:
+        assert static_bit(fr) is None
+        bad = recover_fields(fr, hdr.arch)
+        owned = _patch_owned(fr, bad)
+    finally:
+        fr.functions[at] = saved
+    assert bad.patched == 0 and "static bit" in bad.patch_refused, bad.patch_refused
+    assert owned and not any(ref in bad.func_owner for ref, _n, _c, _kt in owned)
+    assert not any(bad.for_function(ref) for ref, _n, _c, _kt in owned)
+    # and the functions a Class owns are where they were, which is all that is left
+    class_owned = {ref: ow for ref, _n, ow, _kt in fr.functions if ow in good.class_name}
+    assert bad.func_owner == {r: c for r, c in class_owned.items() if c in bad.class_name}
+    assert set(good.func_owner) - set(bad.func_owner) == {r for r, *_ in owned
+                                                          if r in good.func_owner}
+
+
+def test_one_patch_owner_its_own_signature_contradicts_places_none_of_them():
+    # Teeth, and the second encoding. An instance function's `parameter_types[0]` is its
+    # receiver's own type, written by the FunctionType cluster and resolved through a
+    # Type's class id, so it shares nothing with `PatchClass.wrapped_class` but the
+    # answer. Pointing ONE PatchClass at another class must refuse every hop, on the
+    # argument `recover_fields` makes for an offset outside its owner: they were all
+    # read the same way.
+    from jadart.disasm import load_instructions
+    from jadart.fields import _receiver_type_class, recover_fields
+    image, fr, hdr = load_instructions(CLEAN)
+    good = recover_fields(fr, hdr.arch)
+    by_cid = {cid & 0xFFFFFFFF: ref for ref, _n, cid, _s in fr.classes}
+    owner_of = {ref: ow for ref, _n, ow, _kt in fr.functions}
+    victim = next(ref for ref in good.func_owner
+                  if owner_of[ref] in fr.patch_class
+                  and _receiver_type_class(fr, ref, by_cid) == good.func_owner[ref])
+    patch = owner_of[victim]
+    saved = fr.patch_class[patch]
+    other = next(ref for ref in good.by_class if ref != saved)
+    fr.patch_class[patch] = other
+    try:
+        bad = recover_fields(fr, hdr.arch)
+        owned = _patch_owned(fr, bad)
+    finally:
+        fr.patch_class[patch] = saved
+    assert bad.patch_disagreed >= 1 and bad.patched == 0, bad
+    assert "another class" in bad.patch_refused, bad.patch_refused
+    assert len(owned) > 300 and not any(bad.for_function(r) for r, _n, _c, _kt in owned)
+
+
+def test_every_patch_owner_agrees_with_the_receiver_its_signature_declares():
+    # N of N on both fixtures, and a control that says the comparison is reading what it
+    # claims to: a function a CLASS owns has to agree with its signature as well, which
+    # pins `Epoch.ftype_params_index` (one slot off reads result_type or the parameter
+    # names, and nothing would agree).
+    from jadart.disasm import load_instructions
+    from jadart.fields import _RECEIVER_KINDS, _receiver_type_class, recover_fields
+    from jadart.program import _FUNCTION_KINDS, static_bit
+    for lib, want, control in ((CLEAN, 20, 350), (OBF, 15, 190)):
+        image, fr, hdr = load_instructions(lib)
+        lay = recover_fields(fr, hdr.arch)
+        assert lay.patch_disagreed == 0 and not lay.patch_refused, (lib, lay)
+        assert lay.patch_agreed >= want, (lib, lay.patch_agreed)
+        sb = static_bit(fr)
+        by_cid = {cid & 0xFFFFFFFF: ref for ref, _n, cid, _s in fr.classes}
+        agree = differ = 0
+        for ref, _nr, ow, kt in fr.functions:
+            if ow not in by_cid.values() or (kt >> sb) & 1:
+                continue
+            if _FUNCTION_KINDS[kt & 0x1F] not in _RECEIVER_KINDS:
+                continue
+            said = _receiver_type_class(fr, ref, by_cid)
+            if said is not None:
+                agree += said == ow
+                differ += said != ow
+        assert differ == 0 and agree >= control, (lib, agree, differ)
+
+
+def test_parameter_types_is_read_from_the_slot_each_release_keeps_it_in():
+    # `hash` is UntaggedFunctionType's last pointer through 3.0.6 and
+    # UntaggedAbstractType's second from 3.1.5, so the four pointers after it sit one
+    # slot later from 3.1 on. Read off raw_object.h for all nineteen registered releases,
+    # and checked here by the RELEASE each epoch is, not by the family name the table
+    # is keyed on, so a family registered under the wrong name fails.
+    from jadart import versions
+    seen = set()
+    for ep in versions._EPOCHS.values():
+        major, minor = (int(x) for x in re.match(r"(\d+)\.(\d+)", ep.dart).groups())
+        early = (major, minor) < (3, 1)
+        assert ep.ftype_params_index == (3 if early else 4), (ep.name, ep.dart)
+        seen.add(early)
+    assert seen == {True, False}
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

@@ -13,6 +13,57 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
+- **A method a `PatchClass` owns names the fields of `this`.** `Function.owner` is a
+  Class or a PatchClass, and `Function::Owner` (object.cc:11358) resolves the second to
+  the class it wraps. The lifter read only the first, so every member a mixin
+  application takes from its mixin and every member a patch file adds to a core class,
+  1,145 functions on the clean fixture, had no receiver class at all and nothing off
+  `this` in them could carry a name: `describeSemanticsConfiguration` of
+  `SemanticsAnnotationsMixin` printed `this.field_0x58` for the `late bool _container`
+  its own source declares.
+  `recover_fields` already took this hop for `Field.owner`, and dispatch.py for the class
+  a table row belongs to; `fields._place_patched` is the third reader of the same fact.
+
+  Three refusals, because the hop is a statement about `this` and not only about an
+  owner. The function's StaticBit has to calibrate on the snapshot (`program.static_bit`
+  returns None on two of the seven real apps measured, where every caller already treats
+  every function as an instance method; the hop adds nothing there). Its kind has to be
+  one whose first argument is the receiver, a method, an accessor, a generative
+  constructor or an implicit accessor, so 748 static methods, factories, closures and
+  forwarders on the clean fixture are declined. And where the function kept its
+  signature, `FunctionType.parameter_types[0]`, the receiver's own type written by the
+  FunctionType cluster and resolved through a `Type`'s class id, has to name the wrapped
+  class: 337 of 337 do, over both fixtures and five real apps from 2.19.6 to 3.13.0,
+  with the 42,716 Class-owned functions that also speak agreeing 42,716 times as the
+  control, and one disagreement places none of them, the rule `recover_fields` applies
+  to an offset outside its owner. `Epoch.ftype_params_index` says which of a
+  FunctionType's six refs that array is, because `hash` moved from the end of
+  UntaggedFunctionType to UntaggedAbstractType at 3.1 (raw_object.h, read on all
+  nineteen registered releases; 3.13.0 keeps it at slot 4, raw_object.h:2984-2985 and
+  :3051).
+
+  397 functions placed on the clean fixture, 346 of them members of a mixin application,
+  and 17 on the obf one. `tools/quality.py`'s byte-offset field row goes 53,511 to 53,463
+  on the clean fixture (28.9% either way) and stays 54,970 on the obf one; 37 bodies and
+  103 lines change on clean, every one a one-for-one substitution of a byte offset by the
+  name the wrapped class's own `Field` object carries (`this._container@27266271`,
+  `this._widget@20042623`, 17 distinct names), and 0 on obf, whose names are obfuscated
+  too. The line total, `regline`, `ellipsis`, `goto`, `rawasm` and `label` are identical
+  on both. `export` is unchanged byte for byte, because it and the `decompile` command
+  list a class's methods by the owner ref and so have never written a PatchClass-owned
+  method at all; `lift`, the `jadart.decompile` API and `tools/quality.py` see the
+  change. On dev.labplus.app (3.5.4) 148 lines in 64 bodies change, on
+  uk.me.amugofjava.anytime (3.6.2) 240 in 79 and on chat.fluffy.fluffychat (3.13.0,
+  1,362 functions placed) 497 in 143, all substitutions; the two below 3.4 place 799 and
+  761 functions and change no line, because their receiver arrives on the stack and is
+  never `this` to the lifter. `tools/pbfuzz.py --census` reads the same as on main on
+  both fixtures,
+  2,086 wrong reads and 0 stale records, and `tools/cfgcheck.py` reports 0 violations of
+  any kind on either. DESIGN 13.1 carries the per-channel measurement this came
+  out of, zeros included: the type system was measured for seven sources of a base's
+  class before this one was built, the cast channel is the one that remains and needs
+  flow, and a callee's identity under `dedup_instructions` is refuted as a source with
+  a counterexample. Part of #240.
 - **A field whose `Field` object survives without a readable name is named by the
   implicit accessor the compiler made for it.** `KernelLoader::GenerateFieldAccessors`
   makes an instance field's getter and setter as `kImplicitGetter` and `kImplicitSetter`,
