@@ -24,6 +24,20 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   is a string the VM snapshot holds, a base object the isolate snapshot refers to and
   never writes (`r`, `g`, `b`, `end`, `state`), while the accessor's `get:g` is written
   into the isolate snapshot.
+
+  Two checks against second encodings, and one contradiction of either refuses the whole
+  channel, the rule `recover_fields` applies to itself. Where the Field does name itself
+  the two names must be equal: 145 of 145 on the clean fixture, 78 of 78 on the obf one.
+  And the body, followed from the entry convention (x1, or the first pushed argument),
+  through copies, spills and reloads, must reach the receiver at the Field's offset and
+  nowhere else for a store: 84 on the clean fixture, 0 differing. A hand-written `get:`
+  or `set:` is never read; see Fixed for what reading them cost.
+
+  6 offsets over 3 classes on the clean fixture: `Color`'s `r`, `g` and `b`,
+  `_AsyncStarStreamController`'s `controller` and `asyncStarBody`, and
+  `_ConstantTickerModeDataListenable.value`. They take `tools/quality.py`'s byte-offset
+  field row from 54,266 to 54,217 before the allocation channel, 49 lines. The obf
+  fixture gains 0, because its accessor names are obfuscated too. Part of #240.
 - **Dart 3.13, the current Flutter stable, is a registered epoch.** Hash
   `0451907c2eaa8467e848c0067bfe8ed4` is the 3.13.0 tag (`tools/sdk_source.py
   --identify`), which makes nineteen epochs over fifteen grammar families. It is the
@@ -86,31 +100,6 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   No output byte changes on an older release: 15 command outputs and the export tree
   of both fixtures, and 7 command outputs on each of six real apps from 2.19.6 to
   3.11.5, compare equal to main's. Closes #254.
-- **A field whose `Field` object was tree-shaken is named by the accessor that reached
-  it.** 9,770 of the clean fixture's 9,943 receiver field accesses sit at an offset the
-  field map has no entry for, which is #240's population 1: the slot is there, its class
-  is known, and the name was dropped. It was not dropped everywhere. 969 `get:` and 208
-  `set:` Function objects survive on that build, so for some of those slots the name is
-  still in the snapshot under another key, and `fields.recover_accessors` reads it. jadx
-  does the same for the same runtime-with-metadata reason: its `kotlin-metadata.getters`
-  flag, "rename simple getters to field names", is on by default. The native decompilers
-  have no such channel, which is an asymmetry rather than an oversight, C having no
-  accessor convention: IDA offers `get_member_name(struct_id, offset)`, a lookup BY
-  offset, and Ghidra has the analyst rename the member.
-
-  Two checks against second encodings, and one contradiction of either refuses the whole
-  channel, the rule `recover_fields` applies to itself. Where the Field does name itself
-  the two names must be equal: 145 of 145 on the clean fixture, 78 of 78 on the obf one.
-  And the body, followed from the entry convention (x1, or the first pushed argument),
-  through copies, spills and reloads, must reach the receiver at the Field's offset and
-  nowhere else for a store: 84 on the clean fixture, 0 differing. A hand-written `get:`
-  or `set:` is never read; see Fixed for what reading them cost.
-
-  6 offsets over 3 classes on the clean fixture: `Color`'s `r`, `g` and `b`,
-  `_AsyncStarStreamController`'s `controller` and `asyncStarBody`, and
-  `_ConstantTickerModeDataListenable.value`. They take `tools/quality.py`'s byte-offset
-  field row from 54,266 to 54,217 before the allocation channel, 49 lines. The obf
-  fixture gains 0, because its accessor names are obfuscated too. Part of #240.
 - **A field of an object the body allocated is named, and the allocation says which
   class it is.** `Lifter._field` printed a recovered name only off `this`, because
   `Function.owner` was the only thing in the snapshot that stated a base's class, and
