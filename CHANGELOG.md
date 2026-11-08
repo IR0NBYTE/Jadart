@@ -287,6 +287,11 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **CONTRIBUTING.md and framework/README.md no longer state a test count.** They said
+  378 and 397 while pytest collects 466; each copy went stale on the next change that
+  added a test. Both point to the top-level README's Tests section instead, so there is
+  one count to keep current.
+
 - **A signature line says what the body reads.** `name() {` meant nothing; it now
   lists the argument registers the body reads by their names, `benchWithdraw(a1) {`,
   stays `()` where it reads none, and is `(...)` where the list was not read, at tier 3
