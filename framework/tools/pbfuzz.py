@@ -803,7 +803,7 @@ def _census_hooks(expr):
              for n in ("note_slot", "record_drop", "forget_slot", "copy",
                        "stale_on_write")}
     real_merge, real_reload = expr._merge, expr.Lifter._reload
-    real_init = expr.Lifter.__init__
+    real_init, real_reenter = expr.Lifter.__init__, expr.Lifter._reenter
 
     def h(st):
         alive.append(st)
@@ -842,6 +842,17 @@ def _census_hooks(expr):
         ha, hb = h(a), h(b)
         h(dst).clear()
         h(dst).update({k: v for k, v in ha.items() if hb.get(k) == v})
+
+    def reenter(self, addr, st, *a, **k):
+        # `_reenter` hands the state a slot map of its own: the one predecessor's exit
+        # state, or none at all. The history has to go with it, or a reload past the reset
+        # is judged against a path the state no longer describes, and an honest decline
+        # counts as a wrong read. On the clean fixture that took 17 wrong reads away and
+        # judged 3 against the predecessor they really came by, 2,086 to 2,072.
+        real_reenter(self, addr, st, *a, **k)
+        came = (self._came.get(addr) or self._exit.get(st.src)) if st.src is not None \
+            else None
+        hist[id(st)] = dict(h(came)) if came is not None else {}
 
     def init(self, *a, **k):
         real_init(self, *a, **k)
@@ -896,12 +907,13 @@ def _census_hooks(expr):
     expr.State.forget_slot, expr.State.copy = forget_slot, copy
     expr.State.stale_on_write = stale_on_write
     expr._merge, expr.Lifter._reload, expr.Lifter.__init__ = merge, reload, init
+    expr.Lifter._reenter = reenter
 
     def restore():
         for n, f in saved.items():
             setattr(expr.State, n, f)
         expr._merge, expr.Lifter._reload = real_merge, real_reload
-        expr.Lifter.__init__ = real_init
+        expr.Lifter.__init__, expr.Lifter._reenter = real_init, real_reenter
 
     return restore, tot, walk, hist, alive
 

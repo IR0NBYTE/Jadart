@@ -354,6 +354,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`pbfuzz --census` judges a reload past `_reenter` by the way in the state came by.**
+  The census keeps, per walk state, what each frame slot was filled with, and counts a
+  reload the lifter declines as a wrong read when the slot held another register.
+  `Lifter._reenter` hands a block a slot map of its own, its one predecessor's exit state
+  or none at all, and the history stayed with the path printed above it, so past a trap
+  an honest decline read as a wrong read of the register that path had stored. The
+  history now follows the reset. On the clean fixture that takes 17 wrong reads away and
+  judges 3 against the predecessor they came by, 2,086 to 2,072, and the same on obf.
+  Reloads that name a value the slot did not hold, names out of scope included, go from
+  2,853 to 2,886 under the new count, and the bound in
+  `test_no_frame_slot_record_outlives_the_path_that_made_it` moves with them. The
+  lifter's output does not change, only the oracle's reading of it.
+
 - **A code symbol that ends before its instructions image is refused, not read as empty
   code.** The image states its own length in its first word, header and payload
   together (`Image::HeaderField::ImageSize`, image_snapshot.h:113 at 3.12.2), and the

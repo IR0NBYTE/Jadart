@@ -15451,9 +15451,12 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
         f"{got['wrong']} of {got['spelled']} spelled records read back wrong, a higher "
         f"share than the 23.3% #234 left; a count that rises with the records spelled is "
         f"the same residual, a rising share is a new one")
-    assert got["wrong"] + got["name"] <= 2856, (
+    # 2,856 to 2,886 when the census began to follow `_reenter`'s reset, which is not the
+    # same count: main read 2,853 judged against the path printed above a reset, and
+    # 2,886 against the way in the state came by.
+    assert got["wrong"] + got["name"] <= 2886, (
         f"{got['wrong'] + got['name']} reloads in total name a different value than the "
-        f"slot held, up from 2856, of which {got['name']} are names out of scope")
+        f"slot held, up from 2886, of which {got['name']} are names out of scope")
     # And the reader-visible half of #198, which the two numbers above cannot see: they
     # score what `_reload` DECIDES, and the fix for a decline is at the call site, which
     # names the read rather than keeping the load's own register. A register the printed
@@ -15531,6 +15534,27 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
         assert bad["stale"] > 0, (
             f"with {what} the census still reported 0 stale records, so it is not "
             f"measuring what it claims")
+
+
+def test_the_census_judges_a_reload_past_a_reset_by_the_way_in_it_came():
+    """The census keeps, per walk state, what each frame slot was filled with, and judges
+    a reload the lifter declines against it. `_reenter` hands a block a slot map of its
+    own, the one predecessor's exit state or none at all, and the history stayed with the
+    path printed above: past a trap, an honest decline read as a wrong read of the
+    register that path had stored. The history follows the reset now: 17 wrong reads
+    went on the clean fixture and 3 were judged against the predecessor they came by."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pbfuzz
+    from jadart import expr
+    rows = [("stur", "x2, [x29, #-8]"), ("brk", "#0"), ("ldur", "x3, [x29, #-8]"),
+            ("stur", "x3, [x4, #7]"), ("ret", "")]
+    restore, _tot, walk, _hist, _alive = pbfuzz._census_hooks(expr)
+    try:
+        expr.lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    finally:
+        restore()
+    got = walk["cur"]
+    assert (got["diff_reg"], got["never"]) == (0, 1), got
 
 
 def test_a_reload_of_a_dropped_slot_reads_the_value_it_held():
