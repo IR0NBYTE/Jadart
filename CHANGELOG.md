@@ -345,6 +345,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **`check.sh` runs the suite with capstone blocked, as CI does.** CI's
+  install-without-capstone job requires every test that decodes an instruction to skip
+  there rather than fail, and nothing local ran that: a cast-channel test that loaded the
+  fixture without skipping passed `check.sh --full` and was first seen failing on CI
+  (#277). `framework/tests/conftest.py` makes capstone unimportable in every worker when
+  `JADART_TEST_NO_CAPSTONE` is set, and the fast set now runs the suite that way too:
+  339 pass and 148 skip in about 7 seconds. With that test's skip taken back out, the
+  step fails.
+
 - **CONTRIBUTING.md and framework/README.md no longer state a test count.** They said
   378 and 397 while pytest collects 466; each copy went stale on the next change that
   added a test. Both point to the top-level README's Tests section instead, so there is
