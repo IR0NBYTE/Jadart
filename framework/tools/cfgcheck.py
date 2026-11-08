@@ -20,6 +20,20 @@ Reported separately:
   exit      an instruction that leaves the function, always branches elsewhere or
             traps, which the tier 2 CFG lets control run on past
 
+and for tier 3's graph (expr.tier3_graph), the same edge and twice checks, and
+
+  dropped   a block no edge reaches, with code in it, that reaches no statement. Tier 3
+            placed only what its entry reaches, and the body behind a monomorphic entry
+            and every catch handler left the output with nothing in their place, while
+            the tier 2 count above read 0 (#266)
+  cut       the same, for a block only an edge strip_boilerplate took out leads to, which
+            tier 3 leaves out on purpose and so does not fail on: the slow path that boxes
+            a Mint, and, counted apart, a stack check's
+
+A block of the body that such a section runs on into is printed again under it when it
+leads nowhere (expr._ends_again), and the edge check reads that copy as the edge to it,
+and flags one that leads on, or that does not leave the way the block does.
+
 The first three compare the rendering against the CFG, so they pass a CFG that is wrong
 and rendered faithfully: arm32's `pop {fp, pc}` once had an edge to the code after it in
 a quarter of its functions, and every function read 0 violations (#45). The exit check
@@ -50,7 +64,7 @@ def _entry(stmts, cont, brk, cont_of_loop):
     another, or for an arm that leaves to somewhere else (#107)."""
     for s in stmts:
         k = s[0]
-        if k in ("asm", "loop", "goto"):
+        if k in ("asm", "loop", "goto", "again"):
             return s[1]
         if k in ("exit", "cut"):
             return (k, s[1])
@@ -190,6 +204,18 @@ def check_function(blocks, stmts):
                 after = _entry(seq[i + 1:], cont, brk, cont_of_loop)
                 # falling off the end of a loop body is the back edge to its header
                 walk(s[2], s[1], after, s[1])
+            elif k == "again":
+                # A block printed again where a section jumps to it (#266). Only one that
+                # leads nowhere may be: copying one with a successor would print a path
+                # into what follows it twice over. And it leaves as the block does.
+                blk = blocks[s[1]]
+                nxt = seq[i + 1] if i + 1 < len(seq) else None
+                if blk.succ:
+                    bad.append((s[1], ["printed again, and it leads on"],
+                                sorted(blk.succ)))
+                elif _leaving(blk) and not (nxt and nxt[0] in ("exit", "cut")
+                                            and (nxt[0], nxt[1]) in _leaving(blk)):
+                    bad.append((s[1], ["printed again with no exit"], []))
             i += 1
 
     walk(stmts, None, None, None)
@@ -298,18 +324,50 @@ def _tier2_cfg(image, dis, pc_to_name, pool_map, with_exits=True, cut_end=None):
                      cut_end=cut_end)[0]
 
 
+def _with_code(blk) -> bool:
+    """Whether tier 3 has anything of `blk` to print: a nop prints nothing and a `b` is
+    structure, so a block of only those has nothing to drop."""
+    return any(mn not in ("b", "nop") for (_a, mn, _o, _n) in blk.insns)
+
+
+def tier3_left_out(g):
+    """(blocks dropped, blocks cut off on purpose, stack check slow paths) of one
+    function's Tier3Graph: the blocks with code that no edge reaches and no statement
+    places, split by whether only an edge strip_boilerplate took out leads to them, and
+    by whether that edge was a stack check's."""
+    from jadart.cfg import cut_off, entry_reach
+    placed = set()
+
+    def walk(stmts):
+        for s in stmts:
+            if s[0] == "asm":
+                placed.add(s[1])
+            elif s[0] == "if":
+                walk(s[2])
+                walk(s[3])
+            elif s[0] == "loop":
+                walk(s[2])
+    walk(g.stmts)
+    dead = set(g.blocks) - entry_reach(g.blocks, g.entry)
+    left = {b for b in dead - placed if _with_code(g.blocks[b])}
+    off = cut_off(g.blocks, dead, g.cut)
+    return left - off, (left & off) - g.slow, left & off & g.slow
+
+
 def run(path):
     from jadart.cfg import build_cfg, structure
     from jadart.branches import exits, row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
                                build_pool_map, function_name_by_pc, cut_end)
-    from jadart.expr import strip_boilerplate
+    from jadart.expr import strip_boilerplate, tier3_graph
 
     image, fr, _hdr = load_instructions(path)
     pc_to_name, pool_map = function_name_by_pc(image, fr), build_pool_map(fr, getattr(image, "arch", None))
     n = edges = dropped = twice = badfn = deep = 0
     worst = None
     exit_bad, exit_first = 0, None
+    t3 = dict(n=0, edges=0, twice=0, dropped=0, dropped_fns=0, cut=0, cut_fns=0,
+              any_fns=0, slow=0, deep=0, first=None)
     for cr in image.all_ranges:
         dis = disassemble_range(image, cr)
         if not dis:
@@ -321,6 +379,25 @@ def run(path):
         if ex and exit_first is None:
             exit_first = ex[0]
         ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+        try:
+            g = tier3_graph(ann, end)
+        except RecursionError:
+            g = None
+            t3["deep"] += 1     # lift_function prints such a range flat
+        if g is not None:
+            t3["n"] += 1
+            bad3, placed3 = check_function(g.blocks, g.stmts)
+            t3["edges"] += len(bad3)
+            t3["twice"] += len(placed3) - len(set(placed3))
+            lost, off, slow = tier3_left_out(g)
+            t3["slow"] += len(slow)
+            t3["dropped"] += len(lost)
+            t3["dropped_fns"] += bool(lost)
+            t3["cut"] += len(off)
+            t3["cut_fns"] += bool(off)
+            t3["any_fns"] += bool(lost or off)
+            if (lost or bad3) and t3["first"] is None:
+                t3["first"] = (cr.pc_offset, bad3[:3], sorted(lost)[:3])
         blocks, entry = build_cfg(strip_boilerplate(ann), exits=exits(image, dis),
                                   cut_end=end)
         if not blocks:
@@ -349,7 +426,7 @@ def run(path):
         edges += len(bad)
         dropped += len(miss)
         twice += dup
-    return n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep
+    return n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep, t3
 
 
 #: arm32 words for --synthetic: each range ends at a return or an indirect jump that the
@@ -400,7 +477,7 @@ def main(argv=None):
         print(f"{len(_A32_RANGES)} synthetic arm32 ranges: {good} exit violations; "
               f"{broken} without the exits, which the check has to see")
         return 0 if good == 0 and broken > 0 else 1
-    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep = run(a.lib)
+    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep, t3 = run(a.lib)
     if deep:
         print(f"{deep} functions nest too deeply to structure and print flat")
     print(f"{n} functions: {edges} edge violations, {dropped} dropped blocks, "
@@ -416,7 +493,23 @@ def main(argv=None):
                           f"{shown(r)}" for b, c, r in bad)
               + (f" dropped {[hex(x) for x in miss]}" if miss else "")
               + (f" {dup} duplicated" if dup else ""))
-    return 1 if (edges or dropped or twice or exit_bad) else 0
+    if t3["deep"]:
+        print(f"tier 3: {t3['deep']} functions nest too deeply to structure and print "
+              f"flat")
+    print(f"tier 3: {t3['n']} functions: {t3['edges']} edge violations, {t3['dropped']} "
+          f"dropped blocks ({t3['dropped_fns']} functions), {t3['twice']} blocks emitted "
+          f"twice")
+    print(f"  {t3['dropped'] + t3['cut']} blocks with code in {t3['any_fns']} functions "
+          f"no edge reaches and tier 3 leaves out, past {t3['slow']} stack check slow "
+          f"paths: {t3['dropped']} dropped, and {t3['cut']} in {t3['cut_fns']} functions "
+          f"only an edge strip_boilerplate took out leads to")
+    if t3["first"]:
+        off, bad, lost = t3["first"]
+        print(f"  first at .text+0x{off:x}: "
+              + "; ".join(f"0x{b:x} renders as {c} but goes to {r}" for b, c, r in bad)
+              + (f" dropped {[hex(x) for x in lost]}" if lost else ""))
+    return 1 if (edges or dropped or twice or exit_bad or t3["edges"] or t3["dropped"]
+                 or t3["twice"]) else 0
 
 
 if __name__ == "__main__":

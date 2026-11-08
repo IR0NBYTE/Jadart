@@ -35,9 +35,11 @@ import heapq
 import re
 from dataclasses import dataclass, field
 from sys import intern
+from typing import NamedTuple
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, _idoms, cut_goto, flat, TRAPS, _target)
+                  cond_of, _idoms, cut_goto, flat, TRAPS, _target, entry_reach,
+                  UNREACHED, cut_off)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -2503,6 +2505,20 @@ def _sp_step(state, here, mn: str, op: str):
     return state
 
 
+def _cut_edges(blocks, raw) -> dict:
+    """{block: where each edge strip_boilerplate took out of it led}: the target of a
+    conditional branch it made a nop, which is a stack check's slow path, and the
+    fallthrough of one it made unconditional, which is the slow path that boxes a Mint.
+    `raw` is what it changed: the mnemonic and operands it had, by address."""
+    cut = {}
+    for b, blk in blocks.items():
+        for t in blk.insns:
+            if cond_of(raw.get(t[0], ("",))[0]):
+                to = _target(raw[t[0]][1]) if t[1] == "nop" else t[0] + 4
+                cut.setdefault(b, []).append(to)
+    return cut
+
+
 def _frame_pass(blocks, entry, raw):
     """Where SP and FP are at the entry of each block, from _sp_step (#162): ({block: the
     state at its entry}, {block: the instructions that may change it or end a path, in
@@ -2533,12 +2549,7 @@ def _frame_pass(blocks, entry, raw):
     for b, blk in blocks.items():
         steps[b] = [(t, *insn(t), _ends_path(t[1], t[3])) for t in blk.insns
                     if not _sp_neutral(*insn(t)) or _ends_path(t[1], t[3])]
-    cut = {}
-    for b, blk in blocks.items():
-        for t in blk.insns:
-            if cond_of(raw.get(t[0], ("",))[0]):
-                to = _target(raw[t[0]][1]) if t[1] == "nop" else t[0] + 4
-                cut.setdefault(b, []).append(to)
+    cut = _cut_edges(blocks, raw)
     seen = object()                     # not reached yet
     into = {b: seen for b in blocks}
     clash = set()
@@ -2932,6 +2943,24 @@ class Lifter:
         # Block addresses a goto refers to; the renderer defines each exactly once.
         self.labels: set = set()
         self._labelled: set = set()
+        #: The labels a way in the entry takes leads to, and the sections no edge leads
+        #: into, which `structure` places after the body (#266). None takes every label.
+        #: A goto out of such a section into the body is a way in no path from the entry
+        #: takes, and what it carries justifies nothing about the others (#237), so it
+        #: does not make its target a join the walk meets and names a phi for, nor an
+        #: arm it enters one the walk declares phis around: the body prints as it did
+        #: with the section left out, and gains the label the goto names.
+        self.joinable = None
+        self.orphans: frozenset = frozenset()
+        #: The blocks before those sections that a goto out of one of them jumps to, and
+        #: whether the walk is in them yet. The code past such a label was worked out for
+        #: the body's own ways in, so the goto says so (REJOIN); a block that leads
+        #: nowhere is printed again under the section instead (`_ends_again`). Meeting
+        #: that way in at the label, dropping the body to bare registers there, changed
+        #: 641 lines in 49 functions of the clean fixture and is the static meet #237
+        #: measured and set aside (#266).
+        self.rejoined: frozenset = frozenset()
+        self._in_tail = False
         # precompute loop metadata reused during the walk
         self._preds = {a: [] for a in blocks}
         for a, b in blocks.items():
@@ -6273,13 +6302,24 @@ class Lifter:
             return _in_cond(v if v is not None else self._leaf(r, st))
         return _REG_RE.sub(sub, cond)
 
+    def _entered(self, lines) -> bool:
+        """Whether `lines` define a label a goto the walk meets jumps to: one out of a
+        section no edge leads into does not count (`joinable`)."""
+        for ln in lines:
+            m = _LABEL_LINE_RE.match(ln)
+            if m and (self.joinable is None or int(m.group(1), 16) in self.joinable):
+                return True
+        return False
+
     def _entry_block(self, stmts, cont):
         """The block a statement list first transfers control to, or `cont` if it has none
         of its own. Which block a conditional REJOINS at is what says whether the registers
         its arms disagree about are still wanted."""
         for s in stmts:
             k = s[0]
-            if k in ("asm", "loop", "goto", "label"):
+            if k == "note" or (k == "label" and s[1] in self.orphans):
+                return None             # a section nothing before it runs on into
+            if k in ("asm", "loop", "goto", "label", "again"):
                 return s[1]
             if k in ("exit", "cut"):
                 return None
@@ -6320,8 +6360,7 @@ class Lifter:
         bare, named, decls = {}, {}, []
         # An arm a `goto` jumps into is entered below the declaration, so it cannot leave
         # the name holding what the declaration gave it (#121); it assigns it itself.
-        entered = {id(lines): any(_LABEL_LINE_RE.match(ln) for ln in lines)
-                   for lines in (tlines, elines)}
+        entered = {id(lines): self._entered(lines) for lines in (tlines, elines)}
         # ...and one that prints a write to a register has changed it, even where it
         # ends up spelled as the register again, which is also how the entry value reads.
         printed = {id(lines): _printed_writes(lines) for lines in (tlines, elines)}
@@ -6501,10 +6540,19 @@ class Lifter:
         # answer for the WHOLE list and never goes back up; this is the local question, and
         # a `no` means the state the walk is carrying belongs to some other path.
         alive = True
+        # The note over the section being walked: where it is in `out`, and whether the
+        # section's own label has been passed. A section that printed nothing but labels,
+        # a trap tier 3 does not print, loses its note at the next one: a note over
+        # nothing says nothing, and it read as being about the section after it (#266).
+        note = None
         for i, s in enumerate(stmts):
             kind = s[0]
+            if note is not None and (kind == "note" or (kind == "label" and note[1])):
+                _drop_empty_note(out, note[0])
+                note = None
             if kind == "asm":
-                join = (s[1] in self.labels and len(self._preds.get(s[1], ())) > 1
+                joins_at = self.labels if self.joinable is None else self.joinable
+                join = (s[1] in joins_at and len(self._preds.get(s[1], ())) > 1
                         and s[1] not in self.carried)
                 # Before the phi write below, which spells the arriving value: a section
                 # the entry cannot reach falling into a block with other ways in hands it
@@ -6532,8 +6580,11 @@ class Lifter:
                     # loop that collapsed the receiver's name left toUpperCase reading an
                     # undeclared t1 at `return t1`. A register's temp name holds only
                     # until it is reassigned, so the bare register is the same value;
-                    # drop the undeclared temps, keep the declared (#179, #129).
-                    if not self.blocks[s[1]].succ:
+                    # drop the undeclared temps, keep the declared (#179, #129). Only
+                    # where the state spells a temp at all: scanning `out` at every
+                    # section a range places past its body made 4,000 `ret` take 6.8 s
+                    # (#266), and right after a bare `_reenter` there is none to drop.
+                    if not self.blocks[s[1]].succ and _spells_a_temp(st):
                         bound = _declared_temps(out)
                         bound |= {int(n[1:]) for n in self.pins}
                         bound |= {int(n[1:]) for n in self.phi_names}
@@ -6593,6 +6644,18 @@ class Lifter:
                     falls = False
             elif kind == "label":
                 label(s[1])
+                if s[1] in self.orphans:
+                    alive = False       # placed after the body; nothing runs on into it
+                    self._in_tail = True
+                if note is not None:
+                    note = (note[0], True)
+            elif kind == "note":
+                # Over a section no edge leads into, which says what it can be. Nothing
+                # above it runs on into it, so its first block starts from what `_reenter`
+                # justifies and not from the state the walk was carrying (#266).
+                note = (len(out), False)
+                out.append(pad + "// " + s[1])
+                alive = False
             elif kind == "if":
                 _, cond, then, els = s
                 cond_txt = self._cond(cond, st)
@@ -6612,7 +6675,7 @@ class Lifter:
                     # Declared above the `if`, at the end of the block that decides it,
                     # and set on every path through it. Where a goto enters an arm, that
                     # arm sets it too, and it is set on every path into the join instead.
-                    entered = any(_LABEL_LINE_RE.match(ln) for ln in tlines + elines)
+                    entered = self._entered(tlines + elines)
                     at = joins[i] if entered and joins[i] is not None else head
                     self._anchor.update(dict.fromkeys(range(first, st.tmpc[0]), at))
                 out.extend(self._render_if(cond_txt, tlines, elines, pad, indent))
@@ -6647,7 +6710,7 @@ class Lifter:
                 if alive and self._unjustified(s[1], st):
                     self._reenter(s[1], st)      # the same way in, into a loop head
                 label(s[1])
-                if s[1] in self.labels:
+                if s[1] in (self.labels if self.joinable is None else self.joinable):
                     # A goto into the loop's head brings a state the walk never saw: the
                     # goto join's meet, over the ways in and not the latches, before the
                     # loop binds its names from it (#125).
@@ -6675,6 +6738,13 @@ class Lifter:
                 out.extend(self._carry_out(st, pad, kind == "break"))
                 out.append(pad + kind + ";")
                 falls = alive = False
+            elif kind == "again":
+                # A block of the body that leads nowhere, printed again under a section
+                # no edge leads into and lifted from its state (`_ends_again`). No label:
+                # nothing jumps to this copy, and the body's own is where its gotos go.
+                blines, _bfalls = self._lift_block(s[1], st)
+                out.extend(pad + ln for ln in blines)
+                falls = alive = False
             elif kind == "goto":
                 if self._carrying:
                     self._note_goto(s[1])
@@ -6684,7 +6754,9 @@ class Lifter:
                 # so they hold the carried value, not the register the loop forgot (#123).
                 if s[1] in self.join_phi:
                     out.extend(self._join_write(s[1], st, pad))
-                out.append(pad + f"goto L_0x{s[1]:x};")
+                out.append(pad + f"goto L_0x{s[1]:x};"
+                           + (f"   // {REJOIN}" if self._in_tail and s[1] in self.rejoined
+                              else ""))
                 falls = alive = False
             elif kind in ("exit", "cut"):
                 # Out of the loop as surely as a break, so its names are written back
@@ -6704,6 +6776,8 @@ class Lifter:
                 else:
                     out.append(pad + cut_goto(s[1], self.show))  # inside this function
                 falls = alive = False
+        if note is not None:
+            _drop_empty_note(out, note[0])
         return out, falls
 
     def _render_if(self, cond, tlines, elines, pad, indent):
@@ -8035,6 +8109,14 @@ def _forget_temps(st: State, gone) -> None:
 
 _TMP_NUM_RE = re.compile(r"\bt(\d+)\b")
 
+
+def _spells_a_temp(st: State) -> bool:
+    """Whether anything `_forget_temps` looks at in `st` spells a temp."""
+    texts = [v.text for v in st.reg.values()] + [v.text for v in st.slot.values()]
+    texts += [v.text for v, _f in st.dropped.values()]
+    texts += [t.text for b, i, _s, _f in st.elem.values() for t in (b, i)]
+    return any("t" in t and _TMP_NUM_RE.search(t) for t in texts)
+
 #: How many values one function's first walk writes out before a goto (_arrive). A real
 #: function needs a handful; a crafted one with thousands of slots and hundreds of gotos
 #: asked for millions, a gigabyte of declarations. Past the bound a value is forgotten,
@@ -8130,7 +8212,13 @@ def _printed_writes(lines: list) -> set:
     return out
 
 
-_LABEL_LINE_RE = re.compile(r"\s*L_0x[0-9a-f]+:$")
+_LABEL_LINE_RE = re.compile(r"\s*L_0x([0-9a-f]+):$")
+
+
+def _drop_empty_note(out: list, at: int) -> None:
+    """Drop the note at `out[at]` when nothing but labels follows it."""
+    if all(_LABEL_LINE_RE.match(ln) for ln in out[at + 1:]):
+        del out[at]
 #: A declaration of a minted name, with or without an initialiser.
 _PHI_DECL_RE = re.compile(r"\s*var (t\d+)\s*(?:=|;)")
 
@@ -8421,9 +8509,34 @@ def _drop_unread_slots(lines: list, names: set) -> list:
     return [ln for i, ln in enumerate(lines) if i not in decl or decl[i] in keep]
 
 
+#: The note over the section at a Code's monomorphic entry, in place of cfg.UNREACHED,
+#: where the snapshot says the code has one (#266). That is the low bit of the Code's
+#: payload_info (app_snapshot.cc:8488 at 3.12.2), and the deserializer puts the entry a
+#: monomorphic call takes at the payload start plus kMonomorphicEntryOffsetAOT
+#: (app_snapshot.cc:9625-9644), which is 8 on arm64 (object.h:5922) in 2.19.6, 3.12.2 and
+#: 3.13.0. The same bit puts `entry_point`, the normal entry, at the payload start plus
+#: kPolymorphicEntryOffsetAOT, 24 on arm64 (app_snapshot.cc:9628-9643, object.h:5923),
+#: where MegamorphicCallStub jumps (stub_code_compiler_arm64.cc:3650-3660); the section
+#: runs on into it, so the note says where. That is all it says.
+#: MonomorphicCheckedEntryAOT (assembler_arm64.cc:1939-1958) is entered with the receiver
+#: in x0 and its class id to check in x5, and the walk names no register there all the
+#: same: the section starts from `_reenter`'s bare registers.
+MONOMORPHIC_ENTRY = ("reached by no edge in this graph: the monomorphic entry, which the "
+                     "snapshot says this code has, 8 bytes in; its normal entry is 24 "
+                     "bytes in")
+
+#: The note on a goto out of a section no edge leads into back into the body above it
+#: (Lifter.rejoined), where the block it lands on leads on: one that leads nowhere is
+#: printed again under the section instead (`_ends_again`). The code past the label was
+#: worked out for the body's ways in, and nothing says whether it holds for this one.
+REJOIN = ("the names past that label were worked out for the ways in above it, not "
+          "checked for this one")
+
+
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
                   indent="  ", depth=1, selectors=None, arch=None, fields=None,
-                  show=None, cut_end=None, returns=None, allocs=None) -> list:
+                  show=None, cut_end=None, returns=None, allocs=None,
+                  mono=None) -> list:
     """Annotated disasm -> pseudo-Dart body lines (Tier 3). `receiver` is an optional
     register-alias map, e.g. {"x1": "this"} for an instance method; `arity` is an optional
     `pc -> int` resolver (see make_arity_resolver) enabling call-argument reconstruction;
@@ -8439,7 +8552,9 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     None` resolver (make_return_resolver) saying which register the function's callers
     read its result from, and, where none does, its `by_table` asks the other functions
     `selectors` places under the same selector; without it a `ret` is decided by the
-    function's own code.
+    function's own code. `mono` is the address of the code's monomorphic entry where
+    the snapshot says it has one (disasm.monomorphic_entry), and the section placed
+    there says so; see MONOMORPHIC_ENTRY.
 
     `arch` is the resolved target. Passing one whose roles are not modelled refuses; see
     LIFTABLE_ARCHS. Omitting it keeps the arm64 assumption every caller had before the
@@ -8455,7 +8570,8 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     with use_target(TARGETS[name] if name else ARM64):
         try:
             return _lift_function(ann, pool_map, receiver, arity, indent, depth,
-                                  selectors, fields, show, cut_end, returns, allocs)
+                                  selectors, fields, show, cut_end, returns, allocs,
+                                  mono)
         except RecursionError:
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
@@ -8519,9 +8635,20 @@ def use_target(tgt: Target):
         _DEFUSE_CACHE.update(defuse)
 
 
-def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
-                   fields=None, show=None, cut_end=None, returns=None,
-                   allocs=None) -> list:
+class Tier3Graph(NamedTuple):
+    """One function's graph as tier 3 lifts it, and how `structure` places it."""
+    stripped: list          # the rows after strip_boilerplate
+    slow: frozenset         # the stack checks' slow paths it took the branch to
+    blocks: dict
+    entry: int
+    raw: dict               # what it changed: the mnemonic and operands, by address
+    cut: frozenset          # where the edges it took out led (_cut_edges)
+    stmts: list             # structure(), with every block no edge reaches after the body
+
+
+def tier3_graph(ann, cut_end=None):
+    """The Tier3Graph of the annotated rows `ann`, or None where they make no block.
+    `_lift_function` lifts it and tools/cfgcheck.py checks it, so both see one graph."""
     slow = set()
     stripped = strip_boilerplate(ann, slow)
     # Tier 3 honours traps, the rule tier 2 took in #57: a block ends at a `brk`/`udf`
@@ -8534,11 +8661,83 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     blocks, entry = build_cfg(stripped, traps=TRAPS, cut_end=cut_end,
                               ends=_path_ends(stripped))
     if not blocks:
-        return []
+        return None
     _fold_frame_offsets(blocks)
-    stmts = structure(blocks, entry)
-    dispatch = detect_dispatch(stripped)
     raw = {t[0]: t[1:3] for t, s in zip(ann, stripped) if s[1:3] != t[1:3]}
+    # Every block, as tier 2 places them (#67): what no edge reaches goes after the body,
+    # each section under a note. Placing only what the entry reaches dropped the body
+    # behind a monomorphic entry and the catch entries after a `ret` or a `b` without a
+    # word (#266). What strip_boilerplate cut off on purpose stays out, since an edge
+    # does reach it in the machine: a stack check's slow path, and the slow path that
+    # boxes a Mint.
+    cut = frozenset(to for tos in _cut_edges(blocks, raw).values() for to in tos)
+    return Tier3Graph(stripped, frozenset(slow), blocks, entry, raw, cut,
+                      _ends_again(blocks, structure(blocks, entry, orphans=True, cut=cut),
+                                  entry_reach(blocks, entry)))
+
+
+def _ends_again(blocks, stmts, placed) -> list:
+    """`stmts` with each goto out of a section no edge leads into, to a block of the body
+    that leads nowhere, a return, a throw or a jump out, made `("again", block)`: that
+    block printed once more under the section, and lifted from the section's own state,
+    with the exit or cut the body prints after it.
+
+    Read on from a goto, the block's lines are worked out for the body's ways in, and
+    the section's way in had nothing to do with them: `invokeCallback` on the clean
+    fixture went on to `return t2;`, the callback's result, from a catch entry that
+    leaves null in x0, and every monomorphic entry ended in a goto to the miss handler
+    (#266). Printed again, the block says what this way in does there, and nothing
+    follows it to read on into. A block with a successor is left a goto: copying it
+    would copy what it leads to as well."""
+    def copy(ss):
+        out = []
+        for s in ss:
+            if s[0] == "goto" and s[1] in placed and not blocks[s[1]].succ:
+                blk = blocks[s[1]]
+                out.append(("again", s[1]))
+                if blk.exit_target >= 0:
+                    out.append(("cut" if blk.past_cut else "exit", blk.exit_target))
+                elif blk.cut_next >= 0:
+                    out.append(("cut", blk.cut_next))
+            elif s[0] == "if":
+                out.append(("if", s[1], copy(s[2]), copy(s[3])))
+            elif s[0] == "loop":
+                out.append(("loop", s[1], copy(s[2])))
+            else:
+                out.append(s)
+        return out
+    tail = next((i for i, s in enumerate(stmts)
+                 if s[0] == "label" and s[1] not in placed), len(stmts))
+    return stmts[:tail] + copy(stmts[tail:])
+
+
+def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
+                   fields=None, show=None, cut_end=None, returns=None,
+                   allocs=None, mono=None) -> list:
+    g = tier3_graph(ann, cut_end)
+    if g is None:
+        return []
+    stripped, slow, blocks, entry, raw, stmts = (g.stripped, g.slow, g.blocks, g.entry,
+                                                 g.raw, g.stmts)
+    # The sections no edge leads into start at the first label `structure` placed past
+    # what the entry reaches, under its note.
+    placed = entry_reach(blocks, entry)
+    tail = next((i for i, s in enumerate(stmts)
+                 if s[0] == "label" and s[1] not in placed), len(stmts))
+    if tail and stmts[tail - 1][0] == "note":
+        tail -= 1
+    for i in range(len(stmts) - 1):
+        if stmts[i] == ("note", UNREACHED) and stmts[i + 1] == ("label", mono):
+            stmts[i] = ("note", MONOMORPHIC_ENTRY)
+    labels = label_targets(stmts)
+    joinable = frozenset(label_targets(stmts[:tail]) | {a for a in labels
+                                                        if a not in placed})
+    orphans = frozenset(s[1] for s in stmts[tail:] if s[0] == "label")
+    # The blocks before the sections that a block of one jumps to.
+    dead = set(blocks) - placed
+    rejoined = frozenset(t for b in dead - cut_off(blocks, dead, g.cut)
+                         for t in blocks[b].succ if t in placed)
+    dispatch = detect_dispatch(stripped)
     meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
 
@@ -8562,7 +8761,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
             by_table = getattr(returns, "by_table", None)
             if by_table is not None and selectors:
                 lifter.table = lambda: by_table(ann[0][0], selectors)
-        lifter.labels = label_targets(stmts)
+        lifter.labels = labels
+        lifter.joinable, lifter.orphans, lifter.rejoined = joinable, orphans, rejoined
         lifter.keep = keep
         lifter.carry_more = carry or {}
         lifter.join_phi = join_phi or {}

@@ -160,7 +160,7 @@ def decompile(path: str, symbol: str) -> list:
     its register arguments by (program.EntryNames.params): `"a1, a2"`, `""` where it
     reads none, `"..."` where the list is not read."""
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
-                         function_name_by_pc, build_pool_map)
+                         function_name_by_pc, build_pool_map, monomorphic_entry)
     from .branches import row_kinds
     from .disasm import rebaser, cut_end
     from .expr import lift_function, make_arity_resolver, make_return_resolver
@@ -205,7 +205,7 @@ def decompile(path: str, symbol: str) -> list:
                              fields=layout.for_function(cr.owner_ref),
                              allocs=allocs,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
-                             returns=returns)
+                             returns=returns, mono=monomorphic_entry(image, cr))
         out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
                     "params": entry.params(cr),
                     "body": [ln.strip() for ln in body]})

@@ -66,7 +66,7 @@ def is_raw_asm(line: str) -> bool:
 def measure(path):
     from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc)
+                               build_pool_map, function_name_by_pc, monomorphic_entry)
     from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
     from jadart.fields import recover_accessors, recover_allocations, recover_fields
@@ -95,7 +95,7 @@ def measure(path):
                              arity=arity, selectors=selectors, returns=returns,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             allocs=allocs)
+                             allocs=allocs, mono=monomorphic_entry(image, cr))
         c["functions"] += 1
         c["lines"] += len(body)
         had_goto = False

@@ -354,6 +354,63 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Tier 3 places the code only a second entry or a catch entry reaches.** It structured
+  a range from its first instruction and placed nothing else, so a block no edge leads
+  into left the output with nothing in its place: `lift` of the `dyn:-` forwarder at
+  0x104 printed only the miss handler's `br x16`, and `_dispatch` at 0x7ac3c lost the
+  catch entry that reports "while routing a pointer event". `lift`, `decompile`,
+  `export`, `ffi` and `jadart.decompile` now place every such block after the body, as
+  tier 2 has since #67, each section under the note that lists what it can be. The one
+  at a Code's monomorphic entry says that instead, where the snapshot flags the code as
+  having one, and that its normal entry is 24 bytes in: the same payload_info bit puts
+  the entry a monomorphic call takes at the payload start plus 8 and `entry_point` at
+  plus 24 (app_snapshot.cc:9625-9644 at 3.12.2, object.h:5922-5923). A catch entry is
+  not named as one, since jadart does not read the ExceptionHandlers it walks past. A
+  section starts from bare registers, as a block no path reaches does since #255. Where
+  it runs on into a block of the body that leads nowhere, a return, a throw or a jump
+  out, that block is printed again under it from its own state, so `invokeCallback`'s
+  catch entry ends `return NULL;` and not in a goto to the body's `return t2;`, the
+  callback's result. Where the block leads on, the goto says the names past its label
+  were worked out for the body's ways in, not checked for this one. Dropping the body
+  to bare registers at such a label instead changed 641 lines in 49 functions of the
+  clean fixture, the static meet #237 measured and set aside. What strip_boilerplate
+  cuts off on purpose stays out, a stack check's slow path and the one that boxes a
+  Mint, and so does the note over a section that prints nothing, a `brk`. The code
+  after a trap, which tier 3 placed with no note, now gets one.
+
+  `tools/cfgcheck.py` counted only what the entry reaches and read 0 dropped blocks. It
+  now checks tier 3's own graph too: on main 2,435 blocks with code in 858 functions no
+  edge reaches and tier 3 leaves out, 2,436 on obf. 1,216 of them, in 610 functions, are
+  the Mint slow path and stay out; the other 1,219 (1,220 on obf), in 258 functions, are
+  placed, and it reads 0 dropped and 0 edge violations, a block printed again included.
+
+  The changed answer, measured with `lift` over every range against main. On the clean
+  fixture 184,062 lines become 188,003: 261 ranges gain 3,882 lines of sections under
+  334 notes, 78 of them the monomorphic entry, one for each range the snapshot flags.
+  The sections print 126 blocks of the body again and keep 49 gotos into it, each with
+  its note. The bodies gain 49 labels, 6 notes and 1 declaration, and 3 lines that
+  printed before change in 3 functions: an `if` no longer flipped round an arm that now
+  holds a label. The obfuscated fixture is the same, to one line of sections. Over the
+  seven app-sweep libraries 4,724,313 lines become 4,860,117: 6,951 ranges gain 134,857
+  lines under 10,487 notes, 4,004 of them monomorphic entries, with 5,256 blocks printed
+  again and 969 gotos noted; the bodies gain 641 labels, 199 notes, 100 declarations and
+  3 `} else {` round an arm that now holds a label, and 4 lines that printed before
+  change, 2 such flips and 2 calls folded into the next statement split from it by a
+  label. `export` changes 35 of the clean fixture's 328 files, 163,083 lines to 165,915
+  of which 3 are removed, and 13 of obf's 312, 16,434 to 17,724. Tier 2 is
+  byte-identical on both. `tools/quality.py` on the clean fixture, main then this:
+  184,060 and 188,001 lines, bare-register lines 12,353 and 12,768, offset fields
+  52,626 and 53,905, `(...)` 5,139 and 5,288, gotos 5,493 and 5,644 in 1,414 and 1,434
+  functions, raw lines 1,288 and 1,394, all 106 more in the sections and 78 of them the
+  miss handler's `br x16` printed again; obf moves the same way. `pbfuzz` and `irfuzz
+  --corpus`, `--cfg` and `--cfg --nested` do not reach the new sections: their counts
+  are identical to main's. `pbfuzz --census` reads 2,072 wrong reads on main and 2,082
+  here, the 10 more in the sections, 0 stale, and a note after a `throw` no longer
+  counts as a statement under it, 37 on the clean fixture. Blocks holding only a
+  declaration nothing reads go from 1,489 to 1,527, all in the sections. A crafted
+  range of 4,000 `ret` lifts in 0.10 s, where scanning the printed lines at every
+  section took 6.8 s. Closes #266.
+
 - **`pbfuzz --census` judges a reload past `_reenter` by the way in the state came by.**
   The census keeps, per walk state, what each frame slot was filled with, and counts a
   reload the lifter declines as a wrong read when the slot held another register.

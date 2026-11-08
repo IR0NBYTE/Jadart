@@ -73,7 +73,7 @@ _LIFT_ALL = """
 import hashlib, sys
 from jadart.branches import row_kinds
 from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                           build_pool_map, function_name_by_pc)
+                           build_pool_map, function_name_by_pc, monomorphic_entry)
 from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
 from jadart.dispatch import recover_selectors
 from jadart.program import EntryNames
@@ -94,7 +94,8 @@ for cr in image.all_ranges:
     body = lift_function(ann, pool_map,
                          receiver=entry.names(cr),
                          arity=arity, selectors=selectors, returns=returns,
-                         arch=getattr(image, "arch", None))
+                         arch=getattr(image, "arch", None),
+                         mono=monomorphic_entry(image, cr))
     n += 1
     lines += len(body)
     h.update(("%x\\n" % cr.pc_offset).encode())

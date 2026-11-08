@@ -57,6 +57,16 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | `// reached by no edge ...` | code no branch shown leads to | "it runs after that" |
 | `// TRUNCATED: past the instruction cut` | the function goes on past the 4,000 instructions decoded | "it ends here" |
 
+A section under `// reached by no edge ...` lists what it can be, and which one it is was
+not worked out; it says `the monomorphic entry` only where the snapshot flags the code as
+having one. It starts from bare registers. If it is a catch entry, the VM enters it with
+the exception in x0 and the stack trace in x1 (kExceptionObjectReg and
+kStackTraceObjectReg, constants_arm64.h), but nothing in the output says it is one. Where
+it runs on into a return or a throw of the body, that code is printed again under it, from
+its own state. A goto out of it into the body says `// the names past that label were
+worked out for the ways in above it, not checked for this one`: what is past that label
+is the body's, so do not say "the catch returns t2".
+
 A name holding `\u202e`, `\u001b`, `\u200b` or another `\u` escape is a name the binary
 really carries, with a character in it that would reorder, hide or colour the text around
 it if printed: a bidi override, a control, a zero width space. Jadart writes it as the

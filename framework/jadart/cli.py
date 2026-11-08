@@ -278,7 +278,7 @@ def cmd_libraries(args) -> int:
 def cmd_lift(args) -> int:
     """Tier 3 for a single function, including top-level ones that belong to no class."""
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
-                         build_pool_map, addr_label, va_of)
+                         build_pool_map, addr_label, va_of, monomorphic_entry)
     from .branches import row_kinds
     from .disasm import rebaser, cut_end
     from .signatures import names_with_signatures
@@ -326,7 +326,7 @@ def cmd_lift(args) -> int:
                              fields=layout.for_function(cr.owner_ref),
                              allocs=allocs,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
-                             returns=returns)
+                             returns=returns, mono=monomorphic_entry(image, cr))
         # The names the body reads its arguments by, so no `a1` in it goes undeclared.
         params = entry.params(cr)
         if getattr(args, "json", False):
@@ -867,7 +867,7 @@ def cmd_ffi(args) -> int:
     """
     from .disasm import addr_label, va_of
     from .disasm import (load_instructions, build_pool_map, pool_xrefs, disassemble_range,
-                         annotate)
+                         annotate, monomorphic_entry)
     from .branches import row_kinds
     from .disasm import rebaser, sub_label
     from .signatures import names_with_signatures
@@ -914,7 +914,8 @@ def cmd_ffi(args) -> int:
                                      arch=getattr(image, "arch", None),
                                      fields=layout.for_function(cr.owner_ref),
                                      allocs=allocs,
-                                     show=rebaser(image), returns=returns)
+                                     show=rebaser(image), returns=returns,
+                                     mono=monomorphic_entry(image, cr))
             except JadartError:
                 # Tier 3 declines on a target it has no register model for (UnsupportedArch
                 # is a JadartError). The pool and xref halves still hold, so the library is

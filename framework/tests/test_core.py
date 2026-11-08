@@ -1639,10 +1639,11 @@ def test_a_call_that_cannot_return_ends_its_block():
     assert kept[0x4].succ == [0x8] and not kept[0x4].ends_path
     assert 0xc not in kept
     # Each arm throws, nothing is printed under either, and the tail nothing reaches is
-    # still there under its own label.
+    # still there under its own label, and under the note that says so (#266).
+    from jadart.cfg import UNREACHED
     assert [ln.strip() for ln in lift_function(ann)] == [
         "if (x0 != 0) {", "throw NullCastError();", "} else {",
-        "throw NullCastError();", "}", "L_0xc:", "return 1;"]
+        "throw NullCastError();", "}", "// " + UNREACHED, "L_0xc:", "return 1;"]
 
 
 def test_the_null_test_chain_that_found_the_false_edge_reads_as_source():
@@ -3921,6 +3922,11 @@ def test_every_lift_call_site_passes_the_target():
             if "arch=" not in src[m.end():i]:
                 line = src[:m.start()].count("\n") + 1
                 missing.append(f"{os.path.relpath(path, root)}:{line}")
+            # ...and the monomorphic entry, or the tools print the generic note where
+            # `lift` prints the one the snapshot proves, and measure another output (#266)
+            if "mono=" not in src[m.end():i]:
+                line = src[:m.start()].count("\n") + 1
+                missing.append(f"{os.path.relpath(path, root)}:{line} (mono=)")
     assert not missing, "lift_function called without arch=: " + ", ".join(missing)
 
 
@@ -6702,11 +6708,14 @@ def test_structured_output_claims_exactly_the_edges_the_cfg_has():
     # Over the whole image, not a sample: 8,194 functions, and the answer has to be zero.
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     import cfgcheck
-    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep = cfgcheck.run(CLEAN)
+    n, badfn, edges, dropped, twice, worst, exit_bad, exit_first, deep, t3 = cfgcheck.run(
+        CLEAN)
     assert n > 8000, f"only {n} functions structured; the fixture is not the whole image"
     assert (edges, dropped, twice, exit_bad, deep) == (0, 0, 0, 0, 0), (
         f"{edges} edge violations, {dropped} dropped, {twice} duplicated: {worst}; "
         f"{exit_bad} exit violations: {exit_first}")
+    # ...and tier 3's own graph, with every block no edge reaches placed (#266)
+    assert t3["n"] > 8000 and (t3["edges"], t3["dropped"], t3["twice"]) == (0, 0, 0), t3
 
 
 def test_a_conditional_whose_arms_both_return_still_gets_a_follow_node():
@@ -9647,6 +9656,199 @@ def test_an_unreached_tangle_too_deep_to_structure_is_counted_not_a_crash():
     stmts = structure(blocks, entry, orphans=True)
     notes = [s[1] for s in stmts if s[0] == "note"]
     assert notes and "nested too deeply to structure; `disasm` lists them" in notes[-1]
+
+
+def _lift_rows(rows, base=0, **kw):
+    """Tier 3 of `rows`, (mnemonic, operands) laid out 4 bytes apart from `base`."""
+    from jadart.expr import lift_function
+    ann = [(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    return [ln.strip() for ln in lift_function(ann, **kw)]
+
+
+#: The layout MonomorphicCheckedEntryAOT emits (assembler_arm64.cc:1941-1962 at 3.12.2):
+#: the miss handler at +0, the class check at +8, and the body from +0x18 on, which here
+#: returns a field of its receiver register.
+_MONO_ROWS = [("ldr", "x16, [x26, #0x258]"), ("br", "x16"), ("ldur", "x16, [x0, #-1]"),
+              ("ubfx", "x16, x16, #0xc, #0x14"), ("cmp", "w5, w16, lsl #1"),
+              ("b.ne", "#0x1000"), ("ldur", "x0, [x1, #7]"), ("ret", "")]
+
+
+def test_tier3_places_the_body_behind_a_monomorphic_entry():
+    """Tier 3 placed only what the first instruction reaches, and a Code with a
+    monomorphic entry starts on the miss handler's `br x16`, so its whole body left the
+    output: `lift` of a `dyn:` forwarder printed that one line (#266). Where the snapshot
+    says the code has one, the section 8 bytes in says it is the monomorphic entry, and
+    where its normal entry is, and with no such word it gets the note any unreached
+    section does. Either way it starts from bare registers: x1 is the receiver only where
+    the function is entered at its first instruction, so it is not `this` here. Its miss
+    branch runs into the miss handler, which leads nowhere, so that prints again in the
+    arm rather than as a goto into the body above."""
+    from jadart.cfg import UNREACHED
+    miss = "br x16   // x16 holds THR.field_0x258"
+    plain = _lift_rows(_MONO_ROWS, 0x1000, receiver={"x1": "this"})
+    assert plain == [miss, "// " + UNREACHED, "L_0x1008:",
+                     "if (x5 == (((x0.tags >> 12) & 0xfffff) << 1)) {",
+                     "return x1.field_0x8;", "} else {", miss, "}"], plain
+    from jadart.expr import MONOMORPHIC_ENTRY
+    assert "its normal entry is 24 bytes in" in MONOMORPHIC_ENTRY
+    body = _lift_rows(_MONO_ROWS, 0x1000, receiver={"x1": "this"}, mono=0x1008)
+    assert body == [miss, "// " + MONOMORPHIC_ENTRY] + plain[2:], body
+    # not a monomorphic entry: the address is not where the section starts
+    assert _lift_rows(_MONO_ROWS, 0x1000, mono=0x100c)[1] == "// " + UNREACHED
+
+
+def test_tier3_places_a_catch_entry_with_bare_registers():
+    """A catch entry after a `ret` is reached by an exception edge the graph does not
+    have, and tier 3 left it out with nothing in its place (#266). It is placed after the
+    body under the note, and entered with the exception in x0 and the stack trace in x1
+    (constants_arm64.h, kStackTraceObjectReg), so neither reads as an entry name. A
+    section that prints nothing, a `brk`, gets no note: a note over nothing read as being
+    about the section after it."""
+    from jadart.cfg import UNREACHED
+    note = "// " + UNREACHED
+    catch = [("ldur", "x0, [x1, #7]"), ("ret", ""), ("sub", "x15, x29, #0x20"),
+             ("ldur", "x0, [x1, #0xb]"), ("ret", "")]
+    body = _lift_rows(catch, receiver={"x1": "this", "x2": "a1"})
+    assert body == ["return this.field_0x8;", note, "L_0x8:",
+                    "return x1.field_0xc;"], body
+    body = _lift_rows(catch[:2] + [("brk", "#0")] + catch[2:], receiver={"x1": "this"})
+    assert body == ["return this.field_0x8;", "L_0x8:", note, "L_0xc:",
+                    "return x1.field_0xc;"], body
+
+
+def test_a_catch_entry_that_runs_on_into_the_body_says_what_it_does_there():
+    """A catch entry that runs on into the body's own code reaches a block the body's
+    names were worked out for. Read on from a goto, they say the handler's way in holds
+    them too: `invokeCallback` on the clean fixture went on to `return t2;`, the
+    callback's result, where the handler leaves null in x0 (#266). A block that leads
+    nowhere is printed again under the section, from the section's own state; one that
+    leads on stays a goto, which says its names were not checked for this way in. The
+    body prints as it did with the section left out (#237 measured the meet that would
+    drop it to bare registers there and set it aside)."""
+    from jadart.cfg import UNREACHED
+    rows = [("ldur", "x0, [x1, #7]"), ("b", "#0x10"), ("sub", "x15, x29, #0x20"),
+            ("mov", "x0, x22"), ("ret", "")]
+    body = _lift_rows(rows, receiver={"x1": "this"})
+    assert body == ["return this.field_0x8;", "// " + UNREACHED, "L_0x8:",
+                    "return NULL;"], body
+    # the join leads on, through an `if`, so the section jumps to it
+    rows[4:] = [("cbz", "x2, #0x18"), ("add", "x0, x0, #1"), ("ret", "")]
+    body = _lift_rows(rows, receiver={"x1": "this"})
+    assert body[0] == "L_0x10:" and body[-3:-1] == ["// " + UNREACHED, "L_0x8:"], body
+    from jadart.expr import REJOIN
+    assert body[-1] == "goto L_0x10;   // " + REJOIN, body
+
+
+def test_tier3_leaves_out_what_strip_boilerplate_cuts_on_purpose():
+    """strip_boilerplate takes out the branch to a stack check's slow path and the one
+    into the slow path that boxes a Mint, so no edge of tier 3's graph reaches either.
+    An edge does in the machine, so the note would list everything they can be but that:
+    they stay out, and a slow path the step past a trap places (#157) keeps no note."""
+    from jadart.cfg import UNREACHED
+    box = [("sbfiz", "x0, x1, #1, #0x1f"), ("cmp", "x1, x0, asr #1"), ("b.eq", "#0x14"),
+           ("bl", "#0x400"), ("stur", "x1, [x0, #7]"), ("ret", "")]
+    assert _lift_rows(box) == ["return x1;"]
+    check = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"), ("b.ls", "#0x14"),
+             ("mov", "x0, x22"), ("ret", ""), ("bl", "#0x500"), ("b", "#0xc")]
+    assert _lift_rows(check) == ["return NULL;"]
+    check[4] = ("brk", "#0")
+    body = _lift_rows(check)
+    assert "sub_0x500(...);" in body and "// " + UNREACHED not in body, body
+
+
+def test_structure_places_a_cut_off_block_only_where_another_leads_to_it():
+    """`cut` names where the edges the caller took out led. A block only those lead to
+    stays out of the orphans; one another unreached block jumps to is still placed, since
+    that jump is in the graph and the output shows it."""
+    from jadart.cfg import build_cfg, render, structure
+    # ret | mov; ret @0x4, cut | sub; b 0x4 @0xc, unreached
+    rows = [("ret", ""), ("mov", "x0, #1"), ("ret", ""), ("sub", "x15, x29, #0x20"),
+            ("b", "#0x4")]
+    blocks, entry = build_cfg([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    alone = structure(blocks, entry, orphans=True, cut={0x4})
+    assert ("label", 0x4) in alone and ("label", 0xc) in alone, alone
+    rows = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows[:3])]
+    blocks, entry = build_cfg(rows)
+    out = [ln.strip() for ln in render(blocks, structure(blocks, entry, orphans=True,
+                                                         cut={0x4}), show=None)]
+    assert out == ["return;"], out
+
+
+def test_cfgcheck_counts_the_blocks_tier3_leaves_out():
+    """cfgcheck counted only the blocks the entry reaches, so tier 3 dropping a catch
+    entry read as 0 dropped blocks (#266). It counts the blocks no edge reaches that
+    tier 3's statements leave out, apart from the ones strip_boilerplate cut off, and it
+    has to see the drop when the orphans are taken back out."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import cfgcheck
+    from jadart.cfg import structure
+    from jadart.expr import tier3_graph
+    rows = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"), ("b.ls", "#0x20"),
+            ("sbfiz", "x0, x1, #1, #0x1f"), ("cmp", "x1, x0, asr #1"), ("b.eq", "#0x1c"),
+            ("bl", "#0x400"), ("ret", ""), ("bl", "#0x500"), ("b", "#0xc"),
+            ("sub", "x15, x29, #0x20"), ("ldur", "x0, [x1, #0xb]"), ("ret", "")]
+    g = tier3_graph([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+    assert cfgcheck.tier3_left_out(g) == (set(), {0x18}, {0x20}), g.stmts
+    main = g._replace(stmts=structure(g.blocks, g.entry))
+    assert cfgcheck.tier3_left_out(main) == ({0x28}, {0x18}, {0x20})
+
+
+def test_census_reads_a_note_after_a_throw_as_no_statement():
+    """pbfuzz's census counts a line under a `throw` as code no path reaches, and must
+    stay 0. The note tier 3 now prints over a section no edge leads into is not code, and
+    37 of them right after a `throw` on the clean fixture read as dead statements (#266).
+    It is looked past, so a statement after one still counts."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import pbfuzz
+    from jadart.cfg import UNREACHED
+    note = "// " + UNREACHED
+    assert pbfuzz._shape(["throw t0;", note, "L_0x8:", "return x0;"])["dead"] == 0
+    assert pbfuzz._shape(["throw t0;", note, "return x0;"])["dead"] == 1
+
+
+def test_placing_the_sections_past_the_body_is_linear():
+    """Each section no edge leads into that ends in a return or a throw had the walk
+    scan every line printed so far for the temps it declares, and a crafted range of
+    4,000 `ret` took 6.8 s where main took 0.02 s (#266). Right after `_reenter` drops
+    to bare registers there is no temp to drop, so the scan runs only where the state
+    spells one. Measured as CPU time against a range a quarter the size, so a slow or
+    busy machine does not decide it: four times the code may cost four times as much."""
+    import time
+    from jadart.expr import lift_function
+
+    def took(n):
+        ann = [(i * 4, "ret", "", "") for i in range(n)]
+        start = time.process_time()
+        lift_function(ann)
+        return time.process_time() - start
+    small = min(took(1000) for _ in range(3))
+    large = min(took(4000) for _ in range(3))
+    assert large < 8 * small, (small, large)
+
+
+def test_tier3_shows_the_fixture_forwarder_and_catch_entry():
+    """The two cases #266 was found on, on the clean fixture: the `dyn:-` forwarder at
+    0x104 printed only its miss handler, and `_dispatch` at 0x7ac3c lost the catch entry
+    that reports "while routing a pointer event"."""
+    _needs_capstone()
+    if not os.path.exists(CLEAN):
+        _skip("  SKIP test_tier3_shows_the_fixture_forwarder_and_catch_entry "
+              "(no fixture)")
+    from jadart.cfg import UNREACHED
+    body = jadart.decompile(CLEAN, "0x7ac3c")[0]["body"]
+    assert "// " + UNREACHED in body, body
+    catch = body[body.index("// " + UNREACHED) + 1:]
+    assert any("while routing a pointer event" in ln for ln in catch), body
+    assert any(ln.startswith("reportError(") for ln in catch), body
+    assert not any(re.search(r"\b(this|a\d)\b", ln.split("//")[0]) for ln in catch), catch
+    body = jadart.decompile(CLEAN, "0x12aa10")[0]["body"]
+    assert body[2] == "return t1.field_0x20(t0);" and body[-1] == "return NULL;", body
+    body = jadart.decompile(CLEAN, "0x104")[0]["body"]
+    miss = "br x16   // x16 holds THR.field_0x258"
+    assert body[0] == miss and body[-2:] == [miss, "}"], body
+    assert any(ln.startswith("return sub_") for ln in body[2:]), body
+    from jadart.expr import MONOMORPHIC_ENTRY
+    assert body[1] == "// " + MONOMORPHIC_ENTRY, body
 
 
 def test_a_condition_reads_the_compare_arm32_puts_further_back():
@@ -12883,13 +13085,15 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
     # arm's d1 is the bare register: a join inside that arm lost the value, which reads
     # just like the d1 from before the `if`, and the name would carry that one down an
     # arm that loaded a field.
+    # The `nop` after the `b` is a block nothing reaches, placed after the body since
+    # #266, and the label its goto names keeps the arm it opens from vanishing.
     rows = [("cbz", "x0, #0x10"), ("movi", "d1, #0"), ("b", "#0x24"), ("nop", ""),
             ("cbz", "x2, #0x1c"), ("ldur", "d1, [x3, #7]"), ("b", "#0x20"),
             ("ldur", "d1, [x3, #0xf]"), ("nop", ""), ("stur", "d1, [x4, #7]"),
             ("ret", "")]
     assert [ln.strip() for ln in lift_function(
-        [(i * 4, *r, "") for i, r in enumerate(rows)])] == [
-        "x4.field_0x8 = d1;", "return x0;"]
+        [(i * 4, *r, "") for i, r in enumerate(rows)])][:5] == [
+        "if (x0 == 0) {", "L_0x10:", "}", "x4.field_0x8 = d1;", "return x0;"]
 
     # the two ways the VM zeroes a double are 0.0
     for mid in ((4, "eor", "v0.16b, v0.16b, v0.16b", ""), (4, "movi", "v0.2d, #0", ""),
@@ -14028,8 +14232,10 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
         "foo(...);", "var t0 = (FP - 8).field_0x1;", "t0.field_0x8 = d0;"]
     mixed = [("cbz", "x1, #0x10", ""), ("bl", "#0x100", "  ; -> foo"), ("b", "#0x14", ""),
              ("nop", "", ""), ("fmov", "d0, #1.0", ""), ("ret", "", "")]
-    assert lift(mixed, "d0") == ["var t1;", "if (x1 != 0) {", "var t0 = foo(...);",
-                                 "t1 = t0;", "} else {", "t1 = 1.0;", "}", "return t1;"]
+    # (the `nop` nothing reaches goes after the body, and its goto names the else arm)
+    assert lift(mixed, "d0")[:9] == ["var t1;", "if (x1 != 0) {", "var t0 = foo(...);",
+                                     "t1 = t0;", "} else {", "L_0x10:", "t1 = 1.0;", "}",
+                                     "return t1;"]
     # Not where a stub's or a register call's d0 may reach the `ret`, on any one path: a
     # stub's result is an object, and a register call's callee is unknown.
     three = [("cbz", "x1, #0x14", ""), ("cbz", "x2, #0x1c", ""), mixed[1],
@@ -15453,10 +15659,11 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
         f"the same residual, a rising share is a new one")
     # 2,856 to 2,886 when the census began to follow `_reenter`'s reset, which is not the
     # same count: main read 2,853 judged against the path printed above a reset, and
-    # 2,886 against the way in the state came by.
-    assert got["wrong"] + got["name"] <= 2886, (
+    # 2,886 against the way in the state came by. Then 2,896 at #266, the code tier 3 now
+    # places adding 10 wrong reads, all of them in it.
+    assert got["wrong"] + got["name"] <= 2896, (
         f"{got['wrong'] + got['name']} reloads in total name a different value than the "
-        f"slot held, up from 2886, of which {got['name']} are names out of scope")
+        f"slot held, up from 2896, of which {got['name']} are names out of scope")
     # And the reader-visible half of #198, which the two numbers above cannot see: they
     # score what `_reload` DECIDES, and the fix for a decline is at the call site, which
     # names the read rather than keeping the load's own register. A register the printed
@@ -15495,9 +15702,11 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # nothing reading it, and the arm of that `if` is a block holding one dead assignment.
     # Dropping a computation whose only reader was a suppressed stub is the fix, and it is
     # `_drop_unread`'s business rather than the naming's.
-    assert got["sole"] <= 1489, (
+    # 1,489 to 1,527 at #266, all in the code tier 3 now places: over `lift`'s own output
+    # 1,144 to 1,179, every one of the 35 in a section past the body.
+    assert got["sole"] <= 1527, (
         f"{got['sole']} blocks hold nothing but a declaration nothing reads, up from "
-        f"1489; see the guard in `_drop_unread` (#210)")
+        f"1527; see the guard in `_drop_unread` (#210)")
 
     # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
     real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,
@@ -15770,11 +15979,14 @@ def test_a_store_through_a_base_the_join_lost_names_it_unknown():
 
     # One arm loads x2 from itself, the other copies x4 into it, and the store after the
     # join uses x2 as its base.
+    # The `nop` is a block nothing reaches, placed after the body since #266; the `if`
+    # above the store is there only for the label its goto names.
     got = lift([("cbz", "x3, #0x10"), ("ldur", "x2, [x2, #7]"), ("b", "#0x14"),
                 ("nop", ""), ("mov", "x2, x4"),
                 ("stur", "x1, [x2, #0xb]"), ("ret", "")])
-    assert got[0] == "var t0;", got
-    assert got[1] == "t0.field_0xc = x1;", got
+    assert got[:3] == ["if (x3 == 0) {", "L_0x10:", "}"], got
+    assert got[3] == "var t0;", got
+    assert got[4] == "t0.field_0xc = x1;", got
     # Where the arms AGREE the register is not lost and keeps its own name, which is the
     # value the function came in with and reads right.
     agree = lift([("cbz", "x3, #0x10"), ("mov", "x5, #1"), ("b", "#0x14"),
@@ -16317,7 +16529,12 @@ def test_a_loop_falls_out_to_a_block_some_run_can_enter():
     assert nxt[1] == 0x28, (
         f"the loop falls out to 0x{nxt[1]:x}, which no run can enter; 0x28 is the way "
         f"out its own blocks take")
-    body = "\n".join(lift_function(ann, arch="arm64"))
+    lines = lift_function(ann, arch="arm64")
+    # The body, above the section 0xc is placed in after it (#266). That section prints
+    # the return it reaches again, from its own state, and `x9 + 27` is right there.
+    from jadart.cfg import UNREACHED
+    note = "  // " + UNREACHED
+    body = "\n".join(lines[:lines.index(note)] if note in lines else lines)
     assert "x9 + 27" not in body, (
         f"the join reads a value only the unreachable block computes\n{body}")
     assert "return x2 | x11;" in body, body
@@ -18028,7 +18245,8 @@ def test_a_name_holds_only_while_the_register_holds_what_it_came_in_with():
     assert "throw a1;" in body and "return x2.field_0x8;" in body, body
     body = lift([("bl", "#0x100", "  ; -> _iso_stub_ThrowStub"), ("brk", "#0"),
                  ("ldur", "x0, [x1, #7]"), ("ret", "")])
-    assert "return x1.field_0x8;" in body and "this" not in body, body
+    code = "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("//"))
+    assert "return x1.field_0x8;" in body and "this" not in code, body
     # A type-testing stub hands back x0, x1, x2 and x8 and nothing else
     # (TypeTestABI::kPreservedAbiRegisters), so x5 after one is not the argument.
     body = lift([("bl", "#0x100", "  ; -> _iso_stub_DefaultTypeTestStub"),
