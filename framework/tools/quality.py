@@ -69,7 +69,8 @@ def measure(path):
                                build_pool_map, function_name_by_pc, monomorphic_entry)
     from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
-    from jadart.fields import recover_accessors, recover_allocations, recover_fields
+    from jadart.fields import (recover_accessors, recover_allocations, recover_casts,
+                               recover_fields)
     from jadart.program import EntryNames
 
     image, fr, hdr = load_instructions(path)
@@ -82,6 +83,7 @@ def measure(path):
     layout = recover_fields(fr, getattr(image, "arch", None))
     layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout)
+    casts = recover_casts(image, fr, layout)
 
     c = dict(functions=0, lines=0, regline=0, field=0, ellipsis=0, goto=0,
              rawasm=0, goto_funcs=0, label=0)
@@ -95,7 +97,8 @@ def measure(path):
                              arity=arity, selectors=selectors, returns=returns,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             allocs=allocs, mono=monomorphic_entry(image, cr))
+                             allocs=allocs, casts=casts,
+                             mono=monomorphic_entry(image, cr))
         c["functions"] += 1
         c["lines"] += len(body)
         had_goto = False

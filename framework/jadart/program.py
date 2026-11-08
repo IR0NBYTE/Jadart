@@ -413,7 +413,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     from .cfg import render_function
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import recover_allocations, recover_fields
+    from .fields import recover_allocations, recover_casts, recover_fields
     image, fr, hdr = load_instructions(path)
     prog = build_program(fr, hdr)
     S = fr.names                         # names, as printed (#74)
@@ -450,6 +450,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     selectors = recover_selectors(image, fr, hdr) if lvl >= 3 else None
     layout = recover_fields(fr, getattr(image, "arch", None)) if lvl >= 3 else None
     allocs = recover_allocations(image, fr, layout) if lvl >= 3 else None
+    casts = recover_casts(image, fr, layout) if lvl >= 3 else None
     for nm, ref, kt in sorted(method_refs)[:max_methods]:
         disp = nm.split(":", 1)[1] if nm.startswith(("get:", "set:")) else nm.rstrip(".")
         dis = disassemble_function(image, ref)
@@ -472,7 +473,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                                        selectors=selectors,
                                        arch=getattr(image, "arch", None),
                                        fields=layout.for_function(ref),
-                                       allocs=allocs,
+                                       allocs=allocs, casts=casts,
                                        show=rebaser(image), cut_end=cut_end(cr, dis),
                                        returns=returns,
                                        mono=monomorphic_entry(image, cr)))

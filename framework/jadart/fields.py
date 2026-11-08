@@ -33,10 +33,10 @@ a plausibility argument:
     unboxed-fields bitmap on all 58 it can be read from (G15).
 
 WHAT IT DOES NOT DO. It names a slot only where the base's class is known. `this` in a
-method whose owner class resolves is one such base, and `recover_allocations` below adds a
-second. Everything else stays `field_0x8`, because a name attributed to the wrong class is
-worse than an offset: the reader can see that an offset is opaque and cannot see that a
-name is wrong.
+method whose owner class resolves is one such base, `recover_allocations` below adds a
+second, and `recover_casts` a third, on the edges after a cast. Everything else stays
+`field_0x8`, because a name attributed to the wrong class is worse than an offset: the
+reader can see that an offset is opaque and cannot see that a name is wrong.
 
 WHICH CLASS `this` IS. `Function::Owner` (object.cc:11358) answers it in two steps: the
 owner is a Class, or it is a PatchClass and the class is the one it wraps. The second
@@ -46,6 +46,7 @@ class, and `_place_patched` below takes it under three refusals of its own.
 """
 from __future__ import annotations
 
+import bisect
 import re
 from dataclasses import dataclass, field as _dcfield
 
@@ -855,3 +856,1207 @@ def _receiver_walk(rows, nargs, build_cfg, traps):
 
 def _pack(regs, homes, sp, fp, consts):
     return frozenset(regs), frozenset(homes), sp, fp, tuple(sorted(consts.items()))
+
+
+# --------------------------------------------------------------------------------------
+# A THIRD base whose class the snapshot states: the value a cast has just let through.
+
+#: Class::ImplementedBit and Class::AbstractBit in UntaggedClass::state_bits_. ConstBit is
+#: bit 0, ImplementedBit the next one, then two two-bit fields, then AbstractBit
+#: (object.h). Neither position is taken on trust: `recover_casts` checks the first
+#: against every class's `interfaces` array and the second against every class that owns
+#: an allocation stub, and refuses the channel on one disagreement.
+_IMPLEMENTED = 1 << 1
+_ABSTRACT_BIT = 1 << 6
+
+#: The shared type-testing stubs, which test the instance in x0 against the Type in x8
+#: and return only when it is assignable. `TopTypeTypeTestStub` returns for anything and
+#: the TypeParameter ones are handed their type in another register, so neither is here.
+#: A stub this names is used only where its own body reads as one (`_stub_accepts`).
+_TTS_STUB_RE = re.compile(r"_iso_stub_Default(?:Nullable)?TypeTestStub")
+
+#: The registers a type-testing stub hands back as it found them, TypeTestABI's
+#: kPreservedAbiRegisters (constants_arm64.h: the instance, the destination type and the
+#: two type argument vectors). Every other register the stub may use as scratch.
+_TTS_KEEPS = frozenset({"x0", "x1", "x2", "x8"})
+
+#: The classes a `Type` can name whose instances are not laid out as that class, or that
+#: no value is an instance of: `FutureOr<T>` holds a T or a Future, and the rest are the
+#: top and bottom types and Null.
+_NOT_A_LAYOUT = ("FutureOrCid", "NullCid", "NeverCid", "DynamicCid", "VoidCid",
+                 "InstanceCid")
+
+#: The class ids a check may accept without saying anything about a layout: null, which
+#: a cast to a nullable type lets through and no field is read off, and three types no
+#: value has. The compiler's subtype ranges treat them as "don't care", as they do an
+#: abstract class and an unused id (compiler/backend/il.cc, CidCheckerForRanges::
+#: MayInclude), so a check may span them.
+_NO_LAYOUT_CIDS = ("NullCid", "NeverCid", "DynamicCid", "VoidCid")
+
+#: Bounds for reading one stub's paths, past which it is not read. No stub of a closed
+#: class on the two fixtures or the seven app-sweep libraries reaches either.
+_STUB_MAX_INSNS = 512
+#: The site marker for a call through the entry point x8's Type holds.
+_INDIRECT = "indirect"
+
+#: The cast analysis's work budget, in units per instruction of the body: a unit is one
+#: entry of a state a meet reads or a redefinition scans, and one instruction walked.
+#: Past it the body is declined, which names nothing and is always safe. Measured with
+#: no budget over the 3,890 bodies the analysis runs on in the two fixtures and the seven
+#: app-sweep libraries, the most any spends is 316 per instruction (a 2,919-instruction
+#: FluffyChat body), the 99th percentile 191 to 208 per binary and the median 64 to 80,
+#: and 55.5M units cost 5.9 s of CPU, about 107 ns each. So 1,000 is three times the
+#: most a real body spends, and caps the analysis near 0.1 ms per instruction, 0.43 s at
+#: the 4,000-instruction cut, whatever a crafted body does to the state it carries.
+_CAST_WORK_PER_INSN = 1000
+#: Sweeps over the blocks in reverse postorder before the fixpoint counts as not found.
+_CAST_SWEEPS = 64
+
+
+class _OverBudget(Exception):
+    """The cast analysis spent its work budget on one body."""
+_STUB_MAX_STATES = 4096
+_CID_TOP = 1 << 20       # class ids are 20 bits of the header word (bits 12..31)
+
+
+@dataclass(frozen=True, eq=False)
+class CastClass:
+    """A class whose every subtype EXTENDS it, so its own map names a slot of any value
+    a cast to it let through."""
+    class_ref: int
+    name: str
+    cid: int
+    fields: dict              # field name by byte offset, the class's FULL map
+    subclasses: frozenset     # the class id of the class and of every class extending it
+    bound: int                # bytes: the largest instance among those, 0 if one varies
+
+
+@dataclass
+class CastLayout:
+    """What `cast_accesses` needs from the snapshot, plus why anything was dropped."""
+    by_class: dict = _dcfield(default_factory=dict)   # CastClass by class ref
+    pool: dict = _dcfield(default_factory=dict)       # (Type, CastClass) by pool offset
+    tts: dict = _dcfield(default_factory=dict)        # stub pc: the Types owning it
+    defaults: frozenset = frozenset()  # pcs of the shared stubs whose body reads as one
+    free: frozenset = frozenset()      # class ids no layout is read off (see `_cid_ok`)
+    known: frozenset = frozenset()     # every class id the class table holds
+    predefined: int = 0                # the VM's own ids, below the first user class
+    smi_cid: int = -1
+    null_cid: int = -1
+    closed: int = 0            # classes no class implements, by Class::is_implemented
+    implemented: int = 0       # ...and the ones some class does
+    iface_checked: int = 0     # interface entries the table names, checked against it
+    iface_unread: int = 0      # ...entries that are not a Type of a class it holds
+    contradicted: int = 0      # classes whose implemented or abstract bit is contradicted
+    allocated: int = 0         # classes owning an allocation stub, checked for the bit
+    stats: dict = _dcfield(default_factory=dict)       # what the stub reading found
+    refused: str = ""
+
+
+def _cid_ok(c: int, cc: CastClass, casts: CastLayout) -> bool:
+    """Whether a check accepting class id `c` is consistent with every value it lets
+    through being null or an instance of `cc`: c is the class's own id or a subclass's,
+    an id no layout is read off (null, a type no value has, an abstract class), or an id
+    the class table leaves unused above the VM's own. An id the table does not hold BELOW
+    them is a VM class this snapshot does not describe, and counts against the cast."""
+    if c in cc.subclasses or c in casts.free:
+        return True
+    return c not in casts.known and c >= casts.predefined
+
+
+def _stub_accepts(dis, smi_cid: int, null_cid: int):
+    """What a type-testing stub's own code says about x0 where it returns: a tuple of
+    inclusive class-id intervals, or None where the body does not read as a stub that
+    tests x0 and returns, or tail-calls through the thread, and nothing else.
+
+    Every path is followed, with the constraint its branches put on x0's class id: the
+    Smi test of bit 0, the null test against NULL_REG (x22), and compares of the class id
+    loaded from x0's header, `ldur xT, [x0, #-1]; ubfx xC, xT, #0xc, #0x14`, biased by a
+    `sub`. A path that reaches `ret` adds its constraint to the answer. A path that ends
+    in `br` through a word the thread holds, `ldr x16, [THR, #k]` or a Code loaded off
+    the thread and its entry point, hands the instance to the runtime's check against the
+    type in x8 and adds nothing. Anything else, a call, a branch out of the stub, a write
+    to a register TypeTestABI preserves, refuses the stub: what it accepts is then not
+    read, and nothing is proved through it."""
+    if not dis or len(dis) > _STUB_MAX_INSNS:
+        return None
+    from . import expr as E
+    at = {a: i for i, (a, _m, _o) in enumerate(dis)}
+    full = ((0, _CID_TOP - 1),)
+    accepted: list = []
+    seen: set = set()
+    work = [(0, (), full, None)]
+    while work:
+        state = work.pop()
+        if state in seen:
+            continue
+        seen.add(state)
+        if len(seen) > _STUB_MAX_STATES:
+            return None
+        i, regs, cons, flags = state
+        if not cons:
+            continue
+        if i >= len(dis):
+            return None
+        a, mn, op = dis[i]
+        ops = E._split_ops(op)
+        R = dict(regs)
+
+        def go(j, r=R, c=cons, f=flags):
+            work.append((j, tuple(sorted(r.items())), c, f))
+
+        if mn == "ret":
+            accepted.append(cons)
+            continue
+        if mn == "b" or mn.startswith("b.") or mn in ("tbz", "tbnz", "cbz", "cbnz"):
+            tgt = E._imm(ops[-1]) if ops else None
+            if tgt not in at:
+                return None
+            if mn == "b":
+                go(at[tgt])
+            elif mn in ("tbz", "tbnz"):
+                taken = None
+                if E.canon(ops[0]) == "x0" and E._imm(ops[1]) == 0:
+                    smi = ((smi_cid, smi_cid),)
+                    taken = smi if mn == "tbz" else _cid_not(smi)
+                go(at[tgt], c=_cid_and(cons, taken) if taken else cons)
+                go(i + 1, c=_cid_and(cons, _cid_not(taken)) if taken else cons)
+            elif mn in ("cbz", "cbnz"):
+                go(at[tgt])
+                go(i + 1)
+            else:
+                cond = mn[2:]
+                if flags is None:
+                    go(at[tgt])
+                    go(i + 1)
+                elif flags[0] == "const":
+                    go(at[tgt] if _const_taken(cond, flags[1], flags[2]) else i + 1)
+                else:
+                    s = _cid_taken(cond, flags[1], flags[2])
+                    if s is None:
+                        return None
+                    go(at[tgt], c=_cid_and(cons, s))
+                    go(i + 1, c=_cid_and(cons, _cid_not(s)))
+            continue
+        if mn == "br":
+            if R.get(E.canon(ops[0]) if ops else "", ("",))[0] in ("thr", "thrcode"):
+                continue
+            return None
+        if mn in ("bl", "blr", "blx", "svc", "hvc", "brk"):
+            if mn == "brk":
+                continue                     # a trap: the path does not return
+            return None
+        defs = E._def_use(mn, op)[0]
+        if defs & _TTS_KEEPS:
+            return None
+        if mn in ("ldr", "ldur", "ldrh", "ldurh") and len(ops) == 2:
+            m = E._mem(ops[1])
+            d = E.canon(ops[0])
+            if m and m[2] is None and op.find("]!") < 0 and len(ops) == 2:
+                base, disp = m[0], m[1]
+                if base == "x0" and disp == -1 and mn in ("ldr", "ldur"):
+                    R[d] = ("tags",)
+                    go(i + 1)
+                    continue
+                if base == "x0" and disp == 1 and mn in ("ldrh", "ldurh"):
+                    R[d] = ("cid", 0)
+                    go(i + 1)
+                    continue
+                if base == "x26" and mn in ("ldr", "ldur") and ops[0][:1] == "x":
+                    R[d] = ("thr", disp)
+                    go(i + 1)
+                    continue
+                bv = R.get(base)
+                if (bv and bv[0] == "thr" and disp == 7 and mn in ("ldr", "ldur")
+                        and ops[0][:1] == "x"):
+                    R[d] = ("thrcode", bv[1])
+                    go(i + 1)
+                    continue
+        if mn == "ubfx" and len(ops) == 4:
+            d, s = E.canon(ops[0]), E.canon(ops[1])
+            if R.get(s) == ("tags",) and E._imm(ops[2]) == 0xc and E._imm(ops[3]) == 0x14:
+                R[d] = ("cid", 0)
+                go(i + 1)
+                continue
+        if mn in ("mov", "movz") and len(ops) == 2:
+            d = E.canon(ops[0])
+            k = E._imm(ops[1]) if ops[1].startswith("#") else None
+            src = None if ops[1].startswith("#") else R.get(E.canon(ops[1]))
+            R.pop(d, None)
+            if k is not None:
+                R[d] = ("const", k)
+            elif src is not None and ops[0][:1] == ops[1][:1]:
+                R[d] = src
+            go(i + 1)
+            continue
+        if mn in ("add", "sub") and len(ops) in (3, 4):
+            # A bias too wide for an immediate is moved into a register first, `mov x17,
+            # #-0x1229; add x9, x9, x17`, so a register holding a constant is one too.
+            d, s = E.canon(ops[0]), E.canon(ops[1])
+            if ops[2].startswith("#"):
+                k = E._imm(ops[2])
+                if len(ops) == 4:
+                    k = k << 12 if k is not None and ops[3].strip() == "lsl #12" else None
+            else:
+                kv = (R.get(E.canon(ops[2])) if len(ops) == 3 and ops[2][:1] == "x"
+                      else None)
+                k = kv[1] if kv and kv[0] == "const" else None
+            sv = R.get(s)
+            R.pop(d, None)
+            if k is not None and sv is not None and sv[0] in ("cid", "const"):
+                k = k if mn == "sub" else -k
+                R[d] = (sv[0], sv[1] + k) if sv[0] == "cid" else ("const", sv[1] - k)
+            go(i + 1)
+            continue
+        if mn == "cmp" and len(ops) in (2, 3):
+            f = None
+            if (len(ops) == 2 and E.canon(ops[0]) == "x0" and E.canon(ops[1]) == "x22"
+                    and ops[0][:1] == ops[1][:1]):
+                f = ("cid", null_cid, 0)   # NULL_REG: equal is exactly the null class id
+            else:
+                sv = R.get(E.canon(ops[0]))
+                kv = R.get(E.canon(ops[1])) if len(ops) == 2 else None
+                k = (_cmp_imm(ops, E) if ops[1].startswith("#")
+                     else kv[1] if kv and kv[0] == "const" else None)
+                if sv and k is not None and sv[0] in ("cid", "const"):
+                    f = (sv[0], sv[1], k)
+            go(i + 1, f=f)
+            continue
+        for r in defs:
+            R.pop(r, None)
+        go(i + 1, f=None if mn in _FLAG_WRITERS else flags)
+    out: set = set()
+    for c in accepted:
+        out.update(c)
+    return tuple(sorted(out))
+
+
+def _cid_and(a, b):
+    return tuple((max(l1, l2), min(h1, h2)) for l1, h1 in a for l2, h2 in b
+                 if max(l1, l2) <= min(h1, h2))
+
+
+def _cid_not(a):
+    out, nxt = [], 0
+    for lo, hi in sorted(a):
+        if lo > nxt:
+            out.append((nxt, lo - 1))
+        nxt = max(nxt, hi + 1)
+    if nxt < _CID_TOP:
+        out.append((nxt, _CID_TOP - 1))
+    return tuple(out)
+
+
+def _cid_taken(cond: str, bias: int, k: int):
+    """The class ids for which `cmp (cid - bias), #k` takes `b.<cond>`, or None for a
+    condition not read. The subtraction is the machine's: below `bias` it wraps, so an
+    unsigned compare is false there and a signed one true."""
+    if cond == "eq":
+        s = ((bias + k, bias + k),)
+    elif cond == "ls":
+        s = ((bias, bias + k),)
+    elif cond in ("lo", "cc"):
+        s = ((bias, bias + k - 1),)
+    elif cond == "lt":
+        s = ((0, bias + k - 1),)
+    elif cond == "le":
+        s = ((0, bias + k),)
+    else:
+        inv = {"ne": "eq", "hi": "ls", "hs": "lo", "cs": "cc", "ge": "lt", "gt": "le"}
+        return _cid_not(_cid_taken(inv[cond], bias, k)) if cond in inv else None
+    return tuple((max(0, lo), min(_CID_TOP - 1, hi)) for lo, hi in s
+                 if min(_CID_TOP - 1, hi) >= max(0, lo))
+
+
+def _cmp_imm(ops, E):
+    """The immediate a `cmp xR, #k` or `cmp xR, #k, lsl #12` compares against, or None:
+    a class id past 4095 is the second form, `cmp x9, #1, lsl #12` for class 4096."""
+    k = E._imm(ops[1]) if ops[1].strip().startswith("#") else None
+    if k is not None and len(ops) == 3:
+        k = k << 12 if ops[2].strip() == "lsl #12" else None
+    return k
+
+
+def _const_taken(cond: str, c: int, k: int) -> bool:
+    m = (1 << 64) - 1
+    uc, uk = c & m, k & m
+    return {"eq": c == k, "ne": c != k, "ls": uc <= uk, "hi": uc > uk, "lo": uc < uk,
+            "cc": uc < uk, "hs": uc >= uk, "cs": uc >= uk, "lt": c < k, "le": c <= k,
+            "gt": c > k, "ge": c >= k}.get(cond, False)
+
+
+def recover_casts(image, fr, layout: FieldLayout) -> CastLayout:
+    """The classes a cast proves a value's layout for, and the type-testing stubs.
+
+    WHAT A CAST PROVES. An `as C`, an implicit downcast and a covariant parameter check
+    compile to `AssertAssignable`: inline class-id checks that jump past the stub on the
+    classes the compiler enumerated, then a call to the destination type's type-testing
+    stub with the instance in x0 and the `Type` in x8 (TypeTestABI, the same registers
+    from 2.19.6 to 3.13.0), which returns only when the value is assignable and throws
+    otherwise (flow_graph_compiler.cc GenerateAssertAssignable, GenerateTTSCall). So past
+    the call, and past every inline check that jumped to the same place, the value is null
+    or an instance of a subtype of C.
+
+    WHY THAT NAMES A SLOT ONLY FOR SOME C. A subtype that IMPLEMENTS C has a layout of
+    its own; only one that EXTENDS it keeps C's fields at C's offsets. The VM records
+    which is which: `ClassHiearchyUpdater::MarkImplemented` (class_finalizer.cc) sets
+    `is_implemented` on every class some class lists as an interface or a mixin, and on
+    each of its superclasses, so a class with the bit clear has no subtype that does not
+    extend it. The compiler leans on exactly that: where the bit is clear the specialised
+    stub reads the type arguments at C's own offset off any instance that passed
+    (type_testing_stubs.cc:974). The bit is `Class::state_bits_`, which the serializer
+    writes whole.
+
+    THREE CROSS-CHECKS, each of which refuses rather than guesses.
+
+    * Every class's `interfaces` array is read, and each interface it names, and that
+      class's superclasses, must carry the implemented bit. One that does not refuses
+      the whole channel, the rule `recover_fields` applies to an offset outside its
+      owner: the bit and the arrays would then not mean what they are read to mean. So
+      does a table whose arrays name no interface at all while classes carry the bit.
+    * The abstract bit says which class ids no instance has, which a check may accept
+      without counting against a cast. A class that owns an allocation stub has
+      instances, so one of those carrying the bit refuses the channel too.
+    * A type-testing stub specialised for one type is a Code object whose owner is that
+      Type, and the compiler built its inline ranges from the same hierarchy this reads.
+      So each one's own code is read (`_stub_accepts`): a stub that accepts a class id
+      outside its class's subclasses (`_cid_ok`) refuses that class everywhere, since
+      the compiler then knows a subtype this table does not. A stub whose code does not
+      read proves nothing, and nor does a shared default stub whose code does not read
+      as one, since only its name says what it is.
+
+    The pool's `Type` objects are what x8 is loaded from, and `cast_accesses` checks the
+    owner of a specialised stub against x8 at every call."""
+    out = CastLayout()
+    arch = getattr(image, "arch", None)
+    if arch is None or getattr(arch, "name", None) != "arm64":
+        out.refused = "the cast reader runs on arm64 only"
+        return out
+    epoch = getattr(image, "epoch", None)
+    table = getattr(epoch, "cid_table", None)
+    if table is None:
+        out.refused = "no class id table for this release"
+        return out
+    from .disasm import disassemble_range, function_name_by_pc, pool_byte_offset
+    cws = arch.compressed_word_size
+    cls_cid = {ref: cid & 0xFFFFFFFF for ref, _n, cid, _s in fr.classes}
+    by_cid = {cid: ref for ref, cid in cls_cid.items()}
+    state = getattr(fr, "class_state", None) or {}
+    ifaces = getattr(fr, "class_interfaces", None) or {}
+    parent = {}
+    for ref, _n, cid, sref in fr.classes:
+        sup = fr.types.get(sref)
+        p = by_cid.get(sup & 0xFFFFFFFF) if sup is not None else None
+        if p is not None and p != ref:
+            parent[ref] = p
+
+    def chain(ref):
+        seen = []
+        while ref is not None and ref not in seen and len(seen) < 256:
+            seen.append(ref)
+            ref = parent.get(ref)
+        return seen
+
+    def implemented(ref):
+        return bool(state.get(cls_cid[ref], 0) & _IMPLEMENTED)
+
+    for ref in cls_cid:
+        if implemented(ref):
+            out.implemented += 1
+        else:
+            out.closed += 1
+    for ref, iref in ifaces.items():
+        arr = fr.arrays.get(iref)
+        if not arr:
+            continue
+        for t in arr:
+            tc = fr.types.get(t)
+            y = by_cid.get(tc & 0xFFFFFFFF) if tc is not None else None
+            if y is None:
+                out.iface_unread += 1
+                continue
+            out.iface_checked += 1
+            # MarkImplemented stops below Object, which has no superclass here.
+            for z in chain(y):
+                if parent.get(z) is None:
+                    break
+                if not implemented(z):
+                    out.contradicted += 1
+    abstract = {c for c in cls_cid.values() if state.get(c, 0) & _ABSTRACT_BIT}
+    for _ref, owner, _ci in fr.codes:
+        if owner in cls_cid and owner in image.code_ranges:
+            out.allocated += 1
+            if cls_cid[owner] in abstract:
+                out.contradicted += 1
+    if out.contradicted or (out.implemented and not out.iface_checked):
+        why = (f"{out.contradicted} classes carry an implemented or abstract bit that "
+               f"their interfaces or allocation stubs contradict" if out.contradicted
+               else "no interface array was read to check the implemented bit against")
+        return CastLayout(closed=out.closed, implemented=out.implemented,
+                          iface_checked=out.iface_checked, allocated=out.allocated,
+                          iface_unread=out.iface_unread, contradicted=out.contradicted,
+                          refused=why)
+
+    kids: dict = {}
+    for c, p in parent.items():
+        kids.setdefault(p, []).append(c)
+    special = {table.get(n, -1) for n in _NOT_A_LAYOUT}
+    out.smi_cid = table.get("SmiCid", -1)
+    out.null_cid = table.get("NullCid", -1)
+    out.known = frozenset(cls_cid.values())
+    out.predefined = getattr(table, "num_predefined", 0) or 0
+    out.free = frozenset(abstract | {table.get(n, -1) for n in _NO_LAYOUT_CIDS})
+
+    def cast_class(ref):
+        if ref in out.by_class:
+            return out.by_class[ref]
+        got = None
+        if (ref in cls_cid and cls_cid[ref] not in special and not implemented(ref)
+                and layout.class_name.get(ref)):
+            subs, work, bound = set(), [ref], 0
+            while work:
+                c = work.pop()
+                if cls_cid[c] in subs:
+                    continue
+                subs.add(cls_cid[c])
+                work.extend(kids.get(c, ()))
+                sizes = fr.class_sizes.get(cls_cid[c])
+                size = sizes[0] * cws if sizes else 0
+                bound = -1 if size <= 0 or bound < 0 else max(bound, size)
+            m = layout.by_class.get(ref) or {}
+            got = CastClass(class_ref=ref, name=layout.class_name[ref], cid=cls_cid[ref],
+                            fields={off: fi.name for off, fi in m.items()},
+                            subclasses=frozenset(subs), bound=max(bound, 0))
+        out.by_class[ref] = got
+        return got
+
+    stats = out.stats
+
+    def bump(k, n=1):
+        stats[k] = stats.get(k, 0) + n
+
+    # The specialised stubs, each read once however many Types own it.
+    owners_at: dict = {}
+    for _ref, owner, _ci in fr.codes:
+        if owner in fr.types:
+            cr = image.code_ranges.get(owner)
+            if cr is not None:
+                owners_at.setdefault(cr.pc_offset, (cr, set()))[1].add(owner)
+    known_sorted = sorted(out.known | set(range(out.predefined)))
+    leaky: set = set()
+    for pc, (cr, owners) in owners_at.items():
+        classes = {by_cid.get(fr.types[t] & 0xFFFFFFFF) for t in owners}
+        mine = [cc for cc in map(cast_class, (c for c in classes if c is not None))
+                if cc is not None]
+        if not mine:
+            continue
+        got = _stub_accepts(disassemble_range(image, cr), out.smi_cid, out.null_cid)
+        if got is None:
+            bump("stubs of a closed class whose code does not read")
+            continue
+        bump("stubs of a closed class read")
+        bad = set()
+        for cc in mine:
+            for lo, hi in got:
+                k = bisect.bisect_left(known_sorted, lo)
+                while k < len(known_sorted) and known_sorted[k] <= hi:
+                    if not _cid_ok(known_sorted[k], cc, out):
+                        bad.add(cc.class_ref)
+                        break
+                    k += 1
+        if bad:
+            bump("stubs accepting a class id outside their class")
+            leaky |= bad
+        else:
+            out.tts[pc] = frozenset(owners)
+    stats["classes refused by their own stub"] = len(leaky)
+    # The shared stubs, which only their names say are type-testing stubs: each has to
+    # read as one that accepts nothing but null itself and hands the rest to the runtime.
+    nulls = ((out.null_cid, out.null_cid),)
+    by_pc = {cr.pc_offset: cr for cr in image.all_ranges}
+    defaults = set()
+    for pc, nm in function_name_by_pc(image, fr).items():
+        if not _TTS_STUB_RE.fullmatch(str(nm)):
+            continue
+        cr = by_pc.get(pc)
+        got = _stub_accepts(disassemble_range(image, cr), out.smi_cid,
+                            out.null_cid) if cr is not None else None
+        if got is not None and _cid_and(got, _cid_not(nulls)) == ():
+            defaults.add(pc)
+        else:
+            bump("shared stubs whose code does not read as one")
+    out.defaults = frozenset(defaults)
+
+    for idx, (kind, val) in enumerate(fr.pool):
+        if kind != "ref" or val not in fr.types:
+            continue
+        cls = by_cid.get(fr.types[val] & 0xFFFFFFFF)
+        cc = cast_class(cls) if cls is not None and cls not in leaky else None
+        if cc is not None:
+            out.pool[pool_byte_offset(idx, arch)] = (val, cc)
+    out.by_class = {k: v for k, v in out.by_class.items()
+                    if v is not None and k not in leaky}
+    return out
+
+
+#: The instructions that write the condition flags, so a compare before one of them no
+#: longer decides the branch after it.
+_FLAG_WRITERS = frozenset({"cmp", "cmn", "tst", "fcmp", "fcmpe", "ccmp", "ccmn", "fccmp",
+                           "fccmpe", "adds", "subs", "ands", "bics", "negs", "adcs",
+                           "sbcs", "ngcs"})
+
+
+def cast_accesses(blocks, entry, casts: CastLayout, cross=None, moves=None, clash=(),
+                  stats=None, proofs=None, slow=(), raw=None) -> dict:
+    """{(instruction address, base register): CastClass} for every field access whose
+    base a cast proves the class of, on every path to it.
+
+    A forward must-analysis over the body's CFG, `_receiver_walk`'s shape with value
+    numbers: each register and each frame slot holds a value number, a value number
+    carries the classes a cast proved for it, and two paths meet by intersection, so a
+    fact that reaches an access holds on every path there. A location that holds a
+    different value on each path, each proven a class, holds a value proven that class,
+    and gets a value number of the join's own (`meet`). It is seeded in two places and
+    nowhere else:
+
+      * the instruction after a call to a type-testing stub, for the value in x0, when
+        x8 holds a pool `Type` of a class every subtype of which extends it
+        (`recover_casts`). The stub is either one specialised for that very Type, a
+        Code the Type in x8 owns, or a shared default stub; `recover_casts` has read
+        the code of each, and one that did not read is not called a stub here. Or it
+        is the one the Type in x8 holds, called through its entry point (`_INDIRECT`),
+        the call a destination with type arguments gets.
+      * an inline class-id check that jumps to the same instruction, `ldur xT, [xV,
+        #-1]; ubfx xC, xT, #0xc, #0x14; [sub xC, xC, #lo;] cmp xC, #n; b.eq|b.ls`, for the
+        value in xV, when every class id it accepts passes `_cid_ok`: the class's own, a
+        subclass's, or one no layout is read off. An id outside that set is a
+        counterexample, and the cast seeds nothing at all. The Smi test
+        `LoadClassIdMayBeSmi` puts in front, `mov xC, #kSmiCid; tbz wV, #0`, is read as
+        what it is, the class id of a Smi.
+
+    The value is followed through register copies and through the frame slots it is
+    spilled to and reloaded from, and forgotten wherever it is redefined, at a call for
+    the registers a call may clobber, at a store that may write its slot, and at every
+    move of the frame. A type-testing stub keeps only the registers TypeTestABI says it
+    keeps, whether or not it proves anything. `cross`, `moves` and `clash` are
+    `_frame_plan`'s: a store through SP forgets every frame slot `_frame_plan` says it may
+    reach, the bytes the lifter drops for it (sixteen more either side where it writes
+    back), one it cannot place forgets them all, and so does a move of FP. A block that
+    something the CFG does not reach from the entry flows into, a catch handler or an
+    unchecked entry, is entered knowing nothing, since the runtime enters those with a
+    register file this does not see. The paths
+    `strip_boilerplate` cut are not that, and are walked like any other: a stack check's
+    slow path (`slow`, entered from the branch it turned into a nop) and the Mint path a
+    box-or-tag check takes (entered from the `b` it made of a `b.eq`; `raw` holds both
+    originals).
+
+    An access the result then names has to fit: one at or past the largest instance
+    size among the class's subclasses says the proof or the tracking is wrong, and the
+    whole body is refused, the rule `_alloc_field` applies to an allocation.
+
+    WHAT IT MAY COST. The walk sweeps the blocks in reverse postorder, so a sweep meets
+    each edge once, and a fact carries the classes proven and not the casts that proved
+    them unless `proofs` asks. Every state entry a meet reads or a redefinition scans is
+    charged to a budget of `_CAST_WORK_PER_INSN` per instruction, and a body that spends
+    it is declined with nothing named: the analysis costs at most a fixed multiple of
+    the body's size, whatever a crafted body does to it.
+
+    `proofs`, when handed a dict, gets {(address, base, byte offset): the call sites of
+    the casts that proved it}, for measuring; the lifter does not ask."""
+    from . import expr as E
+    if not casts.pool:
+        return {}
+    if stats is None:
+        stats = {}
+
+    def bump(k, n=1):
+        stats[k] = stats.get(k, 0) + n
+
+    # Cheap refusals first: most bodies call no type-testing stub, and most of the rest
+    # load no Type of a class with a map.
+    sites = {}
+    for b in blocks.values():
+        for (a, mn, op, _note) in b.insns:
+            if mn != "bl":
+                continue
+            tgt = E._imm(op.strip())
+            if tgt in casts.tts:
+                sites[a] = casts.tts[tgt]
+            elif tgt in casts.defaults:
+                sites[a] = None
+        # The call a destination with type arguments gets, through the stub its Type
+        # holds: `ldr x9, [x8, #7]; ldr x3, [PP, #k]; blr x9` (GenerateIndirectTTSCall,
+        # flow_graph_compiler_arm64.cc). Offset 7 is `type_test_stub_entry_point_`, the
+        # first field of an AbstractType (raw_object.h). Whether x8 holds a pool Type is
+        # the walk's to check, at the call.
+        for k, (a, mn, op, _note) in enumerate(b.insns):
+            if mn != "blr" or k < 1:
+                continue
+            r = E.canon(op.strip())
+            for (_a, mn2, op2, _n2) in reversed(b.insns[:k]):
+                defs = E._def_use(mn2, op2)[0]
+                if r in defs:
+                    if mn2 in ("ldr", "ldur") and E.canon(op2.split(",", 1)[0]) == r:
+                        m = E._mem(E._split_ops(op2)[1])
+                        if m and m[0] == "x8" and m[1] == 7 and m[2] is None:
+                            sites[a] = _INDIRECT
+                    break
+                if "x8" in defs:
+                    break
+    if not sites:
+        return {}
+    named = False
+    hi: dict = {}
+    for b in blocks.values():
+        for (a, mn, op, note) in b.insns:
+            if mn == "add" and ", x27, #" in op:
+                ops = E._split_ops(op)
+                if len(ops) >= 3 and E.canon(ops[1]) == "x27":
+                    k = E._imm(ops[2]) or 0
+                    wide = len(ops) == 4 and "lsl #12" in ops[3]
+                    hi[E.canon(ops[0])] = k << 12 if wide else k
+            elif mn == "ldr" and op.startswith("x8, ["):
+                m = E._mem(E._split_ops(op)[1])
+                off = None
+                if m and m[2] is None and m[0] == "x27":
+                    off = m[1]
+                elif m and m[2] is None and m[0] in hi:
+                    off = hi[m[0]] + m[1]
+                got = casts.pool.get(off)
+                if got is not None and got[1].fields:
+                    named = True
+    if not named:
+        return {}
+    bump("bodies")
+    declined: set = set()
+    size = sum(len(b.insns) for b in blocks.values())
+    allowed = _CAST_WORK_PER_INSN * max(size, 1)
+    budget = [allowed]
+    for _ in range(4):
+        try:
+            got = _cast_pass(blocks, entry, casts, sites, declined, cross or {},
+                             moves or {}, frozenset(clash or ()), stats, E,
+                             frozenset(slow or ()), raw or {}, budget,
+                             proofs is not None)
+        except _OverBudget:
+            bump("refused, over the work budget")
+            return {}
+        finally:
+            stats["work"] = allowed - budget[0]
+            stats["size"] = size
+        if got is None:
+            bump("refused, no fixpoint")
+            return {}
+        out, again = got
+        if not again:
+            break
+        declined |= again
+    else:
+        return {}
+    for (a, base, off), (cc, _why) in out.items():
+        if cc.bound and off >= cc.bound:
+            bump("refused, an access past every subclass")
+            return {}
+    if proofs is not None:
+        proofs.update({k: why for k, (_cc, why) in out.items()})
+    return {(a, base): cc for (a, base, _off), (cc, _why) in out.items()}
+
+
+def _cast_pass(blocks, entry, casts, sites, declined, cross, moves, clash, stats, E,
+               slow=frozenset(), raw=None, budget=None, track=False):
+    """One run of the analysis `cast_accesses` describes. Returns ({(addr, base, byte
+    offset): (CastClass, the sites proving it)}, the call sites a counterexample
+    declines), or None.
+
+    A value number's facts are a frozenset of (class ref, call site) pairs: two paths
+    keep a class both prove, with the sites of either, so the class is what holds and
+    the sites say where it came from. Only where `track` asks, for measuring: otherwise
+    every site is 0, so a fact is one pair per class however many casts prove it.
+
+    Every entry a meet reads and a redefinition scans is charged to `budget`, and
+    `_OverBudget` ends the walk once it is spent."""
+    def charge(n):
+        budget[0] -= n
+        if budget[0] < 0:
+            raise _OverBudget()
+
+    by_class = casts.by_class
+    joins = {a + 4: a for a in sites if a not in declined}
+    preds = {a: [] for a in blocks}
+    for a, b in blocks.items():
+        for s in b.succ:
+            if s in preds:
+                preds[s].append(a)
+    # The edges `strip_boilerplate` cut, put back: from the instruction it rewrote to the
+    # path that instruction branched to, with the state at that instruction.
+    raw = raw or {}
+    side: dict = {}
+    for b, blk in blocks.items():
+        for (a, mn, _op, _n) in blk.insns:
+            was = raw.get(a, ("", ""))
+            tgt = None
+            if mn == "nop" and E.cond_of(was[0]):
+                t = E._target(was[1].rsplit(",", 1)[-1]) if was[1] else None
+                tgt = t if t in slow else None
+            elif mn == "b" and was[0] in ("b.eq", "b.ne"):
+                tgt = a + 4
+            if tgt in blocks:
+                side.setdefault(b, {})[a] = tgt
+                preds[tgt].append(b)
+    reach, todo = set(), [entry]
+    while todo:
+        x = todo.pop()
+        if x in reach or x not in blocks:
+            continue
+        reach.add(x)
+        todo.extend(blocks[x].succ)
+        todo.extend(side.get(x, {}).values())
+    found: set = set()
+    seeds: dict = {}
+    nothing = ({}, {}, {}, None, frozenset())
+
+    def bump(k, n=1):
+        stats[k] = stats.get(k, 0) + n
+
+    def step(state, here, record):
+        insns = blocks[here].insns
+        charge(len(insns))
+        locs, facts, sym, flags, fptr = state
+        locs, facts, sym, fptr = dict(locs), dict(facts), dict(sym), set(fptr)
+        cur = [flags]
+
+        def purge(vn):
+            charge(len(locs) + len(sym))
+            for k in [k for k, v in locs.items() if v == vn]:
+                del locs[k]
+            facts.pop(vn, None)
+            for k in [k for k, v in sym.items() if len(v) > 1 and v[1] == vn]:
+                del sym[k]
+
+        def define(r, a):
+            vn = ("d", a, r)
+            purge(vn)
+            locs[r] = vn
+            sym.pop(r, None)
+            fptr.discard(r)
+            return vn
+
+        def get(r, a):
+            v = locs.get(r)
+            if v is None:
+                v = ("u", a, r)
+                purge(v)
+                locs[r] = v
+            return v
+
+        def clobber(defs, a):
+            for r in defs:
+                if r[:1] == "x":
+                    define(r, a)
+
+        def kill_range(lo, hi):
+            for k in [k for k in locs if isinstance(k, int) and k < hi and k + 8 > lo]:
+                del locs[k]
+
+        def tts(a, seed):
+            # TypeTestABI: the stub hands back x0, x1, x2 and x8 and nothing else, and
+            # the flags are its own.
+            for r in [r for r in locs if isinstance(r, str) and r not in _TTS_KEEPS]:
+                del locs[r]
+            for r in [r for r in sym if r not in _TTS_KEEPS]:
+                del sym[r]
+            fptr.difference_update([r for r in fptr if r not in _TTS_KEEPS])
+            cur[0] = None
+            if not seed:
+                return
+            seeds[a] = None
+            if a in declined:
+                return
+            pv = sym.get("x8")
+            pool = casts.pool.get(pv[1]) if pv and pv[0] == "pool" else None
+            owners = sites[a]
+            if pool is None:
+                if record:
+                    bump("tts calls whose type is not a closed class"
+                         if pv and pv[0] == "pool"
+                         else "tts calls whose x8 is not read off the pool")
+                return
+            if owners is not None and owners is not _INDIRECT and pool[0] not in owners:
+                if record:
+                    bump("CX: a specialised stub of another type than x8's")
+                return
+            if record:
+                bump("tts calls seeding a class")
+                if owners is _INDIRECT:
+                    bump("...through the stub x8's own Type holds")
+                elif owners is not None:
+                    bump("...through a specialised stub its x8 Type owns")
+            seeds[a] = pool[1]
+            v = get("x0", a)
+            facts[v] = (facts.get(v, frozenset())
+                        | {(pool[1].class_ref, a if track else 0)})
+
+        def memory(a, mn, op, ops, defs):
+            got = E._addr(ops)
+            load = mn in E._LOADS
+            pair = mn in ("ldp", "ldpsw", "stp")
+            regs = [E.canon(o) for o in ops[:2 if pair else 1]]
+            if got is None or got[1] is E._BAD_POST:
+                clobber(defs, a)
+                if not load:
+                    kill_range(-1 << 62, 1 << 62)
+                return
+            (base, disp, index, _scale, wb), post = got
+            kind = ops[0].strip()[:1]
+            w = 4 if kind in ("w", "s") else 16 if kind == "q" else 8
+            if mn in ("ldrb", "ldurb", "strb", "sturb", "ldrsb", "ldursb"):
+                w = 1
+            elif mn in ("ldrh", "ldurh", "strh", "sturh", "ldrsh", "ldursh"):
+                w = 2
+            n = w * (2 if pair else 1)
+            plain = index is None and not wb and not post
+            if base == "x29" and plain:
+                if not load:
+                    kill_range(disp, disp + n)
+                for i, r in enumerate(regs):
+                    whole = w == 8 and ops[i].strip()[:1] == "x" and r != "xzr"
+                    slot = disp + i * w
+                    if not load:
+                        if whole:
+                            locs[slot] = get(r, a)
+                    elif not whole:
+                        clobber((r,), a)
+                    elif slot in locs:
+                        v = locs[slot]
+                        sym.pop(r, None)
+                        fptr.discard(r)
+                        locs[r] = v
+                    else:
+                        locs[slot] = define(r, a)
+                return
+            if base == "x15" or base == "x29" or base in fptr:
+                # Through SP, the stores `_frame_plan` placed against FP forget what they
+                # may write; any other frame address this cannot place forgets it all.
+                if not load:
+                    c = cross.get(a) if base == "x15" else None
+                    if c is None:
+                        kill_range(-1 << 62, 1 << 62)
+                    elif plain:
+                        # The bytes `Lifter._cross_write` drops for the same store.
+                        at, slack = c
+                        kill_range(at + disp - slack, at + disp + n)
+                    else:
+                        # A write-back moved SP first, and `cross` is placed after it.
+                        at, slack = c
+                        kill_range(at + disp - slack - 16, at + disp + n + 16)
+                clobber([r for r in defs if r != "x15"], a)
+                return
+            if base == "x27" or sym.get(base, ("",))[0] == "pp":
+                off = disp if base == "x27" else sym[base][1] + disp
+                clobber(defs, a)
+                if load and not pair and plain:
+                    sym[regs[0]] = ("pool", off)
+                return
+            bv = locs.get(base)
+            if (record and bv is not None and plain and disp >= -1
+                    and base not in E._UNTAGGED):
+                cs = facts.get(bv)
+                if cs:
+                    found.add((a, base, disp + 1, cs))
+                    if pair:
+                        found.add((a, base, disp + 1 + w, cs))
+            clobber(defs, a)
+            if load and not pair and plain and bv is not None:
+                if disp == -1 and w == 8:
+                    sym[regs[0]] = ("tags", bv)
+                elif disp == 1 and w == 2 and mn in ("ldrh", "ldurh"):
+                    sym[regs[0]] = ("cid", bv)
+            pv = sym.get(base) if base == "x8" else None
+            if (load and not pair and plain and disp == 7 and w == 8 and pv
+                    and pv[0] == "pool"):
+                sym[regs[0]] = ("ttsentry", pv[1])
+
+        def one(a, mn, op, note):
+            ops = E._split_ops(op)
+            defs = E._def_use(mn, op)[0]
+            if mn == "bl":
+                if a in sites:
+                    tts(a, True)
+                    return defs
+                name = note.split("-> ", 1)[1].strip() if "-> " in note else ""
+                if "_iso_stub_" in name and "TypeTest" in name:
+                    tts(a, False)              # one this does not read: no proof
+                    return defs
+                if "_iso_stub_" in name and E._classify_stub(name)[0] == "suppress":
+                    defs = frozenset({"x16", "x17", "x30"})
+                cur[0] = None
+                clobber(defs, a)
+                return defs
+            if mn in ("blr", "blx", "br"):
+                pv, ep = sym.get("x8"), sym.get(E.canon(op.strip()))
+                if (sites.get(a, 0) is _INDIRECT and pv and pv[0] == "pool"
+                        and ep == ("ttsentry", pv[1])):
+                    tts(a, True)
+                    return defs
+                cur[0] = None
+                clobber(defs, a)
+                return defs
+            if mn in E._LOADS or mn in E._STORES:
+                memory(a, mn, op, ops, defs)
+                return defs
+            if mn in ("mov", "movz") and len(ops) == 2:
+                d, src = E.canon(ops[0]), ops[1].strip()
+                if src.startswith("#"):
+                    k = E._imm(src)
+                    define(d, a)
+                    if k is not None and ops[0].strip()[:1] == "x":
+                        sym[d] = ("const", k)
+                    return defs
+                s = E.canon(src)
+                if mn == "mov" and ops[0].strip()[:1] == "x" and src[:1] == "x":
+                    if s in ("x29", "x15") or s in fptr:
+                        define(d, a)
+                        fptr.add(d)
+                        return defs
+                    if s not in E._UNTAGGED and d not in E._UNTAGGED:
+                        v = get(s, a)
+                        sym.pop(d, None)
+                        fptr.discard(d)
+                        locs[d] = v
+                        if s in sym:
+                            sym[d] = sym[s]
+                        return defs
+            if mn in ("add", "sub") and len(ops) >= 3:
+                d, s = E.canon(ops[0]), E.canon(ops[1])
+                if s == "x27" and ops[2].strip().startswith("#"):
+                    k = E._imm(ops[2]) or 0
+                    define(d, a)
+                    sym[d] = ("pp", k << 12 if len(ops) == 4 and "lsl #12" in ops[3]
+                              else k)
+                    return defs
+                if s in ("x29", "x15") or s in fptr:
+                    define(d, a)
+                    if d not in ("x29", "x15"):
+                        fptr.add(d)
+                    return defs
+                k = None
+                if ops[2].strip().startswith("#"):
+                    k = E._imm(ops[2])
+                    if k is not None and len(ops) == 4:
+                        k = k << 12 if ops[3].strip() == "lsl #12" else None
+                elif len(ops) == 3 and sym.get(E.canon(ops[2]), ("",))[0] == "const":
+                    k = sym[E.canon(ops[2])][1]
+                sv = sym.get(s)
+                define(d, a)
+                if k is not None and sv is not None:
+                    k = -k if mn == "sub" else k
+                    if sv[0] == "cid":
+                        sym[d] = ("cidsub", sv[1], -k)
+                    elif sv[0] == "cidsub":
+                        sym[d] = ("cidsub", sv[1], sv[2] - k)
+                    elif sv[0] == "const":
+                        sym[d] = ("const", sv[1] + k)
+                return defs
+            if mn == "ubfx" and len(ops) == 4:
+                d, s = E.canon(ops[0]), E.canon(ops[1])
+                sv = sym.get(s)
+                define(d, a)
+                if (sv and sv[0] == "tags" and E._imm(ops[2]) == 0xc
+                        and E._imm(ops[3]) == 0x14):
+                    sym[d] = ("cid", sv[1])
+                return defs
+            if mn == "cmp" and len(ops) in (2, 3):
+                c0, c1 = E.canon(ops[0]), E.canon(ops[1])
+                sv = sym.get(c0)
+                if ops[1].strip().startswith("#"):
+                    k = _cmp_imm(ops, E)
+                else:
+                    kv = sym.get(c1)
+                    k = kv[1] if kv and kv[0] == "const" else None
+                cur[0] = ((sv, k) if sv and sv[0] in ("cid", "cidsub") and k is not None
+                          else None)
+                return defs
+            if mn in _FLAG_WRITERS:
+                cur[0] = None
+            clobber(defs, a)
+            return defs
+
+        cut = side.get(here, {})
+        exits = {}
+        for (a, mn, op, note) in insns:
+            if a in cut:
+                exits[cut[a]] = (dict(locs), dict(facts), dict(sym), None,
+                                 frozenset(fptr))
+            if mn == "nop":
+                continue
+            defs = one(a, mn, op, note)
+            if "x29" in defs or (a in moves and moves[a][0]):
+                kill_range(-1 << 62, 1 << 62)
+        return (locs, facts, sym, cur[0], frozenset(fptr)), exits
+
+    def edge(state, src, dst, record):
+        """The state on the edge from src to dst: a cid check's verdict, a Smi test's."""
+        last = blocks[src].insns[-1] if blocks[src].insns else None
+        if last is None:
+            return state
+        a, mn, op, _n = last
+        ops = E._split_ops(op)
+        tgt = E._target(ops[-1]) if ops else None
+        if tgt is None or len(set(blocks[src].succ)) < 2:
+            return state
+        taken = dst == tgt
+        locs, facts, sym, flags, fptr = state
+        if mn in ("tbz", "tbnz") and len(ops) == 3 and E._imm(ops[1]) == 0:
+            v = locs.get(E.canon(ops[0]))
+            smi = taken if mn == "tbz" else not taken
+            if v is not None and smi and casts.smi_cid >= 0:
+                sym = {k: (("cid", v) if s == ("const", casts.smi_cid) else s)
+                       for k, s in sym.items()}
+                return locs, facts, sym, flags, fptr
+            return state
+        if flags is None or mn not in ("b.eq", "b.ne", "b.ls", "b.hi"):
+            return state
+        accept = taken if mn in ("b.eq", "b.ls") else not taken
+        if not accept or dst not in joins:
+            return state
+        site = joins[dst]
+        cc = seeds.get(site)
+        if cc is None:
+            return state
+        (kind, v, *rest), n = flags
+        lo = rest[0] if kind == "cidsub" else 0
+        eq = mn in ("b.eq", "b.ne")
+        ids = range(lo + n, lo + n + 1) if eq else range(lo, lo + n + 1)
+        if len(ids) > 1 << 16:
+            return state
+        bad = [c for c in ids if not _cid_ok(c, cc, casts)]
+        if record:
+            bump("cid edges into a cast")
+        if bad:
+            if record:
+                bump("CX: a cid edge accepts a class outside the subclasses")
+            again.add(site)
+            return state
+        if v not in locs.values():
+            return state
+        facts = dict(facts)
+        facts[v] = facts.get(v, frozenset()) | {(cc.class_ref, site if track else 0)}
+        return locs, facts, sym, flags, fptr
+
+    def proven(cs, o):
+        common = {c for c, _s in cs} & {c for c, _s in o}
+        return frozenset(p for p in cs | o if p[0] in common)
+
+    def meet(x, y, at):
+        lx, fx, sx, gx, px = x
+        ly, fy, sy, gy, py = y
+        charge(len(lx) + len(ly) + len(fx) + len(fy) + len(sx))
+        locs = {k: v for k, v in lx.items() if ly.get(k) == v}
+        # A location that holds a different value on each path, each proven the same
+        # class, holds a value proven that class all the same: two casts on two paths,
+        # or a copy on one and a reload of the spill on the other. It gets a value number
+        # of its own, this join's, and whatever held that number before held an older
+        # value under it and is forgotten, its facts and its symbols with it.
+        phis = {}
+        for k, v in lx.items():
+            w = ly.get(k)
+            if w is not None and w != v and fx.get(v) and fy.get(w):
+                got = proven(fx[v], fy[w])
+                if got:
+                    phis[k] = got
+        stale = {("phi", at, k) for k in phis}
+        locs = {k: v for k, v in locs.items() if v not in stale}
+        held = set(locs.values())
+        facts = {}
+        for vn, cs in fx.items():
+            o = fy.get(vn)
+            if o and vn in held:
+                got = proven(cs, o)
+                if got:
+                    facts[vn] = got
+        for k, got in phis.items():
+            locs[k] = ("phi", at, k)
+            facts[("phi", at, k)] = got
+        sym = {k: v for k, v in sx.items() if sy.get(k) == v
+               and not (len(v) > 1 and v[1] in stale)}
+        flags = gx if gx == gy and not (gx and gx[0][1:2] and gx[0][1] in stale) else None
+        return locs, facts, sym, flags, px | py
+
+    # Sweeps in reverse postorder, each block's state the meet of its predecessors' at
+    # the time it is reached, until a sweep changes nothing. A predecessor not yet
+    # walked is left out, the optimistic start a must-analysis takes; every one is walked
+    # in the first sweep, so each later sweep meets each edge once.
+    order, seen, todo = [], set(), [(entry, False)]
+    while todo:
+        x, done = todo.pop()
+        if done:
+            order.append(x)
+            continue
+        if x in seen or x not in blocks:
+            continue
+        seen.add(x)
+        todo.append((x, True))
+        nxt = list(blocks[x].succ) + list(side.get(x, {}).values())
+        todo.extend((y, False) for y in reversed(nxt) if y in blocks and y not in seen)
+    order.reverse()
+    again: set = set()
+    IN, OUT, EXITS = {}, {}, {}
+    for _sweep in range(_CAST_SWEEPS):
+        changed, before = False, dict(seeds)
+        for a in order:
+            ins = [edge(OUT[p], p, a, False) for p in preds[a]
+                   if p in OUT and a in blocks[p].succ]
+            ins += [EXITS[p][a] for p in preds[a] if a in EXITS.get(p, {})]
+            # The entry is entered with nothing known, and so is a block a path the
+            # entry does not reach flows into.
+            if a == entry or any(p not in reach for p in preds[a]):
+                ins.append(nothing)
+            if not ins:
+                continue
+            new = ins[0]
+            for x in ins[1:]:
+                new = meet(new, x, a)
+            IN[a] = new
+            st = new
+            if a in clash:
+                st = (({k: v for k, v in st[0].items() if not isinstance(k, int)},)
+                      + st[1:])
+            out, exits = step(st, a, False)
+            if OUT.get(a) != out or EXITS.get(a) != exits:
+                OUT[a], EXITS[a], changed = out, exits, True
+        if not changed and seeds == before:
+            break
+    else:
+        return None
+    again.clear()
+    for a in sorted(blocks):
+        st = IN.get(a)
+        if st is None:
+            continue
+        if a in clash:
+            st = ({k: v for k, v in st[0].items() if not isinstance(k, int)},) + st[1:]
+        st, _exits = step(st, a, True)
+        for s in blocks[a].succ:
+            if s in blocks:
+                edge(st, a, s, True)
+    out = {}
+    for (a, base, off, cs) in found:
+        classes = {by_class[c] for c, _s in cs if c in by_class}
+        # Two casts of one value to two classes: one extends the other, and the deeper
+        # one's map is the larger. Two that do not are a contradiction, and name nothing.
+        deep = [c for c in classes
+                if all(o is c or cast_extends(c, o) for o in classes)]
+        if len(deep) != 1:
+            bump("CX: one value, two unrelated classes")
+            continue
+        out[(a, base, off)] = (deep[0], tuple(sorted(s for c, s in cs
+                                                     if c == deep[0].class_ref)))
+    if again - declined:
+        return out, again - declined
+    return out, set()
+
+
+def cast_extends(c: CastClass, o: CastClass) -> bool:
+    """True when class `c` extends class `o`: every class extending c extends o, c's own
+    id among them."""
+    return c.subclasses <= o.subclasses

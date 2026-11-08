@@ -2888,7 +2888,7 @@ class Lifter:
     _reload_blind = False
 
     def __init__(self, blocks, pool_map=None, receiver=None, arity=None, dispatch=None,
-                 selectors=None, entry=None, fields=None, allocs=None):
+                 selectors=None, entry=None, fields=None, allocs=None, casts=None):
         self.blocks = blocks
         self.pool_map = pool_map or {}
         #: Prints an operand kept as is, and names a range with no name; see
@@ -2945,6 +2945,16 @@ class Lifter:
         #: can be spelled one by name and one by offset, and the may-alias rule compares
         #: spellings.
         self._named_at: dict = {}
+        #: The CastClass a cast proves the base of an access an instance of, on every
+        #: path to that access, keyed by (instruction address, base register)
+        #: (fields.cast_accesses). The THIRD base whose class is read rather than
+        #: guessed, and the only one that holds on some edges of a body and not others,
+        #: which is why it is keyed by address.
+        self.cast_at = casts or {}
+        #: The names printed off such a base, which `_reads_mem` asks for the reason it
+        #: asks `_alloc_bases`; and the matcher for them, rebuilt when the set grows.
+        self._cast_names: set = set()
+        self._cast_re = None
         # Block addresses a goto refers to; the renderer defines each exactly once.
         self.labels: set = set()
         self._labelled: set = set()
@@ -4607,7 +4617,7 @@ class Lifter:
             return base_v, off
         return _bin(base_v, "-", _num(-disp), P_ADD), 1
 
-    def _covers(self, base_v: V, byte_off: int, width: int) -> tuple:
+    def _covers(self, base_v: V, byte_off: int, width: int, cast=None) -> tuple:
         """The other spellings of the bytes a `width`-byte write at `byte_off` covers.
 
         The width is in the spelling, so one write's bytes have more than one text and no
@@ -4617,10 +4627,10 @@ class Lifter:
         """
         # Four is not in the list: it prints the same text as eight (see `_field`), so
         # the eight-byte spelling already covers a four-byte access at this offset.
-        out = [self._field(base_v, byte_off, w).text
+        out = [self._field(base_v, byte_off, w, cast).text
                for w in (1, 2, 8, 16) if w != width]
         if width == 16:
-            out.append(self._field(base_v, byte_off + 8).text)   # its top half
+            out.append(self._field(base_v, byte_off + 8, 8, cast).text)   # its top half
         elif width == 8 and byte_off >= 8:
             # Not below the object: `byte_off` carries the tag bias, so 8 is the first
             # offset with a whole word under it.
@@ -4638,7 +4648,7 @@ class Lifter:
             out += [f"{base}.{n}" for n in sorted(self._named_at.get(off, ()))]
         return tuple(out)
 
-    def _field(self, base_v: V, byte_off: int, width: int = 8) -> V:
+    def _field(self, base_v: V, byte_off: int, width: int = 8, cast=None) -> V:
         """The read or write of `width` bytes at `byte_off` off `base_v`, as text.
 
         `.field_0x8` is eight bytes, the word this machine spills and loads, and every
@@ -4659,9 +4669,10 @@ class Lifter:
         field and the object header are each one word, and a read spanning two of them is
         not either of them.
         """
-        # A name is printed for two bases and no others: the RECEIVER, whose class the
-        # snapshot names through Function.owner, and the result of an ALLOCATION this body
-        # made, whose class it names through Code.owner (#240). `x3.field_0x8` stays an
+        # A name is printed for three bases and no others: the RECEIVER, whose class the
+        # snapshot names through Function.owner, the result of an ALLOCATION this body
+        # made, whose class it names through Code.owner, and a value on the edges after
+        # a CAST to a class nothing implements (#240). `x3.field_0x8` stays an
         # offset even where some class has a field there: attributing it would be a guess
         # about which class x3 holds, and a wrong field name reads as fact where a byte
         # offset reads as "the lifter does not know".
@@ -4685,6 +4696,15 @@ class Lifter:
         if width <= 8:
             name = (self.fields.get(byte_off) if base_v.text == _RECEIVER
                     else self._alloc_field(base_v.text, byte_off, width))
+            # The third base: a value a cast let through, whose class is one every
+            # subtype of which extends it, so its map names the slot whatever the value
+            # is (`cast`, from fields.cast_accesses). Taken only where the two above say
+            # nothing, since they state the class exactly and a cast states a bound.
+            if not name and cast is not None:
+                name = cast.fields.get(byte_off)
+                if name and name not in self._cast_names:
+                    self._cast_names.add(name)
+                    self._cast_re = None
         if name:
             tag = "." + name
             self._named_at.setdefault(byte_off, set()).add(name)
@@ -4710,6 +4730,15 @@ class Lifter:
         this is the pattern and nothing else."""
         if _READS_MEMORY.search(text):
             return True
+        if self._cast_names:
+            # A name printed off a cast's base, whatever spells that base: the base can
+            # be any value at all, so the selector is the one thing to match.
+            if self._cast_re is None:
+                self._cast_re = re.compile(
+                    r"\.(?:" + "|".join(re.escape(n) for n in sorted(self._cast_names))
+                    + r")(?![\w$@])")
+            if self._cast_re.search(text):
+                return True
         return any(_base_re(n).search(text) for n in self._alloc_bases)
 
     def _alloc_field(self, base: str, byte_off: int, width: int):
@@ -5228,15 +5257,18 @@ class Lifter:
                 # `_rebase` and not `_byte_off`: a displacement below the base goes into
                 # the base expression, so the offset is a field offset, never negative.
                 bv, off = self._rebase(base, g(base), disp)
-                tgts = [(self._field(bv, off, w), val, self._covers(bv, off, w))]
+                cast = self.cast_at.get((at, base)) if off == disp + 1 else None
+                tgts = [(self._field(bv, off, w, cast), val,
+                         self._covers(bv, off, w, cast))]
                 if pair:
                     # `ops[1]` and not `pair[0]`, which `canon` has folded: s1 is d1
                     # there and would read as eight bytes where the store writes four.
                     # The offset step one line up has the same reason.
                     w2 = _access_width(mn, ops[1])
                     bv2, off2 = self._rebase(base, g(base), pair[1])
-                    tgts.append((self._field(bv2, off2, w2), pair[2],
-                                 self._covers(bv2, off2, w2)))
+                    cast2 = cast if off2 == pair[1] + 1 else None
+                    tgts.append((self._field(bv2, off2, w2, cast2), pair[2],
+                                 self._covers(bv2, off2, w2, cast2)))
             out = list(basedecl)
             for tgt, v, also in tgts:
                 # The value being stored was read off the map before this, so `+=` still
@@ -5418,13 +5450,18 @@ class Lifter:
             # `_rebase` folds a displacement below the base into the base expression, so a
             # pre-indexed `ldr x16, [x1, #-8]!` reads `(t4 - 8).field_0x1` and not a
             # field at -7, which is not a field (see `_rebase`).
-            v = self._field(*self._rebase(base, g(base), disp), w)
+            # A cast names the base only where the access is at the offset it reads,
+            # which a folded displacement is not.
+            cast = self.cast_at.get((here, base))
+            bv, off = self._rebase(base, g(base), disp)
+            v = self._field(bv, off, w, cast if off == disp + 1 else None)
             if sign and w < 8 and _reg_file(ops[0]) == "x":
                 v = _extended(v, 8 * w, True)
             st.set(dst, v)
             if second:
                 w2 = _access_width(mn, ops[1])
-                v2 = self._field(*self._rebase(base, g(base), second[1]), w2)
+                bv2, off2 = self._rebase(base, g(base), second[1])
+                v2 = self._field(bv2, off2, w2, cast if off2 == second[1] + 1 else None)
                 if sign and w2 < 8 and _reg_file(ops[1]) == "x":
                     v2 = _extended(v2, 8 * w2, True)
                 st.set(second[0], v2)
@@ -8558,15 +8595,17 @@ REJOIN = ("the names past that label were worked out for the ways in above it, n
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
                   indent="  ", depth=1, selectors=None, arch=None, fields=None,
                   show=None, cut_end=None, returns=None, allocs=None,
-                  mono=None) -> list:
+                  mono=None, casts=None) -> list:
     """Annotated disasm -> pseudo-Dart body lines (Tier 3). `receiver` is an optional
     register-alias map, e.g. {"x1": "this"} for an instance method; `arity` is an optional
     `pc -> int` resolver (see make_arity_resolver) enabling call-argument reconstruction;
     `selectors` maps a dispatch-call immediate to its source name (see dispatch.py);
     `fields` maps a byte offset to the receiver's field name at that offset (see
     fields.py); `allocs` is the AllocLayout of per-class allocation stubs from the same
-    module, which names the class of an object this body allocates. Those are the two
-    bases a field name is printed off, and an unresolved base still prints its offset.
+    module, which names the class of an object this body allocates; `casts` is its
+    CastLayout, which names the class of a value on the edges after a cast to a class
+    every subtype of which extends it. Those are the bases a field name is printed off,
+    and an unresolved base still prints its offset.
     `show` prints the operand of an instruction kept as it is, rebaser(image) from disasm
     so that an `adr` target reads as a virtual address; without it the operand is
     capstone's. `cut_end` is where the range ends when the instruction cut stopped `ann`
@@ -8593,7 +8632,7 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
         try:
             return _lift_function(ann, pool_map, receiver, arity, indent, depth,
                                   selectors, fields, show, cut_end, returns, allocs,
-                                  mono)
+                                  mono, casts)
         except RecursionError:
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
@@ -8735,7 +8774,7 @@ def _ends_again(blocks, stmts, placed) -> list:
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None, cut_end=None, returns=None,
-                   allocs=None, mono=None) -> list:
+                   allocs=None, mono=None, casts=None) -> list:
     g = tier3_graph(ann, cut_end)
     if g is None:
         return []
@@ -8762,11 +8801,16 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     dispatch = detect_dispatch(stripped)
     meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
+    cast_at = {}
+    if casts is not None and casts.pool:
+        from .fields import cast_accesses
+        cast_at = cast_accesses(blocks, entry, casts, cross, moves, joins,
+                                slow=slow, raw=raw)
 
     def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
-                        fields=fields, allocs=allocs)
+                        fields=fields, allocs=allocs, casts=cast_at)
         lifter.show = show
         lifter.slow_paths = frozenset(slow)
         lifter.frame_meets = meets
