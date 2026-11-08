@@ -165,8 +165,8 @@ def decompile(path: str, symbol: str) -> list:
     from .disasm import rebaser, cut_end
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import (recover_accessors, recover_allocations,
-                     recover_fields)
+    from .fields import (recover_accessors, recover_allocations, recover_casts,
+                         recover_fields)
 
     from .program import EntryNames
 
@@ -183,6 +183,7 @@ def decompile(path: str, symbol: str) -> list:
     layout = recover_fields(fr, getattr(image, "arch", None))
     layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout)
+    casts = recover_casts(image, fr, layout)
     out = []
     for nm, cr in ranges:
         dis = disassemble_range(image, cr)
@@ -203,7 +204,7 @@ def decompile(path: str, symbol: str) -> list:
                              arity=arity, selectors=sels,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             allocs=allocs,
+                             allocs=allocs, casts=casts,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
                              returns=returns, mono=monomorphic_entry(image, cr))
         out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,

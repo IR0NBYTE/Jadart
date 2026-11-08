@@ -8134,6 +8134,323 @@ def test_a_field_is_named_off_an_allocation_and_off_nothing_else():
     assert ".x" not in dropped and ".y" not in dropped, dropped
 
 
+def _cast_body(rows, casts):
+    from jadart.expr import lift_function
+    ann = [(i * 4, r[0], r[1], r[2] if len(r) > 2 else "") for i, r in enumerate(rows)]
+    return "\n".join(lift_function(ann, casts=casts, arch="arm64"))
+
+
+def _cast_rows(cid=5, head=(), tail=(), after_ret=(),
+               stub="-> _iso_stub_DefaultTypeTestStub"):
+    """`x2 = x1.field_0x14`, then `x1 as Box`: an inline class-id check that jumps past
+    the type-testing stub at 0x400, the Type loaded into x8 off the pool, the stub, and
+    after the join `tail`, then both values stored where the body prints them.
+    `after_ret` is code no path from the entry reaches. A call to a specialised stub
+    carries no name, `stub=""`, as on the fixtures."""
+    rows = list(head) + [("ldur", "x2, [x1, #0x13]"), ("mov", "x0, x1"),
+                         ("ldur", "x4, [x0, #-1]"), ("ubfx", "x4, x4, #0xc, #0x14"),
+                         ("cmp", f"x4, #{cid}")]
+    join = (len(rows) + 4) * 4
+    rows += [("b.eq", f"#{join:#x}"), ("ldr", "x8, [x27, #0x10]"),
+             ("ldr", "x3, [x27, #0x18]"), ("bl", "#0x400", stub)]
+    return rows + list(tail) + [("stur", "x2, [x6, #7]"), ("stur", "x5, [x6, #0xf]"),
+                                ("ret", "")] + list(after_ret)
+
+
+def _cast_layout(**kw):
+    """Box, class id 5, extended by 6; 7 extends neither, 9 is abstract, 2 is a VM class
+    this snapshot does not describe and 30 an id the table leaves unused. The stub at
+    0x400 is the shared default one unless `tts` says it is specialised."""
+    from jadart.fields import CastClass, CastLayout
+    box = CastClass(class_ref=1, name="Box", cid=5, fields={0x14: "next"},
+                    subclasses=frozenset({5, 6}), bound=0x20)
+    d = dict(by_class={1: box}, pool={0x10: (100, box)}, tts={},
+             defaults=frozenset({0x400}), free=frozenset({9}),
+             known=frozenset({5, 6, 7, 9}), predefined=4, smi_cid=60, null_cid=3)
+    d.update(kw)
+    return CastLayout(**d)
+
+
+def test_a_cast_names_the_fields_of_the_value_it_let_through():
+    # The third base whose class is read rather than guessed. A type-testing stub returns
+    # only if x0 is assignable to the Type in x8, and an inline check that jumps to the
+    # same place proves it for the classes it accepts, so on the edges after the cast,
+    # and only there, the value's slots have the class's names. A read BEFORE the cast of
+    # the very same slot keeps its offset (#240).
+    after = [("ldur", "x5, [x0, #0x13]")]
+    out = _cast_body(_cast_rows(tail=after), _cast_layout())
+    assert "x6.field_0x8 = x1.field_0x14;" in out, out
+    assert "x6.field_0x10 = x0.next;" in out, out
+    # A cid no instance can have, an abstract class's, is no counterexample, and nor is
+    # one the class table leaves unused above the VM's own.
+    for cid in (9, 30):
+        out = _cast_body(_cast_rows(cid=cid, tail=after), _cast_layout())
+        assert "x0.next" in out, (cid, out)
+    # Through a frame slot the value is spilled to across a call, and back.
+    out = _cast_body(_cast_rows(head=[("stur", "x1, [x29, #-8]")],
+                                tail=[("bl", "#0x800"), ("ldur", "x0, [x29, #-8]")]
+                                + after), _cast_layout())
+    assert ".next;" in out, out
+    # A stub specialised for one type is a Code that Type owns, and the Type has to be
+    # the one in x8.
+    out = _cast_body(_cast_rows(tail=after, stub=""),
+                     _cast_layout(tts={0x400: {100}}, defaults=frozenset()))
+    assert ".next;" in out, out
+    # A stack check's slow path is cut out of the CFG and rejoins the loop it guards,
+    # and its stub gives every live register back, so the join keeps what it knew.
+    loop, slow = 0x24, 0x44
+    out = _cast_body(_cast_rows(tail=[
+        ("ldr", "x16, [x26, #0x38]"), ("cmp", "x15, x16"), ("b.ls", f"#{slow:#x}"),
+        ("ldur", "x5, [x0, #0x13]"), ("cbnz", "x5, #0x24")], after_ret=[
+        ("bl", "#0x900", "-> _iso_stub_StackOverflowSharedWithoutFPURegsStub"),
+        ("b", f"#{loop:#x}")]), _cast_layout())
+    assert ".next" in out, out
+
+
+def test_a_cast_names_nothing_it_does_not_prove():
+    # Every refusal leaves the byte offset, which is what the body printed before.
+    after = [("ldur", "x5, [x0, #0x13]")]
+    join = 0x24
+    refused = {
+        # an inline check accepting a class that does not extend Box: a counterexample,
+        # so the cast seeds nothing at all, not even past its stub
+        "outside": _cast_body(_cast_rows(cid=7, tail=after), _cast_layout()),
+        # ...and so is an id below the user classes that the table does not hold
+        "VM class": _cast_body(_cast_rows(cid=2, tail=after), _cast_layout()),
+        # a Type whose class some class implements, which `recover_casts` leaves out
+        "implemented": _cast_body(_cast_rows(tail=after), _cast_layout(pool={})),
+        # x0 redefined after the cast
+        "redefined": _cast_body(_cast_rows(tail=[("mov", "x0, x7")] + after),
+                                _cast_layout()),
+        # a call between, which may change x0
+        "call": _cast_body(_cast_rows(tail=[("bl", "#0x800")] + after), _cast_layout()),
+        # a second way into the join that proves nothing about x0
+        "join": _cast_body(_cast_rows(head=[("cbz", "x9, #0x28")], tail=after),
+                           _cast_layout()),
+        # a way in from code the entry does not reach, a catch handler or an unchecked
+        # entry, which the runtime enters with registers this cannot see
+        "unreached": _cast_body(_cast_rows(tail=after, after_ret=[
+            ("mov", "x0, x7"), ("b", f"#{join:#x}")]), _cast_layout()),
+        # a specialised stub owned by another Type than the one in x8
+        "stub": _cast_body(_cast_rows(tail=after, stub=""),
+                           _cast_layout(tts={0x400: {101}}, defaults=frozenset())),
+        # a call to a shared stub whose code did not read as a type-testing stub
+        "unread stub": _cast_body(_cast_rows(tail=after),
+                                  _cast_layout(defaults=frozenset())),
+    }
+    for why, out in refused.items():
+        assert ".next" not in out and ".field_0x14;" in out, (why, out)
+    # The box-or-tag check's Mint path is cut too, and it rejoins with x1 overwritten.
+    out = _cast_body(_cast_rows(tail=[
+        ("mov", "x1, x0"), ("sbfiz", "x3, x4, #1, #0x1f"), ("cmp", "x4, x3, asr #1"),
+        ("b.eq", "#0x38"),
+        ("bl", "#0x900", "-> _iso_stub_AllocateMintSharedWithoutFPURegsStub"),
+        ("ldur", "x5, [x1, #0x13]")]), _cast_layout())
+    assert ".next" not in out, out
+    # A type-testing stub hands back four registers, whether or not it proves anything,
+    # so a copy of the value in x7 is not the value past a second one.
+    out = _cast_body(_cast_rows(tail=[
+        ("mov", "x7, x0"), ("bl", "#0x900", "-> _iso_stub_TopTypeTypeTestStub"),
+        ("ldur", "x5, [x7, #0x13]")]), _cast_layout())
+    assert ".next" not in out, out
+
+
+def test_a_cast_through_the_stub_its_type_holds_names_too():
+    # A destination with type arguments is called through the entry point its Type
+    # holds, `ldr x9, [x8, #7]; ldr x3, [PP, #k]; blr x9` (GenerateIndirectTTSCall);
+    # offset 7 is AbstractType::type_test_stub_entry_point_. A type parameter's resolved
+    # type is in x4 and x8 holds the TypeParameter, which is no pool Type, so that call
+    # proves nothing; nor does one through x8 when x8 was not read off the pool.
+    def rows(load_x8=("ldr", "x8, [x27, #0x10]"), via="x8"):
+        out = _cast_rows(tail=[("ldur", "x5, [x0, #0x13]")])
+        k = next(i for i, r in enumerate(out) if r[0] == "bl")
+        out[k - 2] = load_x8
+        out[k - 1] = ("ldr", f"x9, [{via}, #7]")
+        out[k] = ("blr", "x9")
+        return out
+
+    # The lifter prints the `blr` as a call whose result x0 holds, so the base is a
+    # temporary; the name is what the cast proves about the access.
+    out = _cast_body(rows(), _cast_layout())
+    assert ".next;" in out, out
+    for why, r in {"type parameter": rows(via="x4"),
+                   "not a pool Type": rows(load_x8=("ldur", "x8, [x7, #0x17]"))}.items():
+        out = _cast_body(r, _cast_layout())
+        assert ".next" not in out and ".field_0x14;" in out, (why, out)
+
+
+def test_a_cast_on_each_path_names_the_value_the_join_holds():
+    # Two paths that each cast a value of their own into x0 meet with x0 a different
+    # value on each, but proven the same class on both, so the join holds a value
+    # proven that class. One path that proves nothing leaves nothing proven.
+    def cast(load, cid):
+        return [load, ("mov", "x0, x2"), ("ldur", "x4, [x0, #-1]"),
+                ("ubfx", "x4, x4, #0xc, #0x14"), ("cmp", f"x4, #{cid}")]
+
+    def body(second):
+        # 0x00 cbz to the second cast at 0x28; the first at 0x04 joins at 0x24, past
+        # its stub, and goes on to the second's join at 0x48.
+        rows = [("cbz", "x9, #0x28")] + cast(("ldur", "x2, [x1, #0x13]"), 5) + [
+            ("b.eq", "#0x24"), ("ldr", "x8, [x27, #0x10]"),
+            ("bl", "#0x400", "-> _iso_stub_DefaultTypeTestStub"), ("b", "#0x48")]
+        rows += second + [("b.eq", "#0x48"), ("ldr", "x8, [x27, #0x10]"),
+                          ("bl", "#0x400", "-> _iso_stub_DefaultTypeTestStub")]
+        assert len(rows) == 18, len(rows)
+        return rows + [("ldur", "x5, [x0, #0x13]"), ("stur", "x5, [x6, #7]"),
+                       ("ret", "")]
+
+    both = _cast_body(body(cast(("ldur", "x2, [x1, #0x1b]"), 6)), _cast_layout())
+    assert "x6.field_0x8 = " in both and ".next;" in both, both
+    one = _cast_body(body([("ldur", "x2, [x1, #0x1b]"), ("mov", "x0, x2"),
+                           ("ldur", "x4, [x0, #-1]"), ("ubfx", "x4, x4, #0xc, #0x14"),
+                           ("cmp", "x4, #7")]), _cast_layout())
+    assert ".next" not in one, one
+
+
+
+def test_a_cast_name_is_not_printed_in_a_block_a_section_prints_again():
+    # #266 prints a block of the body that leads nowhere once more under a section no
+    # edge leads into, lifted from the section's own state. Cast names are keyed by
+    # address, so a copy would carry the body's name onto a way in no cast proved. It
+    # cannot: the copy is a block the section jumps into, a join with a way in the
+    # entry does not reach, and such a join knows nothing. Neither the body nor the
+    # copy names it, and without the cast the same body names nothing either.
+    stub = ("bl", "#0x400", "-> _iso_stub_DefaultTypeTestStub")
+    rows = [("ldr", "x8, [x27, #0x10]"), stub,
+            ("ldur", "x5, [x0, #0x13]"), ("stur", "x5, [x6, #7]"), ("ret", ""),
+            ("sub", "x15, x29, #0x20"), ("b", "#0x8")]
+    out = _cast_body(rows, _cast_layout())
+    body, _, section = out.partition("// reached by no edge")
+    assert section.count("x0.field_0x14") == 1, out
+    assert ".next" not in out and "x0.field_0x14" in body, out
+    # The same block with no way in from the section is named: the join is the reason.
+    named = _cast_body(rows[:5], _cast_layout())
+    assert ".next" in named, named
+
+def _cast_loop(n):
+    """`x0 as Box` in a loop n times over: each turn casts again, reads a field off the
+    value and branches back to the top, so the top is a join of n paths and each brings
+    a proof from a cast of its own. The shape that once made each update re-meet every
+    path with every cast's provenance, cubic in n."""
+    stub = ("bl", "#0x400", "-> _iso_stub_DefaultTypeTestStub")
+    rows = [("ldr", "x8, [x27, #0x10]"), stub]
+    for _ in range(n):
+        rows += [("ldr", "x8, [x27, #0x10]"), stub,
+                 ("ldur", "x1, [x0, #0x13]"), ("stur", "x1, [x6, #7]"),
+                 ("cbnz", "x3, #0x8")]
+    return rows + [("ret", "")]
+
+
+def test_the_cast_analysis_costs_a_fixed_multiple_of_the_body():
+    # Measured against the same body lifted with no cast layout, so the number is the
+    # analysis's own share and not the machine's speed. Before the walk swept in reverse
+    # postorder and stopped carrying every proving cast, this body took 13.9 s against
+    # the plain lift's 0.028 s, 490 times, and now about the same as the plain lift.
+    import time
+    rows = _cast_loop(200)
+    assert len(rows) == 1003, len(rows)
+
+    def cpu(casts):
+        best = None
+        for _ in range(3):
+            t = time.process_time()
+            out = _cast_body(rows, casts)
+            t = time.process_time() - t
+            best = t if best is None else min(best, t)
+        return best, out
+
+    plain, _ = cpu(None)
+    cast, out = cpu(_cast_layout())
+    assert ".next" in out, out[:400]
+    assert cast < 4 * plain + 0.05, (cast, plain)
+
+
+def test_a_body_over_the_cast_work_budget_names_nothing():
+    # The guarantee behind the cost: a body that spends its budget is declined whole,
+    # which prints the byte offsets the lift printed before and is never wrong.
+    from jadart import fields
+    after = [("ldur", "x5, [x0, #0x13]")]
+    assert ".next" in _cast_body(_cast_rows(tail=after), _cast_layout())
+    saved = fields._CAST_WORK_PER_INSN
+    try:
+        fields._CAST_WORK_PER_INSN = 1
+        out = _cast_body(_cast_rows(tail=after), _cast_layout())
+    finally:
+        fields._CAST_WORK_PER_INSN = saved
+    assert ".next" not in out and ".field_0x14;" in out, out
+
+
+def test_a_type_testing_stub_is_read_for_what_it_accepts():
+    # `recover_casts` reads every specialised stub's own code, and one that lets through
+    # a class outside its class's subclasses refuses that class: the compiler built it
+    # from a hierarchy that has a subtype this one does not. The bodies are the clean
+    # fixture's FocusNode stub (0x3b910) and its two shared stubs.
+    from jadart.fields import _stub_accepts
+    focus = [(0x0, "tbz", "w0, #0, #0x1c"), (0x4, "ldur", "x9, [x0, #-1]"),
+             (0x8, "ubfx", "x9, x9, #0xc, #0x14"), (0xc, "sub", "x9, x9, #0x431"),
+             (0x10, "cmp", "x9, #2"), (0x14, "b.hi", "#0x1c"), (0x18, "ret", ""),
+             (0x1c, "cmp", "w0, w22"), (0x20, "b.ne", "#0x28"), (0x24, "ret", ""),
+             (0x28, "ldr", "x16, [x26, #0x280]"), (0x2c, "br", "x16")]
+    assert _stub_accepts(focus, 60, 171) == ((171, 171), (0x431, 0x433))
+    nullable = [(0x0, "cmp", "w0, w22"), (0x4, "b.eq", "#0x14"),
+                (0x8, "ldr", "x24, [x26, #0x1d8]"), (0xc, "ldur", "x16, [x24, #7]"),
+                (0x10, "br", "x16"), (0x14, "ret", "")]
+    assert _stub_accepts(nullable, 60, 171) == ((171, 171),)
+    assert _stub_accepts(nullable[2:5], 60, 171) == ()
+    # A bias or a class id too wide for an immediate: dev.labplus.app's Shader stub
+    # moves it into a register, com.predidit.kazumi's NextFocusIntent stub shifts it.
+    shader = [(0x0, "tbz", "w0, #0, #0x20"), (0x4, "ldur", "x9, [x0, #-1]"),
+              (0x8, "ubfx", "x9, x9, #0xc, #0x14"), (0xc, "mov", "x17, #-0x1229"),
+              (0x10, "add", "x9, x9, x17"), (0x14, "cmp", "x9, #3"),
+              (0x18, "b.hi", "#0x20"), (0x1c, "ret", ""),
+              (0x20, "ldr", "x16, [x26, #0x278]"), (0x24, "br", "x16")]
+    assert _stub_accepts(shader, 60, 171) == ((0x1229, 0x122c),)
+    intent = [(0x0, "tbz", "w0, #0, #0x18"), (0x4, "ldur", "x9, [x0, #-1]"),
+              (0x8, "ubfx", "x9, x9, #0xc, #0x14"), (0xc, "cmp", "x9, #1, lsl #12"),
+              (0x10, "b.ne", "#0x18"), (0x14, "ret", ""),
+              (0x18, "ldr", "x16, [x26, #0x280]"), (0x1c, "br", "x16")]
+    assert _stub_accepts(intent, 60, 171) == ((4096, 4096),)
+    # The top type's stub returns for anything, and a stub that calls out or writes a
+    # register TypeTestABI preserves is not read at all.
+    assert _stub_accepts([(0x0, "ret", "")], 60, 171) == ((0, (1 << 20) - 1),)
+    assert _stub_accepts([(0x0, "bl", "#0x80"), (0x4, "ret", "")], 60, 171) is None
+    assert _stub_accepts([(0x0, "mov", "x1, x9"), (0x4, "ret", "")], 60, 171) is None
+
+
+def test_a_cast_on_the_clean_fixture_names_what_the_source_reads():
+    # `ContainerRenderObjectMixin.childAfter` is `final childParentData =
+    # child.parentData! as ParentDataType; return childParentData.nextSibling;`, and in
+    # RenderFlex's mixin application the type is FlexParentData, which every class that
+    # implements also extends. `_Future._prependListeners` casts `_resultOrListeners` to
+    # `_Future` and tests its `_state` (future_impl.dart). Both printed byte offsets.
+    _needs_capstone()
+    child_after = "\n".join(jadart.decompile(CLEAN, "0x15f68c")[0]["body"])
+    assert "return t2.field_0x8.nextSibling;" in child_after, child_after
+    prepend = "\n".join(jadart.decompile(CLEAN, "0x155530")[0]["body"])
+    assert "._resultOrListeners@5048458._state@5048458 & 0x18" in prepend, prepend
+
+
+def test_the_implemented_bit_agrees_with_every_interface_the_table_names():
+    # `MarkImplemented` (class_finalizer.cc) sets Class::is_implemented on every class
+    # named as an interface or a mixin and on each of its superclasses. The bit is what
+    # the channel reads; the interfaces arrays are a second encoding of it, and one class
+    # they name without the bit would refuse the whole channel. So would a class that
+    # owns an allocation stub and carries the abstract bit, or a specialised stub that
+    # lets through a class outside its own.
+    _needs_capstone()                   # load_instructions reads the specialised stubs
+    from jadart.disasm import load_instructions
+    from jadart.fields import recover_casts, recover_fields
+    for path, stubs in ((CLEAN, 237), (OBF, 235)):
+        image, fr, hdr = load_instructions(path)
+        c = recover_casts(image, fr, recover_fields(fr, hdr.arch))
+        assert c.refused == "" and c.contradicted == 0, (c.refused, c.contradicted)
+        assert c.iface_checked == 598 and c.iface_unread == 0, c
+        assert c.implemented == 333 and c.allocated == 921, (c.implemented, c.allocated)
+        assert c.stats == {"stubs of a closed class read": stubs,
+                           "classes refused by their own stub": 0}, c.stats
+        assert len(c.tts) == stubs and len(c.defaults) == 2, (len(c.tts), c.defaults)
+
+
 def test_the_smi_note_still_fires_on_a_named_field():
     # `_smi_note` recognised a store target by the literal spelling `.field_0x..`, so
     # recovering the name would have silently dropped the note that says what the stored

@@ -284,8 +284,8 @@ def cmd_lift(args) -> int:
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import (recover_accessors, recover_allocations,
-                     recover_fields)
+    from .fields import (recover_accessors, recover_allocations, recover_casts,
+                         recover_fields)
     try:
         image, fr, hdr = load_instructions(args.libapp)
     except JadartError as e:
@@ -313,6 +313,7 @@ def cmd_lift(args) -> int:
     layout = recover_fields(fr, getattr(image, "arch", None))
     layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout)
+    casts = recover_casts(image, fr, layout)
     out = []
     for nm, cr in ranges:
         dis = disassemble_range(image, cr)
@@ -324,7 +325,7 @@ def cmd_lift(args) -> int:
                              arity=arity, selectors=selectors,
                              arch=getattr(image, "arch", None),
                              fields=layout.for_function(cr.owner_ref),
-                             allocs=allocs,
+                             allocs=allocs, casts=casts,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
                              returns=returns, mono=monomorphic_entry(image, cr))
         # The names the body reads its arguments by, so no `a1` in it goes undeclared.
@@ -873,8 +874,8 @@ def cmd_ffi(args) -> int:
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import (recover_accessors, recover_allocations,
-                     recover_fields)
+    from .fields import (recover_accessors, recover_allocations, recover_casts,
+                         recover_fields)
     from .program import EntryNames
     try:
         image, fr, hdr = load_instructions(args.libapp)
@@ -901,6 +902,7 @@ def cmd_ffi(args) -> int:
         layout = recover_fields(fr, getattr(image, "arch", None))
         layout.add_accessor_names(recover_accessors(image, fr, layout))
         allocs = recover_allocations(image, fr, layout)
+        casts = recover_casts(image, fr, layout)
         lit = _literal_re()
         for pc, cr in by_fn.items():
             dis = disassemble_range(image, cr)
@@ -913,7 +915,7 @@ def cmd_ffi(args) -> int:
                                      arity=arity, selectors=selectors,
                                      arch=getattr(image, "arch", None),
                                      fields=layout.for_function(cr.owner_ref),
-                                     allocs=allocs,
+                                     allocs=allocs, casts=casts,
                                      show=rebaser(image), returns=returns,
                                      mono=monomorphic_entry(image, cr))
             except JadartError:

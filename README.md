@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 477](https://img.shields.io/badge/tests-477-brightgreen.svg)](#tests)
+[![tests: 487](https://img.shields.io/badge/tests-487-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -338,6 +338,17 @@ disagreement refuses a whole channel: on that fixture the implicit accessors agr
 the `Field` objects that name themselves 145 times out of 145, and the wrapped class
 agrees with the receiver type the function's own signature declares 25 times out of 25.
 
+A cast states a fourth base's class, on the edges after it. `x as C` calls C's
+type-testing stub, which returns only if the value is assignable, and where no class
+implements C every subtype extends it and keeps C's fields where C has them, so
+`return t2.field_0x8.field_0x14;` in `childAfter` prints
+`return t2.field_0x8.nextSibling;` after `parentData as FlexParentData`. The name is
+printed only where every path to the access proves the class, and each piece of evidence
+is checked against a second one: the implemented bit against the `interfaces` arrays,
+and every specialised stub's own code against the class's subclasses. On the clean
+fixture that names 96 accesses no other channel names, taking the byte-offset field lines
+from 52,626 to 52,556, and 305 to 496 on each of the seven app-sweep libraries.
+
 **Nineteen supported epochs today**, 2.19 through 3.13.0. This paragraph used to say
 "one, and three more identified and refused"; that was true when it was written and stopped
 being true without being updated, which is the failure mode a README has and a test does
@@ -435,7 +446,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 477 tests
+cd framework && python3 -m pytest tests -q     # 487 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -443,7 +454,7 @@ cd framework && python3 -m pytest tests -q     # 477 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 444 of the 477 to run and the other 33 to
+clone with capstone installed, expect about 454 of the 487 to run and the other 33 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

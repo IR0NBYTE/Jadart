@@ -97,7 +97,8 @@ def lift_named(path, symbol):
                                function_name_by_pc, build_pool_map, monomorphic_entry)
     from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
-    from jadart.fields import recover_accessors, recover_allocations, recover_fields
+    from jadart.fields import (recover_accessors, recover_allocations, recover_casts,
+                               recover_fields)
     from jadart.program import instance_function_refs, receiver_for
 
     image, fr, hdr = load_instructions(path)
@@ -112,6 +113,7 @@ def lift_named(path, symbol):
     layout = recover_fields(fr, getattr(image, "arch", None))
     layout.add_accessor_names(recover_accessors(image, fr, layout))
     allocs = recover_allocations(image, fr, layout)
+    casts = recover_casts(image, fr, layout)
     instance_refs = instance_function_refs(fr)
     out = []
     for _nm, cr in ranges:
@@ -126,7 +128,8 @@ def lift_named(path, symbol):
                                  returns=returns,
                                  arch=getattr(image, "arch", None),
                                  fields=layout.for_function(cr.owner_ref),
-                                 allocs=allocs, mono=monomorphic_entry(image, cr)))
+                                 allocs=allocs, casts=casts,
+                                 mono=monomorphic_entry(image, cr)))
     return out
 
 

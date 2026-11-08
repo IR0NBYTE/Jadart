@@ -153,6 +153,10 @@ class FillResult:
     # target_offset_ is in, so the two index each other directly.
     class_unboxed: dict = field(default_factory=dict)     # class_id -> unboxed-fields bitmap
     class_state: dict = field(default_factory=dict)       # class_id -> Class::state_bits
+    #: Each class ref's `interfaces` Array ref: every type it implements and every mixin
+    #: it applies. A class with none points at the VM's empty array, a base object, so
+    #: the ref resolves to no Array here (fields.recover_casts).
+    class_interfaces: dict = field(default_factory=dict)
     #: From 3.13, per Code cluster: the LazyCompile and UnknownDartCode stubs by ref, as
     #: the fill reads them ahead of the cluster's objects. The roots hold the same two
     #: refs at the positions the release's stub list gives those names, which is what
@@ -237,6 +241,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     class_sizes: dict = {}
     class_unboxed: dict = {}
     class_state: dict = {}
+    class_interfaces: dict = {}
     class_library: dict = {}
     libraries: list = []
     meta = {"field": {}, "patch": {}, "fdata": {}, "fsig": {}, "ftparams": {},
@@ -355,7 +360,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                 st.read_bytes(ln * esz)
         elif cl.name == "ClassCid":
             _fill_class(st, cl, classes, class_sizes, class_library, class_unboxed,
-                        class_state)
+                        class_state, class_interfaces)
         elif cl.name == "TypeCid":
             _fill_type(st, cl, types, epoch.type_class_id_shift)
         elif cl.cid >= boundary or cl.name == "InstanceCid":
@@ -379,7 +384,8 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       classes=classes, types=types, codes=codes, pool=pool, end_pos=st.pos,
                       code_first_ref=code_first, func_code_index=func_code_index,
                       class_sizes=class_sizes, class_unboxed=class_unboxed,
-                      class_state=class_state, code_stub_refs=code_stub_refs,
+                      class_state=class_state, class_interfaces=class_interfaces,
+                      code_stub_refs=code_stub_refs,
                       sized_lengths=sized_lengths,
                       string_lengths=string_lengths,
                       class_library=class_library,
@@ -552,7 +558,7 @@ def _fill_refs(st, cl, spec, functions, fields, func_code_index=None,
 
 
 def _fill_class(st, cl, classes, class_sizes=None, class_library=None, class_unboxed=None,
-                class_state=None):
+                class_state=None, class_interfaces=None):
     top_level = 1 << 20
     for i in range(cl.count):
         refs = [st.read_ref_id() for _ in range(13)]
@@ -564,6 +570,8 @@ def _fill_class(st, cl, classes, class_sizes=None, class_library=None, class_unb
         super_ref = refs[9]
         if class_library is not None:
             class_library[cl.start_ref + i] = refs[7]
+        if class_interfaces is not None:
+            class_interfaces[cl.start_ref + i] = refs[5]
         class_id = st.read_int()
         instance_size = st.read_int()
         next_field_offset = st.read_int()

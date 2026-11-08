@@ -13,6 +13,64 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
+- **A field of a value a cast let through is named, on the edges after the cast.** A
+  name was printed off `this` and off an object the body allocated, the two bases whose
+  class the snapshot states. A cast states a third. `x as C`, an implicit downcast and a
+  covariant parameter check compile to `AssertAssignable`: inline class-id checks that
+  jump past the stub, then a `bl` to C's type-testing stub with the value in x0 and the
+  `Type` in x8, which returns only if the value is assignable. Where no class implements
+  C, every subtype extends it and keeps C's fields at C's offsets, so past the cast C's
+  map names the value's slots: `childAfter` printed `return t2.field_0x8.field_0x14;`
+  and now prints `return t2.field_0x8.nextSibling;`, `parentData as FlexParentData` in
+  RenderFlex's mixin application. A destination with type arguments is called through
+  the entry point its Type holds, `ldr x9, [x8, #7]; blr x9`, and that call proves the
+  same; a type parameter's, called through x4 with the TypeParameter in x8, proves
+  nothing. `fields.cast_accesses` is a forward must-analysis over the body's CFG, with
+  value numbers through copies and frame slots and intersection at every join, so a name
+  is printed only where every path to the access proves the class; a join that code the
+  entry does not reach flows into, a catch handler or an unchecked entry, knows nothing,
+  and one where each path proves the class of a different value gives the join's value
+  that class.
+
+  Each piece of evidence is checked against a second encoding, and one disagreement
+  refuses. `Class::is_implemented` against every class's `interfaces` array, 598 entries
+  on each fixture and 776 to 2,358 on the seven app-sweep libraries, 0 contradicted; the
+  abstract bit, which lets a check accept an id no instance has, against every class
+  owning an allocation stub, 921 and 1,832 to 5,346, 0 carrying it; every specialised
+  type-testing stub's own code, read path by path for the class ids it returns on,
+  against its class's subclasses, 237 and 235 stubs and 399 to 1,362, all read and 0
+  accepting an id outside the class, null and the ids the compiler's ranges treat as
+  "don't care"; the two shared default stubs, which only their names identify, read as
+  accepting null alone; and every inline check's accepted ids, 179 and 101 edges and 575
+  to 1,287, 0 outside. A stub that let through a class outside its own would refuse that
+  class everywhere, and an inline check that did declines its cast.
+
+  Measured over every range against the commit before. Clean fixture: 96 accesses named
+  of the 302 the analysis gives a class, every one from a `Field` object and none named
+  by another channel (`nextSibling` and `previousSibling` off four `ParentData` classes,
+  a `_Future`'s `_state`, `RenderMouseRegion.onEnter` and `onExit`,
+  `_StreamControllerAddStreamState._varData`); 47 bodies and 98 lines change, each a
+  one-for-one substitution of a byte offset by a name recorded for that range and offset,
+  and `tools/quality.py`'s byte-offset row goes 52,626 to 52,556 with every other row and
+  the line total the same. Obf fixture: 8 named, 8 lines, byte-offset row 54,162 to
+  54,157. xeonjia (2.19.6), jsdict (3.3.4), labplus (3.5.4), anytime (3.6.2), kazumi and
+  tsdm_client (3.11.5) and FluffyChat (3.13.0): 309, 305, 352, 414, 373, 496 and 397
+  named, on 365, 316, 369, 442, 393, 556 and 414 lines, every one a substitution. `jadart
+  export` changes 21 lines in 6 files on the clean fixture, all substitutions, and none
+  on the obf one. A destination some class implements is still refused, where an
+  abstract implementer with no concrete subclass would not need to be: 12 accesses over
+  the nine binaries. `tools/pbfuzz.py --census` reads 2,086 wrong and 0 stale on both
+  fixtures and `tools/cfgcheck.py` 0 violations, before and after. See DESIGN 13.1 (c).
+
+  What it may cost is bounded. The walk sweeps the blocks in reverse postorder, carries
+  the classes proven rather than every cast that proved them, and is charged per state
+  entry it meets or scans: a body that spends 1,000 units per instruction is declined
+  with nothing named. With no budget, the most any of the 3,890 bodies the analysis runs
+  on in the two fixtures and the seven apps spends is 316 per instruction, and the 99th
+  percentile 191 to 208. A crafted loop that casts and reads 200 times over, 1,003
+  instructions, took 13.9 s against 0.028 s for the same body lifted without casts and
+  now takes about as long as that.
+
 - **An incoming argument is named by the register it arrived in.** The body printed an
   argument as the machine register it came in, `if (x2 < 0x28)`, while the pass every
   call site asks for a callee's arity had already read that x2 as the function's second

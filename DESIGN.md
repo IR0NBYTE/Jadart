@@ -1307,7 +1307,7 @@ not already named by the two shipped channels:
 | (a) own signature, parameter type of an incoming argument | 156 | 17 | 0 | 0 | 0 |
 | (b) callee's signature, result type of a direct call | 39 | 2 | 2 | 17 | 0 |
 | (b') callee's owner class, for the receiver it is handed | 1,969 | 142 | 11 | 0 | 0 |
-| (c) cast or type test against a pool `Type`, on its edge | 257 | 86 | 86 | 257 | 0 |
+| (c) cast against a pool `Type`, on its edge, as built | 302 | 96 | 96 | 71 | 8 |
 | (d) declared type of the field a value was loaded from | 37 | 1 | 1 | 0 | 0 |
 | (e) common ancestor of a named selector's implementers | 33 | 0 | 0 | 1 | 0 |
 | (f) class of a constant instance read out of the pool | 61 | 2 | 2 | 61 | 0 |
@@ -1320,16 +1320,19 @@ the measurement and the product refuses:
 
 | app | Dart | (a) | (b) | (b') | (c) | (d) | (e) | (f) | (f') |
 |---|---|---|---|---|---|---|---|---|---|
-| xyz.deepdaikon.xeonjia | 2.19.6 | 0 | 4 | 0 | 273 | 2 | 0 | 1 | 0 |
-| io.github.petlyh.jsdict | 3.3.4 | 0 | 4 | 0 | 295 | 0 | 0 | 0 | 0 |
-| dev.labplus.app | 3.5.4 | 0 | 2 | 40 | 302 | 37 | 0 | 0 | 104 |
-| uk.me.amugofjava.anytime | 3.6.2 | 8 | 3 | 48 | 392 | 53 | 0 | 0 | 165 |
-| com.predidit.kazumi `*` | 3.11.5 | 0 | 0 | 161 | 351 | 52 | 0 | 2 | 411 |
-| kzs.th000.tsdm_client `*` | 3.11.5 | 0 | 3 | 98 | 1 | 41 | 0 | 2 | 342 |
-| chat.fluffy.fluffychat | 3.13.0 | 0 | 2 | 125 | 1 | 74 | 0 | 2 | 293 |
+| xyz.deepdaikon.xeonjia | 2.19.6 | 0 | 4 | 0 | 309 | 2 | 0 | 1 | 0 |
+| io.github.petlyh.jsdict | 3.3.4 | 0 | 4 | 0 | 305 | 0 | 0 | 0 | 0 |
+| dev.labplus.app | 3.5.4 | 0 | 2 | 40 | 352 | 37 | 0 | 0 | 104 |
+| uk.me.amugofjava.anytime | 3.6.2 | 8 | 3 | 48 | 414 | 53 | 0 | 0 | 165 |
+| com.predidit.kazumi `*` | 3.11.5 | 0 | 0 | 161 | 373 | 52 | 0 | 2 | 411 |
+| kzs.th000.tsdm_client `*` | 3.11.5 | 0 | 3 | 98 | 496 | 41 | 0 | 2 | 342 |
+| chat.fluffy.fluffychat | 3.13.0 | 0 | 2 | 125 | 397 | 74 | 0 | 2 | 293 |
 
 Two builds below 3.4 pass every argument on the stack, so (a), (b') and (f') have no
-register to reach there, and 3.11.5's receiver is the one the measurement assumed.
+register to reach there, and 3.11.5's receiver is the one the measurement assumed. The
+(c) row and column are the channel as built, measured on the commit that built it (see
+below); (c) reads no receiver, so the `*` does not apply to it. The other channels'
+numbers are the measurement as it was taken.
 
 **(b) and (b') are refuted, not merely small.** Both rest on "the call target is a known
 Function", and under `dedup_instructions` it is not: identical code is kept once, the
@@ -1359,42 +1362,128 @@ what says the type is being read right. (e) has 112 named
 selectors with a common ancestor and the ancestor's map names 0 accesses: a receiver
 whose class is known closely enough for a direct field load is called directly too.
 
-**(c) is the one unbuilt channel that pays, and it needs dominance.** An
-`AssertAssignable` compiles to inline class-id checks that jump past the stub on the
-classes the compiler could enumerate, then `bl` to the destination type's type-testing
-stub with the instance in x0 and the `Type` in x8 (TypeTestABI), which returns only if
-the value is assignable. 449 such calls on the clean fixture; 360 name a class no other
-layout implements;
-182 sit in front of a join every in-edge of which proves the same type (the stub's own
-fallthrough, or a `cmp cid, #n` on x0's tags word accepting a subclass), and the accepted
-cids sit inside the destination class's subclass set at every one of them, 0 outside, on
-both fixtures and all six apps. Following the value through copies, spills and joins
-reaches 257 accesses on the clean fixture, 86 of which the destination's map names, all
-86 from `Field` objects (`FlexParentData.nextSibling` off a `parentData` cast, the
-`_state` of a `_Future`), 0 outside the class's geometry, and 273 to 392 on the four
-calibrated apps below 3.13 (351, 1 and 1 on kazumi, tsdm_client and FluffyChat, whose
-joins mostly fail the in-edge check);
-0 on the obf fixture, whose names are obfuscated. It is not built
-here because the proof holds on the edges after the cast and not at the value's
-definition, so it needs the flow machinery the cid channel needed: a must-analysis over
-the CFG keyed by instruction address, which `detect_dispatch` is the one-pass shape of,
-and then one more thing the textual lifter does not have. A value cast half way through
-a body prints under two spellings, `t0.field_0x14` before and `t0.nextSibling` after,
-and `_pin_mem`'s may-alias rule compared SELECTORS, so a store through either spelling
-did not pin a live read through the other. That gap existed for a name against an
-unnamed base at the same offset (a `this.balance` read stayed live across an
-`x2.field_0x8 = ...` store that the unnamed spelling would have pinned), and a channel
-that names flow-sensitively would have widened it on every site it names. It is closed:
-`Lifter._covers` spells every slot a write lands on both ways, by its offset and by each
-name the walk has printed there, and the rule no longer pins a read off THR or PP, which
-are not Dart objects. The one body this section first measured on the clean fixture was
-not a stale read at all: it was a `THR.field_0x90` read, which the obf build already
-pinned behind its unnamed store of the same constructor and which no heap store can
-write. The fix changes 0 bodies on the clean fixture, that 1 on the obf one (unpinned),
-and 2, 1, 4, 4, 6, 5 and 6 on the seven real apps: 19 of those 28 a read a store to the
-same offset may have overwritten, 1 a declaration nothing reads gone and 8 only a
-temporary renumbered. Both pieces are measured and designed, and (c) is what remains of
-#240 beyond the receiver: 86 lines on the fixture, some hundreds per real app.
+**(c) is built, on the edges after the cast.** An `AssertAssignable` compiles to inline
+class-id checks that jump past the stub on the classes the compiler could enumerate,
+then `bl` to the destination type's type-testing stub with the instance in x0 and the
+`Type` in x8 (TypeTestABI), which returns only if the value is assignable. The proof holds
+after the call and not at the value's definition, so `fields.cast_accesses` is the
+measurement above made a product: a forward must-analysis over the body's CFG, a value
+number per register and per FP slot, the classes proven for each value number, and
+intersection at every join. A fact enters in two places only: the instruction after a
+call to a type-testing stub, for the value in x0, when x8 holds a pool `Type` of a class
+no class implements; and an inline class-id check whose accepting edge jumps to that same
+instruction, for the value whose header it read. The call is a `bl` to the Type's own
+specialised stub or a shared default one, or, for a destination with type arguments, a
+call through the entry point the Type holds, `ldr x9, [x8, #7]; ldr x3, [PP, #k]; blr
+x9` (`GenerateIndirectTTSCall`, flow_graph_compiler_arm64.cc; offset 7 is
+`type_test_stub_entry_point_`, the first field after an AbstractType's header in
+raw_object.h). A type parameter destination resolves its type into x4 and calls
+through that with the TypeParameter in x8 (`GenerateAssertAssignable`), and a
+TypeParameter is no pool `Type`, so that call proves nothing. The fact follows the value
+through copies and frame slots and is forgotten at a redefinition, at a call for every
+register the call may clobber (a type-testing stub hands back TypeTestABI's four,
+whether or not it proves anything), at a store that may reach the slot (through SP, the
+bytes `Lifter._cross_write` drops for it) and at a move of FP. Where a location holds a
+different value on each path into a join and each path proves the same class for it,
+two casts on two paths or a copy on one and a reload of the spill on the other, the join
+gives it a value number of its own carrying that class. A block that code the
+CFG does not reach from the entry flows into, a catch handler or an unchecked entry, is
+entered knowing nothing, and the two paths `strip_boilerplate` cuts out of the CFG, a
+stack check's slow path and the box-or-tag's Mint path, are put back for the analysis and
+walked like any other. The lifter takes a name off the class's map only where the
+receiver and allocation channels say nothing, keyed by instruction address and base
+register, so a value cast half way through a body prints `t0.field_0x14` before the cast
+and `t0.nextSibling` after it.
+
+That one value under two spellings is what the textual lifter did not handle.
+`_pin_mem`'s may-alias rule compared SELECTORS, so a store through either spelling did
+not pin a live read through the other. That gap existed for a name against an unnamed
+base at the same offset (a `this.balance` read stayed live across an `x2.field_0x8 = ...`
+store that the unnamed spelling would have pinned), and a channel that names
+flow-sensitively would have widened it on every site it names. It is closed first, in a
+commit of its own: `Lifter._covers` spells every slot a write lands on both ways, by its
+offset and by each name the walk has printed there, and the rule no longer pins a read
+off THR or PP, which are not Dart objects. The one body this section first measured on
+the clean fixture was not a stale read at all: it was a `THR.field_0x90` read, which the
+obf build already pinned behind its unnamed store of the same constructor and which no
+heap store can write. The fix changes 0 bodies on the clean fixture, that 1 on the obf
+one (unpinned), and 2, 1, 4, 4, 6, 5 and 6 on the seven real apps: 19 of those 28 a read a
+store to the same offset may have overwritten, 1 a declaration nothing reads gone and 8
+only a temporary renumbered. A name printed off a cast's base goes stale with the memory
+it reads whatever spells the base (`Lifter._reads_mem`), as an allocation's already did.
+
+Every piece of evidence is checked against a second encoding of it, and one disagreement
+refuses rather than guesses. The implemented bit against every class's `interfaces`
+array: 598 entries on each fixture and 776 to 2,358 on the seven apps, 0 contradicted. The
+abstract bit, which lets a check accept an id no instance has, against every class that
+owns an allocation stub: 921 on each fixture and 1,832 to 5,346 on the apps, 0 carrying
+it. Every specialised stub's own code, read path by path for the class ids it returns on
+(`fields._stub_accepts`), against its class's subclasses: 237 and 235 stubs of a class no
+class implements on the fixtures and 399 to 1,362 on the apps, all of them read, and 0
+accepting an id outside the subclasses, null and the ids no layout is read off (the
+compiler's own "don't care" set, `CidCheckerForRanges::MayInclude` in il.cc). One that
+did would refuse its class everywhere, since the compiler would then know a subtype this
+table does not. The two shared default stubs, which only their names identify, have to
+read as accepting null and nothing else and handing the rest to the runtime, and do on all
+nine binaries. And every inline check's accepted ids against the same set: 179 edges on
+the clean fixture, 101 on the obf one and 575 to 1,287 on the apps, 0 outside; one
+outside declines that cast. An id the class table does not hold counts against a cast
+below the VM's predefined ids, where it is a VM class this snapshot does not describe,
+and not above them, where it is one tree shaking left unused. The stub reader found
+"leaks" on the clean fixture and on the five apps from 3.5.4 before it was finished, and
+every one was a form it did not yet read: a nullable stub's `cmp w0, w22`, a bias too
+wide for an immediate, `mov x17, #-0x1229; add x9, x9, x17`, and a class id past 4,095,
+`cmp x9, #1, lsl #12`.
+
+Measured over every range. On the clean fixture the analysis runs in 137 bodies and
+gives a class to 302 accesses; the map names 96, all from `Field` objects, none of them
+named by another channel: `nextSibling` and `previousSibling` off a `parentData` cast to
+`FlexParentData`, `StackParentData`, `MultiChildLayoutParentData` or
+`_TheaterParentData`, a `_Future`'s `_state`, `RenderMouseRegion`'s `onEnter` and
+`onExit`, and `_StreamControllerAddStreamState`'s `_varData`, five of its six through
+the indirect call. 94 of the 96 are printed; the other two are values nothing reads. 47
+bodies change on 98 lines, each a one-for-one substitution of a byte offset by the name
+recorded for that range and offset, and `tools/quality.py`'s byte-offset row goes 52,626
+to 52,556 with every other row and the line total the same. On the obf fixture 71
+accesses get a class and 8 a name, from the core-library classes the obfuscation leaves
+alone (`_Future._state`, `_varData`); 8 lines change and the byte-offset row goes 54,162
+to 54,157. On the seven apps 309, 305, 352, 414, 373, 496 and 397 accesses are named, 96
+to 99% of them printed, in 138 to 229 bodies and on 316 to 556 lines, every one a
+substitution. Lifting the clean fixture took 24 and 22 s before and 26 and 23 s after,
+two runs each on a shared machine. 0 to 4 accesses more per app are proven and named by
+the receiver or allocation channel first, with the same name: `this._next = this` in
+`_BroadcastSubscription`'s constructor.
+
+What it may cost is bounded, because a hostile binary chooses its bodies. The walk sweeps
+the blocks in reverse postorder, so a sweep meets each edge once, and a fact carries the
+classes proven and not every cast that proved them, which only measuring asks for. A
+first version did both the other way: a body that casts in a loop 200 times over, 1,003
+instructions, re-met every path into the loop's head on each update with every cast's
+provenance and took 13.9 s, against 0.028 s for the same body lifted with no casts, and
+now takes about as long as that. The guarantee is a budget: every state entry a meet
+reads or a redefinition scans is charged, and a body that spends 1,000 per instruction
+is declined with nothing named. Measured with no budget over the 3,890 bodies the
+analysis runs on in the two fixtures and the seven apps, the most any spends is 316 per
+instruction, the 99th percentile 191 to 208 per binary and the median 64 to 80; at the
+107 ns a unit costs, 1,000 per instruction caps the analysis near 0.43 s for a
+4,000-instruction range.
+
+What it leaves out, measured. A destination some class implements is refused, because
+the bit is all this reads, and `MarkImplemented` sets it for an implementer that is itself
+abstract and has no concrete subclass. Admitting those classes with every other check on
+names 12 more accesses over the nine binaries (0 on either fixture; 1, 0, 0, 2, 0, 2 and 7
+on the apps, `GeneratedMessage.__fieldSet` on FluffyChat among them), while the stub
+cross-check refuses 21 to 103 of the admitted classes per binary because their stubs let
+a concrete implementer through. Telling the two apart from the class table needs the
+subtype closure over every `interfaces` array, VM classes this snapshot does not describe
+included, and is not built. An earlier version of the analysis, which left out of a join
+the predecessors the entry does not reach, named one access more: on
+uk.me.amugofjava.anytime, 0x9f3ac reads a `parentData` reloaded on a path a catch
+handler joins. AOTopsy takes no proof
+from a type-testing stub at all: a `TTS:` pool entry only names a call target
+(internal/typetrack/intraproc_handlers_call.go:99), and its one class narrowing sets the
+register a 32-bit `cmp` compared, the class id rather than the object, on the equal edge
+(intraproc.go:543).
 
 **(f') is built, and it is the receiver again.** `Function::Owner` (object.cc:11358) is a
 Class, or a PatchClass whose `wrapped_class` is the class, and the lifter read only the

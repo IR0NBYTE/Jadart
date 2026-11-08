@@ -248,7 +248,11 @@ statement of what a `bl` allocates, and until an implicit accessor was read as t
 its own Field's slot where that Field's name is a VM-snapshot string (#240, #258): on the
 clean fixture the three channels clear 1,626 of the 55,089 lines that would otherwise
 carry a byte offset, 1,598 of them on `this`, 103 of those in methods whose owner is a
-`PatchClass` and whose receiver class is the class it wraps (#240).
+`PatchClass` and whose receiver class is the class it wraps (#240). A cast states a
+fourth base's class on the edges after it, where no class implements the destination:
+96 accesses on the clean fixture, all from `Field` objects, take the byte-offset lines
+from 52,626 to 52,556 on the commit that added it, and 305 to 496 accesses are named on
+each of the seven app-sweep libraries (#240).
 
 Measured reach on the lifted output, corpus binary: **1,364 of 11,177** `this.field_0x`
 occurrences become names (12.2%), clearing **1,273 of 10,134** lines that carried one
