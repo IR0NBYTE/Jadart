@@ -38,6 +38,12 @@ PAR=
 if "$PY" -c 'import xdist' 2>/dev/null; then PAR="-n auto"; fi
 step "test suite" env -C framework "$PY" -m pytest tests -q -rs $PAR
 
+# CI also runs the suite with no capstone installed, and every test that decodes an
+# instruction has to skip there rather than fail. Run that here as well, or the first
+# sign of a test that forgot to skip is a red CI run (#277).
+step "the suite skips rather than errors without capstone" \
+  env -C framework JADART_TEST_NO_CAPSTONE=1 "$PY" -m pytest tests -q $PAR
+
 # Byte-exact, and the reason a wrong grammar is caught rather than guessed at. The exit
 # code is the contract: 0 when every applicable Tier-A gate passed.
 for f in "$CLEAN" "$OBF"; do
