@@ -1380,14 +1380,21 @@ definition, so it needs the flow machinery the cid channel needed: a must-analys
 the CFG keyed by instruction address, which `detect_dispatch` is the one-pass shape of,
 and then one more thing the textual lifter does not have. A value cast half way through
 a body prints under two spellings, `t0.field_0x14` before and `t0.nextSibling` after,
-and `_pin_mem`'s may-alias rule compares SELECTORS, so a store through either spelling
-does not pin a live read through the other. That gap exists today for a name against an
-unnamed base at the same offset (a `this.balance` read stays live across an
-`x2.field_0x8 = ...` store that the unnamed spelling would have pinned; measured, it
-changes one body on the clean fixture and none on the obf one) and a channel that names
-flow-sensitively would widen it on every site it names. Both pieces are measured and
-designed, and (c) is what remains of #240 beyond the receiver: 86 lines on the fixture,
-some hundreds per real app.
+and `_pin_mem`'s may-alias rule compared SELECTORS, so a store through either spelling
+did not pin a live read through the other. That gap existed for a name against an
+unnamed base at the same offset (a `this.balance` read stayed live across an
+`x2.field_0x8 = ...` store that the unnamed spelling would have pinned), and a channel
+that names flow-sensitively would have widened it on every site it names. It is closed:
+`Lifter._covers` spells every slot a write lands on both ways, by its offset and by each
+name the walk has printed there, and the rule no longer pins a read off THR or PP, which
+are not Dart objects. The one body this section first measured on the clean fixture was
+not a stale read at all: it was a `THR.field_0x90` read, which the obf build already
+pinned behind its unnamed store of the same constructor and which no heap store can
+write. The fix changes 0 bodies on the clean fixture, that 1 on the obf one (unpinned),
+and 2, 1, 4, 4, 6, 5 and 6 on the seven real apps: 19 of those 28 a read a store to the
+same offset may have overwritten, 1 a declaration nothing reads gone and 8 only a
+temporary renumbered. Both pieces are measured and designed, and (c) is what remains of
+#240 beyond the receiver: 86 lines on the fixture, some hundreds per real app.
 
 **(f') is built, and it is the receiver again.** `Function::Owner` (object.cc:11358) is a
 Class, or a PatchClass whose `wrapped_class` is the class, and the lifter read only the

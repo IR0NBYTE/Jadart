@@ -4986,6 +4986,42 @@ def test_a_store_that_may_alias_is_treated_as_one_that_does():
     assert "return t0 + 1;" in across, across
 
 
+def test_a_name_and_a_byte_offset_for_one_slot_alias_each_other():
+    # The may-alias rule compares spellings, and a slot has two: the name the receiver's
+    # map gives it and the byte offset any other base prints. `this.balance` and
+    # `x2.field_0x8` are one address whenever x2 is the receiver, so a store through
+    # either spelling has to pin a live read through the other, and a store to the heap
+    # can never reach the thread's own slots, whatever offset they share (#240).
+    from jadart.expr import lift_function
+
+    def body(rows, fields=None):
+        return "\n".join(lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+            receiver={"x1": "this"}, fields=fields, arch="arm64"))
+
+    named = {8: "balance"}
+    by_offset = body([("ldur", "x3, [x1, #7]"), ("stur", "x4, [x2, #7]"),
+                      ("stur", "x3, [x5, #0xf]"), ("ret", "")], named)
+    assert "var t0 = this.balance;" in by_offset, by_offset
+    assert "x5.field_0x10 = t0;" in by_offset, (
+        f"the read of `balance` went stale across a store to its slot\n{by_offset}")
+
+    by_name = body([("ldur", "x3, [x2, #7]"), ("stur", "x4, [x1, #7]"),
+                    ("stur", "x3, [x5, #0xf]"), ("ret", "")], named)
+    assert "var t0 = x2.field_0x8;" in by_name and "x5.field_0x10 = t0;" in by_name, (
+        f"a store to `this.balance` left the same slot's offset read live\n{by_name}")
+
+    elsewhere = body([("ldur", "x3, [x1, #7]"), ("stur", "x4, [x2, #0xf]"),
+                      ("stur", "x3, [x5, #0xf]"), ("ret", "")], named)
+    assert "x5.field_0x10 = this.balance;" in elsewhere and "var" not in elsewhere, (
+        f"a store at another offset cannot reach `balance`\n{elsewhere}")
+
+    thread = body([("ldr", "x3, [x26, #0x90]"), ("stur", "x3, [x1, #0x8f]"),
+                   ("stur", "x3, [x1, #0x93]"), ("ret", "")])
+    assert "var" not in thread and "this.field_0x94 = THR.field_0x90;" in thread, (
+        f"a heap store pinned a read of the thread\n{thread}")
+
+
 def test_the_memory_oracle_catches_a_stale_field_expression():
     """An oracle that passes everything proves nothing, so the defect goes back in.
 

@@ -541,6 +541,34 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `instrtable: data too short for table at offset 938240 (need 938272, have 938140)`,
   without naming the symbol. Closes #256.
 
+- **A store pins a live read of the same slot whichever way either one spells it.**
+  `Lifter._pin_mem` decides may-alias on the selector: two accesses at one offset are one
+  slot whenever their bases may be one object, which the lifter cannot know. A slot has
+  two spellings, though, the name a recovered map gives it and the byte offset any other
+  base prints, and the rule compared the spellings, so a read through one stayed live
+  across a store through the other. `InputMismatchException.` printed
+  `this.field_0x1c = x2.field_0x20` after `this.offendingToken = ...`, a store to offset
+  0x20 of a receiver x2 may be, and `divert` read `t7.field_0xc` after `t8.begin = ...`
+  had written offset 0xc. `Lifter._covers` now spells every slot a write lands on both
+  ways, by its offset and by each name the walk has printed at that offset, so the read
+  is named before the store as it already was where both sides printed an offset. And a
+  heap store no longer pins a read off THR or PP: those are the thread and the object
+  pool, not Dart objects, and the obf fixture wrote `var t0 = THR.field_0x90;` in front
+  of a constructor whose clean twin, storing through a name, did not.
+
+  Measured against main over every range: 0 bodies change on the clean fixture and 1 on
+  the obf one (that THR pin, one line fewer); 2, 1, 4, 4, 6, 5 and 6 on
+  xeonjia (2.19.6), jsdict (3.3.4), labplus (3.5.4), anytime (3.6.2), kazumi and
+  tsdm_client (3.11.5) and FluffyChat (3.13.0), 28 bodies in all and 18 lines more. 19
+  of them name a value a same-offset store may overwrite, `pull` (the overscroll glow
+  controller) and `divert` on most apps, or drop a frame slot that held one; 1,
+  FluffyChat's `build`, prints one declaration nothing reads fewer; the other 8 only
+  renumber, a pin whose name nothing then read. Where the store's base is an object the
+  body just allocated the read could not in fact go stale, and the rule cannot see that
+  for a name any more than it could for an offset. DESIGN 13.1 had measured this gap as
+  one body on the clean fixture and none on the obf one; on this main it is 0 and 1, and
+  the 1 is the THR pin.
+
 - **A Dart 3.13 library is refused for its epoch by every command, not for a symbol it
   never had.** Dart 3.13 writes one snapshot where every release before it wrote a vm
   and an isolate one, and exports it as `_kDartSnapshotData` and `_kDartSnapshotText`
