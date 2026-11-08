@@ -349,6 +349,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A header that declares any kind but kFullAOT is refused on every release, not only
+  on 3.13.** Through Dart 3.12 the header's snapshot kind was held only to the range of
+  the enum, so a kFull, kFullCore or kFullJIT header was read with the AOT grammar and
+  passed: the clean fixture with the isolate header's kind set to 0 printed `kind kFull`
+  in `info` and verified Tier A 11/11 over 66,323 checks, and so did kinds 1 and 2, the
+  vm header set to any of the three, the obfuscated fixture at 9/9, and five real apps
+  from 2.19.6 to 3.11.5 with the isolate header set to 0 or 2. These headers used to be
+  read and are now refused with an `InputError`, exit 2, that names the kind declared
+  and the one the release writes: the isolate header by all 17 commands, `info` with or
+  without `--lenient`, and the vm header by `info` and `verify`, the two that read it.
+  The others never read the vm header, so an edit to it alone changes nothing there,
+  as before. kFullAOT is 3 at every registered tag from 2.19.0-444.2.beta to 3.12.2
+  (snapshot.h:28) and 2 at 3.13.0 (snapshot.h:27), where #254 already refused the rest
+  with the same message, so 3.13 reads as before. A hash no epoch holds is still held
+  to the range alone under `--lenient`, since nothing says which enum numbers its kind.
+  `info` and `verify`, plain and `-j`, are byte-identical to main's on both fixtures and
+  on the seven real apps from 2.19.6 to 3.13.0. Closes #260.
+
 - **A range no Function owns no longer prints its first argument as `this`.**
   `program.receiver_for` handed the lifter `{"x1": "this"}` for every range whose owner
   was not a static Function, and a range whose Code has no Function owner never is one.

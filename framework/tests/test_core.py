@@ -3750,7 +3750,7 @@ def test_snapshot_kind_matches_the_vm_enum():
     """Every Flutter release snapshot is kFullAOT, and jadart called them all kModule.
 
     Snapshot::Kind (snapshot.h) is kFull, kFullCore, kFullJIT, kFullAOT, then kModule in
-    3.12 and kNone below it. The table here omitted kFullCore, so every value from 1 up
+    3.11 and kNone below it. The table here omitted kFullCore, so every value from 1 up
     was shifted by one and kind 3 printed as "kModule" in `info`, in the export header and
     in anything quoting them.
 
@@ -3765,7 +3765,7 @@ def test_snapshot_kind_matches_the_vm_enum():
     assert KIND[1] == "kFullCore"
     assert KIND[2] == "kFullJIT"
     assert KIND[3] == "kFullAOT"
-    # Index 4 is kModule from 3.12 and kNone before it. Reporting either would be a guess
+    # Index 4 is kModule from 3.11 and kNone before it. Reporting either would be a guess
     # on half the supported range, and no release binary reaches it.
     assert 4 not in KIND
 
@@ -3794,6 +3794,78 @@ def test_snapshot_kind_matches_the_vm_enum():
     from jadart.disasm import load_instructions
     _img, _fr, hdr = load_instructions(CLEAN)
     assert hdr.kind == 3 and hdr.kind_name == "kFullAOT", hdr.kind_name
+
+
+def test_a_header_whose_kind_is_not_the_releases_aot_kind_is_refused(tmp_path):
+    """Every registered release is read as one snapshot kind, kFullAOT, and no other.
+
+    Through 3.12 the kind was checked only against the range of the enum, so a kFull,
+    kFullCore or kFullJIT header was read with the AOT grammar: the clean fixture with
+    its isolate header set to 0 or 2 printed that kind in `info` and verified 11/11
+    (#260). kFullAOT is 3 at every registered tag from 2.19.0-444.2.beta to 3.12.2 and 2
+    at 3.13.0, which dropped kFullCore (snapshot.h at each tag), so the number refused
+    depends on the release. 3.13 already refused this way (#254)."""
+    import contextlib
+    import io
+    import json
+    from jadart import cli, versions
+    from jadart.elf import Elf
+    from jadart.snapshot import DART_MAGIC, KIND, KIND_MERGED
+
+    def header(version_hash, kind, base):
+        # magic, length, kind, the hash, an arm64 features string and five counts, the
+        # cluster count 0 so nothing past the header is read
+        body = (version_hash.encode() + b"product arm64 android compressed-pointers\x00"
+                + _wu(base) + _wu(0) * 4)
+        return struct.pack("<Iqq", DART_MAGIC, 16 + len(body), kind) + body
+
+    first_merged = versions._release_order("3.13.0")
+    seen = set()
+    for version_hash, e in versions._EPOCHS.items():
+        aot = 2 if versions._release_order(e.dart) >= first_merged else 3
+        names = KIND_MERGED if aot == 2 else KIND
+        seen.add(aot)
+        base = e.base_objects or 0
+        for strict in (True, False):           # --lenient knows these releases too
+            hdr = parse_blob(header(version_hash, aot, base), "isolate", strict=strict)
+            assert hdr.kind_name == "kFullAOT", (e.dart, hdr.kind_name)
+            for kind in sorted(set(range(4)) - {aot}):
+                with pytest.raises(jadart.InputError) as err:
+                    parse_blob(header(version_hash, kind, base), "isolate", strict=strict)
+                says = (f"isolate: header declares snapshot kind {kind} ({names[kind]}), "
+                        f"and a Dart {e.dart} app's AOT snapshot is kind {aot} "
+                        f"(kFullAOT)")
+                assert str(err.value).startswith(says), (e.dart, str(err.value))
+    assert seen == {2, 3}
+    # A release nothing has placed numbers its kind by an enum nobody knows, so the
+    # range is all it is held to, and --lenient still prints its header.
+    hdr = parse_blob(header("0" * 32, 0, 0), "isolate", strict=False)
+    assert (hdr.epoch, hdr.kind_name) == (None, "kFull")
+
+    # The same on a real 3.12.2 library, through the commands, for both its headers.
+    if not os.path.exists(CLEAN):
+        _skip("  SKIP fixture half (no clean fixture)")
+    data = open(CLEAN, "rb").read()
+    elf = Elf(data)
+    path = tmp_path / "libapp.so"
+    for which, sym in (("vm", "_kDartVmSnapshotData"),
+                       ("isolate", "_kDartIsolateSnapshotData")):
+        at = elf.va_to_offset(elf.symbols[sym].value)
+        assert struct.unpack_from("<q", data, at + 12)[0] == 3
+        for kind, name in ((0, "kFull"), (2, "kFullJIT")):
+            out = bytearray(data)
+            struct.pack_into("<q", out, at + 12, kind)
+            path.write_bytes(bytes(out))
+            for argv in (["-j", "info"], ["-j", "info", "--lenient"], ["-j", "verify"]):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = cli.main(argv + [str(path)])
+                doc = json.loads(buf.getvalue())
+                assert code == 2, (which, kind, argv, code)
+                assert doc["type"] == "InputError", doc
+                assert doc["error"].startswith(
+                    f"{which}: header declares snapshot kind {kind} ({name}), and a Dart "
+                    f"3.12.2 app's AOT snapshot is kind 3 (kFullAOT)"), doc["error"]
 
 
 def test_library_prefix_has_a_fill_grammar():
@@ -17179,10 +17251,13 @@ def test_a_dart_3_13_library_reads_end_to_end(tmp_path, monkeypatch):
     assert walk_isolate(str(path), full=True)["strings"] == ["Class", "Foo", "bar"]
     # Only on a 3.13 epoch, though. An older one keeps the quick path's answer for a
     # first cluster that is not String, which is none, so a crafted pre-3.13 file is
-    # read as before.
+    # read as before. Its header numbers kFullAOT as every release before 3.13 does,
+    # 3, or the kind check refuses it before the walk (#260).
     older = dataclasses.replace(hdr.epoch, merged=False)
     monkeypatch.setitem(versions._EPOCHS, DART_3_13, older)
-    assert walk_isolate(str(path))["strings"] == []
+    pre = tmp_path / "pre_3_13.so"
+    pre.write_bytes(_merged_elf(_dart_3_13_snapshot(kind=3)[0]))
+    assert walk_isolate(str(pre))["strings"] == []
     monkeypatch.setitem(versions._EPOCHS, DART_3_13, hdr.epoch)
 
     buf = io.StringIO()

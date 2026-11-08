@@ -15,8 +15,11 @@ checkout. Items we could not confirm from source are marked UNVERIFIED.
 [ cluster[0..N].fill  ]     WriteFill pass
 [ roots ]
 ```
-`kind` in {kFull, kFullJIT, kFullAOT, kModule} (snapshot.h:24). `length` excludes the 4
-magic bytes. Release snapshots (what you RE) are NOT self-delimiting: the int32 ref-index
+`kind` in {kFull, kFullJIT, kFullAOT, kModule} (snapshot.h:24). jadart reads kFullAOT
+alone and refuses a header of any other kind, by the number its release gives kFullAOT:
+3 at every registered tag from 2.19.0-444.2.beta to 3.12.2, where kFullCore sits at 1,
+and 2 from 3.13.0 (#260). `length` excludes the 4 magic bytes. Release snapshots
+(what you RE) are NOT self-delimiting: the int32 ref-index
 and section-marker words between clusters exist only in DEBUG builds (app_snapshot.cc:9064,
 9089).
 
