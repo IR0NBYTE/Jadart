@@ -17382,6 +17382,76 @@ def test_a_data_symbol_that_ends_before_its_instructions_table_is_refused(
                        f"{start}..{start + 32}, past the symbol's end.")
 
 
+
+def test_a_code_symbol_that_ends_before_its_image_is_refused(tmp_path, clean_loaded):
+    """The instructions image says how long it is in its first word (ImageSize), and the
+    symbol that holds it is sized by the container. The clean fixture with
+    _kDartIsolateSnapshotInstructions' st_size cut to 0 exited 0 from every command:
+    `verify` said "Grammar consistent" on Tier A 9/9, `functions` listed 8,193 ranges
+    with no bytes behind them, `lift` printed nothing and `decompile` said "no code"
+    (#267). Each cut is a typed failure now that names the symbol."""
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+    from jadart.disasm import load_instructions
+    from jadart.elf import Elf
+    from jadart.stream import TruncatedSnapshot
+
+    d = open(CLEAN, "rb").read()
+    elf = Elf(d)
+    sym = elf.symbols["_kDartIsolateSnapshotInstructions"]
+    record = struct.pack("<QQ", sym.value, sym.size)
+    assert d.count(record) == 1 and sym.size == 1833776
+    at = d.index(record) + 8
+    word = elf.va_to_offset(sym.value)
+    assert struct.unpack_from("<Q", d, word)[0] == sym.size   # ImageSize, as written
+
+    def craft(size=None, image_size=None):
+        out = bytearray(d)
+        if size is not None:
+            struct.pack_into("<Q", out, at, size)
+        if image_size is not None:
+            struct.pack_into("<Q", out, word, image_size)
+        path = tmp_path / f"cut-{size}-{image_size}.so"
+        path.write_bytes(out)
+        return str(path)
+
+    name = "_kDartIsolateSnapshotInstructions: the symbol is"
+
+    def refused(path, said):
+        with pytest.raises(TruncatedSnapshot) as e:
+            load_instructions(path)
+        assert str(e.value) == said
+        for argv in (["verify", path], ["functions", path],
+                     ["lift", path, "benchWithdraw"]):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.main(["-j"] + argv)
+            doc = json.loads(buf.getvalue())
+            assert (rc, doc["type"], doc["error"]) == (2, "TruncatedSnapshot", said), (
+                argv, doc)
+
+    for size in (0, 4):
+        refused(craft(size), f"{name} {size} bytes, too short to hold the "
+                             f"instructions image's own header.")
+    # Past the last range's start too: the table cannot say where the last function
+    # ends, the image can.
+    for size in (1000000, 1833376 + 4, 1833775):
+        refused(craft(size), f"{name} {size} bytes, and the instructions image it "
+                             f"holds says it is 1833776.")
+    # An image that says it ends before the code the table places in it.
+    refused(craft(image_size=1000000),
+            "_kDartIsolateSnapshotInstructions: the InstructionsTable places code at "
+            "offset 1833376, and the instructions image ends at 1000000.")
+    # `info` reads only the data symbol's header.
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["-j", "info", craft(0)]) == 0
+    # The whole symbol is the image, and loads as it did.
+    image, _fr, _hdr = load_instructions(craft(1833776))
+    assert (image.pcs, len(image.text)) == (clean_loaded[0].pcs, 1833776)
+
 def _gates_3_13(hdr_base: int = 7, epoch=None, **knobs):
     """run_gates over _dart_3_13_snapshot(**knobs) with _small_roots for a layout, and
     the image and header a real file would give, cut to what the gates read."""

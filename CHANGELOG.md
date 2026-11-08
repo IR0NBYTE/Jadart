@@ -349,6 +349,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A code symbol that ends before its instructions image is refused, not read as empty
+  code.** The image states its own length in its first word, header and payload
+  together (`Image::HeaderField::ImageSize`, image_snapshot.h:113 at 3.12.2), and the
+  container sizes the symbol that holds it, so nothing made the one hold the other.
+  Slicing the image clamps where a struct read would fail, so a short symbol was read
+  as far as it went. The clean fixture with `_kDartIsolateSnapshotInstructions`'
+  `st_size` set to 0 exited 0 from every command: `verify` said `Tier A 9/9, Tier B
+  2/3 ... Grammar consistent.`, `functions` listed 8,193 ranges with sizes and no bytes
+  behind them, `lift benchWithdraw` printed nothing and `decompile` said `no code
+  (inlined / abstract / no range)`. A symbol shorter than the image says it is, or
+  than its header, is now a `TruncatedSnapshot`, exit 2, that names it, and so is a
+  table that places code at or past the image's end. That catches a cut inside the
+  last function too, which the table alone cannot see, since it gives no sizes. The
+  word equals the symbol's size on both fixtures and the seven app-sweep libraries,
+  2.19.6 to 3.13.0, and `verify` prints the same line as before on all nine. A Mach-O
+  symbol runs to its section's end and may hold more than the image, so only a shorter
+  one is refused. `info` reads only the data symbol's header and still exits 0.
+  Closes #267.
+
 - **A header that declares any kind but kFullAOT is refused on every release, not only
   on 3.13.** Through Dart 3.12 the header's snapshot kind was held only to the range of
   the enum, so a kFull, kFullCore or kFullJIT header was read with the AOT grammar and

@@ -220,6 +220,36 @@ class InstrImage:
     entry_offsets: dict = None
 
 
+def check_image_size(text: bytes, pcs: list, arch, symbol: str) -> None:
+    """Refuse an instructions symbol that ends before the image it holds (#267).
+
+    The image states its own length in its first word, header and payload together
+    (Image::HeaderField::ImageSize, image_snapshot.h:113 at 3.12.2), and the container
+    sizes the symbol, so nothing makes the one hold the other. A short symbol was read
+    as far as it went: the slice clamps where a struct read would have failed, so every
+    range past its end got a size and no bytes, `lift` printed nothing and `verify`
+    still said the grammar was consistent. The word equals the symbol's size on both
+    fixtures and the seven app-sweep libraries, 2.19.6 to 3.13.0. A Mach-O symbol runs
+    to its section's end and may hold more than the image, so only a shorter one is
+    refused. The table's offsets must then fall inside the image: a range starting at
+    or past its end has no instructions to start with."""
+    word = arch.word_size if arch is not None else 8
+    if len(text) < word:
+        raise TruncatedSnapshot(
+            f"{symbol}: the symbol is {len(text)} bytes, too short to hold the "
+            f"instructions image's own header.")
+    size = int.from_bytes(text[:word], "little")
+    if size > len(text):
+        raise TruncatedSnapshot(
+            f"{symbol}: the symbol is {len(text)} bytes, and the instructions image it "
+            f"holds says it is {size}.")
+    top = max(pcs, default=-1)
+    if top >= size:
+        raise TruncatedSnapshot(
+            f"{symbol}: the InstructionsTable places code at offset {top}, and the "
+            f"instructions image ends at {size}.")
+
+
 def load_instructions(path):
     """Parse the isolate instructions image + table and build owner_ref -> CodeRange.
     Returns (image, fr, hdr): the InstrImage, the FillResult from walk_fill, and the
@@ -258,6 +288,7 @@ def load_instructions(path):
     pcs, first_code = parse_instructions_table(data, header_length,
                                                hdr.instr_table_rodata_offset, hdr.arch,
                                                symbol=names.data)
+    check_image_size(text, pcs, hdr.arch, names.instructions)
 
     # Function sizes are the gap to the NEXT table entry, across ALL entries, not just
     # the ones whose Code object we recovered. Using only retained entries made each
