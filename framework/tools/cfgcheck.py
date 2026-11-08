@@ -358,7 +358,8 @@ def run(path):
     from jadart.cfg import build_cfg, structure
     from jadart.branches import exits, row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               build_pool_map, function_name_by_pc, cut_end)
+                               build_pool_map, function_name_by_pc, cut_end,
+                               monomorphic_entry)
     from jadart.expr import strip_boilerplate, tier3_graph
 
     image, fr, _hdr = load_instructions(path)
@@ -380,7 +381,7 @@ def run(path):
             exit_first = ex[0]
         ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
         try:
-            g = tier3_graph(ann, end)
+            g = tier3_graph(ann, end, monomorphic_entry(image, cr))
         except RecursionError:
             g = None
             t3["deep"] += 1     # lift_function prints such a range flat

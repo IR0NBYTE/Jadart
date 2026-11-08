@@ -38,8 +38,9 @@ from sys import intern
 from typing import NamedTuple
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, _idoms, cut_goto, flat, TRAPS, _target, entry_reach,
-                  UNREACHED, cut_off)
+                  cond_of, cut_goto, flat, TRAPS, _target, entry_reach,
+                  UNREACHED, cut_off, dominator_forest, second_reach, _cond_for,
+                  checks_into, _conditions_from_the_block_before)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -1918,7 +1919,7 @@ def _d0_callee(callees):
     return named
 
 
-def _d0_result_reads(blocks, entry, returned, named) -> frozenset:
+def _d0_result_reads(blocks, entry, returned, named, roots=()) -> frozenset:
     """The calls whose result in d0 the code goes on to read, of those `named` says are
     calls to a function that returns d0 (_d0_callee): what one leaves in d0 reaches an
     instruction that reads it, or a `ret` that hands d0 back (`returned`,
@@ -1926,7 +1927,9 @@ def _d0_result_reads(blocks, entry, returned, named) -> frozenset:
     stub that gives every register back keeps it, and so does a slow path's save and
     restore around one (_rv_push, _rv_pop). A d0 read past the next instruction, after
     a reload of x0 or a join, was left as d0, the d0 the function was handed (#152,
-    #127). arm64 only, as _rv_def_use is."""
+    #127). arm64 only, as _rv_def_use is. `roots` are the proven entries no edge
+    reaches (Lifter.roots), each entered, as the entry is, with no call's result in d0
+    (#278)."""
     if _T is not ARM64:
         return frozenset()
     read_, call_, write_ = range(3)
@@ -1953,8 +1956,8 @@ def _d0_result_reads(blocks, entry, returned, named) -> frozenset:
             if "d0" in defs:
                 row.append((a, write_))
     read: set = set()
-    ins = {entry: frozenset()}
-    work = [entry]
+    ins = {r: frozenset() for r in (entry, *roots) if r in blocks}
+    work = list(ins)
     while work:
         b = work.pop()
         cur = ins[b]
@@ -2981,6 +2984,21 @@ class Lifter:
         #: measured and set aside (#266).
         self.rejoined: frozenset = frozenset()
         self._in_tail = False
+        #: The proven entries no edge reaches whose body is lifted as one (#278): the
+        #: monomorphic entry and the normal entry its check falls into, each the root of
+        #: a dominator tree of its own (`_dom_tree`), and each starting from bare
+        #: registers whatever falls into it, since the callers enter it too and the
+        #: graph has no edge for them. `placed` is what the first instruction reaches,
+        #: `second` what those entries reach that it does not, and `rejoined_second`
+        #: the blocks of `placed` a goto out of `second` jumps to, which take the
+        #: REJOIN note there as the ones above do from a section. `_in_second`: whether
+        #: the walk is in that body now.
+        self.roots: tuple = ()
+        self.placed: frozenset = frozenset()
+        self.second: frozenset = frozenset()
+        self.rejoined_second: frozenset = frozenset()
+        self._in_second = False
+        self._root_of: dict = {}
         # precompute loop metadata reused during the walk
         self._preds = {a: [] for a in blocks}
         for a, b in blocks.items():
@@ -3444,7 +3462,7 @@ class Lifter:
         function that returns d0; see _d0_result_reads."""
         if self._d0_calls is None:
             self._d0_calls = _d0_result_reads(self.blocks, self.entry, self._returned(),
-                                              _d0_callee(self.callees))
+                                              _d0_callee(self.callees), self.roots)
         return addr in self._d0_calls
 
     def _ret_use(self, addr, us: int) -> int:
@@ -3581,8 +3599,10 @@ class Lifter:
             return got
         if self._ridom is None:
             ended = self._ended_blocks()
-            self._ridom = _idoms(self.blocks, self.entry, lambda n: () if n in ended
-                                 else self.blocks[n].succ if n in self.blocks else ())[0]
+            self._ridom = dominator_forest(
+                self.blocks, self.entry, lambda n: () if n in ended
+                else self.blocks[n].succ if n in self.blocks else (), self.roots,
+                self.placed)[0]
             self._spills = {}
         idom, ended = self._ridom, self._ended
 
@@ -5992,6 +6012,16 @@ class Lifter:
             n = self._idom.get(n)
         return frozenset(out)
 
+    def _dom_tree(self):
+        """The dominator tree, `_idom`, from the entry and from each proven entry no edge
+        reaches (`roots`, dominator_forest), and which root each block's tree hangs off,
+        `_root_of`. Without `roots` it is the entry's tree alone, as it always was."""
+        self._idom, _order, trees = dominator_forest(
+            self.blocks, self.entry,
+            lambda n: self.blocks[n].succ if n in self.blocks else (), self.roots,
+            self.placed)
+        self._root_of = {n: r for r, nodes in trees for n in nodes}
+
     def _join_kill(self, addr, entry=False) -> tuple:
         """(registers, slots-too) a block reached by a `goto` may NOT assume it still has.
 
@@ -6017,8 +6047,7 @@ class Lifter:
         if hit is not None:
             return hit
         if self._idom is None:
-            self._idom = _idoms(self.blocks, self.entry,
-                                lambda n: self.blocks[n].succ if n in self.blocks else ())[0]
+            self._dom_tree()
         # backward: every block that can reach addr without going through it again
         # `entry`: the ways into a loop's head only, not the latches it dominates, whose
         # values the loop's own names carry (#125).
@@ -6088,7 +6117,11 @@ class Lifter:
             if name is None:
                 name = self._join_name[key] = f"t{st.tmpc[0]}"
                 st.tmpc[0] += 1
-                self._anchor[int(name[1:])] = self.entry
+                # Declared above the body, so in scope wherever the join's own entry is:
+                # the entry's, or a proven entry's for a join in its body (#278).
+                if self._idom is None:
+                    self._dom_tree()
+                self._anchor[int(name[1:])] = self._root_of.get(addr, self.entry)
                 self.phi_names.add(name)
             pairs.append((name, st.get(r)))
             w = self._join_wrote.setdefault(key, set())
@@ -6240,7 +6273,7 @@ class Lifter:
         """
         preds = self._preds.get(addr, ())
         carry = None
-        if len(preds) == 1:
+        if len(preds) == 1 and addr not in self.roots:
             carry = self._came.get(addr) or self._exit.get(preds[0])
         st.elem.clear()
         st.poolbase.clear()
@@ -6320,9 +6353,12 @@ class Lifter:
         overwrote an operand it compared, `subs x1, x1, #8`, where the arriving state has
         the NEW x1 and only the predecessor's captured text has the old one (#116). That
         one is declined rather than re-read.
+
+        Nor into a proven entry (`roots`): the callers enter the normal entry too, with
+        flags no edge brings, so the monomorphic check's comparison is not its (#278).
         """
         preds = self._preds.get(addr, ())
-        if len(preds) != 1:
+        if len(preds) != 1 or addr in self.roots:
             return None
         got = self._flags_out.get(preds[0])
         if got is None:
@@ -6357,13 +6393,15 @@ class Lifter:
         block that decided it rather than the arm that ran. That is enough: a block the
         entry cannot reach has only predecessors it cannot reach either, so a state whose
         last block is unreachable came through unreachable blocks the whole way.
+
+        The body a proven entry roots (`_dom_tree`) counts as reached here, as the
+        entry's does: a section falling into it is a way in its walk did not take (#278).
         """
         preds = self._preds.get(addr, ())
         if len(preds) < 2 or not isinstance(st.src, int):
             return False
         if self._idom is None:
-            self._idom = _idoms(self.blocks, self.entry, lambda n: (
-                self.blocks[n].succ if n in self.blocks else ()))[0]
+            self._dom_tree()
         return (st.src not in self._idom
                 and any(p in self._idom for p in preds))
 
@@ -6641,8 +6679,10 @@ class Lifter:
                 # excluded for the reason the meet below excludes it: `_render_loop` has
                 # already bound its carried registers in this state.
                 came = st.src
+                # A proven entry the walk falls into starts from bare registers all the
+                # same: the normal entry is where the callers come in too (#278).
                 if (alive and s[1] not in self.carried
-                        and self._unjustified(s[1], st)):
+                        and (s[1] in self.roots or self._unjustified(s[1], st))):
                     self._reenter(s[1], st)
                 # The fall-through edge into a goto-join writes its phi names BEFORE the
                 # label, so a goto that jumps to the label does not re-run them (#123).
@@ -6728,6 +6768,7 @@ class Lifter:
                 if s[1] in self.orphans:
                     alive = False       # placed after the body; nothing runs on into it
                     self._in_tail = True
+                    self._in_second = s[1] in self.second
                 if note is not None:
                     note = (note[0], True)
             elif kind == "note":
@@ -6788,7 +6829,7 @@ class Lifter:
                 # block falls straight into them; anything else anchors them nowhere.
                 prev = stmts[i - 1] if i and alive else None
                 self._loop_before = prev[1] if prev and prev[0] == "asm" else None
-                if alive and self._unjustified(s[1], st):
+                if alive and (s[1] in self.roots or self._unjustified(s[1], st)):
                     self._reenter(s[1], st)      # the same way in, into a loop head
                 label(s[1])
                 if s[1] in (self.labels if self.joinable is None else self.joinable):
@@ -6835,8 +6876,9 @@ class Lifter:
                 # so they hold the carried value, not the register the loop forgot (#123).
                 if s[1] in self.join_phi:
                     out.extend(self._join_write(s[1], st, pad))
+                rejoins = self.rejoined_second if self._in_second else self.rejoined
                 out.append(pad + f"goto L_0x{s[1]:x};"
-                           + (f"   // {REJOIN}" if self._in_tail and s[1] in self.rejoined
+                           + (f"   // {REJOIN}" if self._in_tail and s[1] in rejoins
                               else ""))
                 falls = alive = False
             elif kind in ("exit", "cut"):
@@ -7175,15 +7217,18 @@ class Lifter:
         and the body is what reaches one without passing it. `_loop_nodes` takes the
         edge in from before the loop for a latch too, and with it every block before the
         loop (#129). A predecessor no path from the entry reaches counts as a latch, as
-        it may be a handler the graph has no edge into."""
+        it may be a handler the graph has no edge into, and so does one under another
+        root of the forest (`_dom_tree`): that is the edge in from a second entry's body,
+        which reaches no tree but its own (#278)."""
         if self._idom is None:
-            self._idom = _idoms(self.blocks, self.entry, lambda n: (
-                self.blocks[n].succ if n in self.blocks else ()))[0]
+            self._dom_tree()
         got = self._backloops.get(header)
         if got is not None:
             return got
+        tree = self._root_of.get(header)
         latches = [p for p in self._preds.get(header, ())
-                   if p not in self._idom or header in self._dominators(p)]
+                   if p not in self._idom or self._root_of.get(p) != tree
+                   or header in self._dominators(p)]
         nodes, stack = {header}, latches
         while stack:
             n = stack.pop()
@@ -7537,8 +7582,7 @@ class Lifter:
         if got is not None:
             return got
         if self._idom is None:
-            self._idom = _idoms(self.blocks, self.entry, lambda n: (
-                self.blocks[n].succ if n in self.blocks else ()))[0]
+            self._dom_tree()
         nodes, stack = set(), [header]
         while stack:
             n = stack.pop()
@@ -8592,16 +8636,23 @@ def _drop_unread_slots(lines: list, names: set) -> list:
 
 #: The note over the section at a Code's monomorphic entry, in place of cfg.UNREACHED,
 #: where the snapshot says the code has one (#266). That is the low bit of the Code's
-#: payload_info (app_snapshot.cc:8488 at 3.12.2), and the deserializer puts the entry a
-#: monomorphic call takes at the payload start plus kMonomorphicEntryOffsetAOT
-#: (app_snapshot.cc:9625-9644), which is 8 on arm64 (object.h:5922) in 2.19.6, 3.12.2 and
-#: 3.13.0. The same bit puts `entry_point`, the normal entry, at the payload start plus
-#: kPolymorphicEntryOffsetAOT, 24 on arm64 (app_snapshot.cc:9628-9643, object.h:5923),
-#: where MegamorphicCallStub jumps (stub_code_compiler_arm64.cc:3650-3660); the section
-#: runs on into it, so the note says where. That is all it says.
-#: MonomorphicCheckedEntryAOT (assembler_arm64.cc:1939-1958) is entered with the receiver
-#: in x0 and its class id to check in x5, and the walk names no register there all the
-#: same: the section starts from `_reenter`'s bare registers.
+#: payload_info (app_snapshot.cc:8488-8489 at 3.12.2), and the deserializer puts the
+#: entry a monomorphic call takes at the payload start plus kMonomorphicEntryOffsetAOT,
+#: 8 on arm64, and `entry_point`, the normal entry, at kPolymorphicEntryOffsetAOT, 24
+#: (app_snapshot.cc:9625-9644, object.h:5922-5923). MonomorphicCheckedEntryAOT
+#: (assembler_arm64.cc:1941-1965) emits the miss handler at +0 and the class check at +8,
+#: and falls through into +24. That function and both offsets read the same in all 19
+#: releases jadart registers, 2.19.0-444.2.beta to 3.13.0.
+#:
+#: The section is lifted as the body it is (#278): the check and the normal entry each
+#: root a dominator tree (Lifter.roots), so its loops and joins read as the same rows do
+#: lifted from +8, and it starts from bare registers, at +8 and again at +24. A
+#: switchable call enters +8 with the receiver in x0 and the class id it expects in x5
+#: (flow_graph_compiler_arm64.cc:556-575), but +24 on is the normal entry's code too,
+#: which MegamorphicCallStub enters with the target Function in x0, the entry address in
+#: x1 and its cache in x5 (stub_code_compiler_arm64.cc:3643-3660, constants_arm64.h:148
+#: and 151). Neither name, nor the entry's own `this` and `aN`, holds on every way in,
+#: and none is printed.
 MONOMORPHIC_ENTRY = ("reached by no edge in this graph: the monomorphic entry, which the "
                      "snapshot says this code has, 8 bytes in; its normal entry is 24 "
                      "bytes in")
@@ -8609,7 +8660,9 @@ MONOMORPHIC_ENTRY = ("reached by no edge in this graph: the monomorphic entry, w
 #: The note on a goto out of a section no edge leads into back into the body above it
 #: (Lifter.rejoined), where the block it lands on leads on: one that leads nowhere is
 #: printed again under the section instead (`_ends_again`). The code past the label was
-#: worked out for the body's ways in, and nothing says whether it holds for this one.
+#: worked out for the body's ways in, and nothing says whether it holds for this one. A
+#: monomorphic entry's body is such a body to the sections after it, and its own gotos
+#: into the body above it take the note too (Lifter.rejoined_second, #278).
 REJOIN = ("the names past that label were worked out for the ways in above it, not "
           "checked for this one")
 
@@ -8636,8 +8689,8 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     read its result from, and, where none does, its `by_table` asks the other functions
     `selectors` places under the same selector; without it a `ret` is decided by the
     function's own code. `mono` is the address of the code's monomorphic entry where
-    the snapshot says it has one (disasm.monomorphic_entry), and the section placed
-    there says so; see MONOMORPHIC_ENTRY.
+    the snapshot says it has one (disasm.monomorphic_entry): the section placed there
+    says so, and is lifted as a body from that entry; see MONOMORPHIC_ENTRY.
 
     `arch` is the resolved target. Passing one whose roles are not modelled refuses; see
     LIFTABLE_ARCHS. Omitting it keeps the arm64 assumption every caller had before the
@@ -8727,11 +8780,35 @@ class Tier3Graph(NamedTuple):
     raw: dict               # what it changed: the mnemonic and operands, by address
     cut: frozenset          # where the edges it took out led (_cut_edges)
     stmts: list             # structure(), with every block no edge reaches after the body
+    roots: tuple = ()       # the proven entries no edge reaches (_proven_entries)
+    second: frozenset = frozenset()     # what they reach and the entry does not
 
 
-def tier3_graph(ann, cut_end=None):
+#: How far past the monomorphic entry the normal entry is, on arm64:
+#: kPolymorphicEntryOffsetAOT less kMonomorphicEntryOffsetAOT, 24 less 8
+#: (object.h:5922-5923 at 3.12.2, and the same in every release from 2.19.0-444.2.beta
+#: to 3.13.0). MonomorphicCheckedEntryAOT emits the class check between them and falls
+#: through into the normal entry (assembler_arm64.cc:1953-1962 at 3.12.2).
+_NORMAL_PAST_MONO = 16
+
+
+def _proven_entries(blocks, mono, placed) -> tuple:
+    """(the monomorphic entry, the normal entry) where the snapshot says the code has one
+    and the graph has the shape MonomorphicCheckedEntryAOT emits (cfg.checks_into): a
+    check at `mono` that branches back to the miss handler in `placed` and falls into a
+    block 16 bytes on. Anything else gets none, and its section is lifted as one nothing
+    reaches, from bare registers, as before #278. A looser test let a check that also
+    branched into the body dominate code the callers enter at +24 without it, and the
+    meet there kept a value only the check had set."""
+    if mono is None or not checks_into(blocks, mono, mono + _NORMAL_PAST_MONO, placed):
+        return ()
+    return mono, mono + _NORMAL_PAST_MONO
+
+
+def tier3_graph(ann, cut_end=None, mono=None):
     """The Tier3Graph of the annotated rows `ann`, or None where they make no block.
-    `_lift_function` lifts it and tools/cfgcheck.py checks it, so both see one graph."""
+    `_lift_function` lifts it and tools/cfgcheck.py checks it, so both see one graph.
+    `mono` is the code's monomorphic entry, as lift_function takes it."""
     slow = set()
     stripped = strip_boilerplate(ann, slow)
     # Tier 3 honours traps, the rule tier 2 took in #57: a block ends at a `brk`/`udf`
@@ -8754,12 +8831,28 @@ def tier3_graph(ann, cut_end=None):
     # does reach it in the machine: a stack check's slow path, and the slow path that
     # boxes a Mint.
     cut = frozenset(to for tos in _cut_edges(blocks, raw).values() for to in tos)
+    # A monomorphic entry is placed and structured as the body it is, from its own
+    # entry (#278); see structure's `entries`.
+    placed = entry_reach(blocks, entry)
+    roots = _proven_entries(blocks, mono, placed)
+    second = second_reach(blocks, placed, roots)
+    if not second:
+        roots = ()
+    if roots:
+        # Nor does a branch alone at one, or in a chain of lone branches it falls into,
+        # read the flags the check left: the callers come in there too. Each lone branch
+        # gets back its own condition, as build_cfg gave it, and the chains are followed
+        # again, stopping at the entries.
+        for blk in blocks.values():
+            if len(blk.insns) == 1 and blk.cond and not blk.cexit:
+                blk.cond = _cond_for([], blk.insns[0][1], blk.insns[0][2])
+        _conditions_from_the_block_before(blocks, stop=frozenset(roots))
+    stmts = structure(blocks, entry, orphans=True, cut=cut, entries=roots)
     return Tier3Graph(stripped, frozenset(slow), blocks, entry, raw, cut,
-                      _ends_again(blocks, structure(blocks, entry, orphans=True, cut=cut),
-                                  entry_reach(blocks, entry)))
+                      _ends_again(blocks, stmts, placed, second), roots, second)
 
 
-def _ends_again(blocks, stmts, placed) -> list:
+def _ends_again(blocks, stmts, placed, second=frozenset()) -> list:
     """`stmts` with each goto out of a section no edge leads into, to a block of the body
     that leads nowhere, a return, a throw or a jump out, made `("again", block)`: that
     block printed once more under the section, and lifted from the section's own state,
@@ -8771,11 +8864,19 @@ def _ends_again(blocks, stmts, placed) -> list:
     leaves null in x0, and every monomorphic entry ended in a goto to the miss handler
     (#266). Printed again, the block says what this way in does there, and nothing
     follows it to read on into. A block with a successor is left a goto: copying it
-    would copy what it leads to as well."""
-    def copy(ss):
+    would copy what it leads to as well.
+
+    `second` is the body a proven entry has (Tier3Graph.second), placed first among the
+    sections and lifted as a body. A goto inside it to a block of its own is a goto of
+    that body; one out of it to a block of `placed`, the miss handler a monomorphic
+    check branches back to, is copied as from any section; and a section after it
+    treats its blocks as it treats `placed`'s (#278)."""
+    above = placed | second
+
+    def copy(ss, into):
         out = []
         for s in ss:
-            if s[0] == "goto" and s[1] in placed and not blocks[s[1]].succ:
+            if s[0] == "goto" and s[1] in into and not blocks[s[1]].succ:
                 blk = blocks[s[1]]
                 out.append(("again", s[1]))
                 if blk.exit_target >= 0:
@@ -8783,25 +8884,31 @@ def _ends_again(blocks, stmts, placed) -> list:
                 elif blk.cut_next >= 0:
                     out.append(("cut", blk.cut_next))
             elif s[0] == "if":
-                out.append(("if", s[1], copy(s[2]), copy(s[3])))
+                out.append(("if", s[1], copy(s[2], into), copy(s[3], into)))
             elif s[0] == "loop":
-                out.append(("loop", s[1], copy(s[2])))
+                out.append(("loop", s[1], copy(s[2], into)))
             else:
                 out.append(s)
         return out
     tail = next((i for i, s in enumerate(stmts)
                  if s[0] == "label" and s[1] not in placed), len(stmts))
-    return stmts[:tail] + copy(stmts[tail:])
+    out, into = stmts[:tail], above
+    for s in stmts[tail:]:
+        if s[0] == "label":
+            into = placed if s[1] in second else above
+        out.extend(copy([s], into))
+    return out
 
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None, cut_end=None, returns=None,
                    allocs=None, mono=None, casts=None) -> list:
-    g = tier3_graph(ann, cut_end)
+    g = tier3_graph(ann, cut_end, mono)
     if g is None:
         return []
     stripped, slow, blocks, entry, raw, stmts = (g.stripped, g.slow, g.blocks, g.entry,
                                                  g.raw, g.stmts)
+    second = g.second
     # The sections no edge leads into start at the first label `structure` placed past
     # what the entry reaches, under its note.
     placed = entry_reach(blocks, entry)
@@ -8813,13 +8920,24 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         if stmts[i] == ("note", UNREACHED) and stmts[i + 1] == ("label", mono):
             stmts[i] = ("note", MONOMORPHIC_ENTRY)
     labels = label_targets(stmts)
-    joinable = frozenset(label_targets(stmts[:tail]) | {a for a in labels
-                                                        if a not in placed})
+    # The body a proven entry has comes first among the sections (#278), and a goto in
+    # it is one of its own ways in, as one in the body is. A goto into it from a section
+    # after it is not, as one from a section into the body is not.
+    end = next((i for i in range(tail, len(stmts)) if stmts[i][0] == "label"
+                and stmts[i][1] not in placed and stmts[i][1] not in second), len(stmts))
+    if end > tail and stmts[end - 1][0] == "note":
+        end -= 1
+    joinable = frozenset(label_targets(stmts[:tail])
+                         | (label_targets(stmts[tail:end]) & second)
+                         | {a for a in labels if a not in placed and a not in second})
     orphans = frozenset(s[1] for s in stmts[tail:] if s[0] == "label")
-    # The blocks before the sections that a block of one jumps to.
-    dead = set(blocks) - placed
-    rejoined = frozenset(t for b in dead - cut_off(blocks, dead, g.cut)
-                         for t in blocks[b].succ if t in placed)
+    # The blocks before the sections that a block of one jumps to, and those of the body
+    # a goto out of the proven entry's body jumps to.
+    unreached = set(blocks) - placed
+    dead = unreached - second
+    rejoined = frozenset(t for b in dead - cut_off(blocks, unreached, g.cut)
+                         for t in blocks[b].succ if t in placed or t in second)
+    rejoined_second = frozenset(t for b in second for t in blocks[b].succ if t in placed)
     dispatch = detect_dispatch(stripped)
     meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
@@ -8851,6 +8969,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                 lifter.table = lambda: by_table(ann[0][0], selectors)
         lifter.labels = labels
         lifter.joinable, lifter.orphans, lifter.rejoined = joinable, orphans, rejoined
+        lifter.roots, lifter.placed, lifter.second = g.roots, frozenset(placed), second
+        lifter.rejoined_second = rejoined_second
         lifter.keep = keep
         lifter.carry_more = carry or {}
         lifter.join_phi = join_phi or {}
