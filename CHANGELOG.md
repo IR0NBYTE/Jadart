@@ -349,6 +349,61 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A range no Function owns no longer prints its first argument as `this`.**
+  `program.receiver_for` handed the lifter `{"x1": "this"}` for every range whose owner
+  was not a static Function, and a range whose Code has no Function owner never is one.
+  `benchCheckSecret`, a top-level function (flubench/app/lib/constructs.dart:16), is
+  `benchCheckSecret(a0)` with `return a0.sel_0x0("FLUBENCH{str_literal_compare}");` on
+  the clean fixture, which keeps its Function and the static bit, and on the obf one,
+  which discards both, it was `sub_0x159098()` with `return this.sel_0x0(...)`: a
+  receiver the function was never handed, and so a signature that listed no argument.
+  x1 is now `this` only in a range whose Code a Function owns and the static bit leaves
+  clear (`program.instance_function_refs`). Elsewhere it is what any other argument
+  register is, `a0` where the code is a Dart function's and the body reads x1 before
+  writing it (`EntryNames`, #255), and a bare register otherwise, so the obf
+  `benchCheckSecret` now reads exactly as the clean one does. `receiver_for` takes the
+  set as the keyword `instance_refs=`, because it replaced a positional set of the
+  static functions and a caller still passing that would have inverted silently.
+  `tools/semdiff.py`, which still handed `this` to every function, asks it too.
+
+  The owners that are not a Function: on the obf fixture 6,421 ranges with no Code
+  object and 185 whose owner is the Smi left for a dropped Function; on both fixtures 921
+  allocation stubs (a Class), 339 and 338 type-testing stubs (a type) and 85 VM stubs
+  (null). Nothing else in the snapshot says one of them takes a receiver. The dispatch
+  table holds only instance methods, but AOT keeps one Code for functions whose code
+  matches, and 2 of its 2,563 targets on the clean fixture are owned by a static
+  closure (0x2b5900 is a `return NULL;` that static functions, constructors and closures
+  share). The 78 Code objects with a monomorphic entry, which only instance code has,
+  are all owned by a Function on both fixtures.
+
+  Lines printing `this` over every range whose owner is not a Function, string literals
+  not counted, against main with #255: 84 in 23 ranges on the clean fixture and 15,207
+  in 3,800 on the obf one, and on the seven appsweep apps 269 in 58
+  (chat.fluffy.fluffychat), 164 in 34 (com.predidit.kazumi), 108 in 27
+  (dev.labplus.app), 125 in 29 (io.github.petlyh.jsdict), 188 in 37
+  (kzs.th000.tsdm_client), 172 in 31 (uk.me.amugofjava.anytime) and 67 in 24
+  (xyz.deepdaikon.xeonjia). All of them are 0 now. On the clean fixture and six of the
+  apps every changed body is `this` turned into `x1` and nothing else, since none of
+  those ranges is a Dart function's code. On the obf fixture 3,804 bodies change: 3,520
+  turn `this` into `a0` and nothing else, on 13,618 lines; 234 turn it into `x1`, on
+  1,224; and 50 also change shape, 5,435 lines to 5,592, because a register can go
+  stale where a name cannot, so reads off x1 are written into temps first. One VM stub
+  on chat.fluffy.fluffychat does the same, 31 lines to 32. `tools/quality.py` on the
+  clean fixture: bare-register lines 12,289 to 12,353, every other row and the line
+  total identical. On the obf one: lines 183,990 to 184,147, bare-register lines 11,929
+  to 13,037, byte-offset fields 54,152 to 54,163, and `(...)`, goto, rawasm and labels
+  identical.
+
+  Nothing changes for a Function where the static bit does not calibrate, which is
+  still read as every Function taking a receiver. That is the two 3.11.5 apps, where 1
+  and 7 instance-kind witnesses carry bit 16, the bit both fixtures and the other five
+  apps calibrate to, so no bit fits. There 13,780 of com.predidit.kazumi's 29,911 ranges
+  a Function owns print `this`, 60,595 lines, and 16,108 of kzs.th000.tsdm_client's
+  41,755, 67,745 lines. Bit 16 is set on the Function of 1,279 and 1,714 of those
+  ranges, 5,353 and 7,720 lines, and on the seven binaries where it calibrates it means
+  static. None of them is a closure, a static getter or a field initializer.
+  Closes #259.
+
 - **A data symbol that ends before its InstructionsTable is refused, not a crash.**
   `parse_instructions_table` read the table out of the data symbol's bytes at the offset
   the snapshot header gives, `roundUp(Snapshot::length(), 64)` plus
