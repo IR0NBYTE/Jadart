@@ -155,6 +155,141 @@ def receiver_for(func_ref: int, static_refs: frozenset) -> dict:
     return {} if func_ref in static_refs else {"x1": "this"}
 
 
+class EntryNames:
+    """What the argument registers hold when a function is entered, per code range: the
+    lifter's `receiver` map (`names`) and the list a signature line prints (`params`).
+
+    x1 is `this` exactly where `receiver_for` says so. Past that, a register gets a name
+    where three things hold, each read from the binary:
+
+    * the release passes fixed parameters in registers at all. That is Dart 3.4 on, and
+      the snapshot hash pins the release (hooks._register_cc);
+    * the code is a Dart function's, of a kind the VM does not always call through the
+      stack (`_function_code`);
+    * the body reads the register before it writes it, by the pass every call site
+      already asks for a callee's arity (expr.make_arity_resolver, entry_args). Compiled
+      Dart reads no register it was not handed, so such a register holds what the caller
+      left in it, and in a register of DartCallingConvention::kCpuRegistersForArgs under
+      that convention that is an argument.
+
+    Where the resolver declines (an arguments descriptor, stack arguments only, a double
+    in a V register) nothing is named and the body keeps its bare registers, as it does
+    for an argument register the body never reads.
+
+    The name states which register and nothing more. `aN` is the value the function was
+    entered with in register N of x1, x2, x3, x5, x6, x7, counted from 0, so `a0` is the
+    slot an instance method has `this` in and `a1` is always what arrived in x2. That is
+    also its position in the list a direct call to the function prints, which is built
+    from the same registers in the same order (Lifter._call_args). It is NOT a position
+    in the Dart parameter list, which the snapshot does not state: a double is passed in
+    a V register beside these, so in `f(double a, Object b)` it is `b` that arrives in
+    x1. And it is no Dart name or type, neither of which survives for these.
+
+    Whether a register STILL holds that value at a given use is the lifter's to decide,
+    and it decides it the way it always has for `this`: `Lifter._leaf` prints the name
+    only while the state map has never recorded the register, on any path."""
+
+    def __init__(self, image, fr, epoch, arity):
+        from .expr import LIFTABLE_ARCHS, TARGETS
+        arch = getattr(getattr(image, "arch", None), "name", None)
+        tgt = TARGETS.get(arch) if arch in LIFTABLE_ARCHS else None
+        self._arity = arity
+        self._static = static_function_refs(fr)
+        self._owners, self._discarded = _function_code(image, fr, epoch)
+        #: No registers where the target is not one tier 3 lifts or the release has no
+        #: register convention, and then the resolver is never asked.
+        has_code = bool(self._owners or self._discarded)
+        self._regs = tgt.arg_regs if tgt is not None and has_code else ()
+
+    def _read(self, cr) -> tuple:
+        """(the resolver's count, the registers to name) for the code at `cr`: (None, ())
+        where the resolver is not asked or declines, and no register where the code is
+        not a function's."""
+        args = getattr(self._arity, "args", None)
+        if args is None or not self._regs:
+            return None, ()
+        k = self._arity(cr.pc_offset)
+        if cr.owner_ref == -1:
+            mine = cr.pc_offset in self._discarded
+        else:
+            mine = cr.owner_ref in self._owners
+        return k, (args(cr.pc_offset) if mine and k is not None else ())
+
+    def names(self, cr) -> dict:
+        """{register: name} for the code range `cr`."""
+        names = receiver_for(cr.owner_ref, self._static)
+        for reg in self._read(cr)[1]:
+            names.setdefault(reg, f"a{self._regs.index(reg)}")
+        return names
+
+    def params(self, cr) -> str:
+        """What a signature line puts between its brackets: the names the body reads its
+        register arguments by, in call order and without the receiver; nothing where it
+        reads none; and `...` where the list is not read, the spelling a call whose list
+        is not read already has. A function that takes more on the stack ends in `...`.
+
+        It lists what the BODY READS. A parameter the body never reads is not in it, so
+        `f(a1, a3)` reads the registers either side of one it leaves alone, and nothing
+        here says how many parameters the Dart function declares."""
+        from .expr import StackArity
+        k, regs = self._read(cr)
+        if k is None or (k and not regs):
+            return "..."
+        names = self.names(cr)
+        listed = [names[r] for r in regs if names[r] != "this"]
+        if isinstance(k, StackArity):
+            listed.append("...")
+        return ", ".join(listed)
+
+
+def _function_code(image, fr, epoch) -> tuple:
+    """(owner refs, pcs): the code that is a Dart function's and may be entered with its
+    fixed parameters in registers. Both empty where the release does not pass them so.
+
+    A range is one in three ways, each read from the snapshot:
+
+    * its Code is owned by a Function whose kind the VM does not always call through the
+      stack (hooks.STACK_KINDS, which is `MaxNumberOfParametersInRegisters` in object.cc).
+      Belt and braces: of the clean fixture's 1,075 ranges of those kinds the resolver
+      counts a register for none, 249 read nothing and 826 decline;
+    * its Code is owned by a Smi holding the Function class id. The precompiler leaves
+      that behind when it drops a Function and keeps its Code: `owner =
+      WeakSerializationReference::New(owner, Smi::New(owner.GetClassId()))`
+      (precompiler.cc, drop_function, 3.12.2), and the serializer writes the
+      replacement. 185 ranges of the obf fixture, none of the clean one;
+    * it has no Code object at all, an instructions-table entry below
+      `first_entry_with_code`. Only a function's Code is discarded: "Only discard Code
+      objects corresponding to Dart functions", `if (!code.IsFunctionCode() ||
+      code.IsUnknownDartCode()) return;` (precompiler.cc, DiscardCodeObjects, 3.12.2).
+      6,421 ranges of the obf fixture, which is every range of it with no owner.
+
+    Everything else is left out on purpose. An allocation stub is owned by its Class, a
+    type-testing stub by its type, and the VM's own stubs by nothing, and each takes its
+    operands in the registers of an ABI of its own (constants_arm64.h, TypeTestABI: the
+    instance in x0, the type arguments in x2 and x1), so what x1 holds there is not an
+    argument of the Dart calling convention. On the clean fixture 64 such ranges read an
+    argument register on entry: 37 owned by a type, 26 VM stubs and 1 other.
+
+    The facts this rests on were read at 3.12.2 and checked unchanged at 3.13.0: the
+    argument registers, TypeTestABI's preserved registers, drop_function,
+    DiscardCodeObjects and MaxNumberOfParametersInRegisters. `_register_cc` has no upper
+    bound, so when a release newer than 3.13 is registered, repeat that check.
+    """
+    from .hooks import STACK_KINDS, _register_cc
+    if epoch is None or not _register_cc(epoch.dart):
+        return frozenset(), frozenset()
+    owners = set()
+    for ref, _n, _o, kt in fr.functions:
+        kind = kt & 0x1F
+        if kind < len(_FUNCTION_KINDS) and _FUNCTION_KINDS[kind] not in STACK_KINDS:
+            owners.add(ref)
+    cid = epoch.cid_table.get("FunctionCid")
+    if cid >= 0:
+        owners.update(ref for ref, v in fr.smi_values.items() if v == cid)
+    discarded = frozenset(image.pcs[:max(image.first_code, 0)])
+    return frozenset(owners), discarded
+
+
 def build_program(fr, hdr, raw: bool = False) -> Program:
     """Resolve a completed fill-walk result into the Program model (names, owners,
     fields, superclasses). Shared by recover_program and the decompile view.
@@ -279,8 +414,8 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
         lines.append(f"// {signote}")
     lines.append(head + " {")
     # class members receive `this` in x1 (Dart AOT: the receiver is the first argument)
-    static_refs = static_function_refs(fr)
     arity = make_arity_resolver(image) if lvl >= 3 else None
+    entry = EntryNames(image, fr, hdr.epoch, arity) if lvl >= 3 else None
     returns = make_return_resolver(image) if lvl >= 3 else None
     selectors = recover_selectors(image, fr, hdr) if lvl >= 3 else None
     layout = recover_fields(fr, getattr(image, "arch", None)) if lvl >= 3 else None
@@ -294,12 +429,15 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
         cr = image.code_ranges[ref]
         cut = truncated_by(cr, dis)
         note = f", TRUNCATED: {len(dis)} of {len(dis) + cut} instructions" if cut else ""
-        lines.append(f"  {disp}() {{  // {addr_label(image, cr.pc_offset)}, "
+        # The names the tier 3 body reads its arguments by. The other tiers print the
+        # machine's registers, so their brackets stay empty, as they were.
+        params = entry.params(cr) if entry is not None else ""
+        lines.append(f"  {disp}({params}) {{  // {addr_label(image, cr.pc_offset)}, "
                      f"{cr.size} bytes{note}")
         if lvl >= 3:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
             lines.extend(lift_function(ann, pool_map,
-                                       receiver=receiver_for(ref, static_refs),
+                                       receiver=entry.names(cr),
                                        arity=arity, indent="  ", depth=2,
                                        selectors=selectors,
                                        arch=getattr(image, "arch", None),

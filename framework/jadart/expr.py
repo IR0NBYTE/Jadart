@@ -1416,6 +1416,12 @@ def _flags_read(insns) -> frozenset:
 _A64_CLOBBERS = frozenset({f"x{i}" for i in range(15)} | {"x16", "x17", "x30"}
                           | {f"d{i}" for i in range(31)})
 _CALL_CLOBBERS = _A64_CLOBBERS
+#: What a type-testing stub does not hand back: every volatile general register but the
+#: four TypeTestABI::kPreservedAbiRegisters names (constants_arm64.h, 3.12.2). Wider than
+#: kNonPreservedAbiRegisters on purpose, which lists the registers one release's stubs
+#: happen to use; the four it keeps are the claim.
+_TTS_LOSES = frozenset(r for r in _A64_CLOBBERS
+                       if r[0] == "x" and r not in ("x0", "x1", "x2", "x8", "x30"))
 
 
 _NO_REGS = frozenset()
@@ -2879,6 +2885,11 @@ class Lifter:
         self.show = None
         # optional register aliases (e.g. {"x1": "this"} for an instance method)
         self.alias = dict(receiver or {})
+        #: A value spelled with one of those names, for what a stub that loses the
+        #: register has to forget (the type-testing stub below).
+        self._entry_word = (re.compile(r"\b(?:" + "|".join(
+            map(re.escape, sorted(set(self.alias.values())))) + r")\b")
+            if self.alias else None)
         # arity: pc -> callee register-argument count (None if unknown); enables call-site
         # argument reconstruction. The callee's arity is None where it takes an
         # arguments descriptor or reads only stack arguments (entry_arity), and the call
@@ -4868,6 +4879,23 @@ class Lifter:
                 st.set(dst, _narrow(v))
         return flagged + out if flagged else out
 
+    def _box_cut(self, st: State, addr, insns):
+        """The box-or-tag check strip_boilerplate made unconditional at `addr`: the one
+        rewrite there that leaves an unconditional `b` where a `b.eq`/`b.ne` was. The path
+        it cut boxes the value as a Mint through AllocateMintShared*, whose fast path uses
+        R1 as its temporary (AllocateMintABI::kTempReg, constants_arm64.h, 3.12.2), so
+        past the join x1 holds what it held before on one path only. The compiler keeps
+        nothing live in R1 across a box, so on compiled code this records a register
+        nothing reads; on a crafted body it keeps an entry name, `this` or `a0`, from
+        reading as a register the stub overwrote (#255). The register being boxed into is
+        the value either way and is left alone."""
+        k = next((j for j, t in enumerate(insns) if t[0] == addr - 8), None)
+        if k is None or insns[k][1] != "sbfiz":
+            return
+        ops = _split_ops(insns[k][2])
+        if ops and canon(ops[0]) != "x1":
+            st.forget("x1")
+
     def _step_rest(self, st: State, addr, mn, op, note, ops, g) -> list:
         """_step past the flags: what the instruction does to `st`, and its lines."""
         # The instruction's own address, under a name of its own because `addr` is
@@ -4935,6 +4963,26 @@ class Lifter:
                     # header stack check sits in front of, for a call that provably keeps it.
                     # All but LR, which the `bl` itself writes (#162).
                     st.forget(_lr())
+                    if "TypeTest" in name:
+                        # ...and a type-testing stub gives back four registers, not
+                        # the file: the instance, the type and the two type-argument
+                        # vectors, x0, x8, x2 and x1 (constants_arm64.h, TypeTestABI::
+                        # kPreservedAbiRegisters). x3, x5, x6 and x7 are its cache and its
+                        # internals (kNonPreservedAbiRegisters), and all four are
+                        # argument registers. One still spelled by its entry name would
+                        # go on reading as the argument past a stub that overwrote it, and
+                        # so would one the body copied an entry name into, `mov x5, x2`,
+                        # or reloaded one into from a frame slot, so all of those are
+                        # recorded. The compiler reloads what it needs after one, so no
+                        # body on either fixture reads such a register there; a crafted
+                        # body can (#255). What the walk holds in the other registers the
+                        # stub loses is left as it was: forgetting all of it changes 637
+                        # lines on the two fixtures, none of them a read past the stub.
+                        ent = self._entry_word
+                        for r in sorted((set(self.alias) | set(st.reg)) & _TTS_LOSES):
+                            if r not in st.reg or (ent is not None
+                                                   and ent.search(st.reg[r].text)):
+                                st.forget(r)
                     return []
                 pre = self._clobber_call(st)
                 if kind == "throw":
@@ -5982,6 +6030,8 @@ class Lifter:
             self._live_after = after[k] if after is not _NO_LIVE else 0
             last = (k == len(insns) - 1)
             if last and (mn == "b" or cond_of(mn) or mn in _CONDB):
+                if mn == "b" and a in self.raw:
+                    self._box_cut(st, a, insns)
                 break                                          # branch is structural
             # Name-first (#187): a reassignment of a register (a load's unrelated value, a
             # move, or a computed result) leaves a computed expression that still names it
@@ -6095,7 +6145,15 @@ class Lifter:
             st.pair.update(carry.pair)
             st.result = carry.result
         else:
-            st.reg = {}
+            # Dropping to symbolic has to be RECORDED for a register with an entry name,
+            # the rule `_merge` states for a join: one left out of the map falls back to
+            # that name in `_leaf`, and no path here says it still holds the value the
+            # function came in with. A catch block is entered with the exception in x0
+            # and the stack trace in x1 (constants_arm64.h, kStackTraceObjectReg), and
+            # `_run`'s on the clean fixture printed `_list2(x0, this)` for the two of
+            # them. So is the Mint slow path the box-or-tag strip cuts off, where the
+            # register being boxed is one the body has long since rewritten (#255).
+            st.reg = {r: V(r, P_ATOM) for r in sorted(self.alias)}
             st.slot = {}
             st.dropped = {}
             st.slot_by_reg = {}
@@ -6768,7 +6826,12 @@ class Lifter:
         #
         # sorted, not set order: insertion order decides how temporaries are numbered, and
         # iterating a set made that depend on the per-process hash seed.
-        init = {r: st.get(r) for r in sorted(carried)}
+        # Through `_leaf`, not `st.get`: a carried register the function was entered
+        # with reads as its entry name here, `var t0 = a1;`, as it does at any other
+        # use of it before the loop. The state is the one the loop is entered in, so the
+        # rule is the one every use has: the name holds only where no path to here
+        # recorded the register (#255).
+        init = {r: self._leaf(r, st) for r in sorted(carried)}
         names = {}
         before = self._loop_before
         for r in sorted(carried):
@@ -7501,11 +7564,33 @@ def entry_arity(ann: list, cut: bool = False):
     the part left out could read a higher stack slot or a V register, so a StackArity's
     reach is then not known.
     """
+    return _entry_read(ann, cut)[0]
+
+
+def entry_args(ann: list, cut: bool = False) -> tuple:
+    """The argument registers a function reads before it writes them, in ARG_REGS order:
+    the ones it was handed a value in. Empty where `entry_arity` declines, so every
+    reason it has for not knowing the arguments holds here too.
+
+    The count `entry_arity` returns is the LEADING run of these, because a call site
+    prints a list and a list cannot skip a slot. A name can. `classify(int score)` on an
+    instance never touches `this`, so it reads x2 and not x1, the run is empty and its
+    count is 0, while x2 is as much an argument as it would be had the body read x1
+    first: 208 of the clean fixture's 6,037 counted ranges read no x1 and some later
+    register, and 45 more read one past a gap. Checked against the snapshot where it
+    says: on the 428 functions that keep their FunctionType and are counted, the highest
+    register read is never past `num_fixed_parameters`, and in the 11 of them that read
+    past a gap it is exactly the last one (#255)."""
+    return _entry_read(ann, cut)[1]
+
+
+def _entry_read(ann: list, cut: bool) -> tuple:
+    """(entry_arity's answer, entry_args's), from one pass over the function."""
     stripped = strip_boilerplate(ann)
     # honours traps and calls that cannot return, like the lift
     blocks, entry = build_cfg(stripped, traps=TRAPS, ends=_path_ends(stripped))
     if not blocks or entry not in blocks:
-        return 0
+        return 0, ()
     # A function that never moves SP reads its incoming stack arguments off SP itself,
     # `ldr x0, [x15]`, and one that indexes them computes the address from FP, `add x1,
     # x29, w0, sxtw #2; ldr x1, [x1, #0x28]`. Where it reads no register as well, it was
@@ -7538,10 +7623,11 @@ def entry_arity(ann: list, cut: bool = False):
                 indexed -= _def_use(mn, op)[0]        # it holds something else now
     live = _live_in_header(blocks, set(blocks), entry, None)
     if "x4" in live:                  # ARGS_DESC_REG: the stack convention, not arity
-        return None
+        return None, ()
     k = 0
     while k < len(ARG_REGS) and ARG_REGS[k] in live:
         k += 1
+    args = tuple(r for r in ARG_REGS if r in live)
     if not off_stack:
         # A function handed a double in a V register (`_fpu_args_live`) passes it beside
         # the x registers, in an order the registers alone do not give: `f(Object a,
@@ -7550,38 +7636,45 @@ def entry_arity(ann: list, cut: bool = False):
         # known, the same decline a mixed register-and-stack callee handed a double
         # already makes (#148, #155). A `ret` that hands d0 back is not counted here: a
         # function reading only x registers and returning its object in x0 has one too.
-        return None if _fpu_args_live(blocks, entry, with_ret=False) else k
-    if not any(r in live for r in ARG_REGS):
-        return None
+        return (None, ()) if _fpu_args_live(blocks, entry, with_ret=False) else (k, args)
+    if not args:
+        return None, ()
     return StackArity(k, need if reach and not cut else None,
-                      _fpu_args_live(blocks, entry))
+                      _fpu_args_live(blocks, entry)), args
 
 
 def make_arity_resolver(image):
     """Build a cached `pc -> arity` resolver over a whole instruction image, mapping a
     call target to the covering function's register-argument count. A call site uses it
-    to render the callee's real arguments. Returns a callable; results are memoised."""
+    to render the callee's real arguments. Returns a callable; results are memoised.
+
+    Its `args(pc)` is `entry_args` for the same function, from the same pass and the
+    same cache: the registers a body reads its arguments from (program.EntryNames)."""
     from .disasm import disassemble_range, truncated_by
     import bisect
     ranges = sorted(image.all_ranges, key=lambda cr: cr.pc_offset)
     starts = [cr.pc_offset for cr in ranges]
     cache: dict = {}
 
-    def of(pc):
+    def read(pc):
         if pc in cache:
             return cache[pc]
         i = bisect.bisect_right(starts, pc) - 1     # covering range (unchecked entries)
-        val = None
+        val = (None, ())
         if 0 <= i < len(ranges):
             cr = ranges[i]
             if cr.pc_offset <= pc < cr.pc_offset + cr.size:
                 dis = disassemble_range(image, cr)
                 if dis:
-                    val = entry_arity([(a, m, o, "") for (a, m, o) in dis],
+                    val = _entry_read([(a, m, o, "") for (a, m, o) in dis],
                                       cut=bool(truncated_by(cr, dis)))
         cache[pc] = val
         return val
 
+    def of(pc):
+        return read(pc)[0]
+
+    of.args = lambda pc: read(pc)[1]
     return of
 
 
