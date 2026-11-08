@@ -182,6 +182,23 @@ from .snapshot import ISOLATE_INSTRUCTIONS  # noqa: E402,F401
 #: rather than something this code has seen.
 AOT_ENTRY_OFFSET = {"arm64": 24, "arm": 16, "x64": 22, "riscv32": 18, "riscv64": 18}
 
+#: Instructions::kMonomorphicEntryOffsetAOT (object.h:5922 at 3.12.2, and 8 on arm64 in
+#: 2.19.6 and 3.13.0 too): how far into the payload the entry a monomorphic call takes
+#: sits, after the miss handler's two instructions (MonomorphicCheckedEntryAOT,
+#: assembler_arm64.cc:1941-1962). The deserializer sets it from the same payload_info bit
+#: as the entry above (app_snapshot.cc:9625-9644). arm64 only: it is the one target tier
+#: 3 lifts, which is what reads it.
+AOT_MONOMORPHIC_OFFSET = {"arm64": 8}
+
+
+def monomorphic_entry(image, cr):
+    """The address of `cr`'s monomorphic entry, where the snapshot says its code has one
+    (InstrImage.entry_offsets), else None."""
+    if cr.pc_offset not in (getattr(image, "entry_offsets", None) or {}):
+        return None
+    off = AOT_MONOMORPHIC_OFFSET.get(getattr(getattr(image, "arch", None), "name", None))
+    return None if off is None else cr.pc_offset + off
+
 
 
 @dataclass

@@ -1020,7 +1020,7 @@ loop, with no label and no note, as if they ran. Over 4,000 generated graphs, 6 
 20 instructions fewer with `orphans=False`, every one of them in a block nothing reaches,
 and 0 place fewer with `orphans=True`. The check for that is the placement comparison per
 range, not `cfgcheck`: both fixtures place the same instructions as before, 435,854 and
-435,633.
+435,633. (Since #266 tier 3 places them too, and `cfgcheck` checks tier 3's own graph.)
 
 The first attempt at the second half widened `_join_kill` instead, so that a join forgot
 whatever an unreachable ancestor writes whichever way the walk arrived; that is the static

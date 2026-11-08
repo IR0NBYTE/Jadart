@@ -94,7 +94,7 @@ def lift_named(path, symbol):
     """Lifted lines for every function with this name, or None when it is absent."""
     from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, named_ranges, disassemble_range, annotate,
-                               function_name_by_pc, build_pool_map)
+                               function_name_by_pc, build_pool_map, monomorphic_entry)
     from jadart.expr import lift_function, make_arity_resolver, make_return_resolver
     from jadart.dispatch import recover_selectors
     from jadart.fields import recover_accessors, recover_allocations, recover_fields
@@ -126,7 +126,7 @@ def lift_named(path, symbol):
                                  returns=returns,
                                  arch=getattr(image, "arch", None),
                                  fields=layout.for_function(cr.owner_ref),
-                                 allocs=allocs))
+                                 allocs=allocs, mono=monomorphic_entry(image, cr)))
     return out
 
 

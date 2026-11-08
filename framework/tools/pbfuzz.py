@@ -987,8 +987,12 @@ def _shape(flat: list) -> dict:
     # machine cannot reach, and the reader has no way to tell that from code it does run:
     # a phi write-back for the path that never arrives, or a `goto` out of a throw, 1,427
     # of them on the clean fixture before a call that cannot return ended its block
-    # (#234). A brace, a label and an `else` are the structure around it, not statements.
-    out["dead"] = sum(1 for a, b in zip(flat, flat[1:])
+    # (#234). A brace, a label and an `else` are the structure around it, not statements,
+    # and nor is a comment: tier 3 prints the note over a section no edge leads into, and
+    # one after a `throw` read as code under it (#266). Looked past, so a statement after
+    # it still counts.
+    code = [ln for ln in flat if not ln.startswith("//")]
+    out["dead"] = sum(1 for a, b in zip(code, code[1:])
                       if _ENDS_RE.search(a) and b
                       and not b.startswith(("}", "{", "else", "L_0x")))
     return out
@@ -1064,7 +1068,8 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
     from jadart import expr
     from jadart.branches import row_kinds
     from jadart.disasm import (load_instructions, disassemble_range, annotate,
-                               function_name_by_pc, build_pool_map, cut_end)
+                               function_name_by_pc, build_pool_map, cut_end,
+                               monomorphic_entry)
     image, fr, _hdr = load_instructions(path)
     pc_to_name = function_name_by_pc(image, fr)
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
@@ -1087,7 +1092,8 @@ def census(path: str, verbose: bool = False, limit: int = 0) -> dict:
                 # `test_every_lift_call_site_passes_the_target` exists to stop.
                 lines = expr.lift_function(ann, pool_map,
                                            arch=getattr(image, "arch", None),
-                                           cut_end=cut_end(cr, dis))
+                                           cut_end=cut_end(cr, dis),
+                                           mono=monomorphic_entry(image, cr))
             except RecursionError:
                 continue
             # Counted for every range that LIFTED, before the slot census's own guards:

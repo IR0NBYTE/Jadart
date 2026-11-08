@@ -542,7 +542,44 @@ UNREACHED = ("reached by no edge in this graph: a catch entry, another entry poi
              "jump through a register, or dead code")
 
 
-def structure(blocks, entry, orphans: bool = False):
+def _closure(blocks, roots, within) -> set:
+    """The blocks of `within` that `roots` reach along the graph's edges, and `roots`."""
+    seen, stack = set(), [r for r in roots if r in within]
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        stack.extend(s for s in blocks[n].succ if s in within and s not in seen)
+    return seen
+
+
+def cut_off(blocks, dead, cut) -> set:
+    """The blocks of `dead`, the ones no edge from the entry reaches, that only an edge
+    into `cut` leads to. One another block of `dead` leads to is not among them, nor is
+    anything it leads to."""
+    behind = _closure(blocks, set(cut) & dead, dead)
+    return behind - _closure(blocks, dead - behind, dead) if behind else set()
+
+
+def entry_reach(blocks, entry) -> set:
+    """The blocks `structure` places before the orphans: what the entry reaches, and the
+    code after a trap or a call that cannot return it reaches (#57, #234). The rest is
+    what no edge leads into, which `orphans` places after it."""
+    reachable, stack = set(), [entry]
+    while stack:
+        n = stack.pop()
+        if n in reachable or n not in blocks:
+            continue
+        reachable.add(n)
+        blk = blocks[n]
+        stack.extend(blk.succ)
+        if blk.ends_path and blk.insns:
+            stack.append(blk.insns[-1][0] + 4)
+    return reachable
+
+
+def structure(blocks, entry, orphans: bool = False, cut=frozenset()):
     """Return a list of statements. Each is one of:
       ('asm', block_addr)
       ('if', cond, then_stmts, else_stmts)   (else_stmts may be [])
@@ -553,8 +590,16 @@ def structure(blocks, entry, orphans: bool = False):
 
     `orphans` also places every block no edge reaches, each as its own section after a
     note. Tier 2 asks for it: 8,580 instructions of the clean fixture, many of them catch
-    entries, were in no statement, and nothing said so (#67). Tier 3 does not, because
-    strip_boilerplate makes the stack check's slow path unreachable on purpose.
+    entries, were in no statement, and nothing said so (#67).
+
+    `cut` is where the edges the caller took out of the graph led: tier 3's
+    strip_boilerplate takes the branch to a stack check's slow path and the one into the
+    slow path that boxes a Mint, on purpose. A block only those edges lead to is reached
+    in the machine, so it is not one the note describes, and it stays out. One another
+    unreached block leads to is still placed. Tier 3 left every orphan out for the sake
+    of those, which dropped 1,219 blocks of the clean fixture without a word, the body
+    behind each monomorphic entry and the catch entries after a `ret` or a `b` among
+    them (#266).
 
     Loops are reconstructed by structuring the natural-loop body through the same
     recursive if/else machinery (bounded to the loop's nodes), so a conditional inside
@@ -871,16 +916,7 @@ def structure(blocks, entry, orphans: bool = False):
     # One walk and one pass in address order places blocks in the same order as taking the
     # lowest unplaced one again and again, since placing only ever adds to `visited`, and
     # in linear time: repeating it took 0.88 s on a crafted range of 4,000 `brk`.
-    reachable, stack = set(), [entry]
-    while stack:
-        n = stack.pop()
-        if n in reachable or n not in blocks:
-            continue
-        reachable.add(n)
-        blk = blocks[n]
-        stack.extend(blk.succ)
-        if blk.ends_path and blk.insns:
-            stack.append(blk.insns[-1][0] + 4)
+    reachable = entry_reach(blocks, entry)
     # Which of them a real edge reaches, so a section that only the step past a trap
     # brought in is marked as one nothing leads into.
     edged, stack = set(), [entry]
@@ -892,10 +928,15 @@ def structure(blocks, entry, orphans: bool = False):
         stack.extend(blocks[n].succ)
     # What the entry or a trap reaches, then, after all of it, what nothing reaches, so
     # that asking for the orphans only ever adds sections at the end.
-    tail = sorted(set(blocks) - reachable) if orphans else []
+    tail = []
+    if orphans:
+        dead = set(blocks) - reachable
+        tail = sorted(dead - cut_off(blocks, dead, cut))
     # The note says no edge leads into the section, so it goes only where none does: a
     # block another unreached section jumps to shows that `goto` in the output itself.
-    targeted = {s for b in blocks.values() for s in b.succ}
+    # Nor over a slow path the step past a trap placed (#157): an edge the caller cut
+    # leads into it, and the note would list everything it can be but that.
+    targeted = {s for b in blocks.values() for s in b.succ} | set(cut)
     for a in sorted(reachable):
         if a not in visited:
             if a not in edged and a not in targeted:

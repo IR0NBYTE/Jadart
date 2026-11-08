@@ -408,7 +408,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     from .branches import exits, row_kinds
     from .disasm import (load_instructions, disassemble_function, build_pool_map,
                          render_body, annotate, truncated_by, addr_label, rebaser,
-                         cut_end)
+                         cut_end, monomorphic_entry)
     from .signatures import names_with_signatures
     from .cfg import render_function
     from .expr import lift_function, make_arity_resolver, make_return_resolver
@@ -474,7 +474,8 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
                                        fields=layout.for_function(ref),
                                        allocs=allocs,
                                        show=rebaser(image), cut_end=cut_end(cr, dis),
-                                       returns=returns))
+                                       returns=returns,
+                                       mono=monomorphic_entry(image, cr)))
         elif lvl == 2:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
             lines.extend(render_function(ann, exits=exits(image, dis),
