@@ -421,6 +421,43 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A read or write through a copy of THR is at the offset as written.** x26 holds the
+  Thread, an untagged address, so `ldr x9, [x26, #0x6c8]` prints `THR.field_0x6c8`.
+  Through a copy it took the heap-object tag bias, because `_byte_off` asked the
+  register's name: the FFI call sequence at 0x1390e8 on the clean fixture, `mov x25,
+  x26; ldr x9, [x25, #0x7d0]`, printed `THR.field_0x6c8 = THR.field_0x7d1;`, one Thread
+  spelled two ways in one line and the odd offset no slot. The walk already holds the
+  copy as `THR` wherever it can show the register holds the thread: through a move, a
+  spill and its reload, and a join every way in agrees on. A write, a call that
+  clobbers the copy, a join that disagrees and a section no edge leads into each leave
+  it something else, and `add x25, x26, #0x10` is `THR + 16`, not the thread. So the
+  value decides now, in `lift`, `decompile`, `export`, `ffi` and `jadart.decompile`,
+  and that line prints `THR.field_0x6c8 = THR.field_0x7d0;`. An element off a copy
+  keeps its displacement as one off x26 does, and on arm32, which reads null, true and
+  false out of r10, a copy of r10 reads them too. Only the thread follows its value:
+  the null in x22 is a tagged object, a copy of FP or SP is already spelled with the
+  bias the frame read itself carries, no copy of PP, the heap base or the dispatch
+  table appears in the nine binaries below, and LR is copied once, by a FluffyChat
+  stub keeping its return address.
+
+  Measured with `lift` over every range against main. Lines with an odd THR offset go
+  from 466 in 118 ranges to 0 on each fixture, and from 207, 278, 605, 669, 754, 729 and
+  844 to 0 on xeonjia, jsdict, labplus, anytime, kazumi, tsdm_client and FluffyChat.
+  Those are exactly the lines that change, each the same line with every odd THR offset
+  one lower, and no other line changes. `export` changes 438 lines in 8 files of the
+  clean fixture, the same substitution, and tier 2 is byte-identical. A must-analysis
+  of the graph written apart from the lifter, following copies through registers and
+  frame slots, with a block no edge leads into knowing only x26, proves the thread at
+  every access the walk now reads as THR: 234 on each fixture, 207 to 425 on the apps.
+  It proves it at 50 more, 1 on each fixture and 0 to 27 on the apps, where the walk
+  declines the frame reload that brings the copy back (`var t38 = (FP - 80).field_0x1;`)
+  and the access keeps the spelling of any unknown base. No access holds the thread on
+  some paths only. `tools/quality.py`, `pbfuzz --census` and its 400 generated
+  runs, `irfuzz --corpus` on both fixtures, `--cfg` and `--cfg --nested`, and
+  `cfgcheck` print what they print on main. The largest range, 4,000 instructions,
+  lifts in 0.119 s on main and here, and a crafted range that copies the thread from
+  register to register through 4,000 joins in 0.59 to 0.61 s on both. Closes #273.
+
 - **Tier 3 places the code only a second entry or a catch entry reaches.** It structured
   a range from its first instruction and placed nothing else, so a block no edge leads
   into left the output with nothing in its place: `lift` of the `dyn:-` forwarder at

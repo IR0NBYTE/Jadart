@@ -13370,6 +13370,133 @@ def test_a_displacement_below_the_base_is_not_a_negative_field_offset():
         "return (THR - 8).field_0x1;"
 
 
+def test_a_copy_of_thr_is_read_and_written_at_the_offset_as_written():
+    """THR is untagged in whichever register holds it (#273).
+
+    `_byte_off` asked the register's NAME, so a read through a copy of x26 took the
+    heap-object tag bias: `mov x25, x26; ldr x9, [x25, #0x7d0]` printed
+    `THR.field_0x7d1` beside `THR.field_0x6c8` read through x26 itself, one Thread
+    spelled two ways, the odd offset no slot at all. The walk already carries the copy
+    as `THR`, through a move, a copy of the copy and a spill and its reload, so the
+    value decides now and the offset is spelled as for x26."""
+    lift = _lift_rows
+    # The FFI call sequence at 0x1390e8 on the clean fixture, cut down to its reads.
+    assert lift([("mov", "x25, x26"), ("ldr", "x9, [x25, #0x7d0]"),
+                 ("str", "x9, [x26, #0x6c8]"), ("ret", "")])[0] == \
+        "THR.field_0x6c8 = THR.field_0x7d0;"
+    # A store through a copy of the copy, and a displacement below a copy, which goes
+    # into the base as it does off x26.
+    got = lift([("mov", "x25, x26"), ("mov", "x0, x25"), ("str", "x1, [x0, #0x6c8]"),
+                ("ldur", "x2, [x25, #-8]"), ("stur", "x2, [x19, #7]"), ("ret", "")])
+    assert got[:2] == ["THR.field_0x6c8 = x1;",
+                       "x19.field_0x8 = (THR - 8).field_0x1;"], got
+    # An element off a copy keeps its displacement, as one off x26 does. It was
+    # dropped, which named another slot.
+    assert lift([("mov", "x25, x26"), ("add", "x0, x25, x1, lsl #3"),
+                 ("ldr", "x2, [x0, #0x18]"), ("mov", "x0, x2"), ("ret", "")]) == \
+        ["return THR[x1 + 3];"]
+    # A spill of the copy, and its reload after a call: the fixture's second read.
+    got = lift([("mov", "x25, x26"), ("stur", "x25, [x29, #-0x50]"), ("bl", "#0x100"),
+                ("ldur", "x0, [x29, #-0x50]"), ("ldr", "x9, [x0, #0x7d8]"),
+                ("stur", "x9, [x19, #7]"), ("ret", "")])
+    assert "x19.field_0x8 = THR.field_0x7d8;" in got, got
+
+    # What must not move. An interior pointer is not the thread, an ordinary register
+    # keeps the bias, and x26 itself reads as it did.
+    assert lift([("add", "x25, x26, #0x10"), ("ldr", "x0, [x25, #8]"),
+                 ("ret", "")]) == ["return (THR + 16).field_0x9;"]
+    assert lift([("ldr", "x0, [x1, #0x7d0]"), ("ret", "")]) == \
+        ["return x1.field_0x7d1;"]
+    assert lift([("ldr", "x0, [x26, #0x7d0]"), ("ret", "")]) == \
+        ["return THR.field_0x7d0;"]
+
+
+def test_a_copy_of_thr_is_the_thread_only_while_every_way_in_holds_it():
+    """The role is the value the walk holds, so it ends where that value does (#273). A
+    write or a call that clobbers the copy ends it, a join keeps it only where every way
+    in holds the thread, and a section no edge leads into hands the body nothing. The
+    guards print the same on main; the assertions that the role is KEPT do not."""
+    from jadart.cfg import UNREACHED
+    lift = _lift_rows
+    # Overwritten: 0x213b2c on the clean fixture. x3 is the thread for one read, then the
+    # object it loads, and the read through that is a tagged field again.
+    got = lift([("mov", "x3, x26"), ("ldr", "x4, [x3, #0x688]"),
+                ("ldr", "x3, [x4, #0x20]"), ("ldr", "x4, [x3, #0x430]"),
+                ("stur", "x4, [x19, #7]"), ("ret", "")])
+    assert got[0] == "x19.field_0x8 = THR.field_0x688.field_0x21.field_0x431;", got
+    # Clobbered: x1 is volatile, so after the call it holds a value nobody knows.
+    got = lift([("mov", "x1, x26"), ("bl", "#0x100"), ("ldr", "x9, [x1, #0x7d0]"),
+                ("stur", "x9, [x19, #7]"), ("ret", "")])
+    store = next(ln for ln in got if ln.startswith("x19.field_0x8 = "))
+    assert re.fullmatch(r"x19\.field_0x8 = t\d+\.field_0x7d1;", store), got
+
+    # A join keeps it where both arms copy the thread, and not where one copies x1.
+    def join(other):
+        return lift([("cbz", "x3, #0xc"), ("mov", "x25, x26"), ("b", "#0x10"),
+                     ("mov", other), ("ldr", "x9, [x25, #0x7d0]"),
+                     ("stur", "x9, [x19, #7]"), ("ret", "")])
+    assert join("x25, x26")[0] == "x19.field_0x8 = THR.field_0x7d0;", join("x25, x26")
+    assert join("x25, x1")[0] == "x19.field_0x8 = x25.field_0x7d1;", join("x25, x1")
+
+    # A section no edge leads into copies the thread and falls into the join: the body
+    # does not take the copy from it, and the block printed again under the section,
+    # from the section's own state, does (#266).
+    got = lift([("cbz", "x3, #0x10"), ("mov", "x25, x1"), ("b", "#0x10"),
+                ("mov", "x25, x26"), ("ldr", "x9, [x25, #0x7d0]"),
+                ("stur", "x9, [x19, #7]"), ("ret", "")])
+    at = got.index("// " + UNREACHED)
+    assert got[:at] == ["x19.field_0x8 = x25.field_0x7d1;", "return x0;"], got
+    assert got[at + 1:] == ["L_0xc:", "x19.field_0x8 = THR.field_0x7d0;",
+                            "return x0;"], got
+    # ...and the section after a trap, falling into a join a goto also reaches, hands it
+    # nothing (#237's arrival guard): the copy at 0x8 never reaches the read at 0xc.
+    got = lift([("cbz", "x1, #0x18"), ("brk", "#0"), ("mov", "x25, x26"),
+                ("ldr", "x9, [x25, #0x7d0]"), ("stur", "x9, [x19, #7]"), ("ret", ""),
+                ("mul", "x5, x6, x12"), ("cbz", "x8, #0xc"), ("cbz", "x9, #0x2c"),
+                ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x18"), ("add", "x4, x4, #2"),
+                ("ret", "")])
+    assert "x19.field_0x8 = x25.field_0x7d1;" in got, got
+    assert not [ln for ln in got if "THR" in ln], got
+
+
+def test_a_copy_of_r10_is_the_thread_on_arm32_too():
+    """arm32 keeps the thread in r10 and reads null, true and false out of it, so a copy
+    of r10 reads them as r10 does, and its other slots at the offset as written (#273).
+    arm32 is not in LIFTABLE_ARCHS, so this binds the target directly, as the arm32
+    target test does. The width is matched loosely: it is not what this is about."""
+    from jadart import expr as E
+    rows = [("mov", "r4, sl"), ("ldr", "r0, [r4, #0x38]"), ("ldr", "r1, [r4, #0x40]"),
+            ("str", "r1, [r4, #0x44]"), ("str", "r0, [r2, #7]"), ("bx", "lr")]
+    with E.use_target(E.ARM32):
+        body = [ln.strip() for ln in E._lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+            None, None, None, "  ", 1, None)]
+    assert re.fullmatch(r"THR\.field\d*_0x44 = THR\.field\d*_0x40;", body[0]), body
+    assert re.fullmatch(r"r2\.field\d*_0x8 = true;", body[1]), body
+    assert body[-1] == "return true;", body
+    assert E._T is E.ARM64
+
+
+def test_the_ffi_sequence_on_the_clean_fixture_reads_the_thread_as_written():
+    """#273 as reported, through the library API and `lift`: the closure at 0x1390ac
+    copies x26 into x25, spills the copy, and reads Thread+0x7d0 through it and
+    Thread+0x7d8 through its reload, and both print as the offsets they are."""
+    _needs_capstone()
+    import contextlib
+    import io
+    from jadart import cli
+    body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x1390e8")[0]["body"]]
+    assert "THR.field_0x6c8 = THR.field_0x7d0;" in body, body
+    assert "THR.field_0x6c8 = THR.field_0x7d8;" in body, body
+    odd = [ln for ln in body for m in re.findall(r"\bTHR\.field\d*_0x([0-9a-f]+)", ln)
+           if int(m, 16) & 1]
+    assert not odd, odd
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert cli.main(["lift", CLEAN, "0x1390e8"]) == 0
+    assert "var t3 = THR.field_0x7d0(...);" in out.getvalue(), out.getvalue()
+
+
 def test_the_low_doubleword_lane_of_a_v_register_reads_what_dn_holds():
     """`v0.d[0]` is the low 64 bits of the register `d0` names, so a read of it reads d0.
 

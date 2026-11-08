@@ -302,6 +302,11 @@ _SPECIAL = set(ARM64.roles) | {"xzr"}
 # role registers that hold an UNtagged address (no kHeapObjectTag bias on field loads)
 _UNTAGGED = ARM64.untagged
 
+#: What the thread pointer reads as, on both targets. The walk keeps a register's VALUE,
+#: so a copy of it, `mov x25, x26` or a spill and reload of one, holds this same text for
+#: as long as the walk can show it holds the thread, and no longer (#273).
+_THR = "THR"
+
 # NULL_REG + offset -> Bool singleton. Getting these backwards would invert a boolean,
 # which is the worst thing this file could do quietly, so they are measured rather than
 # assumed: every `add xD, x22, #imm` in all fifteen arm64 corpus builds (dart 2.19.6
@@ -4568,10 +4573,20 @@ class Lifter:
                 del st.elem[key]
         return out
 
-    def _byte_off(self, base_reg: str, disp: int) -> int:
+    def _byte_off(self, base_reg: str, base_v: V, disp: int) -> int:
         # tagged object pointers carry kHeapObjectTag=1, so a field at object offset F is
         # loaded as [P, #F-1]; untagged role registers (THR/HEAP/...) have no such bias.
-        return disp if base_reg in _UNTAGGED else disp + 1
+        #
+        # The thread is untagged in whichever register holds it, so its VALUE decides too.
+        # Keyed on the name alone, `mov x25, x26; ldr x9, [x25, #0x7d0]` printed
+        # `THR.field_0x7d1` beside `THR.field_0x6c8` for x26 itself: one Thread spelled
+        # two ways, the odd one no slot at all (#273). The value is the walk's must-fact:
+        # a write, a call that clobbers the copy, a join that disagrees and a section no
+        # edge leads into each leave the register something else, and an interior
+        # pointer, `add x25, x26, #0x10`, reads `THR + 16`, which is not the thread. Only
+        # THR follows its value: the null in x22 is a tagged object, and a copy of FP or
+        # SP is spelled with the bias, as the frame read itself is (`_frame_read`).
+        return disp if base_reg in _UNTAGGED or base_v.text == _THR else disp + 1
 
     def _rebase(self, base_reg: str, base_v: V, disp: int) -> tuple:
         """The (base expression, NON-NEGATIVE field offset) `[base_reg, #disp]` names.
@@ -4612,7 +4627,7 @@ class Lifter:
         prints `.tags`. 11,184 of the clean image's 11,695 negative displacements are that
         header read and are untouched.
         """
-        off = self._byte_off(base_reg, disp)
+        off = self._byte_off(base_reg, base_v, disp)
         if off >= 0:
             return base_v, off
         return _bin(base_v, "-", _num(-disp), P_ADD), 1
@@ -5383,9 +5398,13 @@ class Lifter:
             # A canonical object read straight out of the base register. arm64 reaches
             # true/false with an `add` off NULL and is handled there; arm32 has no null
             # register and LOADS all three out of the thread, so the same table is
-            # consulted on the load path too.
-            if (_T.roles.get(base) == _T.consts_base and disp in _T.consts
-                    and not index):
+            # consulted on the load path too, and through a copy of the thread as through
+            # r10 itself, since the role is the value's (`_byte_off`, #273). Asked only
+            # where the table is the thread's, so an arm64 load reads no more than it did.
+            role = _T.roles.get(base)
+            if _T.consts_base == _THR and g(base).text == _THR:
+                role = _THR
+            if role == _T.consts_base and disp in _T.consts and not index:
                 st.set(dst, V(_T.consts[disp], P_ATOM))
                 return []
             if _T.roles.get(base) == "PP":                   # unresolved ObjectPool entry
@@ -5544,11 +5563,14 @@ class Lifter:
             val = self._src(ops, 2, st)
             if val is None:
                 return self._raw(st, dst, mn, op)
-            st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
             # The 4th field records whether the machine's base register held an UNTAGGED
             # address, because that is what decides whether a later displacement off this
-            # base is an object header or a real element offset. See _elem_access.
-            st.elem[dst] = (g(b), g(c), scale, b in _UNTAGGED)
+            # base is an object header or a real element offset. See _elem_access. A copy
+            # of the thread holds one as x26 does (`_byte_off`, #273), read before `dst`,
+            # which can be the base, is written.
+            untagged = b in _UNTAGGED or g(b).text == _THR
+            st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
+            st.elem[dst] = (g(b), g(c), scale, untagged)
             return []
         if mn == "sub" and len(ops) >= 3:
             b = g(ops[1])
@@ -5714,7 +5736,7 @@ class Lifter:
         else:
             base_v = self._leaf(base_reg, st)
             idx_v = self._leaf(index_reg, st) if index_reg else V("0", P_ATOM)
-            s, frame = scale, base_reg in _UNTAGGED
+            s, frame = scale, base_reg in _UNTAGGED or base_v.text == _THR
         idx = idx_v.text
         if frame and disp:
             stride = 1 << s
