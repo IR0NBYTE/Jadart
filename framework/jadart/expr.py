@@ -39,8 +39,8 @@ from typing import NamedTuple
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
                   cond_of, cut_goto, flat, TRAPS, _target, entry_reach,
-                  UNREACHED, cut_off, dominator_forest, second_reach, _cond_for,
-                  checks_into, _conditions_from_the_block_before)
+                  UNREACHED, cut_off, dominator_forest, dom_numbers, second_reach,
+                  _cond_for, checks_into, _conditions_from_the_block_before)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -3061,6 +3061,8 @@ class Lifter:
         #: needs. Built on first use, because most functions never reach a goto join.
         self.entry = entry if entry is not None else (min(blocks) if blocks else 0)
         self._idom = None
+        #: Its numbering (cfg.dom_numbers), which answers `_dominates` in O(1).
+        self._dnum = None
         self._killcache: dict = {}
         #: {temp number: the block its declaration stands in}, and the block lifted last,
         #: for the goto join in `walk`.
@@ -3082,8 +3084,9 @@ class Lifter:
         self._slot_live = ({}, {})
         self._rank = None
         #: Blocks no path runs to the end of (_ends_path), the dominators of the graph
-        #: where they end, and each block's frame stores; see _loop_rewrites.
-        self._ended = self._ridom = self._spills = self._wide = None
+        #: where they end and their numbering, and each block's frame stores; see
+        #: _loop_rewrites and _trip_nodes.
+        self._ended = self._ridom = self._rnum = self._spills = self._wide = None
         #: The stack checks' slow paths strip_boilerplate took the branch to; see
         #: _quiet.
         self.slow_paths: frozenset = frozenset()
@@ -3114,8 +3117,10 @@ class Lifter:
         self._loops: dict = {}
         #: loop header -> its natural body; see _back_loop.
         self._backloops: dict = {}
-        #: loop header -> the blocks it can reach while it runs; see _loop_region.
+        #: loop header -> the blocks it can reach while it runs; see _loop_region. And
+        #: per block, what its subtree of `_idom` writes; see _region_written.
         self._regions: dict = {}
+        self._own_sub: dict = {}
         self._defs: dict = {}
         self._frame_list: dict = {}
         self._reload_ops: dict = {}
@@ -3603,10 +3608,17 @@ class Lifter:
                 self.blocks, self.entry, lambda n: () if n in ended
                 else self.blocks[n].succ if n in self.blocks else (), self.roots,
                 self.placed)[0]
+            self._rnum = dom_numbers(self._ridom)
             self._spills = {}
-        idom, ended = self._ridom, self._ended
+        idom, ended, num = self._ridom, self._ended, self._rnum
 
         def dominated(n):
+            # The header, or a block it is above in its tree: its idom chain reaches the
+            # header before a root. In O(1) from the numbering (#282).
+            if num is not None:
+                pre, end = num[0], num[1]
+                return n == header or (header in pre and n in pre
+                                       and pre[header] <= pre[n] < end[header])
             while n != header:
                 up = idom.get(n)
                 if up is None or up == n:
@@ -6012,6 +6024,25 @@ class Lifter:
             n = self._idom.get(n)
         return frozenset(out)
 
+    def _dominates(self, a, b) -> bool:
+        """Whether `a` is one of `_dominators(b)`, in O(1) from the numbering of the
+        forest (cfg.dom_numbers) and not by walking `_idom` up from `b`, which asked once
+        per block a loop dominates took 42 million steps for 500 loops in a row (#282).
+        The meaning is the walk's: a block above `b` in its tree, and `b` itself only
+        where it roots one, as a root is its own idom; nothing for a block in no tree,
+        nor across two trees."""
+        if self._idom is None:
+            self._dom_tree()
+        num = self._dnum
+        if num is None:
+            return a in self._dominators(b)
+        pre, end = num[0], num[1]
+        if a not in pre or b not in pre:
+            return False
+        if a == b:
+            return self._idom[b] == b
+        return pre[a] <= pre[b] < end[a]
+
     def _dom_tree(self):
         """The dominator tree, `_idom`, from the entry and from each proven entry no edge
         reaches (`roots`, dominator_forest), and which root each block's tree hangs off,
@@ -6020,6 +6051,7 @@ class Lifter:
             self.blocks, self.entry,
             lambda n: self.blocks[n].succ if n in self.blocks else (), self.roots,
             self.placed)
+        self._dnum = dom_numbers(self._idom)
         self._root_of = {n: r for r, nodes in trees for n in nodes}
 
     def _join_kill(self, addr, entry=False) -> tuple:
@@ -6053,7 +6085,7 @@ class Lifter:
         # values the loop's own names carry (#125).
         preds = self._preds.get(addr, ())
         if entry:
-            preds = [p for p in preds if addr not in self._dominators(p)]
+            preds = [p for p in preds if not self._dominates(addr, p)]
         back, stack = set(), list(preds)
         while stack:
             n = stack.pop()
@@ -6741,8 +6773,8 @@ class Lifter:
                     # rule above kept a register a pin in a block between had renamed, and
                     # it read a name the other paths never declared (#121). What a block
                     # that dominates the join declares is on every path into it.
-                    doms = self._dominators(s[1])
-                    _forget_temps(st, lambda k: self._anchor.get(k) not in doms)
+                    _forget_temps(st, lambda k: not self._dominates(
+                        self._anchor.get(k), s[1]))
                     if mem:
                         st.slot.clear()
                         st.dropped.clear()
@@ -6849,8 +6881,8 @@ class Lifter:
                             if v.text != r and self._reads_mem(v.text):
                                 st.forget(r)
                         st.elem.clear()
-                    doms = self._dominators(s[1])
-                    _forget_temps(st, lambda k: self._anchor.get(k) not in doms)
+                    _forget_temps(st, lambda k: not self._dominates(
+                        self._anchor.get(k), s[1]))
                 out.extend(self._render_loop(s[1], s[2], st, indent, depth))
                 st.src = frozenset(self._breakers.get(s[1], ()))
                 alive = True
@@ -7159,7 +7191,7 @@ class Lifter:
         # calls, which is most of them: the shapes in three loop tests are exactly that,
         # and those tests are about the value rather than the base. That half wants its
         # own measurement.
-        own = self._own_written(self._loop_region(header)) - (_SPECIAL - {_lr()})
+        own = self._region_written(header) - (_SPECIAL - {_lr()})
         for r in sorted(written | carried):
             st.forget(r)
             if r in own:
@@ -7228,7 +7260,7 @@ class Lifter:
         tree = self._root_of.get(header)
         latches = [p for p in self._preds.get(header, ())
                    if p not in self._idom or self._root_of.get(p) != tree
-                   or header in self._dominators(p)]
+                   or self._dominates(header, p)]
         nodes, stack = {header}, latches
         while stack:
             n = stack.pop()
@@ -7569,8 +7601,10 @@ class Lifter:
         """The blocks the loop at `header` can reach while it runs: the ones the header
         DOMINATES, so control cannot be in them without having entered the loop.
 
-        Asked by ONE caller, the opaque marking at the loop exit, and deliberately not by
-        the three that ask `_loop_nodes` what the loop may write. `_loop_nodes` returns
+        Asked for ONE caller, the opaque marking at the loop exit, through
+        `_region_written`, which folds what it writes up the dominator tree instead and
+        walks it only where that has no numbers; and deliberately not by the three that
+        ask `_loop_nodes` what the loop may write. `_loop_nodes` returns
         every ANCESTOR of the header, blocks that run BEFORE the loop among them, and a
         register written there is not one the loop assigned: a store based on it after the
         loop reads the value the pre-loop block put there, which its own name says
@@ -7588,12 +7622,44 @@ class Lifter:
             n = stack.pop()
             if n in nodes or n not in self.blocks:
                 continue
-            if n != header and header not in self._dominators(n):
+            if n != header and not self._dominates(header, n):
                 continue
             nodes.add(n)
             stack.extend(self.blocks[n].succ)
         got = self._regions[header] = frozenset(nodes)
         return got
+
+    def _region_written(self, header) -> frozenset:
+        """`_own_written` of `_loop_region(header)`, folded up the dominator tree once.
+
+        The region is the header's subtree of `_idom`, a run of its numbering: a block the
+        header is above is reached from it through blocks it is above, or a path from the
+        entry would pass it by. So what the region writes is what the header writes and
+        what each child's subtree does, worked out once per block for every loop that
+        asks. Walked as a set per loop, the regions asked 125,250 dominance questions
+        between them for 500 loops in a row and 179,700 for 300 nested ones (#282). Where
+        the header is in no tree, or `_idom` is no forest (cfg.dom_numbers), the region is
+        walked as it was."""
+        if self._idom is None:
+            self._dom_tree()
+        num = self._dnum
+        if num is None or header not in num[0]:
+            return frozenset(self._own_written(self._loop_region(header)))
+        kids, memo = num[2], self._own_sub
+        stack = [header]
+        while stack:
+            n = stack[-1]
+            if n in memo:
+                stack.pop()
+                continue
+            todo = [c for c in kids.get(n, ()) if c not in memo]
+            if todo:
+                stack.extend(todo)
+                continue
+            stack.pop()
+            memo[n] = frozenset(self._own_written((n,))).union(
+                *(memo[c] for c in kids.get(n, ())))
+        return memo[header]
 
     def _own_written(self, nodes) -> set:
         """What the instructions in `nodes` write, NOT counting a call's clobbers.

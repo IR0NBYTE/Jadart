@@ -631,6 +631,45 @@ def dominator_forest(blocks, entry, succ, roots=(), placed=frozenset()):
     return idom, order, trees
 
 
+def dom_numbers(idom):
+    """(pre, end, kids) of the forest `idom` (dominator_forest), or None where it is not
+    one: each block's place in a preorder of its tree, one count across every tree, the
+    end of its subtree's run, and its children. `a` is above `b` exactly where
+    pre[a] <= pre[b] < end[a], so a dominance question costs O(1) and not the walk up
+    `idom` it was, which the lifter took 126,249 times for 500 loops in a row (#282).
+    That is the test LLVM's DominatorTreeBase::dominates makes once updateDFSNumbers has
+    run (GenericDomTree.h). Trees of different roots never overlap in it.
+
+    A root is a block that is its own idom. A block whose idom is not in the map, or one
+    on a cycle no root is on, makes it no forest: `_idoms` builds neither, as each idom
+    comes before its block in the order it numbers, but a walk up `idom` stops at a
+    block it saw before, and the numbers would not say what that walk does. Iterative,
+    as 300 nested loops make a tree 599 deep."""
+    kids, roots = {}, []
+    for n, d in idom.items():
+        if d == n:
+            roots.append(n)
+        elif d in idom:
+            kids.setdefault(d, []).append(n)
+        else:
+            return None
+    pre, seq = {}, []
+    for r in roots:
+        stack = [r]
+        while stack:
+            n = stack.pop()
+            pre[n] = len(seq)
+            seq.append(n)
+            stack.extend(kids.get(n, ()))
+    if len(seq) != len(idom):
+        return None
+    size = dict.fromkeys(seq, 1)
+    for n in reversed(seq):
+        if idom[n] != n:
+            size[idom[n]] += size[n]
+    return pre, {n: pre[n] + size[n] for n in seq}, kids
+
+
 def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=()):
     """Return a list of statements. Each is one of:
       ('asm', block_addr)
@@ -682,6 +721,7 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=())
     second = second_reach(blocks, reachable, entries) if orphans else frozenset()
     idom, order, trees = dominator_forest(blocks, entry, fsucc,
                                           entries if second else (), reachable)
+    num = dom_numbers(idom)
     rank = {n: i for i, n in enumerate(order)}
     rpo = _rpo(blocks, entry, fsucc)
     for root, nodes in trees:
@@ -696,6 +736,11 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=())
 
     # loop headers: back edge n->h where h dominates n
     def dominates(a, b):
+        # `a` is `b` or above it in its tree: O(1) from the numbering, where the walk
+        # up `idom` it replaces took 18 million steps for 300 nested loops (#282)
+        if num is not None:
+            pre, end = num[0], num[1]
+            return a == b or (a in pre and b in pre and pre[a] <= pre[b] < end[a])
         while b in idom and b != a and b != idom[b]:
             b = idom[b]
         return b == a
