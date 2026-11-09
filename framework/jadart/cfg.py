@@ -914,28 +914,39 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
         succs = blocks[cur].succ
         if len(succs) != 2 or succs[0] == succs[1] or cur not in rpo:
             return None
-        tag, pending = {}, 0
+        # Only the blocks after this one in reverse postorder are visited, and a tag
+        # moves along forward edges only, so an arm whose block comes before it, a back
+        # edge's, passes its bit to none of them. `live[b]` counts the tagged blocks
+        # still to visit that carry bit b. A block takes its tag from blocks visited
+        # before it, so once either count is 0 no block can come to carry both, and the
+        # scan has nothing left to find. Stopping only once no tag at all was left ran
+        # it to the end of the function behind an arm that ends in a trap or a return,
+        # and N such branches visited about N * N blocks (#302).
+        here = rpo[cur]
+        tag, live = {}, [0, 0]
         for bit, s in enumerate(succs):
-            if s in rpo and s != cur:
-                pending += s not in tag
-                tag[s] = tag.get(s, 0) | (1 << bit)
-        # Only the blocks after this one in reverse postorder can carry a tag, and once
-        # none of them still does there is nothing left to find, so the scan is the size
-        # of the region between the branch and its join rather than of the function.
-        for n in by_rpo[rpo[cur] + 1:]:
+            if s in rpo and rpo[s] > here:
+                tag[s] = 1 << bit
+                live[bit] = 1
+        i = here + 1
+        while live[0] and live[1] and i < len(by_rpo):
+            n = by_rpo[i]
+            i += 1
             t = tag.get(n)
             if not t:
                 continue
-            pending -= 1
             if t == 3 and dominates(cur, n):
                 follow_memo[cur] = n
                 return n
+            live[0] -= t & 1
+            live[1] -= t >> 1
             for s in blocks[n].succ:
                 if s in rpo and rpo[s] > rpo[n]:     # forward edges only
-                    pending += s not in tag
-                    tag[s] = tag.get(s, 0) | t
-            if not pending:
-                break
+                    new = t & ~tag.get(s, 0)
+                    if new:
+                        tag[s] = tag.get(s, 0) | new
+                        live[0] += new & 1
+                        live[1] += new >> 1
         return None
 
     def merge_point(cur, ctx):

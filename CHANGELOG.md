@@ -421,6 +421,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A conditional's follow node is found without scanning on past a dead arm.** Where
+  the two arms of a conditional meet only at the exit, `structure`'s `follow` pushes one
+  tag per arm forward in reverse postorder to find the block both reach, and stopped
+  only once no tagged block was left to visit. An arm that ends in a trap or a return
+  passes its tag on to nothing, yet the other arm's carried the scan to the end of the
+  function, so N such branches cost about N * N: N loops in a row whose bodies trap one
+  way visited 3.0 million blocks at 1,000 loops, and `tier3_graph` took 9.37 s of CPU at
+  4,000 where 1,000 took 0.60 (#302). It now counts the blocks still to visit that carry
+  each tag and stops once either count is 0, since no block can then come to carry
+  both; an arm that is a back edge carries none from the start. The answer is the same:
+  on 1,500 random graphs each follow node is the one the scan to the end gives, crafted
+  shapes print the same text, and the whole-binary tier 3 dump of both fixtures and of
+  the seven app-sweep libraries is byte-identical to main's. CPU seconds of
+  `tier3_graph` on those loops, main then this: 1,000, 2,000, 4,000 and 8,000 loops
+  0.60, 2.31, 9.37 and 38.45 against 0.11, 0.39, 1.51 and 6.24, the rest of it the latch
+  scan of #301; with that fixed too, 0.02, 0.05, 0.10 and 0.22. An arm that dies in a
+  block laid out after the rest of the function, a trap the taken arm jumps to at the
+  end, is still reached last, and N such checks still visit about N * N blocks.
+
 - **A loop's latches are read off its header's predecessors.** `structure` builds a
   loop's body back from its latches, the blocks the header dominates that jump to it,
   and found them by asking every block of the function whether it jumps to the header,
