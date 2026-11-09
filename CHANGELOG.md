@@ -421,6 +421,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop that stores over a slot holding a register a join lost lifts.** Two rules
+  forget a frame slot at a loop's head: one holding the value of a register a join lost
+  goes when the loop writes or carries that register (#140), and one the loop stores a
+  new value to that the next trip reads goes by `_loop_rewrites` (#109). The second was
+  a `del` on the loop's state after the first had run, so a slot both named raised
+  `KeyError: 'x29-8'` out of `lift_function` on a crafted 15-row range (#287). The
+  rewrites now apply to the copy of the state before anything else drops a slot from
+  it, where every slot they name is still there, and the slot is forgotten once: the
+  reload in the loop reads it afresh, as a slot a loop rewrites does anywhere else.
+  None of the nine binaries reached it, 0 errors in main's dumps of the two fixtures
+  and the seven app-sweep libraries, and none of their lines change; 4,000 random
+  graphs of up to 200 rows lift on this as on main.
+
 - **A section too deep to structure prints its rows.** `structure` places a section no
   edge leads into after the body, and one nested too deeply for it ends the placing with
   a note counting what is left and saying `disasm` lists it. Tier 3's walk took that note

@@ -1472,6 +1472,26 @@ def test_a_loop_keeps_a_slot_it_only_writes_back():
     assert [t[4] for t in got if t[4] is not None] == [[False], [True]]
 
 
+def test_a_loop_rewriting_a_slot_that_held_a_lost_register_still_lifts():
+    """Two rules forget the same frame slot at a loop's head. The slot holds x3 as a join
+    lost it, and the loop writes x3, so the slot goes with it (#140); the loop also stores
+    x6 there and reads it back at the top, so `_loop_rewrites` names it too (#109). The
+    second was a `del` on the loop's state after the first had run, and raised KeyError
+    out of `lift_function` on this range (#287). Applied first, both forget the slot, and
+    the reload in the loop reads the slot afresh rather than the x3 the first trip saw."""
+    from jadart.expr import lift_function
+    rows = [("b.ne", "#0x20"), ("cbnz", "x1, #0x14"), ("b", "#0x8"), ("b.ge", "#0x1c"),
+            ("nop", ""), ("stur", "x3, [x29, #-8]"), ("b.ne", "#0x24"), ("b.ne", "#0x18"),
+            ("b", "#0x10"), ("cmp", "x5, x1"), ("ldur", "x5, [x29, #-8]"),
+            ("stur", "x6, [x29, #-8]"), ("ldur", "x3, [x29, #-24]"), ("b", "#0xc"),
+            ("ret", "")]
+    ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    body = "\n".join(lift_function(ann))
+    assert "while (true) {" in body, body
+    assert re.search(r"var t\d+ = \(FP - 8\)", body), body
+    assert not re.search(r"\bx3\b", body), body
+
+
 def test_the_lifted_output_does_not_depend_on_the_hash_seed():
     # Python randomises string hashing per process, so iterating a SET of register names
     # is a different order in every run. The lifter invalidates a set of registers after a

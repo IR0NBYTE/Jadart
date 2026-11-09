@@ -7227,6 +7227,15 @@ class Lifter:
             names[r] = f"t{st.tmpc[0]}"
             st.tmpc[0] += 1
         loop_st = st.copy()
+        # A slot the body stores a new value to holds that value at the top of the next
+        # trip, not the one it came in with (#109). `_loop_rewrites` reads `st`, as it
+        # compares a slot's text with what a register held on the way in, so its keys are
+        # `st`'s and are dropped here, while the copy still has every one. Below, a
+        # register the loop carries or writes takes with it a slot that held its lost
+        # value (#140), and a key both name was gone before a later `del`: a KeyError out
+        # of the lifter on a crafted range (#287).
+        for k in self._loop_rewrites(header, st):
+            del loop_st.slot[k]
         # A record does not cross into the loop. The body's own fills happen in this copy
         # and are never reconciled back, so a record carried in would survive a store the
         # body makes on every trip (#199). What the loop itself drops is re-recorded on
@@ -7251,10 +7260,6 @@ class Lifter:
         for r in sorted(writes - self._reloads(header, trip, st, writes)):
             loop_st.forget(r)
             marks[r] = loop_st.reg[r]
-        # A slot the body stores a new value to holds that value at the top of the next
-        # trip, not the one it came in with (#109).
-        for k in self._loop_rewrites(header, st):
-            del loop_st.slot[k]
         # The outgoing area too, where a trip may write it or a call in it takes it: the
         # next trip starts with what the last one left there, which _loop_rewrites, over
         # FP's slots alone, did not see (#162).
