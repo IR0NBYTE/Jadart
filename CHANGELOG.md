@@ -421,6 +421,33 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A read through x29 past a write that is not the frame chain reads its value.**
+  Tier 3 read an access off x29 as a frame slot by the register's role, even past a row
+  that put something else there: `ldr x29, [x0, #8]; ldur x0, [x29, #-8]; ret` printed
+  `var t0 = (FP - 8).field_0x1; return t0;`, a stack slot the machine does not touch,
+  and now prints `return (x0.field_0x9 - 8).field_0x1;`, what the same rows print
+  through x9; a store through it printed nothing and now prints the field it writes
+  (#307). `_fp_lost_at` finds the rows FP may not hold the frame pointer before, a
+  forward may-analysis over the graph, linear in rows plus edges: a load into x29, a
+  move or add from another register and an `ldp` into it off any base but SP end the
+  role; the frame chain gives it back, the prologue's move, the epilogue's pop and an
+  FFI frame's `ldr x29, [x15], #8`, taken as the chain only right after `mov x15, x29`,
+  as blutter's leave-frame matcher takes it (all 2,550 of those pops in the clean
+  fixture and the seven app-sweep libraries have the move); and FP plus or minus an
+  immediate keeps what it held, the frame where it held the frame (#165), the loaded
+  value where it held that. Past such a write the load, store and write-back go
+  through x29 as through any register, `_frame_plan` leaves them as written, and a
+  store there counts as a write to the heap. The #165 test that read
+  `(FP - 8).field_0x1` past `ldr x29, [x1]` now reads `(x1.field_0x1 - 8).field_0x1`.
+  LR already followed its value (#280).
+  Against unicorn, 6,000 generated runs that write x29 and then read, store, move or
+  add an immediate to it: main printed `FP` for 1,704 and a wrong value for 1,940; this
+  matches the CPU on 5,955, and the other 45 print exactly what the same rows print
+  through x10.
+  Compiled code writes x29 outside the chain once in the nine binaries, `mov x29, x2`
+  in a FluffyChat stub at 0xcfffd8 that sets SP, FP and THR from its arguments, and the
+  tier 3 dump of all nine is byte-identical to main's.
+
 - **A conditional's follow node is found without scanning on past a dead arm.** Where
   the two arms of a conditional meet only at the exit, `structure`'s `follow` pushes one
   tag per arm forward in reverse postorder to find the block both reach, and stopped

@@ -1291,6 +1291,103 @@ def _lr_return_address(blocks, preds, entries) -> dict:
     return {b: into(b) for b in blocks}
 
 
+def _fp_write(a, mn: str, op: str, raw: dict, prev=None):
+    """What the row at `a` leaves in FP: False for the frame pointer, which is what the
+    frame chain puts there, True for anything else, None where FP keeps what it held,
+    as it does where the row leaves it alone or moves it by an immediate.
+
+    The frame chain is what strip_boilerplate blanked, read as it was (`raw`): the
+    prologue's move of SP and the epilogue's pop off SP. And the pop that ends an FFI
+    call's frame, `mov x15, x29; ldr x29, [x15], #8`, which is the chain only with that
+    move just before it (`prev`, the row before in the block), as blutter's leave-frame
+    matcher takes it (CodeAnalyzer_arm64.cpp, tryConsumeLeaveFrameRestore): without it,
+    a pop off SP puts whatever was pushed in FP. All 2,550 such pops in the clean
+    fixture and the seven app-sweep libraries have the move. A write-back through FP
+    moves it, which `_frame_plan` follows where FP holds the frame and `_bump` where it
+    does not, so it is None too. `_def_use` names arm64 registers only, so on another
+    target no row writes FP."""
+    blank = mn == "nop"
+    if blank:
+        got = raw.get(a)
+        if got is None:
+            return None
+        mn, op = got
+    sp, fp = _frame_regs()
+    if fp not in _def_use(mn, op)[0]:
+        return None
+    ops = _split_ops(op)
+    if mn in _LOADS or mn in _STORES:
+        if mn in _STORES or fp not in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]):
+            return None
+        got = _addr(ops)
+        if got is None or got[0][0] != sp:
+            return True
+        if blank:
+            return False
+        if prev is None:
+            return True
+        pmn, pop = raw.get(prev[0], prev[1:3]) if prev[1] == "nop" else prev[1:3]
+        pops = _split_ops(pop)
+        return not (pmn == "mov" and len(pops) == 2 and canon(pops[0]) == sp
+                    and canon(pops[1]) == fp)
+    src = canon(ops[1]) if len(ops) >= 2 else ""
+    if mn in ("mov", "add", "sub") and src == sp:
+        return False
+    # FP moved by an amount the row spells keeps what FP held: in its frame, where
+    # `_frame_moves` and `_frame_plan` follow it (#165), and off the value a write put
+    # there, where it reads as that value moved.
+    if mn in ("add", "sub") and src == fp and len(ops) == 3 and _imm(ops[2]) is not None:
+        return None
+    return True
+
+
+def _fp_lost_at(blocks, raw) -> frozenset:
+    """The addresses of the rows before which FP may hold something other than the frame
+    pointer: a row that is not the frame chain wrote it on some path there (#307).
+
+    The lifter reads an access off FP as a frame slot by the register's role, so after
+    `ldr x29, [x0, #8]` a read off x29 named a stack slot the machine does not touch.
+    Compiled Dart writes FP only in the frame chain, so on compiled code this is empty. A
+    may-analysis, the other way round from `_lr_return_address`: what no such write
+    reaches keeps the role, the entry and every section no edge reaches included, so a
+    function that never writes FP lifts as it did. One bit per block, set at most once,
+    so the work is linear in rows plus edges."""
+    effect, touched = {}, set()
+    for b, blk in blocks.items():
+        got = None
+        for k, (a, mn, op, _n) in enumerate(blk.insns):
+            # Every spelling of FP has these two characters, and a blanked row is
+            # read as it was.
+            if mn != "nop" and "29" not in op:
+                continue
+            w = _fp_write(a, mn, op, raw, blk.insns[k - 1] if k else None)
+            if w is not None:
+                got = w
+                touched.add(b)
+        effect[b] = got
+    lost_in = set()
+    work = [b for b in blocks if effect[b]]
+    while work:
+        b = work.pop()
+        for t in blocks[b].succ:
+            if t in blocks and t not in lost_in:
+                lost_in.add(t)
+                if effect[t] is None:
+                    work.append(t)
+    out = set()
+    for b in lost_in | touched:
+        cur = b in lost_in
+        insns = blocks[b].insns
+        for k, (a, mn, op, _n) in enumerate(insns):
+            if cur:
+                out.add(a)
+            if mn == "nop" or "29" in op:
+                w = _fp_write(a, mn, op, raw, insns[k - 1] if k else None)
+                if w is not None:
+                    cur = w
+    return frozenset(out)
+
+
 #: The slot-map key that says a push dropped part of the outgoing area; see
 #: Lifter._frame_moved. It starts with SP's name, so whatever forgets the area forgets it.
 _LOST = "x15?"
@@ -2869,7 +2966,7 @@ def _frame_meets(blocks, entry, raw, passed=None) -> frozenset:
     return frozenset(out)
 
 
-def _frame_plan(blocks, entry, raw):
+def _frame_plan(blocks, entry, raw, lost=frozenset()):
     """(_frame_meets, the frame moves `_step` does not see, the blocks to forget the frame
     at the entry of, and where each store through SP or FP sits against the other) for
     _lift_function, with the accesses through FP rewritten in place into the
@@ -2896,7 +2993,9 @@ def _frame_plan(blocks, entry, raw):
 
     Only FP's accesses move: a raw store through FP is printed as it is, and keeps its
     text. Where nothing stores through SP and the moves are only the prologue's and the
-    epilogue's, FP is in one place between, and the pass is not run."""
+    epilogue's, FP is in one place between, and the pass is not run. Nor is an access
+    at one of `lost`, the rows where FP may hold something other than the frame pointer
+    (`_fp_lost_at`), rewritten or counted: it is off the value FP holds there (#307)."""
     sp, fp = _frame_regs()
     moves = _frame_moves(blocks, raw)
     inner, pushes = 0, False    # FP moves but an epilogue's restore before a return
@@ -2907,6 +3006,8 @@ def _frame_plan(blocks, entry, raw):
                 if not any(insns[j][1] in ("ret", "b", "br") for j in
                            range(k + 1, min(len(insns), k + 3))):
                     inner += 1
+            elif a in lost:
+                continue
             elif mn in _STORES or mn in _LOADS:
                 got = _addr(_split_ops(op))
                 if got is None:
@@ -2925,7 +3026,9 @@ def _frame_plan(blocks, entry, raw):
         for k, t in enumerate(blk.insns):
             mn, op = raw.get(t[0], t[1:3]) if t[1] == "nop" else t[1:3]
             where = d[3]
-            if t[1] != "nop" and (mn in _STORES or mn in _LOADS):
+            # Not where FP may hold something other than the frame pointer: the access
+            # is off the value there, and keeps its operands and its write-back (#307).
+            if t[1] != "nop" and t[0] not in lost and (mn in _STORES or mn in _LOADS):
                 got = _rekeyed(mn, op, d[4])
                 if got is not None:
                     blk.insns[k] = (t[0], t[1], got, t[3])
@@ -3261,6 +3364,10 @@ class Lifter:
         #: through LR, for the function and for that block (`_holds_ra`); most make none.
         self._lr_in = None
         self._lr_at: dict = {}
+        #: The rows before which FP may not hold the frame pointer (`_fp_lost_at`), built
+        #: the first time an access goes through FP, and the row being stepped.
+        self._fp_lost_set = None
+        self._here = None
         #: {temp number: the block its declaration stands in}, and the block lifted last,
         #: for the goto join in `walk`.
         self._anchor: dict = {}
@@ -4567,7 +4674,7 @@ class Lifter:
         source pointer, and dropping that leaves the loop reading the same element every
         iteration. Frame registers are handled by _frame_moved instead, because SP moving
         is not a source-level statement."""
-        if not delta or _T.roles.get(base) in ("SP", "FP"):
+        if not delta or self._frame_base(base):
             return []
         cur = self._leaf(base, st)
         step = (_bin(cur, "-", _num(-delta), P_ADD) if delta < 0
@@ -4827,12 +4934,8 @@ class Lifter:
         # the Code entry point that `ldr x8, ..; ldur x9, [x8, #7]` spells `.field_0x8`
         # (#280). Where the graph cannot show which, LR takes the bias as any register
         # of unknown value does: a Dart register holds a tagged object unless its role
-        # says otherwise.
-        if base_reg in _UNTAGGED or base_v.text == _THR:
-            return disp
-        if ROLE.get(base_reg) == "LR" and self._holds_ra():
-            return disp
-        return disp + 1
+        # says otherwise. FP the same, past a write that is not the frame chain (#307).
+        return disp if self._untagged(base_reg, base_v) else disp + 1
 
     def _holds_ra(self) -> bool:
         """Whether LR holds a return address before the instruction being stepped, on
@@ -4852,6 +4955,29 @@ class Lifter:
                     cur = w
             self._lr_at[self._last_block] = rows
         return rows[self._at]
+
+    def _fp_lost(self) -> bool:
+        """Whether FP may hold something other than the frame pointer before the row
+        being stepped (`_fp_lost_at`, #307)."""
+        if self._fp_lost_set is None:
+            self._fp_lost_set = _fp_lost_at(self.blocks, self.raw)
+        return self._here in self._fp_lost_set
+
+    def _frame_base(self, base: str) -> bool:
+        """Whether an access off `base` is one off the frame: SP, and FP while it holds
+        the frame pointer. Past a write that put anything else there, FP is a register
+        like any other and the access reads the value it holds (#307)."""
+        role = _T.roles.get(base)
+        return role == "SP" or role == "FP" and not self._fp_lost()
+
+    def _untagged(self, reg: str, v: V) -> bool:
+        """Whether `reg`, holding `v`, holds an untagged address before the row being
+        stepped: a role register that does (`_UNTAGGED`), FP only while it holds the frame
+        pointer (#307), a copy of the thread (#273), and LR where it holds a return
+        address and nowhere else (#280)."""
+        if reg in _UNTAGGED and not (ROLE.get(reg) == "FP" and self._fp_lost()):
+            return True
+        return v.text == _THR or (ROLE.get(reg) == "LR" and self._holds_ra())
 
     def _rebase(self, base_reg: str, base_v: V, disp: int) -> tuple:
         """The (base expression, NON-NEGATIVE field offset) `[base_reg, #disp]` names.
@@ -5217,6 +5343,7 @@ class Lifter:
         # a type-carrying decompiler puts its cast too (#235).
         ops = _split_ops(op)
         g = lambda r: self._leaf(r, st)
+        self._here = addr
 
         # A trap renders nothing, like a nop: the machine never runs past brk, hlt, udf,
         # bkpt or trap, so none leaves text. Only brk and hlt were named here, so udf and
@@ -5445,7 +5572,7 @@ class Lifter:
             delta = disp if wb else post     # how far the base register moves, if at all
             if post:
                 disp = 0                     # post-index: the access is at the OLD base
-            frame = _T.roles.get(base) in ("SP", "FP")
+            frame = self._frame_base(base)
             if frame and delta:
                 # Slots are keyed off where the frame register is once the store retires.
                 # `stp a, b, [SP, #-0x10]!` moves SP first and stores at the NEW SP, so the
@@ -5696,9 +5823,10 @@ class Lifter:
             second = None
             if mn in ("ldp", "ldpsw") and len(ops) >= 3:
                 second = (canon(ops[1]), disp + _access_width(mn, ops[1]))
-            if _T.roles.get(base) in ("SP", "FP") and index is not None:
+            frame = self._frame_base(base)
+            if frame and index is not None:
                 return self._verbatim(st, mn, op, op, dst)       # as for a store
-            if _T.roles.get(base) in ("SP", "FP"):           # reload a stack slot
+            if frame:                                        # reload a stack slot
                 # A 64-bit incoming argument or spill occupies two adjacent slots, and the
                 # same adjacency rule applies as for a field: the previous access was one
                 # word below, off the same base.
@@ -5859,8 +5987,7 @@ class Lifter:
             # of the thread holds one as x26 does (`_byte_off`, #273), read before `dst`,
             # which can be the base, is written, and so does LR where it holds a return
             # address and nowhere else (#280).
-            untagged = (b in _UNTAGGED or g(b).text == _THR
-                        or (ROLE.get(b) == "LR" and self._holds_ra()))
+            untagged = self._untagged(b, g(b))
             st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
             st.elem[dst] = (g(b), g(c), scale, untagged)
             return []
@@ -6061,8 +6188,7 @@ class Lifter:
         else:
             base_v = self._leaf(base_reg, st)
             idx_v = self._leaf(index_reg, st) if index_reg else V("0", P_ATOM)
-            s, frame = scale, (base_reg in _UNTAGGED or base_v.text == _THR
-                               or (ROLE.get(base_reg) == "LR" and self._holds_ra()))
+            s, frame = scale, self._untagged(base_reg, base_v)
         idx = idx_v.text
         if frame and disp:
             stride = 1 << s
@@ -7947,16 +8073,23 @@ class Lifter:
 
         Over-approximate on purpose, and only in one direction: any store not provably to
         the frame counts, including one whose address does not parse, because "I could not
-        read the base" is not evidence about where it points."""
+        read the base" is not evidence about where it points. Nor is FP's role, past a
+        write that put something else there (#307)."""
         for b in nodes:
-            for (_a, mn, op, _n) in self.blocks[b].insns:
+            for (a, mn, op, _n) in self.blocks[b].insns:
                 if mn not in _STORES and not _raw_store(mn):
                     continue
                 got = _addr(_split_ops(op))
                 if got is None or got[1] is _BAD_POST:
                     return True
-                if _T.roles.get(got[0][0]) not in ("SP", "FP"):
+                role = _T.roles.get(got[0][0])
+                if role not in ("SP", "FP"):
                     return True
+                if role == "FP":
+                    if self._fp_lost_set is None:
+                        self._fp_lost_set = _fp_lost_at(self.blocks, self.raw)
+                    if a in self._fp_lost_set:
+                        return True
         return False
 
     def _stale_slots(self, st: State, written, unsafe=None) -> None:
@@ -9472,7 +9605,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     rejoined_trap = frozenset(t for b in trapped for t in blocks[b].succ
                               if t in placed and t not in trapped)
     dispatch = detect_dispatch(stripped)
-    meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw)
+    fp_lost = _fp_lost_at(blocks, raw)
+    meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw, fp_lost)
     save_wrapped = _save_wrapped_calls(stripped)
     cast_at = {}
     if casts is not None and casts.pool:
@@ -9493,6 +9627,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.frame_cross = cross
         lifter.sp_at = spat
         lifter.raw = raw
+        lifter._fp_lost_set = fp_lost
         lifter.fp_moves = frozenset(a for a, (fp, _d) in moves.items() if fp)
         if returns is not None:
             lifter.returns = lambda: returns(ann[0][0])

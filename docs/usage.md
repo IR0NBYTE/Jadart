@@ -116,7 +116,10 @@ adds the shift pair that says so, `.field2_0x1 << 48 >> 48`, since the width alo
 not. In the floating-point file an access narrower than eight declines rather than claim a
 width it cannot spell. An address written off `FP` is in the
 coordinates of the frame the function
-was ENTERED with, whatever FP and SP do inside it, so one address has one spelling. A read
+was ENTERED with, whatever FP and SP do inside it, so one address has one spelling. Past a
+row that puts anything but the frame pointer in x29, a load into it or a move from another
+register, an access through x29 is spelled off the value it holds, as through any other
+register, and claims no slot. A read
 still written off `SP` is one whose place in that frame the analysis could not fix: `SP`
 there means SP at that line, and two such reads of different addresses can print the same
 text. The name is what carries the value; the text says where it came from.

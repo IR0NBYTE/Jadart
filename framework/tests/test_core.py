@@ -17632,10 +17632,10 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
         "(FP - 8).field_0x1")
     assert lift(frame(0x20, spill, ("mov", "x29, x15"), load, *keep))[:2] == gone_at(
         "(FP - 40).field_0x1")
-    # FP here is the pointer the `ldr` just put in it, not the frame the function was
-    # entered with, and the text means the register at that line; see docs/usage.md.
-    assert lift(frame(0x20, spill, ("ldr", "x29, [x1]"), load, *keep))[:2] == gone_at(
-        "(FP - 8).field_0x1")
+    # x29 here is the pointer the `ldr` just put in it, not the frame, so the read is off
+    # that value as through any other register, and claims no slot (#307).
+    assert lift(frame(0x20, spill, ("ldr", "x29, [x1]"), load, *keep))[:2] == [
+        "x2.field_0x8 = (x1.field_0x1 - 8).field_0x1;", "return x0;"]
     # FP moved by an amount known reads its slots where they now are.
     assert lift(frame(0x20, spill, ("add", "x29, x29, #8"), load, *keep))[:2] == gone_at(
         "FP.field_0x1")
@@ -20403,6 +20403,64 @@ def test_strip_boilerplate_drops_the_fp_lr_pair_only_off_the_frame():
         "return x0.field_0x19;"]
     assert lift([("stp", "x29, x30, [x0, #0x10]"), ("ret", "")]) == [
         "x0.field_0x11 = FP;", "x0.field_0x19 = LR;", "return x0;"]
+
+
+def test_a_read_through_x29_past_a_write_that_is_not_the_frame_reads_its_value():
+    """Tier 3 read an access off x29 as a frame slot by the register's role, even past a
+    row that put something else there, so `ldr x29, [x0, #8]; ldur x0, [x29, #-8]`
+    printed `(FP - 8).field_0x1`, a stack slot the machine does not touch, and a store
+    through it printed nothing (#307). Past such a write x29 reads as x9 does in the
+    same rows; the frame chain, its push, its pop and an FFI frame's restore, keeps the
+    frame as it printed."""
+    import re
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+
+    def through(reg, rows):
+        return lift([(mn, op.replace("@", reg)) for mn, op in rows])
+    for rows, want in (
+            ([("ldr", "@, [x0, #8]"), ("ldur", "x0, [@, #-8]"), ("ret", "")],
+             ["return (x0.field_0x9 - 8).field_0x1;"]),
+            ([("mov", "@, x1"), ("ldr", "x0, [@, #0x10]"), ("ret", "")],
+             ["return x1.field_0x11;"]),
+            ([("ldr", "@, [x0, #8]"), ("stur", "x1, [@, #-8]"), ("ret", "")],
+             ["(x0.field_0x9 - 8).field_0x1 = x1;", "return x0;"])):
+        assert through("x29", rows) == want, rows
+        assert [re.sub(r"\bx9\b", "x29", ln) for ln in through("x9", rows)] == want, rows
+    # Moved by an immediate it is still the value the write put there, not the frame.
+    for mn in ("add", "sub"):
+        rows = [("ldr", "@, [x0, #8]"), (mn, "@, @, #8"), ("ldur", "x0, [@, #-8]"),
+                ("ret", "")]
+        sign = "+" if mn == "add" else "-"
+        want = [f"return (x0.field_0x9 {sign} 8 - 8).field_0x1;"]
+        assert through("x29", rows) == want, rows
+        assert [re.sub(r"\bx9\b", "x29", ln) for ln in through("x9", rows)] == want, rows
+    # The issue's pair, which strip_boilerplate no longer drops off x0 (#294).
+    assert lift([("ldp", "x29, x30, [x0, #0x10]"), ("ldur", "x0, [x29, #-8]"),
+                 ("ret", "")]) == ["return (x0.field_0x11 - 8).field_0x1;"]
+    # Two write-backs through it are its own, not FP's moves for `_frame_plan`.
+    assert lift([("mov", "x29, x9"), ("ldr", "x2, [x29, #8]!"), ("ldr", "x3, [x29, #8]!"),
+                 ("add", "x0, x29, #8"), ("ret", "")])[-1] == "return x29 + 8;"
+    # Where only one way in wrote it, x29 is the register, and no slot is claimed.
+    assert lift([("cbz", "x2, #0xc"), ("ldr", "x29, [x0, #8]"), ("nop", ""),
+                 ("ldur", "x0, [x29, #-8]"), ("ret", "")]) == [
+        "return (x29 - 8).field_0x1;"]
+    # The frame chain prints as it did: the push and the pop, and an FFI frame's, whose
+    # pop off SP comes right after `mov x15, x29`. Without that move a pop off SP puts
+    # what was pushed in x29, and is the value it reads as.
+    assert lift([("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+                 ("ldur", "x0, [x29, #0x10]"), ("mov", "x15, x29"),
+                 ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")]) == [
+        "var t0 = FP.field_0x11;", "return t0;"]
+    assert lift([("str", "x29, [x15, #-8]!"), ("mov", "x29, x15"), ("mov", "x15, x29"),
+                 ("ldr", "x29, [x15], #8"), ("ldur", "x0, [x29, #-8]"), ("ret", "")]) == [
+        "var t1 = (FP - 8).field_0x1;", "return t1;"]
+    assert lift([("str", "x0, [x15, #-8]!"), ("ldr", "x29, [x15], #8"),
+                 ("ldur", "x0, [x29, #-8]"), ("ret", "")]) == [
+        "return (x0 - 8).field_0x1;"]
 
 
 if __name__ == "__main__":
