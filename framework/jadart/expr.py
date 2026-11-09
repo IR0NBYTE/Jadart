@@ -606,8 +606,9 @@ class V:
     #: is also what a value that may be NEGATIVE gets, since a negative Dart int is
     #: exactly what a 32-bit destination cannot hold. Carried because the text does not
     #: say it: `(x1 & 0xffffffff) >>> 3` fits in 32 bits and `x1 >>> 3` does not, and
-    #: their tails read the same. Only `_fits32` reads it, and only to leave a truncation
-    #: off a value that needs none (#235); it is the smallest useful piece of the
+    #: their tails read the same. `_fits32` reads it to leave a truncation off a value
+    #: that needs none (#235), and `_sext32` to leave the sign extension off an untag
+    #: whose source is under 2**31 (#285); it is the smallest useful piece of the
     #: representation lattice DESIGN section 13 describes, not that lattice.
     bits: int = 64
 
@@ -640,6 +641,16 @@ def _fits32(v: V) -> bool:
     if v.bits <= 32 or _fits(v, 32) or v.text.endswith(_U32):
         return True
     return bool(_INT_LITERAL.match(v.text)) and 0 <= int(v.text, 0) < (1 << 32)
+
+
+def _sext32(v: V) -> bool:
+    """Whether bits 31 to 63 of `v` provably agree, so `v.toSigned(32)` is `v` itself: a
+    bound under 2**31, which makes every one of them zero, or an int literal in the int32
+    range. `V.bits` is unsigned and a value that may be negative has 64, so a bound of 32
+    says nothing about bit 31 (#285)."""
+    if v.bits <= 31:
+        return True
+    return bool(_INT_LITERAL.match(v.text)) and -(1 << 31) <= int(v.text, 0) < (1 << 31)
 
 
 def _narrow(v: V) -> V:
@@ -680,9 +691,11 @@ def _bits_of(a: V, op: str, b: V) -> int:
     truncation that makes the text right. A shift amount that is not a literal is
     unknown, and so is the result.
 
-    Only `_fits32` reads this, so an estimate that is too LARGE costs a truncation that
-    changes no value, and one that is too small would print a value the machine does not
-    have. Every rule here is therefore the loose side of the real bound (#235)."""
+    `_fits32` and `_sext32` read this. An estimate that is too LARGE costs a truncation
+    or a sign extension that changes no value; one that is too small would print a value
+    the machine does not have, a top half kept by `_fits32` (#235) or, by `_sext32`, a
+    negative Smi untagged as a large positive one (#285). Every rule here is therefore
+    the loose side of the real bound."""
     x, y = a.bits, b.bits
     if op in ("+", "|", "^"):
         return min(64, (max(x, y) + 1) if op == "+" else max(x, y))
@@ -747,8 +760,12 @@ _RECEIVER = "this"
 #: lifter tracks as slots rather than as fields, so a frame store writes it without
 #: anything marking a value that reads it stale; such a text is never recorded (#199).
 _FRAME_TEXT_RE = re.compile(r"\((?:FP|SP)\s*[-+]")
+#: `this.toSigned(32)` and `this.toUnsigned(32)` are width conversions of the receiver
+#: register, not fields of it, and read nothing. Taken for a named field, an untag of
+#: `this` was assigned in each arm of an `if` rather than declared before it (#285).
 _READS_MEMORY = re.compile(
-    r"\.field(?:\d+)?_0x[0-9a-fA-F]+|\.tags\b|\[|\b" + _RECEIVER + r"\.[A-Za-z_$]")
+    r"\.field(?:\d+)?_0x[0-9a-fA-F]+|\.tags\b|\[|\b" + _RECEIVER
+    + r"\.(?!to(?:Signed|Unsigned)\(\d+\))[A-Za-z_$]")
 
 
 def _in_cond(v: V) -> str:
@@ -5690,8 +5707,18 @@ class Lifter:
                     st.set(dst, _bin(_bin(src, "<<", _num(pad), P_SHIFT), ">>",
                                      _num(pad), P_SHIFT))
             elif lsb == 1 and width == 31 and mn == "sbfx":
-                # Smi untag (value = tagged >> 1)
-                st.set(dst, _bin(src, ">>", V("1", P_ATOM), P_SHIFT))
+                # The Smi untag under compressed pointers: SmiUntag is sbfm with immr 1
+                # and imms kSmiBits + 1 = 31. It takes bits 1 to 31 and sign-extends from
+                # bit 31, so it is `src.toSigned(32) >> 1` for every 64-bit source. The
+                # bare `src >> 1` is that only where bits 31 to 63 already agree, and the
+                # VM leaves them zero after a 32-bit Smi add or LoadCompressedSmi and the
+                # heap base after LoadCompressed: a negative Smi read as a large positive
+                # one (#285). Only the low half is read, so a value a 32-bit write
+                # truncated is read whole, as `_leaf` reads a w operand.
+                u = src.wide if src.wide is not None else src
+                if not _sext32(u):
+                    u = V(f"{_wrap(u, P_POST)}.toSigned(32)", P_POST)
+                st.set(dst, _bin(u, ">>", _num(1), P_SHIFT))
             elif lsb + width >= 64:
                 # The field runs to the top bit: a plain shift, arithmetic for sbfx.
                 sym = ">>>" if mn == "ubfx" else ">>"
@@ -8519,8 +8546,12 @@ def _unread(lines: list, names: set) -> set:
 
 
 #: A call in a line: `name(`, `)(`, or a virtual/indirect call. Anything else a phi arm
-#: binds, a field read or arithmetic, has no side effect to keep (#169).
-_CALL_IN_LINE = re.compile(r"[\w\])]\(|\(dynamic call\)")
+#: binds, a field read or arithmetic, has no side effect to keep (#169). A width
+#: conversion the lifter prints, `.toSigned(n)` or `.toUnsigned(n)` with a literal n, is
+#: arithmetic too: read as a call, it kept a dead phi whose arm binds an untag or a
+#: 32-bit result (#285). Anything else after those names is a call, `Foo.toSigned(x1)`.
+_CALL_IN_LINE = re.compile(
+    r"(?<=[\w\])])(?:(?<!\.toSigned)(?<!\.toUnsigned)\(|\((?!\d+\)))|\(dynamic call\)")
 
 
 def _out_of_scope(lines: list, hits=None) -> set:

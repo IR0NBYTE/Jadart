@@ -428,10 +428,12 @@ def run_corpus(path: str, want: int, trials: int, seed: int, verbose: bool) -> i
 #:
 #: The DELIBERATE reinterpretations are absent, and a run splits at one rather than
 #: running through it: `sbfiz xD, xS, #1, #31` prints as plain `xS` because that is the
-#: Smi tag and showing it helps nobody, `sbfx xD, xS, #1, #31` prints as `xS >> 1`, and
-#: the sign/zero extensions print as the value they extend. Fuzzing those against the
-#: hardware would report the rewrite working as designed as a defect, which is how a
-#: partial oracle gets switched off.
+#: Smi tag and showing it helps nobody, and the sign/zero extensions print as the value
+#: they extend. Fuzzing those against the hardware would report the rewrite working as
+#: designed as a defect, which is how a partial oracle gets switched off. The Smi untag,
+#: `sbfx xD, xS, #1, #31`, is no reinterpretation any more: it prints
+#: `xS.toSigned(32) >> 1`, or `xS >> 1` where the value proves its sign (#285). It is
+#: still left out, so the runs drawn here stay the ones drawn before.
 _PURE = frozenset({
     "mov", "movz", "movk", "movn", "mvn", "neg", "add", "sub", "mul", "madd", "msub",
     "mneg", "sdiv", "and", "orr", "eor", "lsl", "lsr", "asr", "ubfx",
