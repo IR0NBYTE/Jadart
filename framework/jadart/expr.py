@@ -615,6 +615,13 @@ class V:
     #: whose source is under 2**31 (#285); it is the smallest useful piece of the
     #: representation lattice DESIGN section 13 describes, not that lattice.
     bits: int = 64
+    #: The signed counterpart of `bits`: bits `sext - 1` to 63 of the value agree, so it
+    #: is in [-2**(sext-1), 2**(sext-1)). 64 is "nothing is known". Set where the text
+    #: prints a sign extension, `.toSigned(k)`, and carried through an arithmetic shift
+    #: right by a literal, so a Smi untag, `x1.toSigned(32) >> 1`, has 31. `_sext32` reads
+    #: it to leave the sign extension off an operand of a 32-bit signed division that
+    #: already has it (#291).
+    sext: int = 64
 
 
 def _wrap(v: V, ctx: int) -> str:
@@ -651,10 +658,22 @@ def _sext32(v: V) -> bool:
     """Whether bits 31 to 63 of `v` provably agree, so `v.toSigned(32)` is `v` itself: a
     bound under 2**31, which makes every one of them zero, or an int literal in the int32
     range. `V.bits` is unsigned and a value that may be negative has 64, so a bound of 32
-    says nothing about bit 31 (#285)."""
-    if v.bits <= 31:
+    says nothing about bit 31 (#285). A value the text already sign-extends from bit 31 or
+    lower, `V.sext`, needs no second extension."""
+    if v.bits <= 31 or v.sext <= 32:
         return True
     return bool(_INT_LITERAL.match(v.text)) and -(1 << 31) <= int(v.text, 0) < (1 << 31)
+
+
+def _to_signed(v: V, k: int) -> V:
+    """`v.toSigned(k)`, the low `k` bits of `v` sign-extended, and the bound it proves."""
+    return V(f"{_wrap(v, P_POST)}.toSigned({k})", P_POST, sext=k)
+
+
+def _signed32(v: V) -> V:
+    """`v` as a 32-bit signed operand reads it: its low 32 bits, sign-extended. `v` itself
+    where `_sext32` proves the two the same."""
+    return v if _sext32(v) else _to_signed(v, 32)
 
 
 def _narrow(v: V) -> V:
@@ -727,7 +746,11 @@ def _bin(a: V, op: str, b: V, prec: int) -> V:
     # short of the `30 - (x1 - 2)` the CPU computes; `a * (b ~/ c)` printed `a * b ~/ c`,
     # which divides a different numerator. Found by evaluating the printed text against
     # the hardware, not by reading it.
-    return V(f"{_wrap(a, prec)} {op} {_wrap(b, prec + 1)}", prec, bits=_bits_of(a, op, b))
+    # An arithmetic shift right by k keeps a sign extension, k bits narrower (`V.sext`).
+    k = int(b.text, 0) if op == ">>" and _INT_LITERAL.match(b.text) else -1
+    sext = max(1, a.sext - k) if 0 <= k < 64 and a.sext < 64 else 64
+    return V(f"{_wrap(a, prec)} {op} {_wrap(b, prec + 1)}", prec, bits=_bits_of(a, op, b),
+             sext=sext)
 
 
 def _num(n: int) -> V:
@@ -5799,7 +5822,20 @@ class Lifter:
             # zero, so the two agree exactly. udiv does NOT get the same treatment: it is
             # the same bits read unsigned, and `~/` would be a different answer on any
             # operand with the top bit set.
-            st.set(dst, _bin(g(ops[1]), "~/", g(ops[2]), P_MUL))
+            #
+            # The 32-bit form divides the LOW halves, read as signed: `sdiv w0, w1, w2`
+            # printed `(x1 ~/ x2).toUnsigned(32)`, the whole registers divided, which is
+            # 0x92b1d3f3 where the CPU has 0x35fdeca2 for x1 = 0x92b1d3f2ca02135e and
+            # x2 = 0xffffffff (#291). Each operand is sign-extended from bit 31 unless
+            # `_sext32` proves it already is, as a Smi untag is. The 64-bit quotient then
+            # agrees with the CPU's in the low half for every input but a zero divisor,
+            # INT32_MIN ~/ -1 included: 0x80000000 either way once truncated. A zero
+            # divisor gives 0 on the CPU and a throw in Dart; the compiler tests the
+            # divisor before it divides, so compiled code never reaches one.
+            a, b = g(ops[1]), g(ops[2])
+            if ops[0].strip()[:1] == "w":
+                a, b = _signed32(a), _signed32(b)
+            st.set(dst, _bin(a, "~/", b, P_MUL))
             return []
         if mn in ("madd", "msub") and len(ops) >= 4:
             prod = _bin(g(ops[1]), "*", g(ops[2]), P_MUL)
@@ -5823,7 +5859,7 @@ class Lifter:
                 # already masked to fit, as w values and hash mixing mostly are, needs
                 # neither.
                 src = (_bin(src, "&", V("0xffffffff", P_ATOM, bits=32), P_AND) if mn == "lsr"
-                       else V(f"{_wrap(src, P_POST)}.toSigned(32)", P_POST))
+                       else _to_signed(src, 32))
             st.set(dst, _bin(src, sym, rhs, P_SHIFT))
             return []
         if mn in ("ubfx", "sbfx") and len(ops) >= 4:
@@ -5853,9 +5889,7 @@ class Lifter:
                 # one (#285). Only the low half is read, so a value a 32-bit write
                 # truncated is read whole, as `_leaf` reads a w operand.
                 u = src.wide if src.wide is not None else src
-                if not _sext32(u):
-                    u = V(f"{_wrap(u, P_POST)}.toSigned(32)", P_POST)
-                st.set(dst, _bin(u, ">>", _num(1), P_SHIFT))
+                st.set(dst, _bin(_signed32(u), ">>", _num(1), P_SHIFT))
             elif lsb + width >= 64:
                 # The field runs to the top bit: a plain shift, arithmetic for sbfx.
                 sym = ">>>" if mn == "ubfx" else ">>"
@@ -5866,7 +5900,7 @@ class Lifter:
             else:
                 # sbfx carries the field's top bit up, which `& mask` would clear (#124).
                 inner = _bin(src, ">>", _num(lsb), P_SHIFT)
-                st.set(dst, V(f"{_wrap(inner, P_POST)}.toSigned({width})", P_POST))
+                st.set(dst, _to_signed(inner, width))
             return []
         if mn in ("sbfiz", "ubfiz") and len(ops) >= 4:
             lsb, width = _imm(ops[2]), _imm(ops[3])
@@ -5883,7 +5917,7 @@ class Lifter:
                 elif mn == "ubfiz":
                     field = _bin(src, "&", V(hex((1 << width) - 1), P_ATOM, bits=width), P_AND)
                 else:
-                    field = V(f"{_wrap(src, P_POST)}.toSigned({width})", P_POST)
+                    field = _to_signed(src, width)
                 st.set(dst, _bin(field, "<<", _num(lsb), P_SHIFT))
             return []
         if mn in ("sxtw", "uxtw", "sxth", "uxth", "sxtb", "uxtb") and len(ops) >= 2:

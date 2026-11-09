@@ -19793,7 +19793,9 @@ def _untag_text(rows, reg="x0"):
 def _dart_int(text, env):
     """`text` evaluated as Dart's 64-bit ints over `env`, the low 64 bits returned. A
     `.toSigned(n)` or `.toUnsigned(n)` becomes a call on the operand before it, a name or
-    a bracketed group, left to right."""
+    a bracketed group, left to right. `~/` truncates toward zero, as Dart's does, where
+    Python's `//` floors; it has `//`'s precedence."""
+    import ast
     def signed(v, n):
         v &= (1 << n) - 1
         return v - (1 << n) if v >> (n - 1) & 1 else v
@@ -19811,8 +19813,19 @@ def _dart_int(text, env):
             j = re.search(r"\w+\Z", text[:i]).start()
         fn = "_s" if m.group(1) == "Signed" else "_u"
         text = f"{text[:j]}{fn}({text[j:i]}, {m.group(2)}){text[m.end():]}"
-    return eval(text, {"_s": signed, "_u": lambda v, n: v & ((1 << n) - 1),
-                       **{k: signed(v, 64) for k, v in env.items()}}) & ((1 << 64) - 1)
+
+    class Trunc(ast.NodeTransformer):
+        def visit_BinOp(self, node):
+            self.generic_visit(node)
+            if not isinstance(node.op, ast.FloorDiv):
+                return node
+            return ast.Call(ast.Name("_td", ast.Load()), [node.left, node.right], [])
+    tree = ast.fix_missing_locations(Trunc().visit(ast.parse(text.replace("~/", "//"),
+                                                            mode="eval")))
+    return eval(compile(tree, "<dart>", "eval"),
+                {"_s": signed, "_u": lambda v, n: v & ((1 << n) - 1),
+                 "_td": lambda a, b: abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1),
+                 **{k: signed(v, 64) for k, v in env.items()}}) & ((1 << 64) - 1)
 
 
 def test_a_smi_untag_reads_bit_31_as_the_sign_of_any_source():
@@ -19970,6 +19983,55 @@ def test_a_width_conversion_is_neither_a_call_nor_a_read_of_memory():
         receiver={"x1": "this"})]
     assert body[:2] == ["var t0 = this.toSigned(32) >> 1;", "if (this & 1 != 0) {"], body
     assert "} else {" not in body, body
+
+
+def test_a_32_bit_sdiv_divides_the_signed_low_halves():
+    """`sdiv w0, w1, w2` divides the low 32 bits of each register, read as signed, and
+    keeps the low half of the quotient. Tier 3 printed `(x1 ~/ x2).toUnsigned(32)`, the
+    whole registers divided: 0x92b1d3f3 for x1 = 0x92b1d3f2ca02135e and x2 = 0xffffffff,
+    where the CPU has 0x35fdeca2 (#291). Each operand is sign-extended unless its value
+    says it already is, as a Smi untag's does, and the text is checked against the arm64
+    definition on random inputs, INT32_MIN ~/ -1 among them. A zero divisor is left out:
+    the CPU gives 0 and Dart throws, and compiled code tests the divisor first."""
+    import random
+    plain = _untag_text([("sdiv", "w0, w1, w2")])
+    assert plain == "(x1.toSigned(32) ~/ x2.toSigned(32)).toUnsigned(32)", plain
+    assert _dart_int(plain, {"x1": 0x92b1d3f2ca02135e, "x2": 0xffffffff}) == 0x35fdeca2
+    # The shape both fixtures have, Smi `~/` and `%`: two untags, then the divide. Each
+    # untag is a 31-bit signed value already, so neither gets a second conversion.
+    untags = [("sbfx", "x1, x3, #1, #0x1f"), ("sbfx", "x2, x4, #1, #0x1f"),
+              ("sdiv", "w0, w1, w2")]
+    smi = _untag_text(untags)
+    assert smi == "((x3.toSigned(32) >> 1) ~/ (x4.toSigned(32) >> 1)).toUnsigned(32)", smi
+    after_add = _untag_text([("add", "w1, w5, #3"), ("sdiv", "w0, w1, w2")])
+    assert after_add == "((x5 + 3).toSigned(32) ~/ x2.toSigned(32)).toUnsigned(32)", (
+        after_add)
+    # The 64-bit form divides the whole registers, and says so.
+    assert _untag_text([("sdiv", "x0, x1, x2")]) == "x1 ~/ x2"
+
+    def sext(v, n):
+        v &= (1 << n) - 1
+        return v - (1 << n) if v >> (n - 1) & 1 else v
+
+    def sdiv_w(n, d):
+        n, d = sext(n, 32), sext(d, 32)
+        q = abs(n) // abs(d) * (1 if (n < 0) == (d < 0) else -1)
+        return q & 0xffffffff
+    edge = (0x80000000, 0xffffffff, 0x7fffffff, 1, 0x100000000, (1 << 64) - 1, 1 << 63,
+            0xffffffff80000000, 0x1234567880000000)
+    assert _dart_int(plain, {"x1": 0x80000000, "x2": 0xffffffff}) == 0x80000000
+    rng = random.Random(291)
+    for _ in range(600):
+        env = {r: rng.choice((rng.getrandbits(64), rng.getrandbits(32), rng.choice(edge),
+                              (1 << 64) - rng.getrandbits(31)))
+               for r in ("x1", "x2", "x3", "x4", "x5")}
+        cases = ((plain, env["x1"], env["x2"]),
+                 (smi, sext(env["x3"] >> 1, 31), sext(env["x4"] >> 1, 31)),
+                 (after_add, env["x5"] + 3, env["x2"]))
+        for text, n, d in cases:
+            if d & 0xffffffff:
+                assert _dart_int(text, env) == sdiv_w(n, d), (
+                    text, {r: hex(v) for r, v in env.items()})
 
 
 if __name__ == "__main__":
