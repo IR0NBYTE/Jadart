@@ -33,7 +33,7 @@ import bisect
 import contextlib
 import heapq
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from sys import intern
 from typing import NamedTuple
 
@@ -622,6 +622,15 @@ class V:
     #: it to leave the sign extension off an operand of a 32-bit signed division that
     #: already has it (#291).
     sext: int = 64
+    #: How the register holds the value the text names, where not as itself (#290). A
+    #: Smi tag, `sbfiz xD, xN, #1, #0x1f`, prints the Dart value it tags, which is how a
+    #: store, a call or a return reads it, and the register holds bits 0 to 30 of it
+    #: shifted up one: `_SMI_TAG`, whose untag gives back `xN.toSigned(31)`. `_SMI_BOX`
+    #: once the box-or-tag check tier 3 follows has compared exactly that against xN, so
+    #: the register holds xN boxed: its untag gives back xN, and so does the Mint's value
+    #: field, the other half of an unbox. 0 is the value itself. A name given to one
+    #: value carries it; two paths that disagree on it keep the value and drop it.
+    smi: int = 0
 
 
 def _wrap(v: V, ctx: int) -> str:
@@ -676,6 +685,36 @@ def _signed32(v: V) -> V:
     return v if _sext32(v) else _to_signed(v, 32)
 
 
+#: `V.smi`.
+_SMI_TAG, _SMI_BOX = 1, 2
+
+
+def _fits31(v: V) -> bool:
+    """Whether `v` is provably a 31-bit signed value, so `v.toSigned(31)` is `v`: a bound
+    under 2**30 or an int literal in that range."""
+    if v.bits <= 30:
+        return True
+    return bool(_INT_LITERAL.match(v.text)) and -(1 << 30) <= int(v.text, 0) < (1 << 30)
+
+
+def _smi_value(v: V) -> V:
+    """What an untag of a register holding `v` Smi-tagged reads: the bits of the value a
+    tag keeps, `.toSigned(31)`, or the value itself where it provably fits, by its bound
+    or by the box-or-tag check. Only the low 31 bits are read, so a value a 32-bit write
+    truncated is read whole (`V.wide`)."""
+    val = replace(v, smi=0)
+    if v.smi == _SMI_BOX or _fits31(val):
+        return val
+    low = val.wide if val.wide is not None else val
+    return _to_signed(low, 31)
+
+
+def _smi_word(v: V) -> V:
+    """The machine word of a register holding `v`: `v` itself, or for a tagged value the
+    Smi it is, shifted up one."""
+    return v if not v.smi else _bin(_smi_value(v), "<<", _num(1), P_SHIFT)
+
+
 def _narrow(v: V) -> V:
     """`v` as a 32-bit destination holds it: the low 32 bits, zero-extended.
 
@@ -693,7 +732,7 @@ def _narrow(v: V) -> V:
     TYPE (`unsigned int`, `uint`) and Binary Ninja in the register name; this file has
     neither, so it goes in the expression."""
     return (v if _fits32(v)
-            else V(f"{_wrap(v, P_POST)}{_U32}", P_POST, wide=v, bits=32))
+            else V(f"{_wrap(v, P_POST)}{_U32}", P_POST, wide=v, bits=32, smi=v.smi))
 
 
 def _prefix(sym: str, v: V) -> V:
@@ -1127,7 +1166,7 @@ class State:
                 self.spill.append(f"{name} = {v.text};")
             else:
                 self.spill.append(f"var {name} = {v.text};")
-            v = V(name, P_ATOM)
+            v = V(name, P_ATOM, smi=v.smi)
         self.reg[reg] = v
         self.elem.pop(reg, None)
         self.poolbase.pop(reg, None)
@@ -1280,6 +1319,18 @@ def _forget_frame(st: State):
         st.slot[_LOST] = V("", P_ATOM)
 
 
+def _joined(a: V, b: V):
+    """The value two paths agree a register holds, or None where they do not. A value
+    held Smi-tagged on one path and not on the other is still the value, which is what a
+    store, a call or a return reads, so the paths agree on it without the record: an
+    untag past the join cannot tell which word it reads (`V.smi`, #290)."""
+    if a == b:
+        return a
+    if a.smi != b.smi and replace(a, smi=0) == replace(b, smi=0):
+        return replace(a, smi=0)
+    return None
+
+
 def _merge(dst: State, a: State, b: State):
     """Post-if state: keep registers/slots the two arms agree on, else drop to symbolic.
     A register the arms disagree about is LOST: its bare name reads like the entry value
@@ -1290,7 +1341,8 @@ def _merge(dst: State, a: State, b: State):
     back to the receiver alias in _leaf, so an instance method whose then-arm overwrote x1
     printed `this` for it after the join, on a path where x1 is provably not this. The
     disagreement is a fact about the register and the map has to hold it."""
-    agreed = {r: a.reg[r] for r in a.reg if r in b.reg and b.reg[r] == a.reg[r]}
+    agreed = {r: j for r in a.reg if r in b.reg
+              and (j := _joined(a.reg[r], b.reg[r])) is not None}
     # sorted, because this INSERTS into the map that `_pin` later walks in insertion order
     # to hand out temporary names. A set of strings iterates in an order that depends on
     # Python's per-process hash seed, so leaving it unsorted made two runs over the same
@@ -1303,7 +1355,8 @@ def _merge(dst: State, a: State, b: State):
             agreed[r] = V(r, P_ATOM)
             dropped.add(r)
     dst.reg = agreed
-    dst.slot = {k: a.slot[k] for k in a.slot if k in b.slot and b.slot[k] == a.slot[k]}
+    dst.slot = {k: j for k in a.slot if k in b.slot
+                and (j := _joined(a.slot[k], b.slot[k])) is not None}
     # ...and the same rule for the records, with the freshness ANDed: a record only one
     # path justifies would be spelled on the path that never made it, and one arm having
     # written memory makes it unfresh for both (#199).
@@ -3421,7 +3474,7 @@ class Lifter:
                 continue
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
-            st.reg[key] = V(tmp, P_ATOM)
+            st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
         return out
 
     def _call_reads(self, insns) -> dict:
@@ -3983,8 +4036,8 @@ class Lifter:
             self.slot_names.add(tmp)
             out.append(decl)
         if st.reg.get(reg) == v:
-            st.reg[reg] = V(tmp, P_ATOM)
-        st.slot[key] = V(tmp, P_ATOM)
+            st.reg[reg] = V(tmp, P_ATOM, smi=v.smi)
+        st.slot[key] = V(tmp, P_ATOM, smi=v.smi)
         return out
 
     # leaf rendering
@@ -4591,7 +4644,7 @@ class Lifter:
                     continue
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
-                holder[key] = V(tmp, P_ATOM)
+                holder[key] = V(tmp, P_ATOM, smi=v.smi)
         for key, (b, i, _s, _f) in list(st.elem.items()):
             if pat.search(b.text) or pat.search(i.text):
                 del st.elem[key]
@@ -4650,7 +4703,7 @@ class Lifter:
                 continue                      # feeds a later self-referential store
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
-            st.reg[key] = V(tmp, P_ATOM)
+            st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
             st.elem.pop(key, None)
             st.poolbase.pop(key, None)
         return out
@@ -4738,7 +4791,7 @@ class Lifter:
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
             self.raw_names.add(tmp)
-            st.reg[key] = V(tmp, P_ATOM)
+            st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
         # A stack slot has no liveness to consult, it is read back by a later load or not
         # at all, so a slot that reads the written location is dropped rather than named.
         # Dropping is honest (the reload renders as the bare destination register) and does
@@ -5197,6 +5250,11 @@ class Lifter:
         ops = _split_ops(insns[k][2])
         if ops and canon(ops[0]) != "x1":
             st.forget("x1")
+        # The Smi path is taken only where `cmp xS, xD, asr #1` found the tag's own untag
+        # equal to xS, so past it the register holds xS boxed (`_SMI_BOX`, #290).
+        d = canon(ops[0]) if len(ops) >= 4 and _imm(ops[3]) == 31 else None
+        if d is not None and st.reg.get(d, V("")).smi == _SMI_TAG:
+            st.reg[d] = replace(st.reg[d], smi=_SMI_BOX)
 
     def _step_rest(self, st: State, addr, mn, op, note, ops, g) -> list:
         """_step past the flags: what the instruction does to `st`, and its lines."""
@@ -5652,6 +5710,14 @@ class Lifter:
                 self._last_mem = ("load", base, disp, dst)
                 self._frame_moved(st, base, delta)
                 return out
+            # The Mint half of an unbox, `ldur xD, [xB, #7]` past a `tbz wB, #0`: a boxed
+            # value's Mint holds it at Mint::value_offset, 8, less the heap-object tag
+            # (#290). The Smi half is the untag.
+            boxed = g(base)
+            if (boxed.smi == _SMI_BOX and disp == 7 and index is None and not delta
+                    and mn in ("ldr", "ldur") and ops[0].strip()[:1] == "x"):
+                st.set(dst, replace(boxed, smi=0))
+                return []
             if index is not None or base in st.elem:          # element load
                 st.set(dst, self._elem_access(base, index, scale, st, disp))
                 return self._bump(st, base, delta)
@@ -5889,6 +5955,13 @@ class Lifter:
                 # one (#285). Only the low half is read, so a value a 32-bit write
                 # truncated is read whole, as `_leaf` reads a w operand.
                 u = src.wide if src.wide is not None else src
+                if u.smi:
+                    # A Smi tag read back. The tag prints the value it tags, so the
+                    # arithmetic below would divide it a second time: `sbfiz x1, x2, #1,
+                    # #0x1f; sbfx x0, x1, #1, #0x1f` printed `x2.toSigned(32) >> 1`, where
+                    # the CPU has bits 0 to 30 of x2 sign-extended (#290).
+                    st.set(dst, _smi_value(u))
+                    return []
                 st.set(dst, _bin(_signed32(u), ">>", _num(1), P_SHIFT))
             elif lsb + width >= 64:
                 # The field runs to the top bit: a plain shift, arithmetic for sbfx.
@@ -5907,7 +5980,12 @@ class Lifter:
             if lsb is None or width is None:
                 return self._raw(st, dst, mn, op)
             src = g(ops[1])
-            if lsb == 1 and width in (31, 63) and mn == "sbfiz":
+            if lsb == 1 and width == 31 and mn == "sbfiz":
+                # Smi tag (value << 1) under compressed pointers: show the value, and
+                # record that the register holds it tagged, which the untag reads (#290).
+                # A tag of a tagged register tags the word that register holds.
+                st.set(dst, replace(_smi_word(src), smi=_SMI_TAG, wide=None))
+            elif lsb == 1 and width == 63 and mn == "sbfiz":
                 st.set(dst, src)                # Smi tag (value << 1): show the value
             else:
                 # The low `width` bits of the source, sign- or zero-extended, then moved
@@ -6792,7 +6870,7 @@ class Lifter:
             # with, which is the register itself, since anything the map knew before the
             # `if` is in both copies of it.
             va, vb = a.reg.get(r) or bare.setdefault(r, V(r, P_ATOM)), b.reg.get(r) or bare.setdefault(r, V(r, P_ATOM))
-            if va == vb or not (live & _reg_mask((r,))):
+            if _joined(va, vb) is not None or not (live & _reg_mask((r,))):
                 continue
             # Only where an arm COMPUTED something: a name or a field read reaching the
             # join is still visible to the reader, an expression is not. Writing out every
@@ -6842,7 +6920,7 @@ class Lifter:
                 memory is decided by text exactly as before, and where it does the arm
                 assigns the name itself, after its own store, which is the only place the
                 read is sound. Found by tools/irfuzz.py --cfgmem --seed-outputs."""
-                return v != pre or bool(self._reads_mem(v.text))
+                return _joined(v, pre) is None or bool(self._reads_mem(v.text))
             # The initialiser exists only for an arm that leaves the value alone. Where
             # both arms assign it, giving one anyway would DUPLICATE the entry expression
             # 506 extra byte-offset field lines on the corpus, paid for a value no path
@@ -7283,7 +7361,7 @@ class Lifter:
                     continue
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
-                st.reg[key] = V(tmp, P_ATOM)
+                st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
                 st.elem.pop(key, None)
                 st.poolbase.pop(key, None)
         # Anchored above the loop, as a carried name is. A goto out of the loop hands its

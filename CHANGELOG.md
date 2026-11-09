@@ -421,6 +421,43 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A Smi tag read back gives the value back, not half of it.** `sbfiz xD, xN, #1, #0x1f`
+  is the Smi tag under compressed pointers, bits 0 to 30 of xN sign-extended and shifted
+  up one. Tier 3 prints it as xN, the Dart value it tags, which is how a store, a call and
+  a return read it, but the untag `sbfx #1, #0x1f` printed machine arithmetic on that
+  value, so a tag read back was divided twice: `sbfiz x1, x2, #1, #0x1f; sbfx x0, x1, #1,
+  #0x1f` printed `x2.toSigned(32) >> 1` where the CPU has bits 0 to 30 of x2
+  sign-extended, `x2.toSigned(31)`, and the w form printed the same (#290). The tag now
+  records on its value that the register holds it tagged, `V.smi`, and the untag reads it
+  back: `x2.toSigned(31)`, or x2 where the value's bound proves it fits. Every tag on the
+  fixtures and the seven app-sweep libraries is a box-or-tag check, `cmp xN, xD, asr #1;
+  b.eq`, and the path tier 3 follows past it is the one where that comparison found xN
+  fits, so there the register holds xN boxed and both halves of an unbox give xN back: the
+  untag, and the Mint's value field, `ldur xR, [xD, #7]`, which printed as a field of the
+  int, `a1.field_0x8`. The record goes where the value goes, through a 32-bit write, a
+  name a stale register or a frame slot gives it, and a tag of a tagged register, which
+  tags the word. Two paths that disagree on it agree on the value and drop the record, so
+  a getter that boxes on one path and loads the field on the other still returns the
+  field, and an untag past such a join reads the word as before.
+
+  Measured against main over every range, lines counted by `difflib`. 16 ranges change on
+  each fixture, 19 lines: 17 read a boxed value's Mint field as the value, `if (a1 ==
+  THR.field_0x78.field_0x9b1.field_0x8)` for `a1.field_0x8 == ...`, and 2 untag a box, at
+  0xfbfd4, which multiplied half the value, `(t0.field_0x8.toSigned(32) >> 1) * 0x2d51`,
+  and multiplies `t0.field_0x8`. On FluffyChat, kazumi, labplus, jsdict, tsdm_client,
+  anytime and xeonjia 45, 43, 41, 36, 52, 48 and 32 ranges change: 56, 47, 38, 31, 56, 46
+  and 30 Mint-field lines, 4, 2, 4, 4, 4, 2 and 0 untag lines, and in 1, 0, 5, 6, 0, 7 and
+  5 ranges an unbox, `t8 = t1.toSigned(32) >> 1; if (t1 & 1 != 0) { t8 = t1.field_0x8; }`,
+  collapses to the value, with the temporaries after it renumbered. Most are the loop
+  counter of `ChangeNotifier.notifyListeners`, reloaded boxed from its frame slot after
+  each listener call, which reads `t1 += 1` where it read `t1 = t8 + 1`, one more than
+  half of t1. Against unicorn 2.1.4, over random runs of up to seven instructions with a
+  tag that end in an untag, three seeds of 5,000: of the runs where nothing but a tag or
+  the untag reads a tag, 10,363 of 11,524 disagree on main and 0 of 11,551 here. Runs
+  where another instruction reads a tag, an add, a shift or a compare, still read the
+  value as the word, 675 of 3,303 disagree here and 3,089 of 3,294 on main; that is the
+  reading of a tag by arithmetic, which this does not change.
+
 - **A 32-bit `sdiv` divides the low halves of its registers, read as signed.** `sdiv w0,
   w1, w2` divides the low 32 bits of each register as signed values and keeps the low half
   of the quotient. Tier 3 printed `(x1 ~/ x2).toUnsigned(32)`, the whole registers
