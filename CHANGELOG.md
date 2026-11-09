@@ -421,6 +421,47 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A Code object called through LR is read at its tagged offset.** Tier 3 kept x30, LR,
+  among its untagged roles by name, so a read through it took no heap-object tag bias.
+  From 3.3 on, AOT code calls a pool Code through LR: `Assembler::BranchLink` takes
+  `code_reg = FLAG_precompiled_mode ? LR : CODE_REG` and calls `FieldAddress(code_reg,
+  Code::entry_point_offset(entry_kind))` (assembler_arm64.cc:833-845 at 3.12.2, and so
+  at every tag read from 3.3.0-174.2.beta to 3.13.0; 2.19.6 to 3.2.6 load CODE_REG).
+  `ldr x30, [x27, #0x13e0]; ldur x30, [x30, #7]; blr x30` reads Code+8, the entry
+  point, and `_get_ffi_native_resolver` at 0x25a0 on the clean fixture printed
+  `pool_0x13e0.field_0x7(x1, NULL);` beside `pool_0x13e8.field_0x8(...);`, the same read
+  through x8, where 0x7 is no word-aligned field (#280). LR is untagged now only where
+  tier 3's graph proves it holds a return address: on entry with no write on any way in,
+  or after a call. That is a must-analysis over the blocks, one bit each, so a join holds
+  it only where every predecessor does and code no edge reaches holds it nowhere. Any
+  other read or store through LR takes the bias, as one through any register of unknown
+  value does, in `lift`, `decompile`, `export`, `ffi` and `jadart.decompile`. arm32's
+  r14 takes the same rule, which no command reaches, as no command lifts arm32 rows.
+
+  Measured with `lift` over every range against main, at the CLI's recursion limit.
+  Every read through LR on both fixtures and the seven app-sweep libraries follows a
+  load into LR earlier in its own block, from the pool, a far pool entry or the thread,
+  and takes the bias now; none reads a return address and none stores through LR.
+  Clean: 520 reads, 520 lines in 356 ranges change, each `pool_0x....field_0x7(` to
+  `.field_0x8(`, and no other line; obf the same, 520 in 356. The apps: 23,598 lines in
+  12,645 ranges, FluffyChat 14,565, kazumi 1,816, labplus 969, jsdict 897, tsdm_client
+  4,119 and anytime 1,232, and none on xeonjia (2.19.6, which calls through CODE_REG).
+  652 of tsdm_client's call the unchecked entry, `.field_0x17(` to `.field_0x18(`,
+  Code+0x18 (raw_object.h:2026 at 3.11.5); every other one is `.field_0x7(` to
+  `.field_0x8(`. The three reads through a Code LR loads from the thread, one on kazumi
+  and two on tsdm_client, print no line. Lines calling `pool_0x....field_0x7(` go from
+  520 and 520 to 0 on the fixtures and from 22,946 to 0 on the apps, and no read through
+  LR takes an odd offset on any of the nine. `tools/quality.py`, `pbfuzz --census` and
+  its 400 generated runs, `irfuzz --corpus`, `--cfg` and `--cfg --nested`, and `cfgcheck`
+  print what they print on main. `export` changes 398 lines in 43 files of the clean
+  fixture and 79 in 7 of the obf one, all that respelling, and tier 2 is byte-identical.
+  CPU seconds of `lift_function`, main then this: the clean fixture's largest range,
+  0xed904, 0.121 on both, best of 9; FluffyChat's, 0x750f3c, 0.232 and 0.228, best of 5;
+  4,000 calls through LR in a row 0.20 on both, 20,000 reads through LR in one block
+  0.15, 1,000 loops reading LR at their head 0.51, and 2,000 joins each reading LR, one
+  arm loading it and the other calling, 59.0 and 58.6, which is main's cost for that
+  shape and not this change's.
+
 - **A Smi untag reads bit 31 as the sign.** `sbfx xD, xN, #1, #0x1f` is SmiUntag under
   compressed pointers, `sbfm` with immr 1 and imms kSmiBits + 1 = 31 at all eight tags
   read from 2.19.6 to 3.13.0: bits 1 to 31 of xN, sign-extended from bit 31, which is

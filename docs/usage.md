@@ -283,7 +283,7 @@ libnative.so   pool_0xd650
       printToConsole("Main function: process_data_complete");
       printToConsole("VULNERABILITIES ACTIVE: Buffer overflow, weak crypto, format string");
   _open@9050071  0x31cf50  136 bytes
-      pool_0xd6d8.field_0x7("libnative.so", NULL);
+      pool_0xd6d8.field_0x8("libnative.so", NULL);
 ```
 
 `nm -D` on that `libnative.so` exports both names, and `process_data_complete` is the one

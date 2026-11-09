@@ -13227,7 +13227,7 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
     # round the call and reloaded after, not two pushed arguments (#147). Which number it
     # gets is not the point and has moved twice, with #173 and again with #198, because it
     # counts the values named ahead of it.
-    assert any(re.fullmatch(r"var t\d+ = pool_0x2650\.field_0x7\(\.\.\.\);", l)
+    assert any(re.fullmatch(r"var t\d+ = pool_0x2650\.field_0x8\(\.\.\.\);", l)
                for l in body), body
 
 def test_a_raw_line_says_what_the_registers_it_reads_hold():
@@ -13701,6 +13701,132 @@ def test_the_ffi_sequence_on_the_clean_fixture_reads_the_thread_as_written():
     with contextlib.redirect_stdout(out):
         assert cli.main(["lift", CLEAN, "0x1390e8"]) == 0
     assert "var t3 = THR.field_0x7d0(...);" in out.getvalue(), out.getvalue()
+
+
+
+def test_a_code_object_called_through_lr_is_read_at_its_tagged_offset():
+    """LR is the role of a return address, not of every value in x30 (#280).
+
+    `_byte_off` kept x30 in the untagged roles by its name, so a load through it took no
+    heap-object tag bias. From 3.3 on, AOT code calls a pool Code through LR
+    (`Assembler::BranchLink`, `code_reg = FLAG_precompiled_mode ? LR : CODE_REG`):
+    `ldr x30, [x27, #0x13e0]; ldur x30, [x30, #7]` reads Code+8, the entry point, and it
+    printed `pool_0x13e0.field_0x7(...)` beside `pool_0x13e8.field_0x8(...)` for the
+    same read through x8. A value the code put in LR is spelled as in any register."""
+    lift = _lift_rows
+    # The call, off the pool, off the thread and off a far pool entry.
+    assert lift([("ldr", "x30, [x27, #0x10]"), ("ldur", "x30, [x30, #7]"),
+                 ("blr", "x30"), ("ret", "")]) == ["return pool_0x10.field_0x8(...);"]
+    assert lift([("ldr", "x30, [x26, #0xd0]"), ("ldur", "x30, [x30, #7]"),
+                 ("blr", "x30"), ("ret", "")]) == \
+        ["return THR.field_0xd0.field_0x8(...);"]
+    assert lift([("add", "x30, x27, #9, lsl #12"), ("ldr", "x30, [x30, #0x7e8]"),
+                 ("ldur", "x30, [x30, #7]"), ("blr", "x30"), ("ret", "")]) == \
+        ["return pool_0x97e8.field_0x8(...);"]
+    # A read into another register, a store through LR, and a value moved into it.
+    got = lift([("ldr", "x30, [x27, #0x10]"), ("ldur", "x0, [x30, #7]"),
+                ("stur", "x0, [x19, #7]"), ("ret", "")])
+    assert "x19.field_0x8 = pool_0x10.field_0x8;" in got, got
+    assert lift([("ldr", "x30, [x27, #0x10]"), ("stur", "x0, [x30, #7]"),
+                 ("ret", "")])[0] == "pool_0x10.field_0x8 = x0;"
+    assert lift([("mov", "x30, x1"), ("ldur", "x0, [x30, #7]"), ("ret", "")]) == \
+        ["return x1.field_0x8;"]
+    # A copy of the thread in LR is the thread, as in any register (#273).
+    assert lift([("mov", "x30, x26"), ("ldr", "x0, [x30, #0x68]"), ("ret", "")]) == \
+        ["return THR.field_0x68;"]
+
+
+def test_lr_is_untagged_only_while_every_way_in_holds_a_return_address():
+    """LR holds a return address on entry and after a call, and nowhere else the graph
+    cannot show: a join keeps it only where every way in holds one, and code no edge
+    reaches holds none (#280). Where it is not shown, a read through LR takes the bias,
+    as one through any register of unknown value does. The entry value, a call's return
+    address and a join every way into which holds one are guards and print the same on
+    main; a join or a loop head one way into which does not, and code no edge reaches,
+    do not."""
+    from jadart.cfg import UNREACHED
+    lift = _lift_rows
+    read = [("ldr", "x0, [x30, #8]"), ("stur", "x0, [x19, #7]"), ("ret", "")]
+
+    def through(rows):
+        return [ln for ln in rows if ln.startswith("x19.field_0x8 = ")]
+    # Guards: the entry value, what a call leaves, and a call after a pool load.
+    assert through(lift(read)) == ["x19.field_0x8 = LR.field_0x8;"]
+    got = through(lift([("bl", "#0x100")] + read))
+    assert len(got) == 1 and re.fullmatch(r"x19\.field_0x8 = t\d+\.field_0x8;",
+                                          got[0]), got
+    got = through(lift([("ldr", "x30, [x27, #0x10]"), ("bl", "#0x100")] + read))
+    assert len(got) == 1 and got[0].endswith(".field_0x8;"), got
+
+    # A join: kept where neither arm writes LR and where both call, not where one arm
+    # loads a pool object into it.
+    def join(arm):
+        return through(lift([("cbz", "x2, #0xc"), arm, ("nop", "")] + read))
+    assert join(("add", "x3, x3, #1")) == ["x19.field_0x8 = LR.field_0x8;"]
+    assert join(("ldr", "x30, [x27, #0x10]")) == ["x19.field_0x8 = x30.field_0x9;"]
+    got = through(lift([("cbz", "x2, #0xc"), ("bl", "#0x100"), ("b", "#0x10"),
+                        ("bl", "#0x200")] + read))
+    assert len(got) == 1 and got[0].endswith(".field_0x8;"), got
+    # A loop head, entered with the return address and come back to with a pool object.
+    got = lift([("ldr", "x0, [x30, #8]"), ("stur", "x0, [x19, #7]"),
+                ("ldr", "x30, [x27, #0x10]"), ("subs", "x2, x2, #1"), ("b.ne", "#0x0"),
+                ("ret", "")])
+    assert through(got) == ["x19.field_0x8 = t1.field_0x9;"], got
+
+    # Code no edge reaches falls into the read: the body has no proof there, and the
+    # block printed again under the section, from the section's pool load, takes it too.
+    got = lift([("cbz", "x3, #0x10"), ("mov", "x25, x1"), ("b", "#0x10"),
+                ("ldr", "x30, [x27, #0x10]")] + read)
+    at = got.index("// " + UNREACHED)
+    assert through(got[:at]) == ["x19.field_0x8 = LR.field_0x9;"], got
+    assert through(got[at:]) == ["x19.field_0x8 = pool_0x10.field_0x9;"], got
+
+    # The dispatch-table call: LR is the index there, an interior value no read goes
+    # through, and it prints as it did.
+    assert lift([("sub", "x30, x0, #0xfda"), ("ldr", "x30, [x21, x30, lsl #3]"),
+                 ("blr", "x30"), ("ret", "")]) == \
+        ["var t0 = dispatch(...);   // virtual dispatch", "return t0;"]
+
+
+def test_lr_on_arm32_rows_is_untagged_only_as_a_return_address():
+    """r14 is arm32's LR and the same rule holds there: a Code object it is loaded with is
+    read at its tagged offset, the entry value and a call's return address at the offset
+    as written (#280). arm32 is not in LIFTABLE_ARCHS, so no command lifts its rows; this
+    binds the target directly, as the arm32 tests do. The width is matched loosely."""
+    from jadart import expr as E
+
+    def lift(rows):
+        with E.use_target(E.ARM32):
+            return [ln.strip() for ln in E._lift_function(
+                [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+                None, None, None, "  ", 1, None)]
+    read = [("ldr", "r0, [lr, #3]"), ("str", "r0, [r1, #3]"), ("bx", "lr")]
+    got = lift([("ldr", "lr, [r5, #0x1f]")] + read)
+    assert re.fullmatch(r"r1\.field\d*_0x4 = pool_0x1f\.field\d*_0x4;", got[0]), got
+    got = lift(read)
+    assert re.fullmatch(r"r1\.field\d*_0x4 = LR\.field\d*_0x3;", got[0]), got
+    got = lift([("bl", "#0x100")] + read)
+    assert any(re.fullmatch(r"r1\.field\d*_0x4 = \w+\.field\d*_0x3;", ln)
+               for ln in got), got
+    assert E._T is E.ARM64
+
+
+def test_get_ffi_native_resolver_on_the_clean_fixture_calls_the_code_entry_point():
+    """#280 as reported: 0x25a0 on the clean fixture calls two pool Codes through their
+    entry points, the first through LR and the second through x8, and both read Code+8.
+    Through the library API and `lift`."""
+    _needs_capstone()
+    import contextlib
+    import io
+    from jadart import cli
+    body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x25a0")[0]["body"]]
+    assert "pool_0x13e0.field_0x8(x1, NULL);" in body, body
+    assert "pool_0x13e8.field_0x8(...);" in body, body
+    assert not [ln for ln in body if ".field_0x7(" in ln], body
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert cli.main(["lift", CLEAN, "0x25a0"]) == 0
+    assert "pool_0x13e0.field_0x8(x1, NULL);" in out.getvalue(), out.getvalue()
 
 
 def test_the_low_doubleword_lane_of_a_v_register_reads_what_dn_holds():
@@ -14515,7 +14641,7 @@ def test_a_phi_name_nothing_reads_is_dropped():
     import jadart
     body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x29ce18")[0]["body"]]
     assert not any(ln.endswith("= NULL;") for ln in body), body
-    assert "var t0 = pool_0x218.field_0x7(...);" in body, body
+    assert "var t0 = pool_0x218.field_0x8(...);" in body, body
 
 
 def test_a_call_whose_double_result_is_read_names_it():
