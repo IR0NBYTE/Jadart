@@ -421,6 +421,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A load from null plus 0x20 reads the word there.** arm64 code makes `true` and
+  `false` with `add xD, x22, #0x20` and `#0x30`, the objects sitting at those offsets
+  from null, and the load path read the same table: `ldr x0, [x22, #0x20]`, a word
+  inside `true`, printed `return true;` (#317). The table is read on the load path only
+  where it is the thread's, as on arm32, and the load prints `NULL.field_0x20`. The VM's
+  own decoder names the two off an `add` alone (`instructions_arm64.cc`, Rn NULL_REG,
+  with `kTrueOffsetFromNull` and `kFalseOffsetFromNull` from `pointer_tagging.h`), and so
+  do aotopsy and blutter. The nine binaries load from x22 once each, `ldurb` at -1, and
+  their tier 3 dump is byte-identical to main's.
+
 - **An `stp` off an element address prints both stores.** An element store printed one
   target, so `add x2, x3, x4, lsl #3; stp x5, x6, [x2]` printed `x3[x4] = x5;` and
   nothing for x6 (#316), the store side of #306. Each word is now a store of its own,

@@ -20846,6 +20846,18 @@ def test_an_stp_off_an_element_address_prints_both_stores():
         "return x0;"]
 
 
+def test_a_load_from_null_plus_a_bool_offset_reads_the_word_there():
+    """`add x0, x22, #0x20` is how arm64 code makes `true`: the object is at null +
+    0x20. A load from that address reads a word inside the object, and printed `true`
+    as well (#317). The table of offsets off NULL names objects only for the `add`."""
+    def lift(*rows):
+        return _lift_rows([*rows, ("ret", "")])
+    assert lift(("ldr", "x0, [x22, #0x20]")) == ["return NULL.field_0x20;"]
+    assert lift(("ldr", "x0, [x22, #0x30]")) == ["return NULL.field_0x30;"]
+    assert lift(("add", "x0, x22, #0x20")) == ["return true;"]
+    assert lift(("add", "x0, x22, #0x30")) == ["return false;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
