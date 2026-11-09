@@ -839,8 +839,14 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
         what this function already does with an irreducible loop and is written down
         rather than wrong.
         """
-        latches = [n for n in blocks
-                   if header in blocks[n].succ and dominates(header, n)]
+        # The latches are the header's predecessors that it dominates, and `preds` has
+        # them. Asking every block whether it jumps to the header made N loops cost
+        # N * N: 3.0 million lines for 1,000 loops in a row (#301). `preds` lists them
+        # in the order of `blocks`, as that scan did, and a block with both edges on the
+        # header twice, which the walk skips. Not that the order could matter: the walk
+        # gathers one set from any order, and it is asked only what is in it and which
+        # exit most of its edges take, the lowest address first.
+        latches = [n for n in preds[header] if dominates(header, n)]
         nodes = {header}
         stack = list(latches)
         while stack:
