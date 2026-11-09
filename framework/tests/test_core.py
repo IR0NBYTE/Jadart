@@ -20119,6 +20119,37 @@ def test_a_smi_tag_still_prints_the_value_it_tags():
     assert _lift_value(box, "x1")[0] == "x2"
 
 
+def test_an_ldp_into_its_own_base_reads_both_words_off_the_base_before_it():
+    """`ldp x8, x0, [x8, #8]` reads both words at the address x8 held before it ran: the
+    ARM ARM computes the address before either register is written. Tier 3 wrote x8 and
+    then read the second word off the value just loaded, `x8.field_0x9.field_0x11`, and
+    the w and ldpsw forms did the same (#293). The two shapes the ARM ARM leaves
+    CONSTRAINED UNPREDICTABLE print as they are: a writeback into a loaded register at a
+    zero immediate read as a plain load, and an ldp into one register twice kept the
+    second word. capstone decodes neither, so they reach the lifter only as rows."""
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    tail = [("add", "x0, x0, x8"), ("ret", "")]
+    assert lift([("ldp", "x8, x0, [x8, #8]")] + tail) == [
+        "return x8.field_0x11 + x8.field_0x9;"]
+    # The same second word the rows print with another first register.
+    assert lift([("ldp", "x1, x0, [x8, #8]"), ("add", "x0, x0, x1"), ("ret", "")]) == [
+        "return x8.field_0x11 + x8.field_0x9;"]
+    assert lift([("ldp", "w8, w0, [x8, #8]")] + tail) == [
+        "return x8.field_0xd + x8.field_0x9;"]
+    assert lift([("ldpsw", "x8, x0, [x8, #-8]")] + tail) == [
+        "return ((x8 - 4).field_0x1 << 32 >> 32) + ((x8 - 8).field_0x1 << 32 >> 32);"]
+    for mn, op in (("ldp", "x8, x0, [x8, #0]!"), ("ldp", "x0, x8, [x8], #0"),
+                   ("ldr", "x8, [x8, #0]!"), ("ldp", "x0, x0, [x8, #8]"),
+                   ("ldpsw", "x0, x0, [x8]")):
+        assert lift([(mn, op)] + tail) == [f"{mn} {op}", "return x0 + x8;"], (mn, op)
+    assert lift([("ldp", "d0, d0, [x1]"), ("ret", "")]) == ["ldp d0, d0, [x1]",
+                                                           "return d0;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

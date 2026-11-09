@@ -5651,9 +5651,16 @@ class Lifter:
                 return self._verbatim(st, mn, op, op, dst)
             (base, disp, index, scale, wb), post = addr
             delta = disp if wb else post
-            if delta and base in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]):
-                # writeback into a loaded register: arm64 calls it unpredictable, so
-                # neither do we
+            # The two shapes the ARM ARM leaves CONSTRAINED UNPREDICTABLE, where no one
+            # outcome is the machine's, so the row stays as it is. A writeback into a
+            # loaded register is one whatever the immediate: `[x8, #0]!` and `[x8], #0`
+            # write back too, and were read as plain loads. An `ldp` into one register
+            # twice is the other (LDPOVERLAP). capstone decodes neither, so only a row
+            # that did not come from it reaches here (#293).
+            moves = wb or "[" not in ops[-1]
+            if ((moves and base in _regs(ops[:2 if mn in ("ldp", "ldpsw") else 1]))
+                    or (mn in ("ldp", "ldpsw") and len(ops) >= 3
+                        and canon(ops[0]) == canon(ops[1]))):
                 return self._verbatim(st, mn, op, op, dst)
             if post:
                 disp = 0                     # post-index: the access is at the OLD base
@@ -5745,14 +5752,19 @@ class Lifter:
             # A cast names the base only where the access is at the offset it reads,
             # which a folded displacement is not.
             cast = self.cast_at.get((here, base))
-            bv, off = self._rebase(base, g(base), disp)
+            # Both words are read off the base as it was before the instruction: an `ldp`
+            # whose first register is its base wrote it, and the second word was then read
+            # off the value just loaded, `x8.field_0x9.field_0x11` for `ldp x8, x0, [x8,
+            # #8]` (#293).
+            at_base = g(base)
+            bv, off = self._rebase(base, at_base, disp)
             v = self._field(bv, off, w, cast if off == disp + 1 else None)
             if sign and w < 8 and _reg_file(ops[0]) == "x":
                 v = _extended(v, 8 * w, True)
             st.set(dst, v)
             if second:
                 w2 = _access_width(mn, ops[1])
-                bv2, off2 = self._rebase(base, g(base), second[1])
+                bv2, off2 = self._rebase(base, at_base, second[1])
                 v2 = self._field(bv2, off2, w2, cast if off2 == second[1] + 1 else None)
                 if sign and w2 < 8 and _reg_file(ops[1]) == "x":
                     v2 = _extended(v2, 8 * w2, True)

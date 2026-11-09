@@ -421,6 +421,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An `ldp` into its own base reads both words off the base it had.** `ldp x8, x0,
+  [x8, #8]` loads both words from the address x8 held before it ran, and tier 3 wrote
+  x8 first and read the second word off the value just loaded: with `add x0, x0, x8;
+  ret` after it, `return x8.field_0x9.field_0x11 + x8.field_0x9;`, which now prints
+  `return x8.field_0x11 + x8.field_0x9;`, the second word the same rows print with x1
+  as the first register (#293). The w and `ldpsw` forms had the same fault. The two
+  load shapes the ARM ARM leaves CONSTRAINED UNPREDICTABLE now print as they are: a
+  writeback into a loaded register at a zero immediate, `[x8, #0]!` or `[x8], #0`,
+  which read as a plain load, and an `ldp` into one register twice, which kept the
+  second word. capstone decodes neither, so only rows handed to `lift_function` reach
+  them. Against unicorn, every `ldp` and `ldpsw` capstone decodes with the base as the
+  first, the second or neither register, x and w, signed offset, pre and post-index at
+  four immediates, 60 in all: 12 printed a wrong value on main and none do now; of 22
+  unpredictable rows, 19 picked one outcome on main and none do now. No `ldp` or
+  `ldpsw` on either fixture or FluffyChat names its base as a register or one register
+  twice, and no load there writes back into its own base, 4,081,069 instructions in
+  all; the tier 3 dump of those three and the six other app-sweep libraries is
+  byte-identical to main's.
+
 - **A Smi tag read back gives the value back, not half of it.** `sbfiz xD, xN, #1, #0x1f`
   is the Smi tag under compressed pointers, bits 0 to 30 of xN sign-extended and shifted
   up one. Tier 3 prints it as xN, the Dart value it tags, which is how a store, a call and
