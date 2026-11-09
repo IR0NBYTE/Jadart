@@ -1418,9 +1418,14 @@ def strip_boilerplate(ann: list, slow: set = None) -> list:
             continue
         ops = _split_ops(op)
         dst0 = canon(ops[0]) if ops else ""
-        # frame chain: any stp/ldp of the FP/LR pair, or SP<->FP moves / SP frame adjust
-        if mn in ("stp", "ldp") and {canon(ops[0]) if ops else "",
-                                     canon(ops[1]) if len(ops) > 1 else ""} == {"x29", "x30"}:
+        # frame chain: an stp/ldp of the FP/LR pair off SP, or SP<->FP moves / SP frame
+        # adjust. Off another base the pair stores FP and LR to an object or loads both
+        # from one, and dropping it hid that write (#294). Nor is FP taken as a base:
+        # every such pair on both fixtures and FluffyChat is off x15, the push
+        # pre-indexed and the pop post-indexed.
+        if (mn in ("stp", "ldp") and len(ops) >= 3
+                and {canon(ops[0]), canon(ops[1])} == {"x29", "x30"}
+                and (m := _mem(ops[2])) and _T.roles.get(m[0]) == "SP"):
             nop(i)
         elif (mn in ("mov", "add") and _T.roles.get(dst0) == "FP" and len(ops) > 1
               and _T.roles.get(canon(ops[1])) == "SP"):

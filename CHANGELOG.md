@@ -421,6 +421,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The frame's push and pop are stripped only off SP.** `strip_boilerplate` made any
+  `stp` or `ldp` of x29 and x30 a nop as the frame chain, whatever its base, so `ldp
+  x29, x30, [x0, #0x10]` loaded FP and LR from an object with no line saying so: with
+  `mov x0, x30; ret` after it, `return LR;`, which now prints `return
+  x0.field_0x19;`, and `stp x29, x30, [x0, #0x10]` now prints its two stores (#294).
+  The pair is stripped where its base is SP and nowhere else, FP included: every one
+  on the two fixtures and FluffyChat is off x15, the push pre-indexed and the pop
+  post-indexed, 15,136, 15,126 and 89,493 of them, all stripped as before, and the
+  tier 3 dump of those three and the six other app-sweep libraries is byte-identical
+  to main's.
+
 - **An `ldp` into its own base reads both words off the base it had.** `ldp x8, x0,
   [x8, #8]` loads both words from the address x8 held before it ran, and tier 3 wrote
   x8 first and read the second word off the value just loaded: with `add x0, x0, x8;
