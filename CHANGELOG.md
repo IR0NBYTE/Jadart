@@ -421,6 +421,28 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A conditional's follow node no longer waits on a block laid out after the rest.**
+  `follow` stops once no block left to visit carries one arm's bit (#302), but an arm
+  that jumps to a trap or a slow path placed after the `ret` keeps its bit on that
+  block, which reverse postorder puts last, so each such check still scanned the rest
+  of the function; and where several checks share that block it carried both bits,
+  dominated by none of them but the first, which no stop could see. N loops in a row
+  with such a check visited 24 million blocks at 4,000 loops, and `tier3_graph` took
+  7.05 s of CPU where 1,000 took 0.44 (#311). A block more than `FOLLOW_NEAR` (16)
+  places on that the conditional does not dominate is now never tagged, as nothing it
+  leads to can be the follow node either; and one with one bit, all of whose edges in
+  come from blocks done with, passes its bit on at once and is done with, one for each
+  tagged block the scan visits. The answer is the same: on 3,000 random graphs with
+  ends laid out last and shared, half of them with every block asked, each follow node
+  is the one the scan to the end gives, crafted shapes print the same text, and the
+  whole-binary tier 3 dump of both fixtures and of the seven app-sweep libraries is
+  byte-identical to main's. CPU seconds of `tier3_graph`, main then this, at 1,000,
+  2,000, 4,000 and 8,000 loops: a trap per loop 0.44, 1.75, 7.05 and 28.50 against
+  0.02, 0.05, 0.11 and 0.24; one trap they share 0.40, 1.56, 6.20 and 26.90 against
+  0.08, 0.27, 1.02 and 4.26, where what is left is `_idoms` building the post-dominator
+  tree, 0.94 s of the 1.02 at 4,000. On the clean fixture `follow` takes 0.054 s where
+  it took 0.060; asking every block, it took 0.068.
+
 - **A read through x29 past a write that is not the frame chain reads its value.**
   Tier 3 read an access off x29 as a frame slot by the register's role, even past a row
   that put something else there: `ldr x29, [x0, #8]; ldur x0, [x29, #-8]; ret` printed

@@ -6922,6 +6922,146 @@ def test_a_follow_node_costs_the_same_per_instruction_at_any_length():
         assert 0 < small and large < 1.5 * small, (end, small, large)
 
 
+def test_a_follow_node_is_the_scan_s_where_an_arm_ends_late_or_shares_its_end():
+    """A guard test (#311). `follow` takes a block as done before the scan reaches it
+    where `cur` does not dominate it, or where it carries one bit and every edge into it
+    comes from a block done with. This holds each answer to the scan run to the end of
+    the function, on 3,000 random graphs built the way those blocks come about: arms
+    that end in a chain of blocks laid out after everything else, ends that several
+    branches share, loops, and second entries; half of them with `cfg.FOLLOW_NEAR` at 0,
+    so that every block is asked. Traced at the return, as #302's guard is."""
+    import random
+    from jadart import cfg
+    from jadart.cfg import Block, structure
+    seen = {"found": 0, "none": 0, "undominated": 0, "late": 0}
+
+    def scanned(cur, blocks, rpo, dominates, preds):
+        succs = blocks[cur].succ
+        if len(succs) != 2 or succs[0] == succs[1] or cur not in rpo:
+            return None
+        tag = {s: 1 << bit for bit, s in enumerate(succs) if rpo.get(s, -1) > rpo[cur]}
+        for s in tag:
+            # An arm whose block is no candidate the moment it is tagged, and which the
+            # scan reaches only after the other arm's.
+            if (all(p == cur for p in preds[s] if rpo.get(p, 1 << 30) < rpo[s])
+                    and any(rpo[o] < rpo[s] for o in tag if o != s)):
+                seen["late"] += 1
+        for n in sorted(rpo, key=rpo.get):
+            t = tag.get(n, 0) if rpo[n] > rpo[cur] else 0
+            if t == 3 and dominates(cur, n):
+                return n
+            seen["undominated"] += bool(t) and not dominates(cur, n)
+            for s in blocks[n].succ if t else ():
+                if s in rpo and rpo[s] > rpo[n]:
+                    tag[s] = tag.get(s, 0) | t
+        return None
+
+    def returned(frame, event, arg):
+        if event == "return":
+            cur, up = frame.f_locals["cur"], frame
+            while up.f_code.co_name != "structure":
+                up = up.f_back
+            f = up.f_locals                     # the graph `structure` was handed
+            want = scanned(cur, f["blocks"], f["rpo"], f["dominates"], f["preds"])
+            assert arg == want, (cur, arg, want)
+            seen["found" if want is not None else "none"] += 1
+        return returned
+
+    def calls(frame, _event, _arg):
+        code = frame.f_code
+        if code.co_name == "follow" and code.co_filename == cfg.__file__:
+            return returned
+        return None
+    near = getattr(cfg, "FOLLOW_NEAR", None)
+    sys.settrace(calls)
+    try:
+        for seed in range(3000):
+            # Every other graph with every block asked, as these are small.
+            cfg.FOLLOW_NEAR = near if seed % 2 else 0
+            rng = random.Random(seed)
+            n, m = rng.randrange(2, 30), rng.randrange(1, 8)
+            ends = [0x100 * (n + j) for j in range(m)]       # after everything else
+            blocks = {}
+            for i in range(n):
+                a = 0x100 * i
+                k = rng.choice((0, 1, 2, 2, 2))
+                succ = [rng.choice(ends) if rng.random() < 0.3 else
+                        0x100 * min(n - 1, max(0, i + rng.randrange(-3, 6)))
+                        for _ in range(k)]
+                blocks[a] = Block(a, [(a, "nop", "", "")], succ,
+                                  "b.ne" if k == 2 else "b" if k else "ret",
+                                  "x0 != 0" if k == 2 else "")
+            for j, a in enumerate(ends):
+                k = rng.choice((0, 0, 1, 2))
+                succ = [rng.choice(ends[j + 1:] or [0x100 * rng.randrange(n)])
+                        for _ in range(k)]
+                blocks[a] = Block(a, [(a, "nop", "", "")], succ,
+                                  "b.ne" if k == 2 else "b" if k else "brk",
+                                  "x0 != 0" if k == 2 else "")
+            roots = tuple(0x100 * rng.randrange(n + m)
+                          for _ in range(rng.randrange(0, 3)))
+            structure(blocks, 0, orphans=True, entries=roots)
+    finally:
+        sys.settrace(None)
+        cfg.FOLLOW_NEAR = near
+    assert seen["found"] > 400 and seen["none"] > 3000, seen
+    assert seen["undominated"] > 1000 and seen["late"] > 1000, seen
+
+
+def test_a_follow_node_costs_the_same_where_an_arm_ends_after_the_rest():
+    """N loops in a row with a check whose taken arm jumps to a `brk` after the `ret`,
+    one per loop or one they all share: that block came last in reverse postorder, so
+    `follow` carried the arm's bit, or both bits on a block the check does not dominate,
+    to the end of the function for each check, 24 million blocks visited at 4,000 loops
+    (#311). Counted, not timed: the lines run inside `follow`, per instruction, at 30
+    loops and at 120. Scanned to the trap that was 156 and 606, and 154 and 582 with the
+    trap shared; with the trap done with once nothing more can reach it, and the shared
+    one never tagged where the check does not dominate it, 20 and 15, and 48 and 38."""
+    from jadart import cfg
+    from jadart.expr import tier3_graph
+    ran, inside = [0], [0]
+
+    def lines(frame, event, _arg):
+        if event == "line":
+            ran[0] += 1
+        elif event == "return" and frame.f_code.co_name == "follow":
+            inside[0] -= 1
+        return lines
+
+    def calls(frame, _event, _arg):
+        code = frame.f_code
+        if code.co_filename != cfg.__file__:
+            return None
+        if code.co_name == "follow":
+            inside[0] += 1
+        return lines if inside[0] else None
+
+    def per_instruction(n, shared):
+        rows = []
+        for _ in range(n):
+            h = len(rows) * 4
+            rows += [("add", "x2, x2, #1"), ("cbz", None), ("cmp", "x2, x1"),
+                     ("b.lt", f"#{h:#x}")]
+        rows.append(("ret", ""))
+        for k in range(n):
+            rows[4 * k + 1] = ("cbz", f"x9, #{len(rows) * 4:#x}")
+            if not shared:
+                rows.append(("brk", "#0"))
+        if shared:
+            rows.append(("brk", "#0"))
+        ran[0] = 0
+        sys.settrace(calls)
+        try:
+            g = tier3_graph([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        finally:
+            sys.settrace(None)
+        assert sum(s[0] == "loop" for s in g.stmts) == n, g.stmts
+        return ran[0] / len(rows)
+    for shared in (False, True):
+        small, large = per_instruction(30, shared), per_instruction(120, shared)
+        assert 0 < small and large < 1.5 * small, (shared, small, large)
+
+
 def test_json_and_text_agree_on_exit_codes():
     # `jadart -j verify` printed "ok": false on a failed gate and exited 0, so a script
     # branching on $? saw success where a human reading the same run saw failure.
