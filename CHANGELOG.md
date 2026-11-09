@@ -421,6 +421,69 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A monomorphic section is lifted as the body it is, from its own entry.** #266
+  placed the code a Code's monomorphic entry reaches as a section after the body, but
+  lifted it inside the walk of the whole range, which starts on the miss handler and
+  reaches none of it. Nothing in the section had a dominator, so the structurer found
+  no loop in it and no join a dominator speaks for, and the lifter met each of its joins
+  over everything that can reach it. The clean fixture's 868-byte `dyn:call` at
+  0x2f5198 tested `x9 == NULL` where the same rows lifted from +8 name the value `t3`,
+  and printed the loop after it as gotos whose counter no line assigned, so the printed
+  loop never advanced; FluffyChat's `toLowerCase` printed three such loops. The check at
+  +8 and the normal entry at +24 now each root a dominator tree of their own
+  (`cfg.dominator_forest`): the body is placed first among the sections, the check is a
+  guard over its miss handler with the body after it, and the analyses that ask for
+  dominators, and the one that names a call's result in d0, ask from those roots. It
+  starts from bare registers at +8, as before, and again at +24. A switchable call
+  enters +8 with the receiver in x0 and the class id it expects in x5
+  (flow_graph_compiler_arm64.cc:556-575 at 3.12.2), but +24 on is also the normal
+  entry's code, which MegamorphicCallStub enters with the target Function in x0 and the
+  entry address in x1 (stub_code_compiler_arm64.cc:3643-3660), so none of those, nor
+  `this` or an `aN`, holds on every way in; and nothing from +24 on reads the check's
+  flags, through a `cset` or a chain of lone branches, or the class id it left in x16.
+  Only the shape MonomorphicCheckedEntryAOT emits is lifted so, a check that branches
+  back to the miss handler and falls into a block of its own 16 bytes on: the same
+  function and the same offsets, 8 and 24, in all 19 registered releases
+  (assembler_arm64.cc:1941-1965 and object.h:5922-5923 at 3.12.2). A check that also
+  branched into the body would dominate code the callers reach without it. The one
+  flagged range of another shape, FluffyChat's `FixCallersTargetStub`, is lifted as
+  before. The body is what its entries reach along the graph's edges: the code past a
+  trap in it is a section like any other, so a catch entry there that jumps to a return
+  prints the return again from its own state, and one that jumps on takes the REJOIN
+  note, as a section after the body that jumps into it does; neither is a way in the
+  body's joins meet. In a plain body the code past a trap is still part of it (#283).
+
+  Measured with `lift` over every range against main. Clean fixture: all 78 sections
+  change, 188,003 lines to 187,872; their bare-register lines go 215 to 183, of which 78
+  are the miss handler's `br x16` under its guard and the other 105 are as many as the
+  same rows have lifted from +8; loops 0 to 3, as from +8, and gotos 36 to 15. 67 sections
+  say what the +8 lift says, the check and its miss branch aside, and the other 11 only
+  lack the stack check's slow path past their throw, which the +8 lift places as a body
+  does and main does not print either. Nothing else changes but 3 `var tN;` at the top of
+  a body, for a name its section reads in a loop. The obf fixture is the same, 188,090 to
+  187,959. Over the seven app-sweep libraries 4,004 of 4,005 sections change, 4,860,135
+  lines to 4,855,275; bare-register lines 9,477 to 8,598, 4,004 of them the miss
+  handler's; loops 0 to 173, as from +8, and gotos 1,718 to 801. 3,912 sections say what
+  the +8 lift says and 92 only lack code past a trap, a stack check's slow path or, in 20,
+  a Mint's, which main does not print either. 180 `var tN;` are added and 1 dropped at the
+  top of 164 bodies, and no other line changes. No section prints `this` or an `aN`, on
+  any of the nine. `export` changes 12 of the clean fixture's 328 files (850 lines out,
+  728 in), 11 of obf's 312 (845, 724) and 837 of the apps' 10,232 (39,049, 35,168); tier 2
+  is byte-identical on both fixtures. `tools/quality.py`, clean, main then this: 188,001
+  and 187,870 lines, bare-register lines 12,768 and 12,736, byte-offset fields 53,835 and
+  53,834, gotos 5,644 and 5,623 in 1,434 and 1,428 functions, labels 6,128 and 6,113,
+  `(...)` and raw lines the same. `pbfuzz --census` keeps 2,082 wrong reads and 0 stale on
+  both fixtures; out-of-scope names go 814 to 817, three loop latches that now see the
+  slot they reload held a name, each printed as a declined read as from +8, and blocks
+  holding only a declaration nothing reads 1,527 to 1,528, a phi under 0x1be718's null
+  test, as from +8. `irfuzz --corpus`, the pbfuzz cases and `cfgcheck` (0 edge violations,
+  0 dropped) read as on main. `export` takes as long as on main, 16 s and 17 s on the
+  clean fixture and 124 s and 125 s on FluffyChat. A section costs what its rows cost
+  lifted from +8, 0.007 s to 0.011 s for the one at 0x1be718: a body's loops are dominator
+  work it now does, and 1,000 loops in a row behind a monomorphic entry take 13.4 s, as
+  the same rows do as a plain body on main (#282). Behind a check of another shape they
+  take 0.31 s, as on main.
+
 - **A read or write through a copy of THR is at the offset as written.** x26 holds the
   Thread, an untagged address, so `ldr x9, [x26, #0x6c8]` prints `THR.field_0x6c8`.
   Through a copy it took the heap-object tag bias, because `_byte_off` asked the

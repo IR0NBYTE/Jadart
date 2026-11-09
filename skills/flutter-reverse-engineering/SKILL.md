@@ -59,7 +59,11 @@ Every one of these means *the tool declined*, not *the tool failed*:
 
 A section under `// reached by no edge ...` lists what it can be, and which one it is was
 not worked out; it says `the monomorphic entry` only where the snapshot flags the code as
-having one. It starts from bare registers. If it is a catch entry, the VM enters it with
+having one. It starts from bare registers. Where the check falls into the normal entry,
+as MonomorphicCheckedEntryAOT emits, the monomorphic one is the function's body and is
+lifted as one from that entry: its loops and joins read as they would from the entry. It
+starts bare again at the normal entry 24 bytes in, where the callers come in too, so read
+no register there as the receiver. If it is a catch entry, the VM enters it with
 the exception in x0 and the stack trace in x1 (kExceptionObjectReg and
 kStackTraceObjectReg, constants_arm64.h), but nothing in the output says it is one. Where
 it runs on into a return or a throw of the body, that code is printed again under it, from

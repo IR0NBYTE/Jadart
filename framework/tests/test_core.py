@@ -10035,7 +10035,8 @@ def test_tier3_places_the_body_behind_a_monomorphic_entry():
     section does. Either way it starts from bare registers: x1 is the receiver only where
     the function is entered at its first instruction, so it is not `this` here. Its miss
     branch runs into the miss handler, which leads nowhere, so that prints again in the
-    arm rather than as a goto into the body above."""
+    arm rather than as a goto into the body above. Since #278 the monomorphic one is the
+    check as a guard and the body after it, as the rows read lifted from +8."""
     from jadart.cfg import UNREACHED
     miss = "br x16   // x16 holds THR.field_0x258"
     plain = _lift_rows(_MONO_ROWS, 0x1000, receiver={"x1": "this"})
@@ -10045,7 +10046,9 @@ def test_tier3_places_the_body_behind_a_monomorphic_entry():
     from jadart.expr import MONOMORPHIC_ENTRY
     assert "its normal entry is 24 bytes in" in MONOMORPHIC_ENTRY
     body = _lift_rows(_MONO_ROWS, 0x1000, receiver={"x1": "this"}, mono=0x1008)
-    assert body == [miss, "// " + MONOMORPHIC_ENTRY] + plain[2:], body
+    assert body == [miss, "// " + MONOMORPHIC_ENTRY, "L_0x1008:",
+                    "if (x5 != (((x0.tags >> 12) & 0xfffff) << 1)) {", miss, "}",
+                    "return x1.field_0x8;"], body
     # not a monomorphic entry: the address is not where the section starts
     assert _lift_rows(_MONO_ROWS, 0x1000, mono=0x100c)[1] == "// " + UNREACHED
 
@@ -10090,6 +10093,207 @@ def test_a_catch_entry_that_runs_on_into_the_body_says_what_it_does_there():
     assert body[0] == "L_0x10:" and body[-3:-1] == ["// " + UNREACHED, "L_0x8:"], body
     from jadart.expr import REJOIN
     assert body[-1] == "goto L_0x10;   // " + REJOIN, body
+
+
+def test_a_monomorphic_section_is_lifted_as_a_body_of_its_own():
+    """The section #266 places at a monomorphic entry was lifted inside the walk of the
+    whole range, from an entry it is not reached from, so it had no dominator: its loops
+    came out as gotos and every join in it dropped to bare registers (#278). A goto loop
+    printed its counter without the write-back, and a join printed `x9` where both ways
+    in agreed on `x1.field_0x8`. It is structured and lifted as the body it is, from its
+    own entry, as the same rows lifted from +8 read. It still names nothing: x1 is not
+    `this` there. A call's result in d0 is named where it is read, as in a body."""
+    from jadart.expr import MONOMORPHIC_ENTRY
+    loop = _MONO_ROWS[:6] + [("mov", "x2, #0"), ("add", "x2, x2, #1"),
+                             ("cmp", "x2, x1"), ("b.lt", "#0x101c"), ("mov", "x0, x2"),
+                             ("ret", "")]
+    body = _lift_rows(loop, 0x1000, receiver={"x1": "this"}, mono=0x1008)
+    assert body[1:6] == ["// " + MONOMORPHIC_ENTRY, "L_0x1008:",
+                         "if (x5 != (((x0.tags >> 12) & 0xfffff) << 1)) {",
+                         "br x16   // x16 holds THR.field_0x258", "}"], body
+    assert body[6:] == ["var t0 = 0;", "while (true) {", "if ((t0 + 1) >= x1) {",
+                        "t0 += 1;", "break;", "}", "t0 += 1;", "}", "return t0;"], body
+    # a join two ways into it agree at, past a conditional that is not nested
+    join = _MONO_ROWS[:6] + [("ldur", "x9, [x1, #7]"), ("cbz", "x2, #0x102c"),
+                             ("cmp", "x3, #6"), ("b.ne", "#0x1040"), ("b", "#0x1034"),
+                             ("cmp", "x4, #6"), ("b.gt", "#0x1040"),
+                             ("cbz", "x9, #0x1040"), ("ldur", "x0, [x9, #0xb]"),
+                             ("ret", ""), ("mov", "x0, x22"), ("ret", "")]
+    body = _lift_rows(join, 0x1000, receiver={"x1": "this"}, mono=0x1008)
+    assert "if (x1.field_0x8 != 0) {" in body, body
+    assert "return x1.field_0x8.field_0xc;" in body, body
+    assert not any(re.search(r"\b(x9|this)\b", ln.split("//")[0]) for ln in body), body
+    # a call's result in d0 read past a join, which only a walk from the entry was asked
+    # about: the store read the bare d0 (`_d0_result_reads`)
+    dbl = _MONO_ROWS[:6] + [("bl", "#0x2000"), ("cbz", "x1, #0x1028"),
+                            ("mov", "x0, #1"), ("b", "#0x102c"), ("mov", "x0, #2"),
+                            ("stur", "d0, [x0, #7]"), ("ret", "")]
+    body = _lift_rows(dbl, 0x1000, mono=0x1008,
+                      returns=lambda pc: "d0" if pc == 0x2000 else None)
+    assert "var t1 = sub_0x2000(...);" in body and "t2.field_0x8 = t1;" in body, body
+
+
+def test_a_monomorphic_section_starts_bare_again_at_the_normal_entry():
+    """The check at +8 falls into the normal entry at +24, which the callers enter as
+    well (MegamorphicCallStub with the target Function in x0 and the entry address in x1,
+    stub_code_compiler_arm64.cc:3643-3660 at 3.12.2), so nothing the check left there
+    holds on every way in: the class id it loaded into x16, and the flags it set. A
+    branch alone at +24 read the check's comparison, and x16 read as the class id
+    (#278)."""
+    rows = _MONO_ROWS[:6] + [("b.eq", "#0x1024"), ("mov", "x0, x16"), ("ret", ""),
+                             ("mov", "x0, x22"), ("ret", "")]
+    body = _lift_rows(rows, 0x1000, receiver={"x1": "this"}, mono=0x1008)
+    assert body[6:] == ["if (? != ?) {", "return x16;", "} else {", "return NULL;",
+                        "}"], body
+
+
+def test_a_section_running_into_a_monomorphic_body_takes_the_rejoin_note():
+    """A monomorphic entry's body is a body to the sections after it. A catch entry that
+    jumps into it gets the REJOIN note, as one into the body above does, and is not a
+    way in the body's own join meets: `x3` there is still `x1.field_0x8`, which the catch
+    entry's `mov x3, #9` does not reach (#278). Where the body's own branch goes back
+    into the code above it and that code leads on, it takes the note too."""
+    from jadart.cfg import UNREACHED
+    from jadart.expr import REJOIN
+    rows = _MONO_ROWS[:6] + [("ldur", "x3, [x1, #7]"), ("cbz", "x2, #0x1028"),
+                             ("mov", "x4, #1"), ("b", "#0x102c"), ("mov", "x4, #2"),
+                             ("add", "x0, x3, x4"), ("cbz", "x0, #0x1038"), ("ret", ""),
+                             ("mov", "x0, x22"), ("ret", ""),
+                             ("sub", "x15, x29, #0x20"), ("mov", "x3, #9"),
+                             ("b", "#0x102c")]
+    body = _lift_rows(rows, 0x1000, receiver={"x1": "this"}, mono=0x1008)
+    assert "if ((x1.field_0x8 + x4) != 0) {" in body, body
+    assert body[-3:] == ["// " + UNREACHED, "L_0x1040:",
+                         "goto L_0x102c;   // " + REJOIN], body
+    back = [("b", "#0x1020"), ("brk", "#0")] + _MONO_ROWS[2:6] + [
+        ("mov", "x0, #1"), ("ret", ""), ("cbz", "x1, #0x102c"), ("mov", "x0, #2"),
+        ("ret", ""), ("mov", "x0, #3"), ("ret", "")]
+    body = _lift_rows(back, 0x1000, receiver={"x1": "this"}, mono=0x1008)
+    assert "goto L_0x1000;   // " + REJOIN in body, body
+
+
+def test_a_monomorphic_entry_of_another_shape_is_lifted_as_before():
+    """Only the shape MonomorphicCheckedEntryAOT emits is lifted as a body: a check that
+    falls into a block of its own 16 bytes on. Anything else keeps #266's section, from
+    bare registers, and says the same as one with no such word but the note."""
+    from jadart.cfg import UNREACHED
+    from jadart.expr import MONOMORPHIC_ENTRY
+    rows = _MONO_ROWS[:5] + [("mov", "x3, x16"), ("b.ne", "#0x1000"), ("mov", "x0, x3"),
+                             ("ret", "")]
+    body = _lift_rows(rows, 0x1000, mono=0x1008)
+    plain = _lift_rows(rows, 0x1000)
+    assert plain[1] == "// " + UNREACHED and body[1] == "// " + MONOMORPHIC_ENTRY
+    assert body[:1] + body[2:] == plain[:1] + plain[2:], body
+
+
+def test_a_check_that_also_branches_into_the_body_is_not_a_proven_entry():
+    """Only a check whose taken arm goes back to the miss handler above it is lifted as
+    the root of a body. One that also branches into the body dominated, as a root, a join
+    the callers reach from +24 without it, and the meet there kept the `mov x4, #5` only
+    the check ran: `return 5 + x2;`. Lifted as a section nothing reaches, it keeps x4
+    (#278)."""
+    from jadart.cfg import UNREACHED
+    from jadart.expr import MONOMORPHIC_ENTRY
+    rows = [("ldr", "x16, [x26, #0x258]"), ("br", "x16"), ("mov", "x4, #5"),
+            ("mov", "x3, #2"), ("mov", "x6, #0"), ("cbnz", "x0, #0x1034"),
+            ("add", "x2, x2, #1"), ("cmp", "x2, x1"), ("b.eq", "#0x1034"),
+            ("cmp", "x2, #9"), ("b.lt", "#0x1018"), ("mov", "x0, #0"), ("ret", ""),
+            ("add", "x0, x4, x2"), ("ret", "")]
+    body = _lift_rows(rows, 0x1000, mono=0x1008)
+    plain = _lift_rows(rows, 0x1000)
+    assert body[1] == "// " + MONOMORPHIC_ENTRY and plain[1] == "// " + UNREACHED
+    assert body[2:] == plain[2:] and "return x4 + x2;" in body, body
+
+
+def test_lone_branches_after_the_normal_entry_read_no_flags_of_the_check():
+    """The callers enter at +24 with flags of their own, so nothing there reads the
+    check's comparison: not a `cset` at +24, which printed `x5 == (x16 << 1) ? 1 : 0`
+    (`_flags_in`), nor a lone branch at +28 that falls out of a lone branch at +24, which
+    printed `x5 >= (x16 << 1)` (cfg._conditions_from_the_block_before) (#278)."""
+    cset = _MONO_ROWS[:6] + [("cset", "x0, eq"), ("ret", "")]
+    body = _lift_rows(cset, 0x1000, mono=0x1008)
+    assert body[6:] == ["cset x0, eq", "return x0;"], body
+    two = _MONO_ROWS[:6] + [("b.eq", "#0x1028"), ("b.lt", "#0x1030"),
+                            ("mov", "x0, #1"), ("ret", ""), ("mov", "x0, #2"),
+                            ("ret", ""), ("mov", "x0, #3"), ("ret", "")]
+    body = _lift_rows(two, 0x1000, mono=0x1008)
+    assert body[6:8] == ["if (? != ?) {", "if (? >= ?) {"], body
+
+
+def test_a_goto_join_in_a_monomorphic_body_keeps_its_phi_name():
+    """A goto out of nested loops to the block the outer loop leaves to is a join whose
+    register a phi name carries (#123). The name is declared above the body, so it is in
+    scope wherever the join's own entry is; anchored at the first instruction, which no
+    block of the monomorphic body sits under, the join forgot it and stored the bare
+    `x7` (#278)."""
+    rows = _MONO_ROWS[:6] + [("add", "x7, x5, x1"), ("mov", "x9, #2"),
+                             ("mov", "x10, #3"), ("cbz", "x3, #0x1040"),
+                             ("umulh", "x7, x6, x1"), ("sub", "x10, x10, #1"),
+                             ("cbnz", "x10, #0x1024"), ("sub", "x9, x9, #1"),
+                             ("cbnz", "x9, #0x1020"), ("nop", ""), ("str", "x7, [x2]"),
+                             ("ret", "")]
+    body = _lift_rows(rows, 0x1000, mono=0x1008)
+    store = next(ln for ln in body if ln.startswith("x2.field_0x1 = "))
+    name = store[len("x2.field_0x1 = "):].rstrip(";")
+    assert re.fullmatch(r"t\d+", name), body
+    assert sum(1 for ln in body if ln.startswith(f"{name} = ")) >= 2, body
+
+
+def test_the_body_above_prints_the_same_with_a_monomorphic_body_jumping_into_it():
+    """A goto from the monomorphic body into a loop of the code above it is a way into
+    that loop the code above was not worked out for, and it prints as it did with the
+    section left out: the loop's predecessor in the other dominator tree still counts as
+    a latch, so the `mov x7, #9` it may run keeps x7 out of the loop's names. Taken as
+    no latch, the return read the `mov x7, #3` above the loop: `return t0 + 3;` (#278)."""
+    rows = [("mov", "x7, #3"), ("b", "#0x1020")] + _MONO_ROWS[2:6] + [
+        ("mov", "x7, #9"), ("b", "#0x1020"), ("add", "x2, x2, #1"), ("cmp", "x2, x1"),
+        ("b.lt", "#0x1020"), ("add", "x0, x2, x7"), ("ret", "")]
+    body = _lift_rows(rows, 0x1000, mono=0x1008)
+    plain = _lift_rows(rows, 0x1000)
+    cut = body.index("L_0x1008:") - 1
+    assert body[:cut] == plain[:cut] and "return t0 + x7;" in body, body
+
+
+def test_a_catch_entry_past_a_trap_in_a_monomorphic_body_is_a_section_of_its_own():
+    """The code after a trap in the monomorphic body is reached by no edge from its
+    entries, so it is not part of that body: a catch entry there is a section like any
+    other. Its jump to a return of the body prints that return again from its own state,
+    `9 + 1`, where it was a goto with no note into a join that kept the body's
+    `x1.field_0x8` (#278; the same in a plain body is #283)."""
+    from jadart.cfg import UNREACHED
+    rows = _MONO_ROWS[:6] + [("ldur", "x3, [x1, #7]"), ("cbnz", "x2, #0x1030"),
+                             ("brk", "#0"), ("sub", "x15, x29, #0x20"),
+                             ("mov", "x3, #9"), ("b", "#0x1030"), ("add", "x0, x3, #1"),
+                             ("ret", "")]
+    body = _lift_rows(rows, 0x1000, mono=0x1008)
+    assert body[6:9] == ["if (x2 != 0) {", "return x1.field_0x8 + 1;", "}"], body
+    assert body[9:] == ["// " + UNREACHED, "L_0x1024:", "return 9 + 1;"], body
+
+
+def test_lift_prints_a_monomorphic_closure_as_it_reads_from_its_entry():
+    """The clean fixture's 868-byte `dyn:call` at 0x2f5198, the case #278 reports. Its
+    section tested `x9 == NULL` where the value was named, and printed the loop that
+    follows as gotos whose counter nothing assigned. Lifted as a body from its entry it
+    reads as the same rows do from +8: the null test on a name and the loop as a loop, and
+    the only bare registers in it are the class check's and the miss handler's."""
+    _needs_capstone()
+    import io
+    import contextlib
+    from jadart import cli
+    from jadart.expr import MONOMORPHIC_ENTRY
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from quality import _REG_RE
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.main(["lift", CLEAN, "0x2f5198", "--color", "never"]) == 0
+    lines = [ln.strip() for ln in buf.getvalue().splitlines()]
+    sec = lines[lines.index("// " + MONOMORPHIC_ENTRY) + 1:]
+    assert sum(ln == "while (true) {" for ln in sec) == 1, sec
+    assert "goto L_0x1be920;" not in sec, sec
+    assert any(re.fullmatch(r"if \(t\d+ == NULL\) \{", ln) for ln in sec), sec
+    regs = [ln for ln in sec if _REG_RE.search(ln.split("//")[0])]
+    assert regs == ["if (x5 != (((x0.tags >> 12) & 0xfffff) << 1)) {",
+                    "br x16   // x16 holds THR.field_0x258"], regs
 
 
 def test_tier3_leaves_out_what_strip_boilerplate_cuts_on_purpose():
@@ -10198,8 +10402,9 @@ def test_tier3_shows_the_fixture_forwarder_and_catch_entry():
     assert body[2] == "return t1.field_0x20(t0);" and body[-1] == "return NULL;", body
     body = jadart.decompile(CLEAN, "0x104")[0]["body"]
     miss = "br x16   // x16 holds THR.field_0x258"
-    assert body[0] == miss and body[-2:] == [miss, "}"], body
-    assert any(ln.startswith("return sub_") for ln in body[2:]), body
+    # the check is a guard over its miss handler, and the body follows it (#278)
+    assert body[0] == miss and body[4:6] == [miss, "}"], body
+    assert any(ln.startswith("return sub_") for ln in body[6:]), body
     from jadart.expr import MONOMORPHIC_ENTRY
     assert body[1] == "// " + MONOMORPHIC_ENTRY, body
 
@@ -16140,10 +16345,14 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # 2,856 to 2,886 when the census began to follow `_reenter`'s reset, which is not the
     # same count: main read 2,853 judged against the path printed above a reset, and
     # 2,886 against the way in the state came by. Then 2,896 at #266, the code tier 3 now
-    # places adding 10 wrong reads, all of them in it.
-    assert got["wrong"] + got["name"] <= 2896, (
+    # places adding 10 wrong reads, all of them in it. Then 2,899 at #278, `wrong` at
+    # 2,082 still and `name` 814 to 817: a monomorphic section lifted as a body keeps its
+    # frame, so three loop latches, one in each of the `dyn:call` closures at 0x1be718,
+    # 0x1bea7c and 0x1bedac, see a slot that held a name out of scope where they saw none.
+    # Each prints as a declined read, as the same rows lifted from +8 do.
+    assert got["wrong"] + got["name"] <= 2899, (
         f"{got['wrong'] + got['name']} reloads in total name a different value than the "
-        f"slot held, up from 2896, of which {got['name']} are names out of scope")
+        f"slot held, up from 2899, of which {got['name']} are names out of scope")
     # And the reader-visible half of #198, which the two numbers above cannot see: they
     # score what `_reload` DECIDES, and the fix for a decline is at the call site, which
     # names the read rather than keeping the load's own register. A register the printed
@@ -16183,10 +16392,12 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
     # Dropping a computation whose only reader was a suppressed stub is the fix, and it is
     # `_drop_unread`'s business rather than the naming's.
     # 1,489 to 1,527 at #266, all in the code tier 3 now places: over `lift`'s own output
-    # 1,144 to 1,179, every one of the 35 in a section past the body.
-    assert got["sole"] <= 1527, (
+    # 1,144 to 1,179, every one of the 35 in a section past the body. 1,528 at #278: the
+    # section at 0x1be718, lifted as a body, writes the phi of x4 under its null test,
+    # which nothing reads, as the same rows lifted from +8 do.
+    assert got["sole"] <= 1528, (
         f"{got['sole']} blocks hold nothing but a declaration nothing reads, up from "
-        f"1527; see the guard in `_drop_unread` (#210)")
+        f"1528; see the guard in `_drop_unread` (#210)")
 
     # Put the bug back, twice, on a subset for speed. #197 was both of these at once.
     real_note, real_copy, real_merge = (expr.State.note_slot, expr.State.copy,

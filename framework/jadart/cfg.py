@@ -429,7 +429,7 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None,
     return blocks, lo
 
 
-def _conditions_from_the_block_before(blocks) -> None:
+def _conditions_from_the_block_before(blocks, stop=frozenset()) -> None:
     """A branch alone in its block reads the flags its one predecessor left.
 
     `cmp r0, r1; blt X; bgt Y` is two branches on one compare, and the second starts a
@@ -437,7 +437,8 @@ def _conditions_from_the_block_before(blocks) -> None:
     conditions of arm32-2.19.6 (#70). When the block has a single predecessor that falls
     into it and that ends in a conditional branch or exit, which set no flags, the
     flags are that block's, so its instructions are the context; a chain of such blocks
-    is followed up, a few steps at most."""
+    is followed up, a few steps at most. Not up past a block of `stop`, an entry the
+    callers come in at as well, with flags no edge of the graph brings (#278)."""
     preds = {}
     for a, b in blocks.items():
         for s in b.succ:
@@ -447,6 +448,8 @@ def _conditions_from_the_block_before(blocks) -> None:
             continue
         at, ctx = a, []
         for _ in range(8):
+            if at in stop:
+                break
             p = preds.get(at, [])
             if len(p) != 1:
                 break
@@ -579,7 +582,56 @@ def entry_reach(blocks, entry) -> set:
     return reachable
 
 
-def structure(blocks, entry, orphans: bool = False, cut=frozenset()):
+def checks_into(blocks, a, normal, placed) -> bool:
+    """Whether the block at `a` has the shape MonomorphicCheckedEntryAOT emits: a check
+    whose taken arm goes back into `placed`, the code above (the miss handler), and that
+    falls into `normal` and nowhere else. Then `a` reaches nothing but its miss handler
+    and `normal`, so `normal` and what it reaches are the body, and the check dominates
+    none of it: the callers enter at `normal` too (#278)."""
+    blk = blocks.get(a)
+    return (blk is not None and normal in blocks and _is_cond(blk.term) and not blk.cexit
+            and blk.exit_target < 0 and blk.cut_next < 0 and len(blk.succ) == 2
+            and blk.succ[1] == normal and blk.succ[0] in placed)
+
+
+def second_reach(blocks, placed, entries) -> frozenset:
+    """The body of its own that the proven entries `entries` have: the blocks they reach
+    along the graph's edges that `placed`, what the first instruction reaches, does not.
+    Empty where one of them is not a block or is in `placed`. A Code with a monomorphic
+    entry starts on the miss handler, so its whole body is here (#278). Not the code past
+    a trap, which only the step entry_reach takes leads to: a catch entry there is
+    reached by no edge from these entries either, and is a section like any other."""
+    if not entries or any(e not in blocks or e in placed for e in entries):
+        return frozenset()
+    return frozenset(_closure(blocks, entries, set(blocks) - set(placed)))
+
+
+def dominator_forest(blocks, entry, succ, roots=(), placed=frozenset()):
+    """(idom, order, trees): `_idoms` from `entry`, then one tree from each of `roots`
+    that `placed` leaves out, over the blocks no earlier tree took and no other root
+    is, with [(root, its blocks)]. The first tree is what it was without the others.
+
+    A block the entry reaches by no path is dominated by nothing, so a body behind a
+    second entry had no loops and no joins a dominator could speak for (#278). Its
+    own entry dominates it, and nothing else: the trees share no block, and an edge
+    from one into another is a way in the second does not count. That is what a
+    monomorphic entry needs, as the normal entry 16 bytes past it is entered by the
+    callers too, so it roots a tree of its own rather than sit under the check."""
+    idom, order = _idoms(blocks, entry, succ)
+    trees = []
+    for r in roots:
+        if r not in blocks or r in idom or r in placed:
+            continue
+        within = {b for b in blocks if b not in placed and b not in idom
+                  and (b == r or b not in roots)}
+        got, more = _idoms(within, r, succ)
+        idom.update(got)
+        order.extend(more)
+        trees.append((r, frozenset(more)))
+    return idom, order, trees
+
+
+def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=()):
     """Return a list of statements. Each is one of:
       ('asm', block_addr)
       ('if', cond, then_stmts, else_stmts)   (else_stmts may be [])
@@ -601,6 +653,13 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset()):
     behind each monomorphic entry and the catch entries after a `ret` or a `b` among
     them (#266).
 
+    `entries` are entry points the caller has proof of that no edge reaches, in the
+    order their sections go: a monomorphic entry and the normal entry its check falls
+    into. What they reach and the entry does not is placed first among the orphans,
+    from the first of them, and structured as a body: each roots a dominator tree of
+    its own (dominator_forest), so its loops are loops and its conditionals meet where
+    they do, not at a goto (#278).
+
     Loops are reconstructed by structuring the natural-loop body through the same
     recursive if/else machinery (bounded to the loop's nodes), so a conditional inside
     a loop becomes a real if/else and the loop-exit test becomes `... break;`. The
@@ -619,9 +678,15 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset()):
     for s in sinks:
         rsucc[VEXIT].append(s)
     pidom, _ = _idoms(vblocks, VEXIT, lambda n: rsucc.get(n, []))
-    idom, order = _idoms(blocks, entry, fsucc)
+    reachable = entry_reach(blocks, entry)
+    second = second_reach(blocks, reachable, entries) if orphans else frozenset()
+    idom, order, trees = dominator_forest(blocks, entry, fsucc,
+                                          entries if second else (), reachable)
     rank = {n: i for i, n in enumerate(order)}
     rpo = _rpo(blocks, entry, fsucc)
+    for root, nodes in trees:
+        base = len(rpo)
+        rpo.update((n, base + i) for n, i in _rpo(nodes, root, fsucc).items())
 
     preds = {a: [] for a in blocks}
     for a, b in blocks.items():
@@ -916,7 +981,6 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset()):
     # One walk and one pass in address order places blocks in the same order as taking the
     # lowest unplaced one again and again, since placing only ever adds to `visited`, and
     # in linear time: repeating it took 0.88 s on a crafted range of 4,000 `brk`.
-    reachable = entry_reach(blocks, entry)
     # Which of them a real edge reaches, so a section that only the step past a trap
     # brought in is marked as one nothing leads into.
     edged, stack = set(), [entry]
@@ -932,11 +996,34 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset()):
     if orphans:
         dead = set(blocks) - reachable
         tail = sorted(dead - cut_off(blocks, dead, cut))
+        if second:
+            # The body of its own goes first, from its first entry, and all of it, as
+            # the entry's does. In address order a section below it that reached one
+            # of its blocks first would structure that block from there instead.
+            tail = ([e for e in entries if e in second]
+                    + sorted(second - set(entries))
+                    + [a for a in tail if a not in second])
     # The note says no edge leads into the section, so it goes only where none does: a
     # block another unreached section jumps to shows that `goto` in the output itself.
     # Nor over a slow path the step past a trap placed (#157): an edge the caller cut
     # leads into it, and the note would list everything it can be but that.
     targeted = {s for b in blocks.values() for s in b.succ} | set(cut)
+
+    def guard(a):
+        """The check at the first of `entries`, where its taken arm goes back into the
+        code above and it falls into the next of them, the shape a monomorphic check has
+        with its miss handler above it: `if (c) goto X;` with the body after it at the
+        same depth, and not nested in the check's other arm. A goto does not fall
+        through, so the two forms say the same, and in this one a name the body declares
+        is in scope in the sections swept up after it, as it is in a body (#278)."""
+        if (len(entries) < 2 or a != entries[0]
+                or not checks_into(blocks, a, entries[1], reachable)):
+            return None
+        blk = blocks[a]
+        visited.add(a)
+        return ([("asm", a), ("if", blk.cond, [("goto", blk.succ[0])], [])]
+                + region(blk.succ[1], set(), None, None))
+
     for a in sorted(reachable):
         if a not in visited:
             if a not in edged and a not in targeted:
@@ -952,7 +1039,8 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset()):
         # `disasm`, which lists every instruction.
         before = set(visited)
         try:
-            section = region(a, set(), None, None)
+            section = ((guard(a) if second else None)
+                       or region(a, set(), None, None))
         except RecursionError:
             visited.clear()
             visited.update(before)
