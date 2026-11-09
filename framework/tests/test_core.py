@@ -10095,6 +10095,81 @@ def test_a_catch_entry_that_runs_on_into_the_body_says_what_it_does_there():
     assert body[-1] == "goto L_0x10;   // " + REJOIN, body
 
 
+def test_a_catch_entry_past_a_trap_says_what_it_does_in_the_body():
+    """`structure` places a section no edge leads into among the body's when a trap is
+    all that comes before it, and it is no less a section than one after the body. Its
+    goto into the body was printed bare: read on, a catch entry past a `brk` returned the
+    body's `this.field_0x8 + 1` where its own `mov x3, #9` returns 10 (#283). A block
+    that leads nowhere is printed again under it, from its own state; one that leads on
+    stays a goto, with the REJOIN note. The body prints as it does with the section a
+    trap that prints nothing, but for the label nothing names now."""
+    from jadart.cfg import UNREACHED
+    from jadart.expr import REJOIN
+    note = "// " + UNREACHED
+    rows = [("ldur", "x3, [x1, #7]"), ("cbnz", "x2, #0x1018"), ("brk", "#0"),
+            ("sub", "x15, x29, #0x20"), ("mov", "x3, #9"), ("b", "#0x1018"),
+            ("add", "x0, x3, #1"), ("ret", "")]
+    body = _lift_rows(rows, 0x1000, receiver={"x1": "this"})
+    assert body == ["if (x2 != 0) {", "return this.field_0x8 + 1;", "}", note,
+                    "L_0x100c:", "return 9 + 1;"], body
+    # the block leads on, so the section keeps its goto, and says so
+    rows[7:] = [("cbz", "x4, #0x1024"), ("add", "x0, x0, #2"), ("ret", "")]
+    body = _lift_rows(rows, 0x1000, receiver={"x1": "this"})
+    assert body[-3:] == [note, "L_0x100c:", "goto L_0x1018;   // " + REJOIN], body
+    alone = _lift_rows(rows[:3] + [("brk", "#0")] * 3 + rows[6:], 0x1000,
+                       receiver={"x1": "this"})
+    assert ([ln for ln in body[:-3] if not ln.startswith("L_")]
+            == [ln for ln in alone if not ln.startswith("L_")]), (body, alone)
+
+
+def test_sections_past_a_trap_meet_each_other_at_their_labels():
+    """A goto from one section past a trap into another is a way in the walk meets at
+    the label, as one between the sections after the body is, and keeps no note: the
+    join drops `x3` to the bare register. The section's own way into the body's `ret`
+    returns what it computed, `x3 + 1`, and not the body's `return 3;` (#283)."""
+    rows = [("cbnz", "x2, #0x1024"), ("brk", "#0"),
+            ("mov", "x3, #1"), ("add", "x0, x3, #1"), ("cbz", "x4, #0x1028"),
+            ("brk", "#0"), ("mov", "x3, #9"), ("b", "#0x100c"), ("brk", "#0"),
+            ("mov", "x0, #3"), ("ret", "")]
+    body = _lift_rows(rows, 0x1000, receiver={"x1": "this"})
+    assert body[:3] == ["if (x2 != 0) {", "return 3;", "}"], body
+    assert ["L_0x100c:", "if (x4 == 0) {", "return x3 + 1;", "}"] == body[5:9], body
+    assert "goto L_0x100c;" in body and not any("goto L_0x1028" in ln for ln in body)
+
+
+def test_a_slow_path_laid_out_after_a_throw_keeps_its_goto():
+    """Guard. A slow path that strip_boilerplate cut the edge into is placed past the
+    throw before it, and it is the body's: the machine reaches it, from the stack check
+    or the Mint box the strip folded, so it is not a section past a trap (#157, #283).
+    The rows are `[]` of an Int32List on the clean fixture at 3.12.2, from 0x194460,
+    where the box's store and the allocation stub's way back are left as they were."""
+    rows = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+            ("ldr", "x2, [x29, #0x18]"), ("ldur", "w3, [x2, #0x13]"),
+            ("ldr", "x4, [x29, #0x10]"), ("sbfx", "x5, x4, #1, #0x1f"),
+            ("tbz", "w4, #0, #0x1020"), ("ldur", "x5, [x4, #7]"),
+            ("sbfx", "x0, x3, #1, #0x1f"), ("mov", "x1, x5"), ("cmp", "x1, x0"),
+            ("b.hs", "#0x1084"), ("ldur", "x1, [x2, #7]"), ("add", "x16, x1, x5, lsl #2"),
+            ("ldrsw", "x2, [x16]"), ("sbfiz", "x0, x2, #1, #0x1f"),
+            ("cmp", "w2, w0, asr #1"), ("b.eq", "#0x1078"),
+            ("ldp", "x0, x1, [x26, #0x60]"), ("add", "x0, x0, #0x10"), ("cmp", "x1, x0"),
+            ("b.ls", "#0x1088"), ("str", "x0, [x26, #0x60]"), ("sub", "x0, x0, #0xf"),
+            ("mov", "x1, #0xd19c"), ("movk", "x1, #3, lsl #16"),
+            ("stur", "x1, [x0, #-1]"), ("dmb", "ishst"), ("sxtw", "x1, w2"),
+            ("stur", "x1, [x0, #7]"), ("mov", "x15, x29"),
+            ("ldp", "x29, x30, [x15], #0x10"), ("ret", ""), ("bl", "#0x9000"),
+            ("str", "x2, [x15, #-8]!"), ("bl", "#0x9100"), ("ldr", "x2, [x15], #8"),
+            ("b", "#0x1070")]
+    notes = {0x1084: "  ; -> _iso_stub_RangeErrorSharedWithoutFPURegsStub",
+             0x108c: "  ; -> _iso_stub_AllocateMintStub"}
+    from jadart.expr import lift_function, REJOIN
+    ann = [(0x1000 + i * 4, mn, op, notes.get(0x1000 + i * 4, ""))
+           for i, (mn, op) in enumerate(rows)]
+    body = [ln.strip() for ln in lift_function(ann)]
+    assert body[-6:] == ["L_0x1070:", "x0.field_0x8 = x2 << 32 >> 32;", "goto L_0x1078;",
+                         "L_0x1088:", "var t3 = new int();", "goto L_0x1070;"], body
+    assert not any(REJOIN in ln for ln in body), body
+
+
 def test_a_monomorphic_section_is_lifted_as_a_body_of_its_own():
     """The section #266 places at a monomorphic entry was lifted inside the walk of the
     whole range, from an entry it is not reached from, so it had no dominator: its loops

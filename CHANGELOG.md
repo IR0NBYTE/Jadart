@@ -421,6 +421,41 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A section past a trap says what it does in the body.** `structure` places a section
+  no edge leads into among the body's sections when all that comes before it is a trap
+  or a call that cannot return, and tier 3 took it for body there: its goto into the body
+  was printed bare. A catch entry past a `brk` that sets `x3 = 9` and jumps to the body's
+  `add x0, x3, #1; ret` read as the body's `return this.field_0x8 + 1;`, where its own
+  way in returns 10 (#283). It is now a section wherever `structure` puts it, as one after
+  the body is: a block of the body that leads nowhere is printed again under it, from its
+  own state, `return 9 + 1;`; a goto to one that leads on says `// the names past that
+  label were worked out for the ways in above it, not checked for this one`; a goto to
+  another such section is a way in the walk meets at the label, as one between the
+  sections after the body is; and the body prints as it does without it, but for a label
+  no goto names any more. A block past a trap that an edge reaches stays body, and so does
+  a slow path laid out after a throw that an edge strip_boilerplate cut leads to, a stack
+  check's or the one that boxes a Mint. The issue's example on the clean fixture, a
+  section ending `goto L_0x175418;` in `resolve`, was a misread: that goto, and every one
+  of the 6 bare gotos on each fixture from under a section's note to a label above it,
+  is a stack check's slow path, `bl StackOverflowShared...; b back`, which the cut edge
+  reaches, and each stays bare. In `lift`, `decompile`, `export`, `ffi` and
+  `jadart.decompile`; tier 2 is unchanged.
+
+  Measured over every range of the fixtures at the CLI's recursion limit: each has 762
+  sections past a trap in 491 ranges, and no goto out of one reaches the body or another
+  such section, so neither changes a line (0 of 8,194 and 0 of 8,188 ranges differ from
+  main). On the seven app-sweep libraries one range changes, tsdm_client's at 0x8c0068,
+  20 lines for 22: a catch entry's loop, placed past a trap, ran on into the body's
+  `remove(t2, t1); goto sub_0x741930;` through a bare goto, and that block is now printed
+  again under it, `remove(t25, t26);` with both read from the frame slots it loads
+  itself. The body loses `L_0x8c04e8:`, which no goto names any more, and 17 lines are
+  the later temporaries renumbered past the two new names. On crafted ranges of 1,000
+  and 4,000 sections past a trap, each a catch entry
+  with a branch back into the body, main printed 1,000 and 4,000 bare gotos and this
+  prints none: to a loop head each takes the note, and to the `ret` each prints it again.
+  4,000 of them lift in 0.26 s of CPU, 0.25 s on main; the clean fixture's largest range,
+  `hash` at 0xed904 with 4,000 rows, in 0.125 s, best of five, and 0.124 s on main.
+
 - **A Code object called through LR is read at its tagged offset.** Tier 3 kept x30, LR,
   among its untagged roles by name, so a read through it took no heap-object tag bias.
   From 3.3 on, AOT code calls a pool Code through LR: `Assembler::BranchLink` takes

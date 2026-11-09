@@ -40,7 +40,7 @@ from typing import NamedTuple
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
                   cond_of, cut_goto, flat, TRAPS, _target, entry_reach,
                   UNREACHED, cut_off, dominator_forest, dom_numbers, second_reach,
-                  _cond_for, checks_into, _conditions_from_the_block_before)
+                  past_trap, _cond_for, checks_into, _conditions_from_the_block_before)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -3079,6 +3079,12 @@ class Lifter:
         self.second: frozenset = frozenset()
         self.rejoined_second: frozenset = frozenset()
         self._in_second = False
+        #: The blocks of the body a goto out of a section `structure` placed past a trap
+        #: jumps to, and whether the walk is in one: a section no edge leads into all
+        #: the same, which takes the REJOIN note there too (#283). The body goes on after
+        #: it, so `_in_tail` says only whether the walk is in a section now.
+        self.rejoined_trap: frozenset = frozenset()
+        self._in_trap = False
         self._root_of: dict = {}
         # precompute loop metadata reused during the walk
         self._preds = {a: [] for a in blocks}
@@ -6926,10 +6932,13 @@ class Lifter:
                     falls = False
             elif kind == "label":
                 label(s[1])
-                if s[1] in self.orphans:
-                    alive = False       # placed after the body; nothing runs on into it
-                    self._in_tail = True
+                # A section, after the body or past a trap, or the body going on after
+                # one past a trap: a block a goto of the body left to be placed (#283).
+                self._in_tail = s[1] in self.orphans
+                if self._in_tail:
+                    alive = False       # a section; nothing runs on into it
                     self._in_second = s[1] in self.second
+                    self._in_trap = s[1] in self.placed
                 if note is not None:
                     note = (note[0], True)
             elif kind == "note":
@@ -7037,7 +7046,8 @@ class Lifter:
                 # so they hold the carried value, not the register the loop forgot (#123).
                 if s[1] in self.join_phi:
                     out.extend(self._join_write(s[1], st, pad))
-                rejoins = self.rejoined_second if self._in_second else self.rejoined
+                rejoins = (self.rejoined_second if self._in_second
+                           else self.rejoined_trap if self._in_trap else self.rejoined)
                 out.append(pad + f"goto L_0x{s[1]:x};"
                            + (f"   // {REJOIN}" if self._in_tail and s[1] in rejoins
                               else ""))
@@ -8981,6 +8991,7 @@ class Tier3Graph(NamedTuple):
     stmts: list             # structure(), with every block no edge reaches after the body
     roots: tuple = ()       # the proven entries no edge reaches (_proven_entries)
     second: frozenset = frozenset()     # what they reach and the entry does not
+    trapped: frozenset = frozenset()    # the sections placed past a trap (cfg.past_trap)
 
 
 #: How far past the monomorphic entry the normal entry is, on arm64:
@@ -9047,11 +9058,13 @@ def tier3_graph(ann, cut_end=None, mono=None):
                 blk.cond = _cond_for([], blk.insns[0][1], blk.insns[0][2])
         _conditions_from_the_block_before(blocks, stop=frozenset(roots))
     stmts = structure(blocks, entry, orphans=True, cut=cut, entries=roots)
+    trapped = past_trap(blocks, entry, placed, cut)
     return Tier3Graph(stripped, frozenset(slow), blocks, entry, raw, cut,
-                      _ends_again(blocks, stmts, placed, second), roots, second)
+                      _ends_again(blocks, stmts, placed, second, trapped), roots, second,
+                      trapped)
 
 
-def _ends_again(blocks, stmts, placed, second=frozenset()) -> list:
+def _ends_again(blocks, stmts, placed, second=frozenset(), trapped=frozenset()) -> list:
     """`stmts` with each goto out of a section no edge leads into, to a block of the body
     that leads nowhere, a return, a throw or a jump out, made `("again", block)`: that
     block printed once more under the section, and lifted from the section's own state,
@@ -9069,8 +9082,15 @@ def _ends_again(blocks, stmts, placed, second=frozenset()) -> list:
     sections and lifted as a body. A goto inside it to a block of its own is a goto of
     that body; one out of it to a block of `placed`, the miss handler a monomorphic
     check branches back to, is copied as from any section; and a section after it
-    treats its blocks as it treats `placed`'s (#278)."""
-    above = placed | second
+    treats its blocks as it treats `placed`'s (#278).
+
+    `trapped` are the sections `structure` places past a trap, among the body's
+    (cfg.past_trap). Each is one no edge leads into, as one after the body is, and a goto
+    out of it to a block of the body is copied the same way. Left a goto, a catch entry
+    past a `brk` read on into the body's `return this.field_0x8 + 1;` where its own way in
+    returns 10 (#283). One to another such section is a goto between sections, as one
+    between the sections after the body is."""
+    above, body = placed | second, placed - trapped
 
     def copy(ss, into):
         out = []
@@ -9089,13 +9109,12 @@ def _ends_again(blocks, stmts, placed, second=frozenset()) -> list:
             else:
                 out.append(s)
         return out
-    tail = next((i for i, s in enumerate(stmts)
-                 if s[0] == "label" and s[1] not in placed), len(stmts))
-    out, into = stmts[:tail], above
-    for s in stmts[tail:]:
+    out, into = [], None
+    for s in stmts:
         if s[0] == "label":
-            into = placed if s[1] in second else above
-        out.extend(copy([s], into))
+            into = (body if s[1] in trapped else None if s[1] in placed
+                    else placed if s[1] in second else above)
+        out.extend(copy([s], into) if into is not None else (s,))
     return out
 
 
@@ -9107,9 +9126,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         return []
     stripped, slow, blocks, entry, raw, stmts = (g.stripped, g.slow, g.blocks, g.entry,
                                                  g.raw, g.stmts)
-    second = g.second
+    second, trapped = g.second, g.trapped
     # The sections no edge leads into start at the first label `structure` placed past
-    # what the entry reaches, under its note.
+    # what the entry reaches, under its note, and those past a trap are among the body's.
     placed = entry_reach(blocks, entry)
     tail = next((i for i, s in enumerate(stmts)
                  if s[0] == "label" and s[1] not in placed), len(stmts))
@@ -9126,10 +9145,21 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                 and stmts[i][1] not in placed and stmts[i][1] not in second), len(stmts))
     if end > tail and stmts[end - 1][0] == "note":
         end -= 1
-    joinable = frozenset(label_targets(stmts[:tail])
+    # A section past a trap is placed among the body's, and a goto out of it into the
+    # body is no more a way in the walk meets than one from after the body is; one to
+    # another such section is, as one between the sections after the body is (#283).
+    ours, past = [], []
+    into = ours
+    for s in stmts[:tail]:
+        if s[0] == "label":
+            into = past if s[1] in trapped else ours
+        into.append(s)
+    joinable = frozenset(label_targets(ours) | (label_targets(past) & trapped)
                          | (label_targets(stmts[tail:end]) & second)
                          | {a for a in labels if a not in placed and a not in second})
     orphans = frozenset(s[1] for s in stmts[tail:] if s[0] == "label")
+    if trapped:
+        orphans |= {s[1] for s in stmts[:tail] if s[0] == "label" and s[1] in trapped}
     # The blocks before the sections that a block of one jumps to, and those of the body
     # a goto out of the proven entry's body jumps to.
     unreached = set(blocks) - placed
@@ -9137,6 +9167,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     rejoined = frozenset(t for b in dead - cut_off(blocks, unreached, g.cut)
                          for t in blocks[b].succ if t in placed or t in second)
     rejoined_second = frozenset(t for b in second for t in blocks[b].succ if t in placed)
+    rejoined_trap = frozenset(t for b in trapped for t in blocks[b].succ
+                              if t in placed and t not in trapped)
     dispatch = detect_dispatch(stripped)
     meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw)
     save_wrapped = _save_wrapped_calls(stripped)
@@ -9169,7 +9201,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.labels = labels
         lifter.joinable, lifter.orphans, lifter.rejoined = joinable, orphans, rejoined
         lifter.roots, lifter.placed, lifter.second = g.roots, frozenset(placed), second
-        lifter.rejoined_second = rejoined_second
+        lifter.rejoined_second, lifter.rejoined_trap = rejoined_second, rejoined_trap
         lifter.keep = keep
         lifter.carry_more = carry or {}
         lifter.join_phi = join_phi or {}

@@ -606,6 +606,21 @@ def second_reach(blocks, placed, entries) -> frozenset:
     return frozenset(_closure(blocks, entries, set(blocks) - set(placed)))
 
 
+def past_trap(blocks, entry, placed, cut) -> frozenset:
+    """The blocks of `placed` that only the step past a trap or a call that cannot return
+    brings in (entry_reach): no edge from the entry leads to them, nor one the caller cut
+    (cut_off). Each is a section no edge leads into, as one after the body is, only
+    `structure` places it among the body's sections, in address order. A block past a
+    trap that an edge reaches is the body's, and so is a slow path laid out after a
+    throw that an edge strip_boilerplate cut leads to, a stack check's or the one that
+    boxes a Mint, through the blocks it cut off on the way (#157, #283)."""
+    reach = _closure(blocks, [entry], set(blocks))
+    loose = set(placed) - reach
+    if not loose:
+        return frozenset()
+    return frozenset(loose - cut_off(blocks, set(blocks) - reach, cut))
+
+
 def dominator_forest(blocks, entry, succ, roots=(), placed=frozenset()):
     """(idom, order, trees): `_idoms` from `entry`, then one tree from each of `roots`
     that `placed` leaves out, over the blocks no earlier tree took and no other root
