@@ -6196,6 +6196,21 @@ class Lifter:
             # of them: `add x3, x3, x4, lsl #3` read x3 back as the address it had just
             # made and printed `(x3 + (x4 << 3))[x4]` for element x4 of x3 (#314).
             base_v, idx_v = g(b), g(c)
+            # A right shift scales by no power of two, so the index is the shifted value
+            # itself, one byte a step: `add x2, x3, x4, asr #1` printed `x3[x4]`, the
+            # element `lsl #0` names (#315). The VM shifts right by one only to untag a
+            # Smi index (`ElementAddressForRegIndex`), but a register is read as holding
+            # one only where the walk saw it tagged (#290); anywhere else its word is
+            # shifted as the machine shifts it, `x4 >> 1`, and says no more than that.
+            sh = (ops[3].strip().split()[0].lower()
+                  if len(ops) >= 4 and ops[3].strip() else "")
+            if sh in ("asr", "lsr"):
+                amt = _imm(ops[3].split("#")[-1]) if "#" in ops[3] else 0
+                if idx_v.smi and sh == "asr" and amt == 1:
+                    val = _smi_value(idx_v)
+                elif idx_v.smi:
+                    val = _bin(_smi_word(idx_v), _SHIFT_SYM[sh], _num(amt), P_SHIFT)
+                idx_v, scale = val, 0
             st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
             st.elem[dst] = (base_v, idx_v, scale, offs)
             return []
