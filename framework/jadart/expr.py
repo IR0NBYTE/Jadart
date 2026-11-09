@@ -40,7 +40,7 @@ from typing import NamedTuple
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
                   cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
                   entry_reach, UNREACHED, cut_off, dominator_forest, dom_numbers,
-                  second_reach, past_trap, _cond_for, checks_into,
+                  second_reach, strong_components, past_trap, _cond_for, checks_into,
                   _conditions_from_the_block_before)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
@@ -3231,6 +3231,12 @@ class Lifter:
         #: Per header and per block, what nested loops ask again for each loop around
         #: them; see _loop_nodes, _written, _accesses and _reload_step (#162).
         self._loops: dict = {}
+        #: per block, what `_exit_slots` asks of every block that can reach it; see
+        #: _near_written. And per block, which strongly connected piece of the graph it
+        #: is in; see _pieces.
+        self._near: dict = {}
+        self._piece: dict = {}
+        self._piece_order: list = []
         #: loop header -> its natural body; see _back_loop.
         self._backloops: dict = {}
         #: loop header -> the blocks it can reach while it runs; see _loop_region. And
@@ -6245,15 +6251,18 @@ class Lifter:
         preds = self._preds.get(addr, ())
         if entry:
             preds = [p for p in preds if not self._dominates(addr, p)]
-        back, stack = set(), list(preds)
-        while stack:
-            n = stack.pop()
-            if n in back or n == addr:
-                continue
-            back.add(n)
-            stack.extend(self._preds.get(n, ()))
         d = self._idom.get(addr)
-        if d is not None and d != addr:
+        if d is not None and d != addr and addr not in self._root_of:
+            back = self._between(d, addr, preds)
+        else:
+            back, stack = set(), list(preds)
+            while stack:
+                n = stack.pop()
+                if n in back or n == addr:
+                    continue
+                back.add(n)
+                stack.extend(self._preds.get(n, ()))
+        if d is not None and d != addr and addr in self._root_of:
             # forward from the dominator, which is where the paths part. The dominator
             # itself is one block with one exit state, so what IT writes is agreed on.
             fwd, stack = set(), [s for s in self.blocks[d].succ if s in self.blocks]
@@ -6278,6 +6287,50 @@ class Lifter:
                                        self._writes_stack(back),
                                        self._writes_heap(back))
         return hit
+
+    def _between(self, d, addr, preds) -> set:
+        """The blocks `_join_kill` asks about, for an `addr` in the entry's tree with `d`
+        its immediate dominator: those that reach one of `preds` without passing `addr`,
+        and that `d` reaches the same way. Walked back from `preds`, and on only from a
+        block that is one of them, as every block on such a path from one of them is one
+        too. The walk back over every block that reaches `addr` and the walk on over every
+        block `d` reaches, each nearly the function, made N loops leaving by a goto into
+        the next one's head cost about N * N (#289).
+
+        The entry's tree holds every block the entry reaches and no other, so a path
+        from `d` stays in it. A block below `d` in the tree is one: the entry reaches it
+        by a path that passes `d` and, unless `addr` is above it too, one that avoids
+        `addr` after that. Any other block on a path from `d` into `addr` reaches `d`
+        again, as `d` is on every path from the entry to `addr`: it is in `d`'s strongly
+        connected piece (_pieces), and is one where `d` reaches it within that piece."""
+        piece = self._pieces()[0]
+        home, near = piece.get(d), None
+
+        def one(m):
+            nonlocal near
+            if m != d and self._dominates(d, m):
+                return not self._dominates(addr, m)
+            if piece.get(m) != home:
+                return False
+            if near is None:
+                near, stack = set(), list(self.blocks[d].succ)
+                while stack:
+                    n = stack.pop()
+                    if n in near or n == addr or piece.get(n) != home:
+                        continue
+                    near.add(n)
+                    stack.extend(self.blocks[n].succ)
+            return m in near
+        back, seen, stack = set(), set(), list(preds)
+        while stack:
+            n = stack.pop()
+            if n in seen or n == addr:
+                continue
+            seen.add(n)
+            if one(n):
+                back.add(n)
+                stack.extend(self._preds.get(n, ()))
+        return back
 
     def _join_write(self, addr, st: State, pad: str, src=None) -> list:
         """Write each phi register of goto-join `addr` to its shared name, from `st`.
@@ -7542,11 +7595,51 @@ class Lifter:
                                           for (_a, mn, _o, _n) in self.blocks[b].insns):
             for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
                 del st.slot[k]
-        ended = self._ended_blocks()
-        near = {b for b in self._loop_nodes(header)
-                if b not in ended and not self._quiet(b)}
-        self._stale_slots(st, self._written(near) - _SPECIAL,
-                          unsafe=self._call_written(near))
+        written, unsafe = self._near_written(header)
+        self._stale_slots(st, written, unsafe=unsafe)
+
+    def _near_written(self, header) -> tuple:
+        """(`_written` less _SPECIAL, `_call_written`) of the blocks `_exit_slots` calls
+        near: `_loop_nodes(header)` less a block with a trap or a throw and a stack
+        check's slow path.
+
+        `_loop_nodes` is the header and every block that reaches it: the same set for
+        each block of one strongly connected piece of the graph, that piece and each
+        piece with a path into it. So a piece's answer is its own blocks' joined with the
+        answers of the pieces with an edge into it, worked out once for every block in a
+        topological order of the pieces (_pieces). A set per loop, N loops in a row
+        walked about N * N / 2 blocks between them, and the lift grew with N * N (#289).
+        """
+        if not self._near:
+            piece, order = self._pieces()
+            ended, got = self._ended_blocks(), []
+            for i, members in enumerate(order):
+                w, c = set(), set()
+                for x in members:
+                    if x not in ended and not self._quiet(x):
+                        own = self._written({x})
+                        w |= own
+                        if any(mn in _CALLS for (_a, mn, _o, _n) in self.blocks[x].insns):
+                            c |= own | _CALL_CLOBBERS
+                    for p in self._preds.get(x, ()):
+                        j = piece.get(p)
+                        if j is not None and j != i:
+                            w |= got[j][0]
+                            c |= got[j][1]
+                got.append((frozenset(w - _SPECIAL), frozenset(c)))
+            self._near = {x: got[i] for x, i in piece.items()}
+        return self._near[header]
+
+    def _pieces(self) -> tuple:
+        """({block: its piece}, [blocks of each piece]): the strongly connected pieces
+        of the graph, each before every piece it has an edge into (cfg.strong_components),
+        numbered in that order."""
+        if not self._piece:
+            order = strong_components(
+                self.blocks, lambda n: self.blocks[n].succ if n in self.blocks else ())
+            self._piece = {x: i for i, members in enumerate(order) for x in members}
+            self._piece_order = order
+        return self._piece, self._piece_order
 
     def _wide_slots(self) -> set:
         """The frame slots a store of a q register fills anywhere in the function, which
@@ -7761,13 +7854,14 @@ class Lifter:
         """Every ANCESTOR of `header`: the backward closure over its predecessors, which
         does not stop at the header and so takes the edge in from before the loop too.
 
-        One caller left, `_exit_slots`'s `near`, which wants exactly that: the slot map is
-        carried into the loop from before it, and the staleness it asks about is a
-        register reassigned anywhere between the store that filled a slot and the read
-        after the loop, so the blocks before the loop stand for the ones between the two
-        (#199). The three questions about what the loop itself does ask `_back_loop`, the
-        natural body: a block that ran before the loop is no part of what a trip does
-        (#228).
+        What `_exit_slots`'s `near` wants, which `_near_written` folds once over the
+        graph's strongly connected pieces rather than walk per loop (#289), and is held
+        to this walk by a test. The slot map is carried into the loop from before it,
+        and the staleness it asks about is a register reassigned anywhere between the
+        store that filled a slot and the read after the loop, so the blocks before the
+        loop stand for the ones between the two (#199). The three questions about what
+        the loop itself does ask `_back_loop`, the natural body: a block that ran before
+        the loop is no part of what a trip does (#228).
         """
         got = self._loops.get(header)
         if got is not None:

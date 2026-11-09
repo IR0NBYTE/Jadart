@@ -19617,6 +19617,170 @@ def test_dominance_costs_the_same_per_instruction_at_any_length():
         expr.Lifter._own_written = own
 
 
+def _rows_289(seed):
+    """(rows, base, mono) of a random range for #289's guard: branches anywhere, loops,
+    gotos into loops, traps, frame stores and calls, and in a third a monomorphic
+    entry."""
+    import random
+    rng = random.Random(seed)
+    n = rng.randrange(4, 48)
+    base, mono, rows = 0, None, []
+    if rng.random() < 0.3:
+        base, mono, rows = 0x1000, 0x1008, list(_MONO_ROWS[:6])
+    start = base + len(rows) * 4
+    for _ in range(n):
+        r, q = f"x{rng.randrange(7)}", f"x{rng.randrange(7)}"
+        t = f"#{start + rng.randrange(n + 1) * 4:#x}"
+        rows.append(rng.choice([
+            ("add", f"{r}, {r}, #1"), ("cmp", f"{r}, {q}"), ("b.lt", t), ("b.ne", t),
+            ("cbz", f"{r}, {t}"), ("b", t), ("ret", ""), ("brk", "#0"), ("bl", "#0x100"),
+            ("mov", f"{r}, {q}"), ("stur", f"{r}, [x29, #-{rng.randrange(1, 4) * 8}]"),
+            ("ldur", f"{r}, [x29, #-{rng.randrange(1, 4) * 8}]"),
+            ("str", f"{r}, [x0, #{rng.randrange(4) * 8 + 8}]")]))
+    return rows + [("ret", "")], base, mono
+
+
+def test_loop_exits_and_goto_joins_answer_what_the_walks_over_ancestors_did():
+    """A guard test (#289). A loop's exit asked `_exit_slots` what every block that
+    reaches the header writes, and a goto's join asked `_join_kill` what the blocks
+    between it and its immediate dominator write, each by walking the blocks once per
+    loop or join; both are now worked out once over the graph's strongly connected
+    pieces and a walk bounded by the dominator tree. This holds them to the walks, in
+    the middle of real lifts of 300 random ranges and of _graphs_282's.
+
+    Every join is asked again by the walk as main had it. Every loop exit is asked
+    again of a state holding one frame slot per register, each naming that register
+    and far from any store: a slot goes where the walk over `_loop_nodes` says a block
+    writes the register, and its value is recorded where no block that calls does."""
+    from jadart import expr
+    from jadart.expr import V, P_ATOM, State, lift_function
+    regs = ([f"x{i}" for i in range(31) if f"x{i}" not in expr._SPECIAL]
+            + [f"d{i}" for i in range(8)])
+    exits, kill = expr.Lifter._exit_slots, expr.Lifter._join_kill
+    seen = {"probed": 0, "dropped": 0, "recorded": 0, "joins": 0, "killed": 0}
+
+    def exit_slots(self, st, header):
+        probe = State()
+        for i, r in enumerate(regs):
+            probe.slot[f"x29-{4096 + 8 * i}"] = V(f"{r} + 1", P_ATOM)
+        exits(self, probe, header)
+        if probe.slot:
+            ended = self._ended_blocks()
+            near = {b for b in self._loop_nodes(header)
+                    if b not in ended and not self._quiet(b)}
+            written = self._written(near) - expr._SPECIAL
+            unsafe = self._call_written(near)
+            seen["probed"] += 1
+            for i, r in enumerate(regs):
+                k = f"x29-{4096 + 8 * i}"
+                assert (k not in probe.slot) == (r in written), (header, r)
+                assert (k in probe.dropped) == (r in written and r not in unsafe), (
+                    header, r)
+                seen["dropped"] += k not in probe.slot
+                seen["recorded"] += k in probe.dropped
+        return exits(self, st, header)
+
+    def join_kill(self, addr, entry=False):
+        got = kill(self, addr, entry)
+        preds = self._preds.get(addr, ())
+        if entry:
+            preds = [p for p in preds if not self._dominates(addr, p)]
+        back, stack = set(), list(preds)
+        while stack:
+            n = stack.pop()
+            if n in back or n == addr:
+                continue
+            back.add(n)
+            stack.extend(self._preds.get(n, ()))
+        d = self._idom.get(addr)
+        if d is not None and d != addr:
+            fwd, stack = set(), [s for s in self.blocks[d].succ if s in self.blocks]
+            while stack:
+                n = stack.pop()
+                if n in fwd or n == addr:
+                    continue
+                fwd.add(n)
+                stack.extend(s for s in self.blocks[n].succ if s in self.blocks)
+            back &= fwd
+        want = (frozenset(self._written(back)) - expr._SPECIAL, self._writes_stack(back),
+                self._writes_heap(back))
+        assert got == want, (addr, entry, got, want)
+        seen["joins"] += 1
+        seen["killed"] += bool(want[0])
+        return got
+    graphs = [_rows_289(seed) for seed in range(300)]
+    graphs += [(rows, base, mono) for _n, rows, base, mono, tier3 in _graphs_282()
+               if tier3]
+    expr.Lifter._exit_slots, expr.Lifter._join_kill = exit_slots, join_kill
+    try:
+        for rows, base, mono in graphs:
+            lift_function([(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+                          mono=mono)
+    finally:
+        expr.Lifter._exit_slots, expr.Lifter._join_kill = exits, kill
+    assert seen["probed"] > 100 and seen["joins"] > 300, seen
+    assert seen["dropped"] > 500 and seen["recorded"] > 100 and seen["killed"] > 100, seen
+
+
+def test_loop_exits_and_goto_joins_cost_the_same_per_instruction_at_any_length():
+    """N loops in a row asked `_exit_slots` about every block before each one, and N
+    loops each leaving by a goto into the next one's body asked `_join_kill` to walk
+    back over them and on over every block after: at 2,000 loops 79% of the time was
+    `_exit_slots` and the cost about N * N (#289). Counted, not timed: the lines of
+    expr.py and cfg.py those two run, per instruction, at 30 loops and at 120. Walked
+    per loop that was 181 and 631 for loops in a row, and 257 and 865 with the gotos;
+    folded once over the graph, and walked between a join and its dominator, 62 and 62,
+    and 137 and 139."""
+    from jadart import cfg, expr
+    from jadart.expr import lift_function
+    here = {expr.__file__, cfg.__file__}
+    exits, kill = expr.Lifter._exit_slots, expr.Lifter._join_kill
+    ran, depth = [0], [0]
+
+    def lines(frame, event, _arg):
+        if event == "line":
+            ran[0] += 1
+        return lines
+
+    def calls(frame, _event, _arg):
+        return lines if frame.f_code.co_filename in here else None
+
+    def counted(fn):
+        def run(*args, **kw):
+            depth[0] += 1
+            if depth[0] == 1:
+                sys.settrace(calls)
+            try:
+                return fn(*args, **kw)
+            finally:
+                depth[0] -= 1
+                if not depth[0]:
+                    sys.settrace(None)
+        return run
+
+    def per_instruction(n, goto):
+        rows = []
+        for _ in range(n):
+            h = len(rows) * 4
+            if goto:
+                rows += [("add", "x2, x2, #1"), ("cbz", f"x3, #{h + 20:#x}"),
+                         ("cmp", "x2, x1"), ("b.lt", f"#{h:#x}")]
+            else:
+                rows += [("add", "x2, x2, #1"), ("cmp", "x2, x1"), ("b.lt", f"#{h:#x}")]
+        rows += [("add", "x2, x2, #1"), ("ret", "")]
+        ran[0] = 0
+        lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        return ran[0] / len(rows)
+    expr.Lifter._exit_slots = counted(exits)
+    expr.Lifter._join_kill = counted(kill)
+    try:
+        for goto in (False, True):
+            small, large = per_instruction(30, goto), per_instruction(120, goto)
+            assert large < 1.5 * small, (goto, small, large)
+    finally:
+        expr.Lifter._exit_slots, expr.Lifter._join_kill = exits, kill
+
+
 def _untag_text(rows, reg="x0"):
     """The value tier 3 gives `reg` after `rows`, by the store the body ends with."""
     from jadart.expr import lift_function

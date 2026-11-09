@@ -421,6 +421,33 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop's exit and a goto's join are worked out once, not per loop.** At each loop's
+  exit `_exit_slots` asked `_loop_nodes` for the header and every block that reaches it,
+  and what those write; at each goto's join `_join_kill` walked back over every block
+  that reaches the target and on over every block its immediate dominator reaches. So N
+  loops in a row cost about N * N to lift (#289): `add; cmp; b.lt` 8,000 times took
+  18.97 s of CPU in `lift_function`, and 8,000 loops each leaving by a `cbz` into the
+  next one's body 35.91. `_loop_nodes` is the same set for every block of a strongly
+  connected piece of the graph, so what the exit asks is now folded once over the pieces
+  in a topological order (`cfg.strong_components`, Tarjan's algorithm, iterative). The
+  join walks back from the target only through the blocks between it and its
+  dominator, read off the dominator tree: a block the dominator is above counts unless
+  the target is above it too, and any other only where it is in the dominator's piece
+  and the dominator reaches it there. A join in a tree of another entry, or in none, is
+  walked as before. Output is unchanged: the whole-binary tier 3 dump of both fixtures
+  and of the seven app-sweep libraries is byte-identical to main's, and in lifts of 300
+  random ranges and of #282's graphs every exit and every join answers what the walks
+  did. CPU seconds at 1,000, 2,000, 4,000 and 8,000 loops, main then this: in a row
+  0.39, 1.32, 5.06 and 18.97 against 0.14, 0.36, 1.03 and 3.29; leaving by a `cbz`
+  0.67, 2.45, 9.09 and 35.91 against 0.15, 0.31, 0.64 and 1.29; leaving by a `b` to the
+  next head 1.44, 5.43, 21.25 and 90.48 against 0.40, 1.12, 3.56 and 12.61; with an
+  if/else in each body 1.32, 4.69, 18.29 and 74.98 against 0.47, 1.26, 3.72 and 13.31;
+  trapping one way round 1.33, 5.08, 19.68 and 78.90 against 0.77, 2.71, 10.32 and
+  40.69. What still grows about four times per doubling is the structurer,
+  `cfg.structure`, 58%, 72% and 66% of the first, third and fourth at 4,000, where
+  `loop_nodes` scans every block for each loop's latches, and 92% of the last, in
+  `follow`; the exit and the join take at most 6% each.
+
 - **Which calls' results in d0 are read is worked out in one pass.** `_d0_result_reads`
   decides which calls' d0 a later read or a `ret` sees, on every lift of a function that
   calls something. It carried forward the set of calls whose d0 may still be there,
