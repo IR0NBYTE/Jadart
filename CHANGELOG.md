@@ -421,6 +421,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An `stp` off an element address prints both stores.** An element store printed one
+  target, so `add x2, x3, x4, lsl #3; stp x5, x6, [x2]` printed `x3[x4] = x5;` and
+  nothing for x6 (#316), the store side of #306. Each word is now a store of its own,
+  the second one register's width on, an element where the rule of #308 shows it is one,
+  `x3[x4 + 1] = x6;`, and the store to its address where it does not. Against unicorn
+  2.1.4, `stp` of x and w pairs at six displacements off an element address whose `add`
+  writes its base, its index or neither, 3,000 runs: main prints one store for 905, and
+  this two for all 3,000, each at the address the CPU wrote and holding what it wrote,
+  with the fix of #314 in; without it 642 still differ, every one an add into its own
+  base or index. On the nine binaries 5 lines change in one range of
+  kzs.th000.tsdm_client, four second stores and the name of the value one of them
+  writes, classed by script.
+
 - **An element address built with `asr` prints its index shifted.** `add x2, x3, x4, asr
   #1` adds x4 >> 1, and the element entry kept x4 itself, so `ldrb w0, [x2, #0x17]`
   printed `return x3[x4];`, what `lsl #0` prints (#315). A right shift scales by no

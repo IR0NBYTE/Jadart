@@ -20829,6 +20829,23 @@ def test_an_element_address_built_with_asr_prints_its_index_shifted():
         "return x3[x5.toSigned(31)];"]
 
 
+def test_an_stp_off_an_element_address_prints_both_stores():
+    """An `stp` off an element address printed its first store and dropped the second:
+    `add x2, x3, x4, lsl #3; stp x5, x6, [x2, #0x17]` printed `x3[x4] = x5;` and
+    nothing for x6 (#316), the store side of #306. The second word is one register's
+    width on, an element where #308's rule shows it is one and its address otherwise."""
+    add = ("add", "x2, x3, x4, lsl #3")
+    tail = [("ret", "")]
+    assert _lift_rows([add, ("stp", "x5, x6, [x2]")] + tail) == [
+        "x3[x4] = x5;", "x3[x4 + 1] = x6;", "return x0;"]
+    assert _lift_rows([add, ("stp", "w5, w6, [x2]")] + tail) == [
+        "x3[x4] = x5;", "(x3 + (x4 << 3)).field_0x5 = x6;", "return x0;"]
+    # 0x17 and 0x1f are both data offsets on some release, so neither is shown to be.
+    assert _lift_rows([add, ("stp", "x5, x6, [x2, #0x17]")] + tail) == [
+        "(x3 + (x4 << 3)).field_0x18 = x5;", "(x3 + (x4 << 3)).field_0x20 = x6;",
+        "return x0;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

@@ -5841,27 +5841,26 @@ class Lifter:
             # An element access carries no width: the index is already scaled by the
             # element size, so a 16-byte element is `t3[t4]` either way (#209). One
             # `_elem_access` declines is the store to the address it computes (#308).
-            elem = (self._elem_access(base, index, scale, st, disp)
-                    if index is not None or base in st.elem else None)
-            if elem is not None:                              # element store
-                tgts = [(elem, val, ())]
-            else:
-                w = _access_width(mn, ops[0])
+            # Each word of an `stp` is its own store, the second one register's width on:
+            # off an element address only the first was printed (#316).
+            # `ops[1]` and not `pair[0]` for the second, which `canon` has folded: s1 is
+            # d1 there and would read as eight bytes where the store writes four. The
+            # offset step has the same reason.
+            words = [(disp, ops[0], val)] + ([(pair[1], ops[1], pair[2])] if pair else [])
+            on_elem = index is not None or base in st.elem
+            tgts, cast = [], self.cast_at.get((at, base))
+            for d, reg, v in words:
+                elem = self._elem_access(base, index, scale, st, d) if on_elem else None
+                if elem is not None:                          # element store
+                    tgts.append((elem, v, ()))
+                    continue
+                w = _access_width(mn, reg)
                 # `_rebase` and not `_byte_off`: a displacement below the base goes into
                 # the base expression, so the offset is a field offset, never negative.
-                bv, off = self._rebase(base, g(base), disp)
-                cast = self.cast_at.get((at, base)) if off == disp + 1 else None
-                tgts = [(self._field(bv, off, w, cast), val,
-                         self._covers(bv, off, w, cast))]
-                if pair:
-                    # `ops[1]` and not `pair[0]`, which `canon` has folded: s1 is d1
-                    # there and would read as eight bytes where the store writes four.
-                    # The offset step one line up has the same reason.
-                    w2 = _access_width(mn, ops[1])
-                    bv2, off2 = self._rebase(base, g(base), pair[1])
-                    cast2 = cast if off2 == pair[1] + 1 else None
-                    tgts.append((self._field(bv2, off2, w2, cast2), pair[2],
-                                 self._covers(bv2, off2, w2, cast2)))
+                bv, off = self._rebase(base, g(base), d)
+                cast = cast if off == d + 1 else None
+                tgts.append((self._field(bv, off, w, cast), v,
+                             self._covers(bv, off, w, cast)))
             out = list(basedecl)
             for tgt, v, also in tgts:
                 # The value being stored was read off the map before this, so `+=` still
