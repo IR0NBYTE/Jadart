@@ -14936,6 +14936,120 @@ def test_a_goto_backwards_out_of_a_loop_leaves_it():
     assert lf._leaves_loop(entry) is False
 
 
+def _ranges_301(seed):
+    """(rows, base, mono) of a random range for #301's guard: branches anywhere, so loops
+    with several latches, a latch with both arms on the header, ways into a loop that
+    skip its header, traps and returns, and in a third a monomorphic entry."""
+    import random
+    rng = random.Random(seed)
+    n = rng.randrange(4, 64)
+    base, mono, rows = 0, None, []
+    if rng.random() < 0.3:
+        base, mono, rows = 0x1000, 0x1008, list(_MONO_ROWS[:6])
+    start = base + len(rows) * 4
+    for _ in range(n):
+        r = f"x{rng.randrange(4)}"
+        t = f"#{start + rng.randrange(n + 1) * 4:#x}"
+        rows.append(rng.choice([
+            ("add", f"{r}, {r}, #1"), ("cmp", f"{r}, x1"), ("b.lt", t), ("b.ne", t),
+            ("cbz", f"{r}, {t}"), ("cbnz", f"{r}, {t}"), ("b", t), ("ret", ""),
+            ("brk", "#0")]))
+    return rows + [("ret", "")], base, mono
+
+
+def test_a_loop_body_holds_the_latches_a_scan_of_every_block_finds():
+    """A guard test (#301). `structure`'s `loop_nodes` found a loop's latches by asking
+    every block whether it jumps to the header and the header dominates it, and now takes
+    them from the header's predecessors. This holds each loop body it returns, in tier 3
+    lifts of 1,000 random ranges, to the body that scan gives, traced at the return with
+    the graph and the dominance test the call had."""
+    from jadart import cfg
+    from jadart.expr import tier3_graph
+    seen = {"loops": 0, "many": 0, "twice": 0, "outside": 0}
+
+    def scanned(header, blocks, preds, dominates):
+        latches = [n for n in blocks
+                   if header in blocks[n].succ and dominates(header, n)]
+        nodes, stack = {header}, list(latches)
+        while stack:
+            n = stack.pop()
+            if n not in nodes:
+                nodes.add(n)
+                stack += [p for p in preds.get(n, ()) if dominates(header, p)]
+        return nodes, latches
+
+    def returned(frame, event, arg):
+        if event == "return":
+            header, up = frame.f_locals["header"], frame
+            while up.f_code.co_name != "structure":
+                up = up.f_back
+            f = up.f_locals                     # the graph `structure` was handed
+            want, latches = scanned(header, f["blocks"], f["preds"], f["dominates"])
+            assert arg == want, (header, sorted(arg), sorted(want))
+            seen["loops"] += 1
+            seen["many"] += len(latches) > 1
+            seen["twice"] += any(f["blocks"][n].succ.count(header) > 1 for n in latches)
+            seen["outside"] += any(not f["dominates"](header, p)
+                                   for p in f["preds"][header])
+        return returned
+
+    def calls(frame, _event, _arg):
+        code = frame.f_code
+        if code.co_name == "loop_nodes" and code.co_filename == cfg.__file__:
+            return returned
+        return None
+    sys.settrace(calls)
+    try:
+        for seed in range(1000):
+            rows, base, mono = _ranges_301(seed)
+            tier3_graph([(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+                        mono=mono)
+    finally:
+        sys.settrace(None)
+    assert seen["loops"] > 600 and seen["many"] > 50, seen
+    assert seen["twice"] > 0 and seen["outside"] > 500, seen
+
+
+def test_a_loop_body_costs_the_same_per_instruction_at_any_length():
+    """N loops in a row asked every block of the function whether it jumps to the loop's
+    header, once per loop, to find the loop's latches: 3.0 million lines for 1,000 loops,
+    and 2.50 s of `tier3_graph` at 8,000 loops where 2,000 took 0.16 (#301). Counted, not
+    timed: the lines `structure`'s `loop_nodes` runs, per instruction, at 30 loops and at
+    120. Scanning every block that was 35 and 125; from the header's predecessors, 3.6
+    and 3.7."""
+    from jadart import cfg
+    from jadart.expr import tier3_graph
+    ran = [0]
+
+    def lines(frame, event, _arg):
+        if event == "line":
+            ran[0] += 1
+        return lines
+
+    def calls(frame, _event, _arg):
+        code = frame.f_code
+        if code.co_name == "loop_nodes" and code.co_filename == cfg.__file__:
+            return lines
+        return None
+
+    def per_instruction(n):
+        rows = []
+        for _ in range(n):
+            rows += [("add", "x2, x2, #1"), ("cmp", "x2, x1"),
+                     ("b.lt", f"#{len(rows) * 4:#x}")]
+        rows.append(("ret", ""))
+        ran[0] = 0
+        sys.settrace(calls)
+        try:
+            g = tier3_graph([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        finally:
+            sys.settrace(None)
+        assert sum(s[0] == "loop" for s in g.stmts) == n, g.stmts
+        return ran[0] / len(rows)
+    small, large = per_instruction(30), per_instruction(120)
+    assert 0 < small and large < 1.5 * small, (small, large)
+
+
 def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
     # A goto out of a loop handed its target the state the walk had at the jump, the
     # first trip's, where a register the loop writes later still held its value from

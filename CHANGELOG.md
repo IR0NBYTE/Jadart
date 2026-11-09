@@ -421,6 +421,20 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop's latches are read off its header's predecessors.** `structure` builds a
+  loop's body back from its latches, the blocks the header dominates that jump to it,
+  and found them by asking every block of the function whether it jumps to the header,
+  once per loop. So N loops in a row cost about N * N: 3.0 million lines of that scan at
+  1,000 loops, and 2.50 s of CPU in `tier3_graph` at 8,000 where 2,000 took 0.16 (#301).
+  The predecessor lists `structure` already builds hold them, in the same order. The
+  answer is the same: in tier 3 lifts of 1,000 random ranges every loop body is the one
+  the scan gives, and the whole-binary tier 3 dump of both fixtures and of the seven
+  app-sweep libraries is byte-identical to main's. CPU seconds of `tier3_graph`, main
+  then this: 2,000, 4,000, 8,000 and 16,000 loops in a row 0.16, 0.61, 2.50 and 9.93
+  against 0.02, 0.04, 0.09 and 0.17. N loops nested in each other still cost about
+  N * N here, since each loop's body holds every loop inside it: 88 and 358 lines of
+  `loop_nodes` per instruction at 30 and 120 loops, where the scan made it 148 and 598.
+
 - **The frame's push and pop are stripped only off SP.** `strip_boilerplate` made any
   `stp` or `ldp` of x29 and x30 a nop as the frame chain, whatever its base, so `ldp
   x29, x30, [x0, #0x10]` loaded FP and LR from an object with no line saying so: with
