@@ -20150,6 +20150,33 @@ def test_an_ldp_into_its_own_base_reads_both_words_off_the_base_before_it():
                                                            "return d0;"]
 
 
+def test_strip_boilerplate_drops_the_fp_lr_pair_only_off_the_frame():
+    """The frame chain is an `stp`/`ldp` of FP and LR off SP: the prologue's push and
+    the epilogue's pop, `ldp x29, x30, [x15], #0x10`, the only base either fixture or
+    FluffyChat uses for one. Off another base the pair loads FP and LR from an object
+    or stores them to one, and `strip_boilerplate` made it a nop whatever the base was,
+    which hid that write (#294)."""
+    from jadart.expr import lift_function, strip_boilerplate
+
+    def strip(mn, op):
+        return strip_boilerplate([(0x1000, mn, op, ""), (0x1004, "ret", "", "")],
+                                 set())[0][1]
+    assert strip("ldp", "x29, x30, [x0, #0x10]") == "ldp"
+    assert strip("stp", "x29, x30, [x0, #0x10]") == "stp"
+    assert strip("ldp", "x29, x30, [x29]") == "ldp"
+    for mn, op in (("ldp", "x29, x30, [x15], #0x10"), ("stp", "x29, x30, [x15, #-0x10]!"),
+                   ("ldp", "x29, x30, [sp], #0x10"), ("stp", "x29, x30, [sp, #-0x10]!")):
+        assert strip(mn, op) == "nop", (mn, op)
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(0x1000 + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    assert lift([("ldp", "x29, x30, [x0, #0x10]"), ("mov", "x0, x30"), ("ret", "")]) == [
+        "return x0.field_0x19;"]
+    assert lift([("stp", "x29, x30, [x0, #0x10]"), ("ret", "")]) == [
+        "x0.field_0x11 = FP;", "x0.field_0x19 = LR;", "return x0;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
