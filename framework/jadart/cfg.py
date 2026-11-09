@@ -685,7 +685,8 @@ def dom_numbers(idom):
     return pre, {n: pre[n] + size[n] for n in seq}, kids
 
 
-def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=()):
+def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
+              rest: bool = False):
     """Return a list of statements. Each is one of:
       ('asm', block_addr)
       ('if', cond, then_stmts, else_stmts)   (else_stmts may be [])
@@ -713,6 +714,11 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=())
     from the first of them, and structured as a body: each roots a dominator tree of
     its own (dominator_forest), so its loops are loops and its conditionals meet where
     they do, not at a goto (#278).
+
+    A section nested too deeply to structure ends the placing, and what is left is
+    counted in a note that says `disasm` lists it. With `rest`, the caller prints those
+    blocks itself, and ("rest", the blocks left, in the order they would have been
+    placed) stands in place of the note: tier 3 prints their rows as they are (#284).
 
     Loops are reconstructed by structuring the natural-loop body through the same
     recursive if/else machinery (bounded to the loop's nodes), so a conditional inside
@@ -1104,8 +1110,12 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=())
         except RecursionError:
             visited.clear()
             visited.update(before)
-            left = sum(len(blocks[b].insns) for b in tail if b not in visited)
-            out.append(("note", f"{left} more instructions no edge in this graph "
+            left = [b for b in tail if b not in visited]
+            if rest:
+                out.append(("rest", tuple(left)))
+                break
+            n = sum(len(blocks[b].insns) for b in left)
+            out.append(("note", f"{n} more instructions no edge in this graph "
                                 "reaches are nested too deeply to structure; `disasm` "
                                 "lists them"))
             break
@@ -1155,18 +1165,24 @@ TOO_DEEP = ("nested too deeply to structure; its instructions follow as they are
             "address order")
 
 
+def flat_rows(rows, pad, show) -> list:
+    """`rows` as they are, each at its address, as `flat` prints them."""
+    at = getattr(show, "address", None)
+    out = []
+    for a, mn, op, note in rows:
+        where = at(a) if at is not None else f"0x{a:x}"
+        shown = show(a, op) if show is not None else op
+        out.append(f"{pad}{where}  {mn} {shown}".rstrip() + note)
+    return out
+
+
 def flat(rows, indent="  ", depth=1, *, show, cut_end=None) -> list:
     """`rows` as they are, each at its address, under a note saying why: what tier 2 and
     tier 3 print for a function `structure` cannot nest (#81). Cut at the instruction
     limit (`cut_end`), they end with the jump to where it goes on, so that the list does
     not read as the whole function."""
     pad = indent * depth
-    at = getattr(show, "address", None)
-    out = [f"{pad}// {TOO_DEEP}"]
-    for a, mn, op, note in rows:
-        where = at(a) if at is not None else f"0x{a:x}"
-        shown = show(a, op) if show is not None else op
-        out.append(f"{pad}{where}  {mn} {shown}".rstrip() + note)
+    out = [f"{pad}// {TOO_DEEP}"] + flat_rows(rows, pad, show)
     if cut_end is not None and rows and cut_end > rows[-1][0] + 4:
         out.append(f"{pad}{cut_goto(max(r[0] for r in rows) + 4, show)}")
     return out

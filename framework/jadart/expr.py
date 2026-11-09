@@ -38,9 +38,10 @@ from sys import intern
 from typing import NamedTuple
 
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, cut_goto, flat, TRAPS, _target, entry_reach,
-                  UNREACHED, cut_off, dominator_forest, dom_numbers, second_reach,
-                  past_trap, _cond_for, checks_into, _conditions_from_the_block_before)
+                  cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
+                  entry_reach, UNREACHED, cut_off, dominator_forest, dom_numbers,
+                  second_reach, past_trap, _cond_for, checks_into,
+                  _conditions_from_the_block_before)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -6603,7 +6604,7 @@ class Lifter:
         its arms disagree about are still wanted."""
         for s in stmts:
             k = s[0]
-            if k == "note" or (k == "label" and s[1] in self.orphans):
+            if k in ("note", "rest") or (k == "label" and s[1] in self.orphans):
                 return None             # a section nothing before it runs on into
             if k in ("asm", "loop", "goto", "label", "again"):
                 return s[1]
@@ -6833,7 +6834,8 @@ class Lifter:
         note = None
         for i, s in enumerate(stmts):
             kind = s[0]
-            if note is not None and (kind == "note" or (kind == "label" and note[1])):
+            if note is not None and (kind in ("note", "rest")
+                                     or (kind == "label" and note[1])):
                 _drop_empty_note(out, note[0])
                 note = None
             if kind == "asm":
@@ -7029,6 +7031,24 @@ class Lifter:
                     self._note_break(st)
                 out.extend(self._carry_out(st, pad, kind == "break"))
                 out.append(pad + kind + ";")
+                falls = alive = False
+            elif kind == "rest":
+                # The sections `structure` could not nest, from the first one nested too
+                # deeply for it on (_rest_sections): each under its note, the first also
+                # under the one `flat` prints over a whole function, and every row as it
+                # is, with a label where a goto names one. They were a count in a note
+                # this loop took for a section's over nothing and dropped, so the body
+                # behind a monomorphic entry 1,000 ifs deep printed `br x16` (#284).
+                for k, (text, rows_of) in enumerate(s[1]):
+                    if text:
+                        out.append(pad + "// " + text)
+                    if not k:
+                        out.append(pad + "// " + TOO_DEEP)
+                    for b, rows, past in rows_of:
+                        label(b)
+                        out.extend(flat_rows(rows, pad, self.show))
+                        if past >= 0:
+                            out.append(pad + cut_goto(past, self.show))
                 falls = alive = False
             elif kind == "again":
                 # A block of the body that leads nowhere, printed again under a section
@@ -9057,11 +9077,42 @@ def tier3_graph(ann, cut_end=None, mono=None):
             if len(blk.insns) == 1 and blk.cond and not blk.cexit:
                 blk.cond = _cond_for([], blk.insns[0][1], blk.insns[0][2])
         _conditions_from_the_block_before(blocks, stop=frozenset(roots))
-    stmts = structure(blocks, entry, orphans=True, cut=cut, entries=roots)
+    stmts = structure(blocks, entry, orphans=True, cut=cut, entries=roots, rest=True)
+    if stmts and stmts[-1][0] == "rest":
+        stmts[-1] = ("rest", _rest_sections(blocks, stmts[-1][1], ann, cut, mono))
     trapped = past_trap(blocks, entry, placed, cut)
     return Tier3Graph(stripped, frozenset(slow), blocks, entry, raw, cut,
                       _ends_again(blocks, stmts, placed, second, trapped), roots, second,
                       trapped)
+
+
+def _rest_sections(blocks, left, ann, cut, mono) -> tuple:
+    """The blocks `structure` left when a section no edge reaches was nested too deeply
+    for it, `left` in the order it would have placed them (#284), as the sections it
+    would have placed them in: each block no earlier one took starts one, with what it
+    reaches among the rest, under the note `structure` gives it (MONOMORPHIC_ENTRY at the
+    monomorphic entry `mono`), and with its rows as they are in `ann`, by address:
+    ((note or None, ((block, rows, cut_next), ...)), ...). Each block is taken once, so
+    this is linear in the rows."""
+    rest = set(left)
+    targeted = {s for b in blocks.values() for s in b.succ} | set(cut)
+    row = {r[0]: r for r in ann}
+    out, taken = [], set()
+    for a in left:
+        if a in taken:
+            continue
+        group, stack = [], [a]
+        while stack:
+            n = stack.pop()
+            if n in taken or n not in rest:
+                continue
+            taken.add(n)
+            group.append(n)
+            stack.extend(blocks[n].succ)
+        note = None if a in targeted else MONOMORPHIC_ENTRY if a == mono else UNREACHED
+        out.append((note, tuple((b, tuple(row[i[0]] for i in blocks[b].insns),
+                                 blocks[b].cut_next) for b in sorted(group))))
+    return tuple(out)
 
 
 def _ends_again(blocks, stmts, placed, second=frozenset(), trapped=frozenset()) -> list:

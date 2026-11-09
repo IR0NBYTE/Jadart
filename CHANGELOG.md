@@ -421,6 +421,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A section too deep to structure prints its rows.** `structure` places a section no
+  edge leads into after the body, and one nested too deeply for it ends the placing with
+  a note counting what is left and saying `disasm` lists it. Tier 3's walk took that note
+  for a section's over nothing and dropped it, so the rows left the output with no word:
+  1,000 nested ifs behind a monomorphic entry printed `br x16   // x16 holds
+  THR.field_0x258` and nothing else, without the monomorphic note either, and so did the
+  same rows as a catch entry after a `ret`, at the CLI's recursion limit (#284). Each
+  section left now keeps its note, the monomorphic one where the snapshot says so, and
+  its rows follow as they are, at their addresses, as a whole function too deep to
+  structure prints them, under `// nested too deeply to structure; its instructions
+  follow as they are, in address order`; a section after it follows under its own note,
+  and a block a goto names gets its label. Every row of the range is printed once. The
+  body above prints as it did. In `lift`, `decompile`, `export`, `ffi` and
+  `jadart.decompile`; tier 2 keeps its count, which was never dropped.
+
+  Measured at the CLI's recursion limit: 1,000 ifs behind +8, 2,007 rows, went from 1
+  line to 2,008, the two notes and 2,005 rows; 5,000 from 1 to 10,008; the catch entry
+  from 1 line to 2,004. 50 deep is structured as before, 108 lines. Neither fixture has
+  such a section, and neither changes a line. Printing the rest is linear: 200 catch
+  entries each 600 deep, 240,202 rows, lift in 1.45 s of CPU against 1.05 s on main,
+  which printed one line; 20,000 deep behind +8 takes 13.3 s here and 13.5 s on main,
+  13.0 of them in `_idoms`, the same on both.
+
 - **A section past a trap says what it does in the body.** `structure` places a section
   no edge leads into among the body's sections when all that comes before it is a trap
   or a call that cannot return, and tier 3 took it for body there: its goto into the body
