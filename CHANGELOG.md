@@ -421,6 +421,28 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A 32-bit `sdiv` divides the low halves of its registers, read as signed.** `sdiv w0,
+  w1, w2` divides the low 32 bits of each register as signed values and keeps the low half
+  of the quotient. Tier 3 printed `(x1 ~/ x2).toUnsigned(32)`, the whole registers
+  divided: for x1 = 0x92b1d3f2ca02135e and x2 = 0xffffffff the CPU has 0x35fdeca2 and the
+  text 0x92b1d3f3 (#291). It now prints `(x1.toSigned(32) ~/
+  x2.toSigned(32)).toUnsigned(32)`, with a `.toSigned(32)` left off where the operand is
+  already sign-extended from bit 31 or lower. `V.sext` records that: a signed bound, set
+  where the text prints `.toSigned(k)` and carried through `>>` by a literal, so a Smi
+  untag has 31. INT32_MIN ~/ -1 is 0x80000000 on the CPU and in the text. A zero divisor
+  gives 0 on the CPU and throws in Dart; compiled code tests the divisor first. `sdiv x`
+  was right and is unchanged, and `udiv`, which none of the nine binaries has in a w form,
+  still prints as arm64.
+
+  Measured against main. Every 32-bit sdiv on the fixtures and the seven app-sweep
+  libraries, 2 on each fixture and 2, 4, 2, 2, 2, 2 and 2 on FluffyChat, kazumi, labplus,
+  jsdict, tsdm_client, anytime and xeonjia, is the Smi `~/` or `%`: a `cbz` on the divisor
+  and two untags, then the divide. An untag is a 31-bit value, so all 20 print as before
+  and no line of either fixture or any of the seven libraries changes. Against unicorn
+  2.1.4, over random runs of up to three instructions that end in an sdiv, three seeds of
+  4,000: 7,547 of 8,928 w runs disagree on main and 0 of 8,848 here; 115 x runs disagree
+  on main, each after an earlier w sdiv, and 0 here.
+
 - **A loop's exit and a goto's join are worked out once, not per loop.** At each loop's
   exit `_exit_slots` asked `_loop_nodes` for the header and every block that reaches it,
   and what those write; at each goto's join `_join_kill` walked back over every block
