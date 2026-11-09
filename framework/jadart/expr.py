@@ -5992,18 +5992,24 @@ class Lifter:
             if role == _T.consts_base and disp in _T.consts and not index:
                 st.set(dst, V(_T.consts[disp], P_ATOM))
                 return []
-            if _T.roles.get(base) == "PP":                   # unresolved ObjectPool entry
-                st.set(dst, V(f"pool_0x{disp:x}", P_ATOM))
-                return []
-            if base in st.poolbase:                          # far load: add base + ldr off
-                off = st.poolbase[base] + disp
-                lbl = self.pool_map.get(off)
-                st.set(dst, V(lbl if lbl else f"pool_0x{off:x}", P_ATOM))
-                return []
             # `ldp a, b, [base, #d]` loads TWO registers, the second one slot further on.
+            # Every base below reads both: the pool and an element address took the first
+            # and returned, so the second register kept what it held (#306).
             second = None
             if mn in ("ldp", "ldpsw") and len(ops) >= 3:
                 second = (canon(ops[1]), disp + _access_width(mn, ops[1]))
+            words = [(dst, disp)] + ([second] if second else [])
+            if _T.roles.get(base) == "PP":                   # unresolved ObjectPool entry
+                for r, d in words:
+                    st.set(r, V(f"pool_0x{d:x}", P_ATOM))
+                return []
+            if base in st.poolbase:              # far load: add base, then ldr off it
+                # Both offsets before either register is written, which can be the base.
+                offs = [(r, st.poolbase[base] + d) for r, d in words]
+                for r, off in offs:
+                    lbl = self.pool_map.get(off)
+                    st.set(r, V(lbl if lbl else f"pool_0x{off:x}", P_ATOM))
+                return []
             frame = self._frame_base(base)
             if frame and index is not None:
                 return self._verbatim(st, mn, op, op, dst)       # as for a store
@@ -6039,13 +6045,14 @@ class Lifter:
                     and mn in ("ldr", "ldur") and ops[0].strip()[:1] == "x"):
                 st.set(dst, replace(boxed, smi=0))
                 return []
-            if index is not None or base in st.elem:          # element load
+            if index is not None or (base in st.elem and not second):   # element load
                 elem = self._elem_access(base, index, scale, st, disp)
                 if elem is not None:
                     st.set(dst, elem)
                     return self._bump(st, base, delta)
                 # Not one the lifter can show is an element: the load from the address
-                # it computes, as off any other base (#308).
+                # it computes, as off any other base (#308). An `ldp` reads each of its
+                # words that way or as an element, below (#306).
             # The high half of a split 64-bit field load, recognised by adjacency: the
             # previous instruction loaded the slot one word below, from the same base.
             # Only then, two loads that merely happen to be four bytes apart in unrelated
@@ -6063,7 +6070,6 @@ class Lifter:
             # address with the top bit copied up, and the shift pair is how `_extended`
             # spells that. Unsigned needs nothing, the width is in the spelling (#221).
             sign = mn in _SIGNED_LOADS
-            w = _access_width(mn, ops[0])
             # `_rebase` folds a displacement below the base into the base expression, so a
             # pre-indexed `ldr x16, [x1, #-8]!` reads `(t4 - 8).field_0x1` and not a
             # field at -7, which is not a field (see `_rebase`).
@@ -6075,18 +6081,21 @@ class Lifter:
             # off the value just loaded, `x8.field_0x9.field_0x11` for `ldp x8, x0, [x8,
             # #8]` (#293).
             at_base = g(base)
-            bv, off = self._rebase(base, at_base, disp)
-            v = self._field(bv, off, w, cast if off == disp + 1 else None)
-            if sign and w < 8 and _reg_file(ops[0]) == "x":
-                v = _extended(v, 8 * w, True)
-            st.set(dst, v)
-            if second:
-                w2 = _access_width(mn, ops[1])
-                bv2, off2 = self._rebase(base, at_base, second[1])
-                v2 = self._field(bv2, off2, w2, cast if off2 == second[1] + 1 else None)
-                if sign and w2 < 8 and _reg_file(ops[1]) == "x":
-                    v2 = _extended(v2, 8 * w2, True)
-                st.set(second[0], v2)
+            got = []
+            for k, (r, d) in enumerate(words):
+                # A word of an `ldp` off an element address is an element where
+                # `_elem_access` shows it is one, and otherwise the read at its address.
+                v = (self._elem_access(base, None, scale, st, d) if base in st.elem
+                     else None)
+                if v is None:
+                    wk = _access_width(mn, ops[k])
+                    bv, off = self._rebase(base, at_base, d)
+                    v = self._field(bv, off, wk, cast if off == d + 1 else None)
+                    if sign and wk < 8 and _reg_file(ops[k]) == "x":
+                        v = _extended(v, 8 * wk, True)
+                got.append((r, v))
+            for r, v in got:
+                st.set(r, v)
             self._last_mem = ("load", base, disp, dst)
             return self._bump(st, base, delta)
 
