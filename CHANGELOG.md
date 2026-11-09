@@ -421,6 +421,54 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A Smi untag reads bit 31 as the sign.** `sbfx xD, xN, #1, #0x1f` is SmiUntag under
+  compressed pointers, `sbfm` with immr 1 and imms kSmiBits + 1 = 31 at all eight tags
+  read from 2.19.6 to 3.13.0: bits 1 to 31 of xN, sign-extended from bit 31, which is
+  `xN.toSigned(32) >> 1` for every 64-bit xN. Tier 3 printed `xN >> 1`, which is that
+  only where bits 31 to 63 of xN already agree, and the VM leaves them zero after a
+  32-bit Smi add and after LoadCompressedSmi, and the heap base after LoadCompressed.
+  `copyWith` at 0x5d10 on the clean fixture, `add w2, w5, #2; sbfx x5, x2, #1, #0x1f`,
+  printed `t0 = ((x2 << 1) + 2).toUnsigned(32) >> 1;`, a large positive number where the
+  machine has a negative one (#285). The value decides now, in `lift`, `decompile`,
+  `export`, `ffi` and `jadart.decompile`. `>> 1` stays where the value proves bits 31 to
+  63 agree, a bound under 2^31 or an int32 literal; a bound of 32 proves nothing, since
+  `V.bits` is unsigned. A value a 32-bit write left is read through its low half, `t0 =
+  ((x2 << 1) + 2).toSigned(32) >> 1;`, and anything else, a field load, a call result, a
+  joined value or an entry register, takes the conversion too: a string's length reads
+  `a0.field_0xc.field_0x8.toSigned(32) >> 1`. Two rules that read the printed text now
+  know a width conversion is arithmetic: `_drop_dead_phis` took `.toSigned(` and
+  `.toUnsigned(` for a call and kept a phi nothing reads, and `_READS_MEMORY` took
+  `this.toSigned(` for a field of the receiver and assigned an untag of `this` in each
+  arm of an `if`.
+
+  Measured with `lift` over every range against main. Of the 3,731 untag sites on the
+  clean fixture, 216 read a value a 32-bit write left, 3,507 one of unknown width and 8
+  one proven to fit; 217, 3,507 and 8 of 3,732 on obf, and 5,071, 70,639 and 319 of
+  76,029 on the seven app-sweep libraries. Lines with `.toUnsigned(32) >> 1` go from 216
+  and 217 to 0 on the fixtures and from 1,043, 820, 550, 354, 1,286, 645 and 314 to 0 on
+  FluffyChat, kazumi, labplus, jsdict, tsdm_client, anytime and xeonjia. Lines are
+  counted per range over a `difflib.SequenceMatcher` alignment of this output with
+  main's: in a replaced run of equal length the n-th lines pair up, a pair counts once as
+  a respelling where this line respells to main's, and every other line counts on its
+  own side. On clean 4,547 lines are respellings, and 4 ranges change more: a value that
+  crosses the 200-character naming limit is named a step earlier and the names after it
+  renumber, leaving 62 lines here and 59 of main's that are not respellings. Obf has
+  4,518, and 62 and 59 in 4 ranges; the apps 92,678, and 1,234 and 1,206 in 51 ranges.
+  With the naming limit lifted on both sides, every changed line in those ranges is a
+  respelling. 22 more of main's lines go on the apps, in 11 ranges: dead phis main kept,
+  named-argument indices bound to `((x << 1) + 2).toUnsigned(32) >> 1` that nothing
+  reads, because `_drop_dead_phis` read `.toUnsigned(` as a call. On main the two rules
+  misread nothing else in the nine binaries.
+  `irfuzz`'s expression pass, widened locally to take `sbfx` and to read `>>` as Dart's
+  arithmetic shift, over every straight-line run holding an untag: 1,967 of 2,109 runs
+  disagree with the CPU on main and 0 here on clean, 1,967 of 2,111 and 0 on obf, and
+  38,112 of 39,982 and 0 on the apps. `quality` counts 3 more lines on each fixture,
+  the naming limit's, and as many bare-register and byte-offset lines as main does;
+  `pbfuzz --census`, its 400 generated runs, `irfuzz --corpus` and `cfgcheck` print
+  what they print on main. `export` of the clean fixture replaces 3,462 lines with 3,464
+  in 101 of its 328 files, and its 213 `.toUnsigned(32) >> 1` lines go to 0; tier 2 is
+  byte-identical. `ffi --full` changes 2 lines on tsdm_client and none on FluffyChat.
+
 - **A run of loops no longer costs the cube of its length to lift.** Whether one block
   dominates another was a walk up `idom` from the lower one, and tier 3 asked it of every
   block each loop's header dominates, so 1,000 loops in a row (`add; cmp; b.lt` back to

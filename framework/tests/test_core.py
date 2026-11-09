@@ -13311,9 +13311,10 @@ def test_a_bitfield_reads_as_wide_as_its_field():
     # A negative literal is no atom to Dart's `.`: `-128.toSigned(8)` is
     # `-(128.toSigned(8))`, 1024 where the machine has -1024 for `<< 3`.
     assert text("sbfiz", 3, 8, [("mov", "x3, #-0x80")]) == "(-128).toSigned(8) << 3"
-    # The Smi tag and untag keep the reading they had: the value, and `>> 1`. The class
+    # The Smi tag keeps the reading it had, the value. The untag reads bit 31 as the
+    # sign, which `x3 >> 1` did not for an x3 whose top half disagrees (#285). The class
     # id read out of a tags word keeps its brackets.
-    assert text("sbfiz", 1, 31) == "x3" and text("sbfx", 1, 31) == "x3 >> 1"
+    assert text("sbfiz", 1, 31) == "x3" and text("sbfx", 1, 31) == "x3.toSigned(32) >> 1"
     assert text("ubfx", 12, 20) == "(x3 >> 12) & 0xfffff"
 
     mask = (1 << 64) - 1
@@ -13336,8 +13337,8 @@ def test_a_bitfield_reads_as_wide_as_its_field():
     rng = random.Random(124)
     for mn in ("ubfx", "sbfx", "ubfiz", "sbfiz"):
         for lsb, width in ((4, 8), (4, 60), (3, 61), (12, 20), (7, 1), (5, 32), (1, 8),
-                           (1, 63)):
-            if mn == "sbfiz" and (lsb, width) == (1, 63):
+                           (1, 63), (1, 31)):
+            if mn == "sbfiz" and (lsb, width) in ((1, 63), (1, 31)):
                 continue                                    # the Smi tag
             t = text(mn, lsb, width)
             for _ in range(200):
@@ -19211,6 +19212,197 @@ def test_dominance_costs_the_same_per_instruction_at_any_length():
     finally:
         expr.dominator_forest = cfg.dominator_forest = forest
         expr.Lifter._own_written = own
+
+
+def _untag_text(rows, reg="x0"):
+    """The value tier 3 gives `reg` after `rows`, by the store the body ends with."""
+    from jadart.expr import lift_function
+    body = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(
+        list(rows) + [("stur", f"{reg}, [x9, #7]"), ("ret", "")])])
+    line = next(ln.strip() for ln in body if ln.strip().startswith("x9.field_0x8 = "))
+    return line.split(" = ", 1)[1].rstrip(";")
+
+
+def _dart_int(text, env):
+    """`text` evaluated as Dart's 64-bit ints over `env`, the low 64 bits returned. A
+    `.toSigned(n)` or `.toUnsigned(n)` becomes a call on the operand before it, a name or
+    a bracketed group, left to right."""
+    def signed(v, n):
+        v &= (1 << n) - 1
+        return v - (1 << n) if v >> (n - 1) & 1 else v
+    conv = re.compile(r"\.to(Signed|Unsigned)\((\d+)\)")
+    while (m := conv.search(text)):
+        i = m.start()
+        if text[i - 1] == ")":
+            depth, j = 0, i - 1
+            while True:
+                depth += {")": 1, "(": -1}.get(text[j], 0)
+                if depth == 0:
+                    break
+                j -= 1
+        else:
+            j = re.search(r"\w+\Z", text[:i]).start()
+        fn = "_s" if m.group(1) == "Signed" else "_u"
+        text = f"{text[:j]}{fn}({text[j:i]}, {m.group(2)}){text[m.end():]}"
+    return eval(text, {"_s": signed, "_u": lambda v, n: v & ((1 << n) - 1),
+                       **{k: signed(v, 64) for k, v in env.items()}}) & ((1 << 64) - 1)
+
+
+def test_a_smi_untag_reads_bit_31_as_the_sign_of_any_source():
+    """`sbfx xD, xN, #1, #31` is SmiUntag under compressed pointers: bits 1 to 31 of xN,
+    sign-extended from bit 31, `xN.toSigned(32) >> 1` for every 64-bit xN. Tier 3
+    printed `xN >> 1`, right only where bits 31 to 63 of xN already agree. After a
+    32-bit add they do not: the top half is zero, so a negative Smi read as a large
+    positive one, `((x2 << 1) + 2).toUnsigned(32) >> 1` (#285). A field load, a value a
+    join named and an entry register say nothing about the top half either, and the VM
+    leaves it zero (LoadCompressedSmi) or the heap base (LoadCompressed) there. Each
+    form is checked against the arm64 definition on random inputs."""
+    import random
+    after_add = [("add", "w1, w0, #2"), ("sbfx", "x0, x1, #1, #0x1f")]
+    assert _untag_text(after_add) == "(x0 + 2).toSigned(32) >> 1"
+    assert _untag_text([("sbfx", "x0, x1, #1, #0x1f")]) == "x1.toSigned(32) >> 1"
+    # A bound of 32 is not a sign: `V.bits` is unsigned, and bit 31 may be set.
+    masked = [("and", "x1, x2, #0xffffffff"), ("sbfx", "x0, x1, #1, #0x1f")]
+    assert _untag_text(masked) == "(x2 & 0xffffffff).toSigned(32) >> 1"
+    # A literal proves its sign only inside the int32 range. 0x80000000 has bit 31 set and
+    # nothing above it, so the machine has -0x40000000 where `0x80000000 >> 1` says
+    # 0x40000000; -0x80000001 has bit 31 clear under a negative top half.
+    mask = (1 << 64) - 1
+    for imm, want in (("0x80000000", "0x80000000.toSigned(32) >> 1"),
+                      ("-0x80000001", "(-0x80000001).toSigned(32) >> 1")):
+        got = _untag_text([("mov", f"x1, #{imm}"), ("sbfx", "x0, x1, #1, #0x1f")])
+        assert got == want, (imm, got)
+        field = (int(imm, 0) & mask) >> 1 & ((1 << 31) - 1)
+        machine = (field - (1 << 31) if field >> 30 else field) & mask
+        assert _dart_int(got, {}) == machine, (imm, got, hex(machine))
+    # The untagged value may be negative, so a 32-bit write of it is truncated again.
+    chain = after_add + [("add", "w3, w0, #1")]
+    assert _untag_text(chain, "x3").endswith(".toUnsigned(32)"), _untag_text(chain, "x3")
+
+    def arm(x0, x1, x2):
+        def sext(v, n):
+            v &= (1 << n) - 1
+            return v - (1 << n) if v >> (n - 1) & 1 else v
+        mask = (1 << 64) - 1
+        w1 = (x0 + 2) & 0xffffffff
+        r0 = sext(w1 >> 1, 31) & mask
+        return {"after_add": r0, "alone": sext(x1 >> 1, 31) & mask,
+                "masked": sext((x2 & 0xffffffff) >> 1, 31) & mask,
+                "chain": (r0 + 1) & 0xffffffff}
+    texts = {"after_add": _untag_text(after_add),
+             "alone": _untag_text([("sbfx", "x0, x1, #1, #0x1f")]),
+             "masked": _untag_text(masked), "chain": _untag_text(chain, "x3")}
+    rng = random.Random(285)
+    for _ in range(400):
+        # Negative Smis and values with bit 31 set are the inputs main got wrong.
+        env = {r: rng.choice((rng.getrandbits(64), rng.getrandbits(32),
+                              (1 << 64) - rng.getrandbits(31)))
+               for r in ("x0", "x1", "x2")}
+        want = arm(env["x0"], env["x1"], env["x2"])
+        for k, t in texts.items():
+            assert _dart_int(t, env) == want[k], (k, t, {r: hex(v)
+                                                         for r, v in env.items()})
+
+
+def test_a_smi_untag_keeps_the_shift_where_the_value_proves_its_sign():
+    """Guard, passes on main: `>> 1` is exact where the source's bits 31 to 63 agree,
+    and the value says so, a bound under 2**31 or a literal in the int32 range (#285).
+    The value decides, not the pattern before it: a w write that fits in 31 bits keeps
+    the shift, one that does not gets the conversion."""
+    assert _untag_text([("and", "x1, x2, #0xfffe"), ("sbfx", "x0, x1, #1, #0x1f")]) == (
+        "(x2 & 0xfffe) >> 1")
+    assert _untag_text([("and", "w1, w2, #0x7ffffffe"),
+                        ("sbfx", "x0, x1, #1, #0x1f")]) == "(x2 & 0x7ffffffe) >> 1"
+    assert _untag_text([("mov", "x1, #-4"), ("sbfx", "x0, x1, #1, #0x1f")]) == "-4 >> 1"
+    # The bottom of the int32 range is still in it.
+    assert _untag_text([("mov", "x1, #-0x80000000"), ("sbfx", "x0, x1, #1, #0x1f")]) == (
+        "-0x80000000 >> 1")
+
+
+def test_a_smi_untag_reads_the_value_a_w_write_left_through_its_low_half():
+    """A 32-bit write leaves the value it truncated in `V.wide` (#235), and the untag
+    reads only the low 32 bits, which are the same in both, so it reads that one: one
+    conversion, not a truncation and a sign extension of the same bits (#285). A
+    literal whose w write zero-extended it is still the literal to `toSigned(32)`."""
+    assert _untag_text([("add", "w1, w5, #2"), ("sbfx", "x0, x1, #1, #0x1f")]) == (
+        "(x5 + 2).toSigned(32) >> 1")
+    assert _untag_text([("mov", "w1, #-2"), ("sbfx", "x0, x1, #1, #0x1f")]) == "-2 >> 1"
+
+
+def test_a_smi_untag_on_arm32_rows_reads_bit_31_as_the_sign():
+    """arm32 is not in LIFTABLE_ARCHS, so no command lifts its rows, and its SmiUntag is
+    `asr` (kSmiBits 30 on a 32-bit word). The branch runs if a caller binds the target
+    directly, as the arm32 tests do, and prints the exact form there too (#285)."""
+    from jadart import expr as E
+    rows = [("sbfx", "r0, r1, #1, #0x1f"), ("str", "r0, [r2, #7]"), ("bx", "lr")]
+    with E.use_target(E.ARM32):
+        body = [ln.strip() for ln in E._lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+            None, None, None, "  ", 1, None)]
+    assert any(ln.endswith(" = r1.toSigned(32) >> 1;") for ln in body), body
+    assert E._T is E.ARM64
+
+
+def test_copywith_on_the_clean_fixture_untags_its_named_argument_index_signed():
+    """#285 as reported: the named-argument walk at 0x5d10 on the clean fixture adds one
+    Smi to the index with `add w2, w5, #2` and untags it with `sbfx x5, x2, #1, #0x1f`,
+    and `lift` printed `((x2 << 1) + 2).toUnsigned(32) >> 1`. Through the library API and
+    `lift`, each of the six reads the low half signed."""
+    _needs_capstone()
+    import contextlib
+    import io
+    from jadart import cli
+    body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x5d10")[0]["body"]]
+    assert "t0 = ((x2 << 1) + 2).toSigned(32) >> 1;" in body, body
+    assert sum(".toSigned(32) >> 1;" in ln for ln in body) == 6, body
+    assert not [ln for ln in body if ".toUnsigned(32) >> 1" in ln], body
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert cli.main(["lift", CLEAN, "0x5d10"]) == 0
+    assert "t5 = ((t4 << 1) + 2).toSigned(32) >> 1;" in out.getvalue(), out.getvalue()
+
+
+def test_a_width_conversion_is_neither_a_call_nor_a_read_of_memory():
+    """`.toSigned(n)` and `.toUnsigned(n)` are arithmetic on the value before them, and
+    two rules that read the printed text took them for something else. `_CALL_IN_LINE`
+    took one for a call, so `_drop_dead_phis` kept a phi nothing reads because an arm
+    binding an untag or a 32-bit result looked like a side effect. `_READS_MEMORY` took
+    `this.toSigned(` for a named field of the receiver, so an untag of `this` was
+    assigned in each arm of an `if` rather than declared before it. Both were latent on
+    main, which prints `.toUnsigned(32)` on a 32-bit result, and the untag's
+    `.toSigned(32) >> 1` made them fire across the nine binaries #285 measured. A call
+    that carries a conversion is still a call, and a field of `this` still reads
+    memory."""
+    from jadart.expr import _CALL_IN_LINE, _READS_MEMORY, _drop_dead_phis, lift_function
+
+    def arms(v):
+        return ["  var t4;", "  if (x0 != 0) {", f"    t4 = {v};",
+                "    x3.field_0x8 = x4;", "  } else {", "    t4 = 0;",
+                "    x3.field_0x8 = x5;", "  }", "  return x0;"]
+    for v in ("x1.toSigned(32) >> 1", "(x1 + 2).toUnsigned(32)"):
+        out = _drop_dead_phis(arms(v), {"t4"})
+        assert not [ln for ln in out if "t4" in ln], (v, out)
+    # Only the conversion the lifter prints, a literal width in the brackets: anything
+    # else after those names is a call, and its phi stays.
+    for v in ("f(x1).toSigned(32)", "Foo.toSigned(x1)"):
+        called = _drop_dead_phis(arms(v), {"t4"})
+        assert [ln for ln in called if "t4" in ln], (v, called)
+    assert _CALL_IN_LINE.search("t4 = Foo.toSigned(x1);")
+    assert not _CALL_IN_LINE.search("t4 = x1.toSigned(32) >> 1;")
+    assert not _READS_MEMORY.search("this.toSigned(32) >> 1")
+    assert not _READS_MEMORY.search("this.toUnsigned(32)")
+    assert _READS_MEMORY.search("this.balance")
+    assert _READS_MEMORY.search("this.toSigned(32).field_0x8")
+    assert _READS_MEMORY.search("this.toSigned(x1)")
+    # `get:isOdd` at 0x24238 on the clean fixture, the shape LoadInt64FromBoxOrSmi emits:
+    # the untag, then the Mint's payload where the value is not a Smi.
+    rows = [("sbfx", "x2, x1, #1, #0x1f"), ("tbz", "w1, #0, #0xc"),
+            ("ldur", "x2, [x1, #7]"), ("stur", "x2, [x3, #7]"), ("ret", "")]
+    body = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+        receiver={"x1": "this"})]
+    assert body[:2] == ["var t0 = this.toSigned(32) >> 1;", "if (this & 1 != 0) {"], body
+    assert "} else {" not in body, body
 
 
 if __name__ == "__main__":

@@ -603,7 +603,7 @@ loop and the accumulator:
 ```
 var t0 = 0;
 var t2 = a0.field_0xc;
-var t3 = a0.field_0xc.field_0x8 >> 1;
+var t3 = a0.field_0xc.field_0x8.toSigned(32) >> 1;
 var t4 = 0;
 while (true) {
   if (t4 >= t3) break;
