@@ -29,7 +29,7 @@ A Flutter release build has been through AOT compilation and tree shaking. Real
 information is gone: local variable names, most field names, generic type arguments,
 comments. `jadart` is built so that a thing it could not recover comes out looking like a
 gap rather than an answer. That property is the whole point, and you are the weakest link
-in it: the natural move when reading `pool_0xb968.field_0x7(...)` is to say what it
+in it: the natural move when reading `pool_0xb968.field_0x8(...)` is to say what it
 "probably" does, and that turns a careful analysis into a confident fabrication carrying
 the authority of a byte-exact tool.
 
@@ -96,7 +96,7 @@ both with `same_as`: `{"same_as": offset}` in place of `elements`, and
 
 Two examples, so the distinction is concrete.
 
-> Body: `var t0 = pool_0xb968.field_0x7(...);`
+> Body: `var t0 = pool_0xb968.field_0x8(...);`
 >
 > **Wrong:** "It calls the list's `add` method with the decoded byte."
 > **Right:** "It calls an unresolved pool target, with arguments the tool did not

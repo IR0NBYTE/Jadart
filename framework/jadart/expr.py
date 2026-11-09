@@ -207,7 +207,10 @@ class Target:
     """
     name: str
     roles: dict          # canonical register -> role name shown in the output
-    untagged: frozenset  # roles holding an UNtagged address (no kHeapObjectTag bias)
+    #: Roles holding an UNtagged address (no kHeapObjectTag bias) whatever the code does.
+    #: Not LR: Dart also loads a Code object into it and calls through its entry point,
+    #: so what it holds is the code's to say and not the table's (`Lifter._holds_ra`).
+    untagged: frozenset
     arg_regs: tuple      # registers Dart passes arguments in, in order
     zero: str            # the always-zero register, or "" where the machine has none
     aliases: dict        # what the disassembler prints -> canonical name
@@ -242,7 +245,7 @@ ARM64 = Target(
     name="arm64",
     roles={"x15": "SP", "x29": "FP", "x30": "LR", "x26": "THR", "x27": "PP",
            "x28": "HEAP", "x22": "NULL", "x21": "DISPATCH"},
-    untagged=frozenset({"x15", "x21", "x22", "x26", "x27", "x28", "x29", "x30"}),
+    untagged=frozenset({"x15", "x21", "x22", "x26", "x27", "x28", "x29"}),
     arg_regs=("x1", "x2", "x3", "x5", "x6", "x7"),
     zero="xzr",
     aliases={"wzr": "xzr", "xzr": "xzr", "wsp": "x15", "sp": "x15"},
@@ -267,7 +270,7 @@ ARM32 = Target(
     name="arm",
     roles={"r13": "SP", "r11": "FP", "r14": "LR", "r10": "THR", "r5": "PP",
            "r7": "DISPATCH", "r12": "TMP"},
-    untagged=frozenset({"r13", "r11", "r14", "r10", "r7", "r12"}),
+    untagged=frozenset({"r13", "r11", "r10", "r7", "r12"}),
     arg_regs=(),
     zero="",
     aliases={"sl": "r10", "fp": "r11", "ip": "r12", "sp": "r13", "lr": "r14",
@@ -1162,6 +1165,67 @@ def _is_lr_spill(reg: str, st: State) -> bool:
     A call writes it, so after one it is not (#162)."""
     lr = _lr()
     return canon(reg) == lr and lr not in st.reg
+
+
+_WORD_RE = re.compile(r"\b[a-z][a-z0-9]*\b")
+
+
+def _lr_write(mn: str, op: str, lr: str):
+    """What the row leaves in the link register `lr`: True for a call, which puts its own
+    return address there, False for any other row that may write it, None for a row that
+    leaves it alone. `_def_use` names arm64 registers only, so on another target any row
+    that names LR at all counts as a write: it can only say less (#280)."""
+    if mn in _CALLS:
+        return True
+    if lr in _def_use(mn, op)[0]:
+        return False
+    if _T is not ARM64 and any(canon(w) == lr for w in _WORD_RE.findall(op)):
+        return False
+    return None
+
+
+def _lr_return_address(blocks, preds, entries) -> dict:
+    """{block: whether LR holds a return address on entry to it, on every way in} (#280).
+
+    LR holds the caller's return address at each of `entries`, where the function is
+    entered, and a call inside the body leaves its own. Any other write leaves something
+    else: the assembler loads a Code object into LR and calls through its entry point, a
+    tagged pointer. `Assembler::BranchLink` takes `code_reg = FLAG_precompiled_mode ? LR
+    : CODE_REG` in assembler_arm64.cc at every tag from 3.3.0-174.2.beta to 3.13.0
+    (2.19.6 to 3.2.6 load CODE_REG), and in assembler_arm.cc at 3.12.2 and 3.13.0. A
+    must-analysis, the meet the lifter's joins make: a block holds it only where every
+    predecessor's exit does. A block the entries reach by no path holds it nowhere, and
+    counts as a way in that does not hold it, so a join such code falls into knows
+    nothing.
+
+    One bit per block, set to start with and only ever cleared, so each block changes at
+    most once and the work is linear in blocks plus edges."""
+    lr = _lr()
+    last = {}
+    for b, blk in blocks.items():
+        got = None
+        for (_a, mn, op, _n) in blk.insns:
+            w = _lr_write(mn, op, lr)
+            if w is not None:
+                got = w
+        last[b] = got
+    reach, stack = set(), [e for e in entries if e in blocks]
+    while stack:
+        n = stack.pop()
+        if n not in reach:
+            reach.add(n)
+            stack.extend(s for s in blocks[n].succ if s in blocks)
+    out = {b: True if last[b] is None else last[b] for b in blocks}
+
+    def into(b):
+        return b in reach and all(p in reach and out[p] for p in preds.get(b, ()))
+    work = [b for b in blocks if last[b] is None]
+    while work:
+        b = work.pop()
+        if out[b] and not into(b):
+            out[b] = False
+            work.extend(s for s in blocks[b].succ if s in blocks and last[s] is None)
+    return {b: into(b) for b in blocks}
 
 
 #: The slot-map key that says a push dropped part of the outgoing area; see
@@ -3081,6 +3145,11 @@ class Lifter:
         #: Its numbering (cfg.dom_numbers), which answers `_dominates` in O(1).
         self._dnum = None
         self._killcache: dict = {}
+        #: {block: LR holds a return address on entry}, `_lr_return_address`, and {block:
+        #: whether it does before each of its rows}, built the first time an access goes
+        #: through LR, for the function and for that block (`_holds_ra`); most make none.
+        self._lr_in = None
+        self._lr_at: dict = {}
         #: {temp number: the block its declaration stands in}, and the block lifted last,
         #: for the goto join in `walk`.
         self._anchor: dict = {}
@@ -4635,7 +4704,37 @@ class Lifter:
         # pointer, `add x25, x26, #0x10`, reads `THR + 16`, which is not the thread. Only
         # THR follows its value: the null in x22 is a tagged object, and a copy of FP or
         # SP is spelled with the bias, as the frame read itself is (`_frame_read`).
-        return disp if base_reg in _UNTAGGED or base_v.text == _THR else disp + 1
+        #
+        # LR is untagged only while it holds a return address (`_holds_ra`). Keyed on the
+        # name, `ldr x30, [x27, #0x13e0]; ldur x30, [x30, #7]` printed `.field_0x7` for
+        # the Code entry point that `ldr x8, ..; ldur x9, [x8, #7]` spells `.field_0x8`
+        # (#280). Where the graph cannot show which, LR takes the bias as any register
+        # of unknown value does: a Dart register holds a tagged object unless its role
+        # says otherwise.
+        if base_reg in _UNTAGGED or base_v.text == _THR:
+            return disp
+        if ROLE.get(base_reg) == "LR" and self._holds_ra():
+            return disp
+        return disp + 1
+
+    def _holds_ra(self) -> bool:
+        """Whether LR holds a return address before the instruction being stepped, on
+        every path to it: the last write to it in this block is a call, or there is none
+        and `_lr_return_address` says every way into the block holds one (#280)."""
+        rows = self._lr_at.get(self._last_block)
+        if rows is None:
+            if self._lr_in is None:
+                self._lr_in = _lr_return_address(self.blocks, self._preds,
+                                                  (self.entry, *self.roots))
+            lr, cur, rows = _lr(), self._lr_in.get(self._last_block, False), []
+            # Once per block, so a block of N reads through LR costs N and not N squared.
+            for (_a, mn, op, _n) in self._insns:
+                rows.append(cur)
+                w = _lr_write(mn, op, lr)
+                if w is not None:
+                    cur = w
+            self._lr_at[self._last_block] = rows
+        return rows[self._at]
 
     def _rebase(self, base_reg: str, base_v: V, disp: int) -> tuple:
         """The (base expression, NON-NEGATIVE field offset) `[base_reg, #disp]` names.
@@ -5616,8 +5715,10 @@ class Lifter:
             # address, because that is what decides whether a later displacement off this
             # base is an object header or a real element offset. See _elem_access. A copy
             # of the thread holds one as x26 does (`_byte_off`, #273), read before `dst`,
-            # which can be the base, is written.
-            untagged = b in _UNTAGGED or g(b).text == _THR
+            # which can be the base, is written, and so does LR where it holds a return
+            # address and nowhere else (#280).
+            untagged = (b in _UNTAGGED or g(b).text == _THR
+                        or (ROLE.get(b) == "LR" and self._holds_ra()))
             st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
             st.elem[dst] = (g(b), g(c), scale, untagged)
             return []
@@ -5795,7 +5896,8 @@ class Lifter:
         else:
             base_v = self._leaf(base_reg, st)
             idx_v = self._leaf(index_reg, st) if index_reg else V("0", P_ATOM)
-            s, frame = scale, base_reg in _UNTAGGED or base_v.text == _THR
+            s, frame = scale, (base_reg in _UNTAGGED or base_v.text == _THR
+                               or (ROLE.get(base_reg) == "LR" and self._holds_ra()))
         idx = idx_v.text
         if frame and disp:
             stride = 1 << s
