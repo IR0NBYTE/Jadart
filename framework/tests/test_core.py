@@ -20034,6 +20034,91 @@ def test_a_32_bit_sdiv_divides_the_signed_low_halves():
                     text, {r: hex(v) for r, v in env.items()})
 
 
+def _lift_value(rows, reg="x0"):
+    """The value tier 3 gives `reg` after `rows`, by the store the body ends with, and the
+    declarations before it as (name, text) pairs."""
+    from jadart.expr import lift_function
+    body = [ln.strip() for ln in lift_function([(i * 4, mn, op, "") for i, (mn, op) in
+                                                enumerate(list(rows) + [
+                                                    ("stur", f"{reg}, [x9, #7]"),
+                                                    ("ret", "")])])]
+    decl = re.compile(r"var (t\d+) = (.*);\Z")
+    decls = [m.groups() for m in map(decl.match, body) if m]
+    line = next(ln for ln in body if ln.startswith("x9.field_0x8 = "))
+    return line.split(" = ", 1)[1].rstrip(";"), decls
+
+
+def test_a_smi_tag_read_by_an_untag_gives_back_its_31_bits():
+    """`sbfiz xD, xN, #1, #0x1f` is the Smi tag under compressed pointers, bits 0 to 30 of
+    xN sign-extended and shifted up one, and tier 3 prints it as xN, the Dart value it
+    tags. The untag `sbfx #1, #0x1f` printed machine arithmetic on that, so the pair
+    divided twice: `x2.toSigned(32) >> 1` where the CPU has `x2.toSigned(31)` (#290). The
+    tag records that the register holds the value tagged and the untag reads it back:
+    for the w form, through a name a stale register gave it and through a frame slot.
+    Past a box-or-tag check the Smi path proves x2 fits, so the box unboxes to x2 on
+    both halves of an unbox, the untag and the Mint's value field. Each is checked
+    against the arm64 definition, the box on the inputs that take the Smi path."""
+    tag = [("sbfiz", "x1, x2, #1, #0x1f"), ("sbfx", "x0, x1, #1, #0x1f")]
+    wtag = [("sbfiz", "w1, w2, #1, #0x1f"), ("sbfx", "x0, x1, #1, #0x1f")]
+    box = [("sbfiz", "x1, x2, #1, #0x1f"), ("cmp", "x2, x1, asr #1"), ("b.eq", "#0x10"),
+           ("nop", ""), ("sbfx", "x0, x1, #1, #0x1f")]
+    unbox = box + [("tbz", "w1, #0, #0x1c"), ("ldur", "x0, [x1, #7]")]
+    # x3 is written while x1 still holds its tag, so x1's value gets a name first.
+    pinned = [("sbfiz", "w1, w3, #1, #0x1f"), ("asr", "w3, w5, #0x1a"),
+              ("sbfx", "x0, x1, #1, #0x1f")]
+    slot = [("add", "x3, x4, x5"), ("sbfiz", "x1, x3, #1, #0x1f"),
+            ("stur", "x1, [x29, #-8]"), ("mov", "x1, #3"), ("ldur", "x6, [x29, #-8]"),
+            ("sbfx", "x0, x6, #1, #0x1f")]
+    want = {"tag": "x2.toSigned(31)", "wtag": "x2.toSigned(31)", "box": "x2",
+            "unbox": "x2", "pinned": "t0.toSigned(31)", "slot": "(x4 + x5).toSigned(31)"}
+    rows = {"tag": tag, "wtag": wtag, "box": box, "unbox": unbox, "pinned": pinned,
+            "slot": slot}
+    got = {k: _lift_value(r) for k, r in rows.items()}
+    assert {k: g[0] for k, g in got.items()} == want, got
+    # A value that provably fits in 31 signed bits is its own untag.
+    fits = [("and", "x2, x5, #0xffff")] + tag
+    assert _lift_value(fits)[0] == "x5 & 0xffff"
+
+    def sext(v, n):
+        v &= (1 << n) - 1
+        return v - (1 << n) if v >> (n - 1) & 1 else v
+    mask = (1 << 64) - 1
+
+    def untag_of_tag(v):
+        word = (sext(v, 31) << 1) & mask            # sbfiz #1, #0x1f
+        return sext(word >> 1, 31) & mask           # sbfx #1, #0x1f, bits 1 to 31
+
+    def machine(k, e):
+        if k == "slot":
+            return untag_of_tag(e["x4"] + e["x5"])
+        return untag_of_tag(e["x3"] if k == "pinned" else e["x2"])
+    import random
+    rng = random.Random(290)
+    for _ in range(400):
+        env = {r: rng.choice((rng.getrandbits(64), rng.getrandbits(32), 0x40000000,
+                              0x3fffffff, 0x7fffffff, 0x80000000, (1 << 64) - 1,
+                              (1 << 64) - rng.getrandbits(31)))
+               for r in ("x2", "x3", "x4", "x5")}
+        for k, (text, decls) in got.items():
+            if k in ("box", "unbox") and sext(env["x2"], 31) & mask != env["x2"]:
+                continue                    # the Mint path, which the strip cuts
+            scope = dict(env)
+            for name, value in decls:
+                scope[name] = _dart_int(value, scope)
+            assert _dart_int(text, scope) == machine(k, env), (k, text, decls, {
+                r: hex(v) for r, v in env.items()})
+
+
+def test_a_smi_tag_still_prints_the_value_it_tags():
+    """Guard, passes on main: a tag is read as the Dart value where nothing untags it,
+    which is every one of the 1,211 tags on the clean fixture, each a box-or-tag check
+    whose result is stored or passed on (#290)."""
+    assert _lift_value([("sbfiz", "x1, x2, #1, #0x1f")], "x1")[0] == "x2"
+    box = [("sbfiz", "x1, x2, #1, #0x1f"), ("cmp", "x2, x1, asr #1"), ("b.eq", "#0x10"),
+           ("nop", "")]
+    assert _lift_value(box, "x1")[0] == "x2"
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
