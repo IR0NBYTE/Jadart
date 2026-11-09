@@ -20603,6 +20603,60 @@ def test_a_read_through_x29_past_a_write_that_is_not_the_frame_reads_its_value()
         "return (x0 - 8).field_0x1;"]
 
 
+def test_an_element_access_off_the_data_offset_prints_the_address_it_reads():
+    """An element address, `add x2, x3, x4, lsl #3`, is read at the data offset less the
+    tag, and only that access is element x4. Tier 3 dropped every displacement, so
+    stores at #0x17 and #0x1f printed `x3[x4] = x5;` then `x3[x4] = x6;`, the second
+    reading as overwriting the first, and a load at #8 or #-8 read `x3[x4]` too (#308).
+    Where one access reaches a data offset of the target the others print k strides on
+    from it or as the address they read; where none or two do, every one prints its
+    address. 0x1f is Closure's in 3.13.0, so it is one of two there. A call ends the
+    entry where the walk forgets the register, and only there. An untagged base has no
+    header, and its offset is 0."""
+    add = ("add", "x2, x3, x4, lsl #3")
+
+    def lift(*rows, tail=(("ret", ""),)):
+        return " ".join(_lift_rows([add, *rows, *tail], base=0x1000))
+    assert lift(("str", "x5, [x2, #0x17]"), ("str", "x6, [x2, #0x27]")) == (
+        "x3[x4] = x5; x3[x4 + 2] = x6; return x0;")
+    assert lift(("str", "x5, [x2, #0x17]"), ("str", "x6, [x2, #0x1f]")) == (
+        "(x3 + (x4 << 3)).field_0x18 = x5; (x3 + (x4 << 3)).field_0x20 = x6; return x0;")
+    # An access past a call the walk forgets x2 at says nothing about one before it.
+    assert lift(("str", "x5, [x2, #0x1f]"), ("bl", "#0x2000"),
+                ("ldr", "x0, [x2, #0x17]")) == (
+        "(x3 + (x4 << 3)).field_0x20 = x5; var t0; sub_0x2000(...); "
+        "return t0.field_0x18;")
+    assert " ".join(_lift_rows([
+        ("add", "x2, x3, x4, lsl #2"), ("str", "x5, [x2, #0x13]"), ("bl", "#0x2000"),
+        ("ldur", "w0, [x2, #0xf]"), ("ret", "")], base=0x1000)) == (
+        "(x3 + (x4 << 2)).field_0x14 = x5; var t0; sub_0x2000(...); "
+        "return t0.field_0x10;")
+    ret0 = (("ret", ""),)
+    for disp, want in (("#0", "x3[x4]"), ("#0xf", "x3[x4]"), ("#0x17", "x3[x4]"),
+                       ("#8", "(x3 + (x4 << 3)).field_0x9"),
+                       ("#0x1f", "(x3 + (x4 << 3)).field_0x20"),
+                       ("#-8", "(x3 + (x4 << 3) - 8).field_0x1")):
+        assert lift(("ldur", f"x0, [x2, {disp}]"), tail=ret0) == f"return {want};", disp
+    # Two data offsets, 0xf and 0x17, off one address: neither is shown to be it, on
+    # one path or on two.
+    both = "return (x3 + (x4 << 3)).field_0x10 + (x3 + (x4 << 3)).field_0x18;"
+    assert lift(("ldur", "x0, [x2, #0xf]"), ("ldur", "x1, [x2, #0x17]"),
+                ("add", "x0, x0, x1")) == both
+    assert lift(("cbz", "x9, #0x100c"), ("ldur", "x0, [x2, #0xf]"),
+                ("ldur", "x1, [x2, #0x17]"), ("add", "x0, x1, x1")) == (
+        "return (x3 + (x4 << 3)).field_0x18 + (x3 + (x4 << 3)).field_0x18;")
+    # The megamorphic cache's probe reads a key at 0xf and its target one element on.
+    assert " ".join(_lift_rows([
+        ("add", "x2, x3, x4, lsl #2"), ("ldur", "w0, [x2, #0xf]"),
+        ("ldur", "w1, [x2, #0x13]"), ("add", "x0, x0, x1"), ("ret", "")])) == (
+        "return x3[x4] + x3[x4 + 1];")
+    # A frame address: whole strides fold, anything else is the address.
+    assert " ".join(_lift_rows([
+        ("add", "x2, x29, x4, lsl #2"), ("ldr", "x0, [x2, #0x18]"),
+        ("ldr", "x1, [x2, #6]"), ("add", "x0, x0, x1"), ("ret", "")])) == (
+        "return FP[x4 + 6] + (FP + (x4 << 2)).field_0x7;")
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

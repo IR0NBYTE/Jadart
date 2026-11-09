@@ -230,6 +230,14 @@ class Target:
     #: Machine word in bytes. Where it is smaller than a Dart `int`, a 64-bit value lives
     #: in two registers and the lifter has to read the pair as one value; see `State.pair`.
     word: int = 8
+    #: The displacements off an element address, `add xD, xArr, xIdx, lsl #s`, at which
+    #: an indexed load or store reaches element xIdx, by whether pointers are compressed:
+    #: `Instance::DataOffsetFor(cid)` less the heap-object tag for each class it names,
+    #: and 0, which it gives external typed data (runtime_api.cc), as (every Dart
+    #: release cited has it, some release cited has it). An element is printed only at
+    #: a member of the first, and a member of the second is one more offset the class
+    #: could have (`_elem_offsets`). Empty where nothing is read as an element.
+    data_offsets: dict = field(default_factory=dict)
 
     @property
     def pairs(self) -> bool:
@@ -255,6 +263,16 @@ ARM64 = Target(
     # uncompressed iOS build uses 0x20 or 0x30 and nothing else.
     consts_base="NULL", consts={0x20: "true", 0x30: "false", 0x0: "null"},
     incoming_from_fp=0x10, word=8,
+    # The AOT_ offsets of the PRODUCT ARM64 blocks of runtime_offsets_extracted.h at
+    # 2.19.6, 3.12.2 and 3.13.0, for the classes DataOffsetFor names there. Compressed,
+    # all three: Array, OneByteString, TwoByteString and Record at 0x10, TypeArguments
+    # and TypedData at 0x18; 3.13.0 adds Closure, at 0x20. Uncompressed: Array and
+    # TypedData at 0x18, the strings at 0x10, TypeArguments at 0x28, Record at 0x18 in
+    # 2.19.6 and 0x10 after, Closure at 0x28 in 3.13.0. Of the 44,291 element accesses
+    # off a base of unknown tag on the nine compressed binaries, 2.19 to 3.13, 42,275 are
+    # at 0xf or 0x17 and 1,375 at 0.
+    data_offsets={True: (frozenset({0x0, 0xf, 0x17}), frozenset({0x0, 0xf, 0x17, 0x1f})),
+                  False: (frozenset({0x0, 0xf, 0x17, 0x27}),) * 2},
 )
 
 #: constants_arm.h, Android (non-iOS, so FP=R11 and DISPATCH_TABLE_REG=NOTFP=R7).
@@ -285,6 +303,10 @@ ARM32 = Target(
     # factor of four (14,969 loads, against 3,821 for true).
     consts_base="THR", consts={0x34: "null", 0x38: "true", 0x3c: "false"},
     incoming_from_fp=8, word=4,
+    # The PRODUCT ARM block of the same three headers: Array, the strings and
+    # TypedData at 0xc, TypeArguments at 0x14, Record at 0xc in 2.19.6 and 8 after,
+    # Closure at 0x14 in 3.13.0.
+    data_offsets={False: (frozenset({0x0, 0xb, 0x13}), frozenset({0x0, 0x7, 0xb, 0x13}))},
 )
 
 TARGETS = {t.name: t for t in (ARM64, ARM32)}
@@ -1386,6 +1408,153 @@ def _fp_lost_at(blocks, raw) -> frozenset:
                 if w is not None:
                     cur = w
     return frozenset(out)
+
+
+#: The pair forms, each of which reaches a second word one register's width past the
+#: first. The exclusive store's first operand is its status register, not data.
+_PAIR_MEM = frozenset({"ldp", "ldpsw", "stp", "ldnp", "stnp", "ldxp", "ldaxp",
+                       "stxp", "stlxp"})
+
+
+def _data_offsets(compressed) -> tuple:
+    """The bound target's element data offsets for one pointer width, as
+    `Target.data_offsets` pairs them; None is the compressed arm64 every caller without
+    a target to hand has always meant."""
+    tab = _T.data_offsets
+    got = tab.get(True if compressed is None else bool(compressed))
+    return got if got is not None else next(iter(tab.values()), (frozenset(),) * 2)
+
+
+def _stub_of(note: str):
+    """(kind, label) of the VM runtime stub a `bl` row's note names, or None for any
+    other call. The walk's `bl` decides by it what a call leaves standing, and
+    `_elem_offsets` by `_call_forgets`, which reads it, so the two cannot disagree."""
+    name = note.split("-> ", 1)[1].strip() if "-> " in note else None
+    return _classify_stub(name) if name and "_iso_stub_" in name else None
+
+
+def _call_forgets(mn: str, note: str) -> frozenset:
+    """The registers a call row leaves the walk knowing nothing about, on every path:
+    the result register, which `bl` and `blr` both set, and the volatile set
+    `_clobber_call` forgets, except at a stub `_classify_stub` says gives the file back,
+    where it is LR alone. A type-testing stub loses more, but only some of the time."""
+    stub = _stub_of(note) if mn == "bl" else None
+    if stub is not None and stub[0] == "suppress":
+        return frozenset({_T.ret_int, _lr()})
+    return _CALL_CLOBBERS | {_T.ret_int}
+
+
+def _elem_offsets(blocks, data) -> dict:
+    """{address of each `add xD, xB, xI{, shift}`: the members of `data` that some access
+    off xD that the add can reach is made at} (#308).
+
+    `data` holds the displacements at which an indexed access reaches its element, one
+    per class (`Target.data_offsets`). Which class xB holds is not known, so the offset
+    is read from the accesses: where they reach exactly one member of `data`, that one is
+    the element's and the rest are whole strides on from it or are not elements; where
+    they reach none, or two, no access off xD is an element. The compiler computes an
+    element address for each indexed access it emits: scanning each block of the nine
+    arm64 binaries, 7 of the 65,836 it reads through are read at two displacements.
+
+    A backward may-analysis over the CFG: an access counts for every add whose value can
+    reach it along a path that does not write xD, and a write is one the walk forgets
+    the entry at too, a call's being `_call_forgets`, so the set never misses an access
+    the entry can reach. Each block's map only ever grows, by a member of `data` for a
+    register some such add writes, and blocks are taken successors first, in postorder,
+    so a pass over them carries every fact it can and the work is linear in rows times
+    that bound."""
+    if not data:
+        return {}
+    rows, regs = {}, set()
+    for b, blk in blocks.items():
+        out = []
+        for (a, mn, op, note) in blk.insns:
+            ops = _split_ops(op)
+            edef = None
+            if (mn in ("add", "adds") and len(ops) >= 3 and _imm(ops[2]) is None
+                    and _T.roles.get(canon(ops[2])) != "HEAP"):
+                edef = canon(ops[0])
+                regs.add(edef)
+            gen = ()
+            if any("[" in o for o in ops):
+                got = _addr(ops)
+                if got is not None:
+                    (base, disp, index, _s, _wb), post = got
+                    if index is None:
+                        d = 0 if post else disp
+                        gen = [d]
+                        if mn in _PAIR_MEM and len(ops) >= 3:
+                            reg = ops[1] if mn in ("stxp", "stlxp") else ops[0]
+                            gen.append(d + _access_width(mn, reg))
+                        gen = (base, tuple(x for x in gen if x in data))
+            defs = (_call_forgets(mn, note) if mn in ("bl", "blr", "blx")
+                    else _def_use(mn, op)[0])
+            out.append((a, edef, defs, gen))
+        rows[b] = out
+
+    def through(b, live):
+        """`live` at the end of block `b` carried to its start, recording each add's set
+        into `seen` where that is asked for."""
+        live = dict(live)
+        for (a, edef, defs, gen) in reversed(rows[b]):
+            if edef is not None and seen is not None:
+                seen[a] = frozenset(live.get(edef, ()))
+            for r in defs:
+                live.pop(r, None)
+            if gen and gen[0] in regs and gen[1]:
+                live[gen[0]] = live.get(gen[0], frozenset()) | frozenset(gen[1])
+        return live
+
+    seen = None
+    preds = {b: [] for b in blocks}
+    for b, blk in blocks.items():
+        for t in blk.succ:
+            if t in preds:
+                preds[t].append(b)
+    # Postorder over the whole graph, every block a root in address order, iteratively.
+    # A LIFO worklist took a chain laid out from high addresses to low against its flow
+    # once per fact: 6,028 rows, 1.69 s of CPU where the lift took 0.12 s before this.
+    rank, done = {}, set()
+    for root in blocks:
+        if root in done:
+            continue
+        done.add(root)
+        stack = [(root, iter(blocks[root].succ))]
+        while stack:
+            b, it = stack[-1]
+            t = next((t for t in it if t in blocks and t not in done), None)
+            if t is None:
+                rank[b] = len(rank)
+                stack.pop()
+            else:
+                done.add(t)
+                stack.append((t, iter(blocks[t].succ)))
+    live_in = {b: {} for b in blocks}
+    work = [(rank[b], b) for b in blocks]
+    heapq.heapify(work)
+    queued = set(blocks)
+    while work:
+        _r, b = heapq.heappop(work)
+        queued.discard(b)
+        out = {}
+        for t in blocks[b].succ:
+            for r, v in live_in.get(t, {}).items():
+                out[r] = out.get(r, frozenset()) | v
+        got = through(b, out)
+        if got != live_in[b]:
+            live_in[b] = got
+            for p in preds[b]:
+                if p not in queued:
+                    queued.add(p)
+                    heapq.heappush(work, (rank[p], p))
+    seen = {}
+    for b in blocks:
+        out = {}
+        for t in blocks[b].succ:
+            for r, v in live_in.get(t, {}).items():
+                out[r] = out.get(r, frozenset()) | v
+        through(b, out)
+    return seen
 
 
 #: The slot-map key that says a push dropped part of the outgoing area; see
@@ -3188,6 +3357,12 @@ class Lifter:
                  selectors=None, entry=None, fields=None, allocs=None, casts=None):
         self.blocks = blocks
         self.pool_map = pool_map or {}
+        #: The displacements an element access is read at, `Target.data_offsets`'s pair
+        #: for compressed pointers unless `lift_function` is told otherwise, and per
+        #: element address the ones its accesses reach (`_elem_offsets`), made when
+        #: first asked.
+        self.data_offsets = _data_offsets(None)
+        self._elem_box = {}
         #: Prints an operand kept as is, and names a range with no name; see
         #: lift_function.
         self.show = None
@@ -3516,8 +3691,10 @@ class Lifter:
                    | set(st.pair.values()) | set(self.alias) | {_lr()})
         # A V register is clobbered under every spelling: `ldr q0; bl f; str q0` printed
         # the load as what was stored (#114).
-        for r in sorted(r for r in touched if r in _CALL_CLOBBERS
-                        or (_fp_n(r) is not None and f"d{_fp_n(r)}" in _CALL_CLOBBERS)):
+        # `_call_forgets` is the one list, read by `_elem_offsets` too (#308).
+        gone = _call_forgets("blr", "")
+        for r in sorted(r for r in touched if r in gone
+                        or (_fp_n(r) is not None and f"d{_fp_n(r)}" in gone)):
             st.forget(r)
         # ...and the call DEFINES each one it destroyed that is read again, with a name
         # for a value nobody knows. `forget` leaves the register holding its own bare
@@ -5443,8 +5620,9 @@ class Lifter:
             # Leaving it behind let a bl's arguments be read back as the arguments of the
             # next blr, a fully fabricated argument list on a call that pushed nothing.
             _drop_outgoing(st)
-            if name and "_iso_stub_" in name:   # a VM runtime stub, not a source call
-                kind, label = _classify_stub(name)
+            stub = _stub_of(note)
+            if stub is not None:                # a VM runtime stub, not a source call
+                kind, label = stub
                 if kind == "suppress":
                     # These are the stubs that give the registers back. The shared
                     # stack-overflow and write-barrier entries exist precisely to spill the
@@ -5660,10 +5838,13 @@ class Lifter:
             # Both targets are built BEFORE anything is pinned, because pinning rewrites
             # the register map the base is read through and the second half of an `stp`
             # would then be addressed off a temporary that names the base's old value.
-            if index is not None or base in st.elem:          # element store
-                # An element access carries no width: the index is already scaled by the
-                # element size, so a 16-byte element is `t3[t4]` either way (#209).
-                tgts = [(self._elem_access(base, index, scale, st, disp), val, ())]
+            # An element access carries no width: the index is already scaled by the
+            # element size, so a 16-byte element is `t3[t4]` either way (#209). One
+            # `_elem_access` declines is the store to the address it computes (#308).
+            elem = (self._elem_access(base, index, scale, st, disp)
+                    if index is not None or base in st.elem else None)
+            if elem is not None:                              # element store
+                tgts = [(elem, val, ())]
             else:
                 w = _access_width(mn, ops[0])
                 # `_rebase` and not `_byte_off`: a displacement below the base goes into
@@ -5859,8 +6040,12 @@ class Lifter:
                 st.set(dst, replace(boxed, smi=0))
                 return []
             if index is not None or base in st.elem:          # element load
-                st.set(dst, self._elem_access(base, index, scale, st, disp))
-                return self._bump(st, base, delta)
+                elem = self._elem_access(base, index, scale, st, disp)
+                if elem is not None:
+                    st.set(dst, elem)
+                    return self._bump(st, base, delta)
+                # Not one the lifter can show is an element: the load from the address
+                # it computes, as off any other base (#308).
             # The high half of a split 64-bit field load, recognised by adjacency: the
             # previous instruction loaded the slot one word below, from the same base.
             # Only then, two loads that merely happen to be four bytes apart in unrelated
@@ -5988,8 +6173,18 @@ class Lifter:
             # which can be the base, is written, and so does LR where it holds a return
             # address and nowhere else (#280).
             untagged = self._untagged(b, g(b))
+            # The 4th field is what `_elem_access` reads the displacement against: None
+            # off an untagged base, where there is no header and an element is at 0,
+            # else the data offsets the accesses this add reaches are made at (#308).
+            if untagged:
+                offs = None
+            else:
+                box = self._elem_box
+                if "offs" not in box:          # once per body, whichever walk asks first
+                    box["offs"] = _elem_offsets(self.blocks, self.data_offsets[1])
+                offs = box["offs"].get(here, frozenset())
             st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
-            st.elem[dst] = (g(b), g(c), scale, untagged)
+            st.elem[dst] = (g(b), g(c), scale, offs)
             return []
         if mn == "sub" and len(ops) >= 3:
             b = g(ops[1])
@@ -6166,37 +6361,51 @@ class Lifter:
         shown = self.show(addr, op) if self.show is not None else op
         return self._verbatim(st, mn, op, shown, dst)
 
-    def _elem_access(self, base_reg, index_reg, scale, st: State, disp: int = 0) -> V:
-        """`base[index]` for a computed address, with the displacement folded in where it
-        is an element offset rather than an object header.
+    def _elem_access(self, base_reg, index_reg, scale, st: State, disp: int = 0):
+        """`base[index]` for a computed address, or None where the access is not one the
+        lifter can show is an element; the caller then reads it as the address it is.
 
-        The displacement used to be dropped unconditionally, and on a heap object that is
-        right: `add xD, xArr, xIdx, lsl #1; ldur wR, [xD, #0xf]` reaches element zero,
-        because 0xf is Array's data offset less the heap-object tag. A FRAME address has no
-        header to absorb, so dropping it printed different stack slots as the same
-        expression. .text+0x1050 in the 3.12.2 clean build loads three separate incoming
-        arguments from [xN, #0x18], [xN, #0x10] and [xN, #8] off one base, and all three
-        rendered `FP[x4.field_0x14 - 4]`; two of the three stores below them therefore
-        claimed a value they never held.
+        An element address on a heap object is read at the data offset less the tag, so
+        `add xD, xArr, xIdx, lsl #1; ldur wR, [xD, #0xf]` reaches element zero of an
+        Array, and the displacement is absorbed. Every displacement used to be dropped,
+        so two accesses at different ones printed as one element: `str x5, [x2, #0x17];
+        str x6, [x2, #0x1f]` printed `x3[x4] = x5;` and then `x3[x4] = x6;`, which reads
+        as the second overwriting the first where the machine writes two elements
+        (#308). Which displacement is the data offset depends on the class, and that is
+        not known; `_elem_offsets` gives the data offsets the address's accesses are
+        made at, and only where there is one is it taken as the element's. The access
+        there prints `base[index]`, one k strides on prints `base[index + k]`, and every
+        other one, and every one off an address with none or two, returns None.
 
-        The fold is only applied where the base register is one the machine holds an
-        UNTAGGED address in, and only when the displacement is a whole number of strides.
-        Anywhere else the header is unknown, so there is nothing sound to fold and the
-        rendering is left as it was."""
+        A FRAME address has no header to absorb, so its offset is 0: .text+0x1050 in the
+        3.12.2 clean build loads incoming arguments from [xN, #0x18] and [xN, #0x10] off
+        one base, `FP[x4.field_0x14 - 4 + 6]` and `... + 4]`. The register-offset form,
+        `[xB, xI]`, has no displacement at all."""
         if base_reg in st.elem:
-            base_v, idx_v, s, frame = st.elem[base_reg]
-        else:
-            base_v = self._leaf(base_reg, st)
-            idx_v = self._leaf(index_reg, st) if index_reg else V("0", P_ATOM)
-            s, frame = scale, self._untagged(base_reg, base_v)
-        idx = idx_v.text
-        if frame and disp:
-            stride = 1 << s
-            k, rem = divmod(disp, stride)
-            if rem == 0:
-                idx = (_bin(idx_v, "+", _num(k), P_ADD).text if k > 0
-                       else _bin(idx_v, "-", _num(-k), P_ADD).text)
-        return V(f"{_wrap(base_v, P_POST)}[{idx}]", P_POST)
+            if index_reg is not None:
+                # `[xD, xJ]` off an element address: the address plus a second index,
+                # which the entry's own index does not say.
+                return V(f"{_wrap(self._leaf(base_reg, st), P_POST)}"
+                         f"[{self._leaf(index_reg, st).text}]", P_POST)
+            base_v, idx_v, s, offs = st.elem[base_reg]
+            claim, reach = self.data_offsets
+            if offs is None:
+                at = 0
+            elif disp in reach and disp not in offs:
+                return None              # an access `_elem_offsets` did not count
+            elif len(offs) == 1 and next(iter(offs)) in claim:
+                at = next(iter(offs))
+            else:
+                return None
+            k, rem = divmod(disp - at, 1 << s)
+            if rem:
+                return None
+            idx = (idx_v.text if k == 0 else _bin(idx_v, "+", _num(k), P_ADD).text
+                   if k > 0 else _bin(idx_v, "-", _num(-k), P_ADD).text)
+            return V(f"{_wrap(base_v, P_POST)}[{idx}]", P_POST)
+        base_v = self._leaf(base_reg, st)
+        idx_v = self._leaf(index_reg, st) if index_reg else V("0", P_ATOM)
+        return V(f"{_wrap(base_v, P_POST)}[{idx_v.text}]", P_POST)
 
     def _assign(self, lhs: V, rhs: V) -> str:
         # compound assignment when rhs is `lhs <op> operand`
@@ -9320,7 +9529,7 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
         try:
             return _lift_function(ann, pool_map, receiver, arity, indent, depth,
                                   selectors, fields, show, cut_end, returns, allocs,
-                                  mono, casts)
+                                  mono, casts, getattr(arch, "compressed", None))
         except RecursionError:
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
@@ -9555,7 +9764,7 @@ def _ends_again(blocks, stmts, placed, second=frozenset(), trapped=frozenset()) 
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None, cut_end=None, returns=None,
-                   allocs=None, mono=None, casts=None) -> list:
+                   allocs=None, mono=None, casts=None, compressed=None) -> list:
     g = tier3_graph(ann, cut_end, mono)
     if g is None:
         return []
@@ -9614,10 +9823,13 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         cast_at = cast_accesses(blocks, entry, casts, cross, moves, joins,
                                 slow=slow, raw=raw)
 
+    data, elem_box = _data_offsets(compressed), {}
+
     def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields, allocs=allocs, casts=cast_at)
+        lifter.data_offsets, lifter._elem_box = data, elem_box
         lifter.show = show
         lifter.slow_paths = frozenset(slow)
         lifter.frame_meets = meets

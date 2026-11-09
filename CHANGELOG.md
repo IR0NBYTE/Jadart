@@ -421,6 +421,38 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An element address prints an element only at its data offset or whole strides on.**
+  An indexed access computes `add x2, x3, x4, lsl #3` and reads x2 at the data offset
+  less the heap-object tag, and tier 3 dropped the displacement on any base not known
+  to be untagged, so every access off one address printed as the same element: `str
+  x5, [x2, #0x17]; str x6, [x2, #0x1f]` printed `x3[x4] = x5;` and then `x3[x4] = x6;`,
+  the second reading as overwriting the first where the machine writes two elements,
+  and a load at #8 or #-8 printed `x3[x4]` too (#308). The displacement that reaches an
+  element is the VM's `DataOffsetFor(cid)` less the tag, or 0 for external data. The
+  AOT offsets in `runtime_offsets_extracted.h` at 2.19.6, 3.12.2 and 3.13.0 put Array,
+  the strings and Record at 0x10 and TypeArguments and TypedData at 0x18 on compressed
+  arm64, so 0, 0xf and 0x17, 43,650 of the 44,291 element accesses off a base of
+  unknown tag on the nine binaries; 3.13.0 adds Closure, at 0x20. Which class the base
+  holds is not known, so a backward pass over the CFG gives each element address the
+  data offsets its accesses reach, 0x1f among them; where that is one of the first
+  three, the access there is `base[index]`, one k strides on `base[index + k]` and any
+  other the read or write at its address, and otherwise every access prints its
+  address. `str x5, [x2, #0x17]; str x6, [x2, #0x27]` prints `x3[x4] = x5; x3[x4 + 2] =
+  x6;`, and the pair at 0x17 and 0x1f prints the two addresses, since on a 3.13 binary
+  either can be the data offset. A call ends an element address where the walk forgets
+  the register, and a frame address keeps offset 0. Against main, 667 lines change in
+  568 ranges of the nine binaries, each classed by script with none left over: 561 are
+  a copy loop's pre-indexed store at -8, which read as the element it starts from and
+  is now `(A - 8).field_0x1 = ...`; 54 `_estimateQuotientDigit`, which reads two words
+  at 0xb and 0x13 off one address and printed both as one element; 28 a write barrier
+  stub's push onto a block a thread field points to, at 0x10 off it; 9 a store at 0x1f
+  and 7 one at -1 off an object plus a field offset, the second the type arguments
+  AllocateObjectParameterized stores, spelled `.tags` as offset 0 is off any base; 4 a
+  read 4 or 8 bytes past one at 0 off a pointer into native or hash-table memory, which
+  printed as the read at 0 and is now k bytes on, `[i + 4]`; and 4 the same read where
+  the address was spilled first, now its address with the `ldrsw`'s sign extension.
+  Lift CPU of the nine is 1.03x main's.
+
 - **A conditional's follow node no longer waits on a block laid out after the rest.**
   `follow` stops once no block left to visit carries one arm's bit (#302), but an arm
   that jumps to a trap or a slow path placed after the `ret` keeps its bit on that
