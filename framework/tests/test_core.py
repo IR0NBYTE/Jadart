@@ -10026,6 +10026,77 @@ _MONO_ROWS = [("ldr", "x16, [x26, #0x258]"), ("br", "x16"), ("ldur", "x16, [x0, 
               ("b.ne", "#0x1000"), ("ldur", "x0, [x1, #7]"), ("ret", "")]
 
 
+def _nested_ifs(base, n):
+    """`n` conditionals nested in each other from `base`, each `cbz` to the same `ret`:
+    a section of 2n + 1 rows that `structure` nests n deep."""
+    end = base + 8 * n
+    rows = []
+    for i in range(n):
+        rows += [("cbz", f"x{i % 8}, #{end:#x}"), ("add", "x9, x9, #1")]
+    return rows + [("ret", "")]
+
+
+def _at_default_limit(fn):
+    """`fn()` at Python's default recursion limit, the CLI's, which no test may leave
+    changed."""
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    try:
+        return fn()
+    finally:
+        sys.setrecursionlimit(old)
+
+
+def test_a_section_too_deep_to_structure_prints_its_rows():
+    """A section no edge reaches that nests too deeply for `structure` was counted in a
+    note, and the walk took that note for a section's over nothing and dropped it: 1,000
+    ifs behind a monomorphic entry printed `br x16` and nothing else, and so did the same
+    rows as a catch entry after a `ret` (#284). Each keeps its note, the monomorphic one
+    where the snapshot says so, and its rows follow as `flat` prints a whole function
+    too deep to structure, every one once and in address order. 50 deep is structured
+    as before."""
+    from jadart.cfg import TOO_DEEP, UNREACHED
+    from jadart.expr import MONOMORPHIC_ENTRY
+
+    def as_they_are(rows, base):
+        return [f"0x{base + 4 * i:x}  {mn} {op}".rstrip()
+                for i, (mn, op) in enumerate(rows)]
+    mono = _MONO_ROWS[:6] + _nested_ifs(0x1018, 1000)
+    catch = [("mov", "x0, #0"), ("ret", "")] + _nested_ifs(0x1008, 1000)
+    body = _at_default_limit(lambda: _lift_rows(mono, 0x1000, mono=0x1008))
+    assert body[:3] == ["br x16   // x16 holds THR.field_0x258",
+                        "// " + MONOMORPHIC_ENTRY, "// " + TOO_DEEP], body[:4]
+    assert body[3:] == as_they_are(mono[2:], 0x1008), body[3:6]
+    body = _at_default_limit(lambda: _lift_rows(catch, 0x1000))
+    assert body[:3] == ["return 0;", "// " + UNREACHED, "// " + TOO_DEEP], body[:4]
+    assert body[3:] == as_they_are(catch[2:], 0x1008), body[3:6]
+    body = _at_default_limit(lambda: _lift_rows(_MONO_ROWS[:6] + _nested_ifs(0x1018, 50),
+                                                0x1000, mono=0x1008))
+    assert "// " + MONOMORPHIC_ENTRY in body and "// " + TOO_DEEP not in body, body
+    assert len(body) == 108 and body[-1] == "return x0;", body[-3:]
+
+
+def test_the_sections_after_one_too_deep_print_their_rows_under_their_notes():
+    """`structure` stops placing at the section too deep for it, and the sections after
+    it are printed as they are too, each under its own note, so that no row is left out
+    and none is printed twice; cfgcheck counts them as placed (#284)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import cfgcheck
+    from jadart.cfg import UNREACHED
+    from jadart.expr import tier3_graph
+    rows = (_MONO_ROWS[:6] + _nested_ifs(0x1018, 1000)
+            + [("sub", "x15, x29, #0x20"), ("mov", "x0, x22"), ("ret", "")])
+    ann = [(0x1000 + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+    g = _at_default_limit(lambda: tier3_graph(ann, mono=0x1008))
+    assert cfgcheck.tier3_left_out(g) == (set(), set(), set()), g.stmts[-1][0]
+    body = _at_default_limit(lambda: _lift_rows(rows, 0x1000, mono=0x1008))
+    at = [int(ln.split()[0], 16) for ln in body if ln.startswith("0x")]
+    assert at == list(range(0x1008, 0x1000 + 4 * len(rows), 4)), (at[:3], at[-3:])
+    end = 0x1000 + 4 * len(rows)
+    assert body[-4:] == ["// " + UNREACHED, f"0x{end - 12:x}  sub x15, x29, #0x20",
+                         f"0x{end - 8:x}  mov x0, x22", f"0x{end - 4:x}  ret"], body[-4:]
+
+
 def test_tier3_places_the_body_behind_a_monomorphic_entry():
     """Tier 3 placed only what the first instruction reaches, and a Code with a
     monomorphic entry starts on the miss handler's `br x16`, so its whole body left the

@@ -347,6 +347,9 @@ def tier3_left_out(g):
                 walk(s[3])
             elif s[0] == "loop":
                 walk(s[2])
+            elif s[0] == "rest":
+                # rows printed as they are, past a section too deep to structure (#284)
+                placed.update(b for _note, group in s[1] for b, _rows, _cut in group)
     walk(g.stmts)
     dead = set(g.blocks) - entry_reach(g.blocks, g.entry)
     left = {b for b in dead - placed if _with_code(g.blocks[b])}
