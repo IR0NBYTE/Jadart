@@ -421,6 +421,30 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A run of loops no longer costs the cube of its length to lift.** Whether one block
+  dominates another was a walk up `idom` from the lower one, and tier 3 asked it of every
+  block each loop's header dominates, so 1,000 loops in a row (`add; cmp; b.lt` back to
+  itself) took 13 s in `lift_function`, which `lift`, `decompile` and `export` all call,
+  and 2,000 took 108 s: a crafted range stalled them (#282). Each dominator forest is now
+  numbered once in preorder (`cfg.dom_numbers`, iterative), and a block is above another
+  where its number and the end of its subtree's run bracket the other's, the check LLVM's
+  `DominatorTreeBase::dominates` makes after `updateDFSNumbers`. Every question the lifter
+  and the structurer answered by the walk is answered that way, including the forest
+  `_trip_nodes` builds where a trap ends its path; the walk is kept for a map that is no
+  forest, which `_idoms` never builds. What a loop's region writes, the header's subtree,
+  is folded up the tree once rather than gathered per loop. Output is unchanged: the
+  whole-binary tier 3 dump of both fixtures and of the seven app-sweep libraries, and
+  `export` at tiers 3 and 2 of both fixtures, are byte-identical to main's. CPU seconds of
+  `lift_function`, main then this: 125, 250, 500, 1,000 and 2,000 loops in a row 0.05,
+  0.27, 1.89, 13.48 and 107.84 against 0.02, 0.04, 0.12, 0.38 and 1.29; 75, 150 and 300
+  nested loops 0.10, 0.52 and 3.32 against 0.05, 0.15 and 0.51; 1,000 in a row behind a
+  monomorphic entry 13.41 against 0.38; 1,000 loops each leaving by a goto into the next
+  one's head, which `_join_kill` meets, 41.09 against 1.15. The clean fixture's largest
+  range, `hash` at 0xed904, takes 0.119 s on both, best of 5. What is left grows about 3.4
+  times per doubling, not 7 to 8: `_exit_slots` asks `_loop_nodes` for every block before
+  each loop, 79% of 2,000 loops in a row under cProfile, and `_join_kill` walks back over
+  the same blocks, 25% of the goto shape at 1,000.
+
 - **A monomorphic section is lifted as the body it is, from its own entry.** #266
   placed the code a Code's monomorphic entry reaches as a section after the body, but
   lifted it inside the walk of the whole range, which starts on the miss handler and

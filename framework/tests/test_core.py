@@ -19066,6 +19066,153 @@ def test_irfuzz_scores_an_argument_name_as_the_value_the_register_came_in_with()
         expr.Lifter._render_loop = orig
 
 
+def _graphs_282():
+    """(name, rows, base, mono, tier 3) for #282's two tests: loops in a row, nested
+    loops, a cycle with two ways in, a monomorphic entry rooting a second tree with a
+    loop and a join in its body and a section after it that no edge reaches, and a loop
+    one way into which traps, built with no block ending there: `_ridom`, the forest
+    of the graph where it does, has the loop's head under the other way in."""
+    row = []
+    for _ in range(4):
+        row += [("add", "x2, x2, #1"), ("cmp", "x2, x1"), ("b.lt", f"#{len(row) * 4:#x}")]
+    nest = [("add", f"x{2 + i}, x{2 + i}, #1") for i in range(4)]
+    for i in range(4):
+        nest += [("cmp", "x2, x1"), ("b.lt", f"#{(3 - i) * 4:#x}")]
+    two_ways = [("cbz", "x0, #0x10"), ("add", "x1, x1, #1"), ("cmp", "x1, x2"),
+                ("b.ge", "#0x1c"), ("add", "x3, x3, #1"), ("cmp", "x3, x4"),
+                ("b.lt", "#0x4")]
+    mono = _MONO_ROWS[:6] + [
+        ("mov", "x2, #0"), ("add", "x2, x2, #1"), ("cmp", "x2, x1"), ("b.lt", "#0x101c"),
+        ("cbz", "x2, #0x1034"), ("mov", "x0, x2"), ("ret", ""), ("mov", "x0, #1"),
+        ("ret", ""), ("add", "x5, x5, #1"), ("cmp", "x5, x1"), ("b.lt", "#0x103c")]
+    trap = [("cbz", "x0, #0xc"), ("brk", "#0"), ("b", "#0x14"), ("add", "x1, x1, #1"),
+            ("add", "x2, x2, #1"), ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x14")]
+    return [("in a row", row + [("ret", "")], 0, None, True),
+            ("nested", nest + [("ret", "")], 0, None, True),
+            ("two ways in", two_ways + [("ret", "")], 0, None, True),
+            ("second root", mono + [("ret", "")], 0x1000, 0x1008, True),
+            ("trap", trap + [("ret", "")], 0, None, False)]
+
+
+def test_dominance_by_numbers_answers_what_the_walk_up_idom_did():
+    """A guard test (#282). Whether one block dominates another was a walk up `idom`
+    from the lower, and is now a check of two numbers (cfg.dom_numbers). This holds the
+    numbers to the walk: on each graph of _graphs_282, `_dominates` agrees with
+    `_dominators` on every ordered pair of blocks, a block in no tree and an address
+    that is no block among them; and with the numbering turned off, which is the walk
+    as main had it, the loop bodies, trips, regions, join kills, structure and lifted
+    lines are the same. A numbering that is no forest is refused."""
+    from jadart import cfg, expr
+    from jadart.cfg import build_cfg, entry_reach, structure
+    from jadart.expr import Lifter, lift_function, tier3_graph
+
+    assert cfg.dom_numbers({1: 2, 2: 1}) is None                  # a cycle, no root
+    assert cfg.dom_numbers({1: 1, 2: 3}) is None                  # an idom off the map
+    pre, end, _kids = cfg.dom_numbers({1: 1, 2: 1, 3: 3, 4: 3})   # two trees
+    assert pre[1] <= pre[2] < end[1] and not pre[1] <= pre[3] < end[1]
+
+    def built(name, rows, base, mono, tier3, numbered):
+        ann = [(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+        saved = expr.dom_numbers, cfg.dom_numbers
+        if not numbered:
+            expr.dom_numbers = cfg.dom_numbers = lambda idom: None
+        try:
+            if tier3:
+                g = tier3_graph(ann, mono=mono)
+                blocks, entry, roots = g.blocks, g.entry, g.roots
+            else:
+                blocks, entry = build_cfg(ann, traps=())
+                roots = ()
+            lf = Lifter(blocks, entry=entry)
+            lf.roots, lf.placed = roots, frozenset(entry_reach(blocks, entry))
+            lf._dom_tree()
+            got = {"stmts": structure(blocks, entry, orphans=True, entries=roots),
+                   "lines": lift_function(ann, mono=mono) if tier3 else None}
+            for h in sorted(blocks):
+                got[h] = (lf._back_loop(h), lf._trip_nodes(h), lf._region_written(h),
+                          lf._join_kill(h), lf._join_kill(h, entry=True))
+            asked = sorted(blocks) + [None, max(blocks) + 4096]
+            got["pairs"] = {(a, b): lf._dominates(a, b) for a in asked for b in asked}
+            return lf, got
+        finally:
+            expr.dom_numbers, cfg.dom_numbers = saved
+
+    for name, rows, base, mono, tier3 in _graphs_282():
+        lf, got = built(name, rows, base, mono, tier3, True)
+        walk, want = built(name, rows, base, mono, tier3, False)
+        assert lf._dnum is not None and lf._rnum is not None, name
+        assert walk._dnum is None and walk._rnum is None, name
+        for (a, b), yes in got["pairs"].items():
+            assert yes == (a in lf._dominators(b)), (name, a, b, yes)
+        assert got == want, name
+        if name == "second root":
+            assert lf.roots and any(b not in lf._idom for b in lf.blocks), lf._idom
+        if name == "trap":
+            assert lf._ridom != lf._idom, (lf._ridom, lf._idom)
+
+
+def test_dominance_costs_the_same_per_instruction_at_any_length():
+    """N loops in a row, or N nested, asked the dominator tree whether one block was above
+    another once per block each loop dominates, and answered by walking `idom` up from
+    the lower: 42 million steps for 500 loops in a row and 13 s at 1,000 (#282). Counted,
+    not timed: each lookup on a forest dominator_forest builds, per instruction, at 30
+    loops and at 120. Walking, four times the loops cost about sixteen times as many
+    lookups per instruction; numbered, about as many. So too the blocks `_own_written`
+    is handed: gathered per loop, each loop's region held every block it dominates, and
+    folded up the tree each block is handed once."""
+    from jadart import cfg, expr
+    from jadart.expr import lift_function
+    looks, handed = [0], [0]
+
+    class Counted(dict):
+        def get(self, k, d=None):
+            looks[0] += 1
+            return dict.get(self, k, d)
+
+        def __getitem__(self, k):
+            looks[0] += 1
+            return dict.__getitem__(self, k)
+
+        def __contains__(self, k):
+            looks[0] += 1
+            return dict.__contains__(self, k)
+
+    forest, own = cfg.dominator_forest, expr.Lifter._own_written
+
+    def counted(*args, **kw):
+        idom, order, trees = forest(*args, **kw)
+        return Counted(idom), order, trees
+
+    def own_written(self, nodes):
+        handed[0] += len(nodes)
+        return own(self, nodes)
+
+    def per_instruction(n, nested):
+        if nested:
+            rows = [("add", f"x{2 + i % 6}, x{2 + i % 6}, #1") for i in range(n)]
+            for i in range(n):
+                rows += [("cmp", "x2, x1"), ("b.lt", f"#{(n - 1 - i) * 4:#x}")]
+        else:
+            rows = []
+            for _ in range(n):
+                rows += [("add", "x2, x2, #1"), ("cmp", "x2, x1"),
+                         ("b.lt", f"#{len(rows) * 4:#x}")]
+        rows.append(("ret", ""))
+        looks[0] = handed[0] = 0
+        lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        return looks[0] / len(rows), handed[0] / len(rows)
+    expr.dominator_forest = cfg.dominator_forest = counted
+    expr.Lifter._own_written = own_written
+    try:
+        for nested in (False, True):
+            small, large = per_instruction(30, nested), per_instruction(120, nested)
+            assert large[0] < 2 * small[0], ("lookups", nested, small, large)
+            assert large[1] < 2 * small[1], ("blocks written", nested, small, large)
+    finally:
+        expr.dominator_forest = cfg.dominator_forest = forest
+        expr.Lifter._own_written = own
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
