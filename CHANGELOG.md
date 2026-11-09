@@ -421,6 +421,27 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An `ldp` off the pool or an element address loads both registers.** Tier 3 read an
+  `ldp` off PP, a far pool base or an element address as a load of its first register
+  and returned there, so the second kept what it held: `add x2, x3, x4, lsl #3; ldp x0,
+  x1, [x2]; add x0, x0, x1` printed `return x3[x4] + x1;`, x1 reading as its value on
+  entry, and `ldp x0, x1, [x27, #0x10]` printed `return pool_0x10 + x1;` (#306). The
+  second word is one register's width on: off the pool the entry 8 bytes on,
+  `pool_0x18`, or 4 for a w pair, and off an element address an element where the rule
+  of #308 shows it is one, `x3[x4 + 1]`, and the read at its address where it does not.
+  Against unicorn 2.1.4, random `ldp`, w `ldp` and `ldpsw` rows off PP, a far pool base,
+  an element address on a tagged base or on FP and a plain base, three seeds of 5,000:
+  main disagrees on 12,754 of the 30,000 registers they load and prints an element for
+  2,748 more where neither word reaches a data offset, the fix of #308 alone disagrees
+  on 9,223, every one a second register, and this agrees on all 30,000.
+  On the nine binaries 234 `ldp` rows are off a far pool base, `add x16, x27, #2, lsl
+  #12; ldp x5, x30, [x16, #0xc0]; blr x30` in a switchable call, and none off PP or an
+  element address. Where the second register is x30, 82 rows on the four built before
+  3.11, the call reads it: 50 lines change in 23 ranges, each classed by script, the
+  callee printed `x30` 27 times, `(dynamic call)` 4 and a stale value of x30 19, as in
+  `"toc"(t30, "toc")`, and now the pool entry it was loaded from, `pool_0xe058(t30,
+  "toc")`. Every other line of the tier 3 dump is as the fix of #308 prints it.
+
 - **An element address prints an element only at its data offset or whole strides on.**
   An indexed access computes `add x2, x3, x4, lsl #3` and reads x2 at the data offset
   less the heap-object tag, and tier 3 dropped the displacement on any base not known

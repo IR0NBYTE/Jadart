@@ -20657,6 +20657,33 @@ def test_an_element_access_off_the_data_offset_prints_the_address_it_reads():
         "return FP[x4 + 6] + (FP + (x4 << 2)).field_0x7;")
 
 
+def test_an_ldp_off_an_element_address_or_the_pool_loads_both_registers():
+    """An `ldp` off an element address, PP or a far pool base took the element or pool
+    path, set its first register and returned, so the second kept what it held:
+    `ldp x0, x1, [x2]; add x0, x0, x1` printed `return x3[x4] + x1;`, x1 reading as its
+    value on entry, and off PP `return pool_0x10 + x1;` (#306). The second word is one
+    register's width on: an element where #308's rule shows it is one, else its
+    address, and off the pool the entry 8 bytes on, or 4 for a w pair."""
+    tail = [("add", "x0, x0, x1"), ("ret", "")]
+    add = ("add", "x2, x3, x4, lsl #3")
+    assert _lift_rows([add, ("ldp", "x0, x1, [x2]")] + tail) == [
+        "return x3[x4] + x3[x4 + 1];"]
+    assert _lift_rows([add, ("ldp", "w0, w1, [x2]")] + tail) == [
+        "return x3[x4] + (x3 + (x4 << 3)).field_0x5;"]
+    assert _lift_rows([("add", "x2, x3, x4, lsl #2"), ("ldpsw", "x0, x1, [x2]")]
+                      + tail) == ["return x3[x4] + x3[x4 + 1];"]
+    # Into the element address itself: both words off the address it held.
+    assert _lift_rows([add, ("ldp", "x2, x1, [x2]"), ("add", "x0, x2, x1"),
+                       ("ret", "")]) == ["return x3[x4] + x3[x4 + 1];"]
+    assert _lift_rows([("ldp", "x0, x1, [x27, #0x10]")] + tail) == [
+        "return pool_0x10 + pool_0x18;"]
+    assert _lift_rows([("ldp", "w0, w1, [x27, #0x10]")] + tail) == [
+        "return pool_0x10 + pool_0x14;"]
+    assert _lift_rows([("add", "x16, x27, #8, lsl #12"), ("ldp", "x16, x1, [x16, #0x10]"),
+                       ("add", "x0, x16, x1"), ("ret", "")]) == [
+        "return pool_0x8010 + pool_0x8018;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
