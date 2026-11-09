@@ -730,6 +730,14 @@ def strong_components(nodes, succ) -> list:
     return out
 
 
+#: How far past a conditional in reverse postorder `structure`'s `follow` leaves a block
+#: to the scan alone, and asks neither whether the conditional dominates it nor whether
+#: it can be done with early (#311). The scan reaches a block that near in fewer steps
+#: than the bookkeeping costs: the clean fixture's 11,766 follow calls took 0.060 s of
+#: CPU on main, 0.068 s with that asked of every block, and 0.054 s with this.
+FOLLOW_NEAR = 16
+
+
 def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
               rest: bool = False):
     """Return a list of statements. Each is one of:
@@ -881,6 +889,14 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
 
     by_rpo = sorted(rpo, key=rpo.get)
     follow_memo = {}
+    forward_in = {}
+
+    def edges_in(n):
+        """How many edges come into `n` from a block before it in reverse postorder."""
+        k = forward_in.get(n)
+        if k is None:
+            k = forward_in[n] = sum(p in rpo and rpo[p] < rpo[n] for p in preds[n])
+        return k
 
     def follow(cur):
         """Where the two arms of `cur` come back together, when the post-dominator says
@@ -916,37 +932,88 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
             return None
         # Only the blocks after this one in reverse postorder are visited, and a tag
         # moves along forward edges only, so an arm whose block comes before it, a back
-        # edge's, passes its bit to none of them. `live[b]` counts the tagged blocks
-        # still to visit that carry bit b. A block takes its tag from blocks visited
-        # before it, so once either count is 0 no block can come to carry both, and the
-        # scan has nothing left to find. Stopping only once no tag at all was left ran
-        # it to the end of the function behind an arm that ends in a trap or a return,
-        # and N such branches visited about N * N blocks (#302).
+        # edge's, passes its bit to none of them. `live[b]` counts the tagged blocks not
+        # yet done with that carry bit b. A block takes its tag only from blocks done
+        # with before it, so once either count is 0 no block can come to carry both, and
+        # the scan has nothing left to find (#302).
+        #
+        # Two things let a block be done with before the scan reaches it, and neither
+        # changes the answer (#311). A block `cur` does not dominate is never tagged: no
+        # forward edge goes back into an earlier tree of the forest, and within a tree a
+        # way round `cur` to that block is a way round it to every block it leads to, so
+        # none of those is a candidate either. And a block with one bit, all of whose
+        # edges in come from blocks done with, holds its last tag and is no candidate,
+        # so it passes its bit on then and there, off `ready`. Without either, an arm
+        # that ends in a block laid out after the rest of the function, a trap or a slow
+        # path past the `ret`, kept its bit to the end of the scan, as did one that ends
+        # in a block other branches share, and each such branch scanned the rest of the
+        # function. Both are asked only of a block more than FOLLOW_NEAR places on; a
+        # nearer one that `cur` does not dominate is tagged as before, which changes
+        # nothing either, as what it leads to is no candidate whatever its tag.
+        #
+        # One block is taken off `ready` per tagged block the scan visits, first in
+        # first out, so an arm that does run on is walked no faster than the scan, which
+        # stops no later than it did.
         here = rpo[cur]
-        tag, live = {}, [0, 0]
+        near = here + FOLLOW_NEAR
+        pre = num[0] if num is not None else None
+        lo, hi = (pre[cur], num[1][cur]) if pre is not None and cur in pre else (0, 0)
+        tag, seen, gone, ready = {}, {}, set(), []
+        live = [0, 0]
         for bit, s in enumerate(succs):
             if s in rpo and rpo[s] > here:
+                if rpo[s] > near:
+                    if not (lo <= pre.get(s, -1) < hi if pre is not None
+                            else dominates(cur, s)):
+                        continue
+                    seen[s] = 1
+                    if (forward_in.get(s) or edges_in(s)) == 1:
+                        ready.append(s)
                 tag[s] = 1 << bit
                 live[bit] = 1
-        i = here + 1
-        while live[0] and live[1] and i < len(by_rpo):
-            n = by_rpo[i]
-            i += 1
-            t = tag.get(n)
-            if not t:
-                continue
-            if t == 3 and dominates(cur, n):
-                follow_memo[cur] = n
-                return n
+        i, r, scanned = here + 1, 0, True
+        while live[0] and live[1]:
+            n = None
+            while scanned and r < len(ready):
+                s = ready[r]
+                r += 1
+                if s not in gone and rpo[s] >= i:
+                    n, scanned = s, False
+                    gone.add(n)
+            if n is None:
+                scanned = True
+                while i < len(by_rpo):
+                    m = by_rpo[i]
+                    i += 1
+                    if m in tag and m not in gone:
+                        n = m
+                        break
+                else:
+                    return None
+                t = tag[n]
+                if t == 3 and dominates(cur, n):
+                    follow_memo[cur] = n
+                    return n
+            t, rn = tag[n], rpo[n]
             live[0] -= t & 1
             live[1] -= t >> 1
             for s in blocks[n].succ:
-                if s in rpo and rpo[s] > rpo[n]:     # forward edges only
-                    new = t & ~tag.get(s, 0)
-                    if new:
-                        tag[s] = tag.get(s, 0) | new
-                        live[0] += new & 1
-                        live[1] += new >> 1
+                rs = rpo.get(s, -1)
+                if rs <= rn:
+                    continue
+                if rs > near:
+                    if not (lo <= pre.get(s, -1) < hi if pre is not None
+                            else dominates(cur, s)):
+                        continue
+                    seen[s] = seen.get(s, 0) + 1
+                new = t & ~tag.get(s, 0)
+                if new:
+                    tag[s] = tag.get(s, 0) | new
+                    live[0] += new & 1
+                    live[1] += new >> 1
+                if rs > near and tag[s] < 3 and seen[s] == (forward_in.get(s)
+                                                             or edges_in(s)):
+                    ready.append(s)
         return None
 
     def merge_point(cur, ctx):
