@@ -2037,21 +2037,44 @@ def _d0_result_reads(blocks, entry, returned, named, roots=()) -> frozenset:
                 row.append((a, read_))
             if "d0" in defs:
                 row.append((a, write_))
-    read: set = set()
-    ins = {r: frozenset() for r in (entry, *roots) if r in blocks}
-    work = list(ins)
-    while work:
-        b = work.pop()
-        cur = ins[b]
-        for a, kind in rows.get(b, ()):
-            if kind == read_:
-                read |= cur
-            else:
-                cur = frozenset((a,)) if kind == call_ else frozenset()
+    # A call's d0 is read where d0 is live right after it, on a path from a block the
+    # entry or a root reaches; every block on that path is reached too. So one bit per
+    # block, backward: d0 is live into a block that reads it before any write, or into
+    # one with no row at all whose successor has it live. This was the forward set of
+    # calls whose d0 may still be there, rebuilt at every join and walked again each
+    # time it grew: N if/else diamonds with a call in one arm walked 3,001 blocks
+    # 1,502,501 times at 1,000. A bit is set once, so each block is handled once (#296).
+    preds, live_in = {}, set()
+    for b, row in rows.items():
         for s in blocks[b].succ:
-            if s in blocks and (s not in ins or not cur <= ins[s]):
-                ins[s] = ins.get(s, frozenset()) | cur
+            if s in blocks:
+                preds.setdefault(s, []).append(b)
+        if row and row[0][1] == read_:
+            live_in.add(b)
+    live_out, work = set(), list(live_in)
+    while work:
+        for p in preds.get(work.pop(), ()):
+            live_out.add(p)
+            if not rows[p] and p not in live_in:
+                live_in.add(p)
+                work.append(p)
+    reach = {r for r in (entry, *roots) if r in blocks}
+    work = list(reach)
+    while work:
+        for s in blocks[work.pop()].succ:
+            if s in blocks and s not in reach:
+                reach.add(s)
                 work.append(s)
+    read = set()
+    for b in reach:
+        live = b in live_out
+        for a, kind in reversed(rows[b]):
+            if kind == read_:
+                live = True
+                continue
+            if kind == call_ and live:
+                read.add(a)
+            live = False
     return frozenset(a for a in read if named(*insn[a]))       # asked only of these
 
 

@@ -421,6 +421,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Which calls' results in d0 are read is worked out in one pass.** `_d0_result_reads`
+  decides which calls' d0 a later read or a `ret` sees, on every lift of a function that
+  calls something. It carried forward the set of calls whose d0 may still be there,
+  rebuilt that set at every join and walked a block again each time it grew, so N if/else
+  diamonds with a call in one arm cost about the cube of N: 1,000 took 8.05 s of CPU in
+  `lift_function`, which `lift`, `decompile` and `export` call, 7.61 of them in that one
+  call, and 2,000 took 58.07 (#296). It now asks backward whether d0 is live right after
+  each call, one bit per block that is set at most once, the question liveness answers,
+  over the blocks the entry or a root reaches. The answer is the same: on 400 random
+  graphs with loops, edges out of the map, unreached blocks and extra roots it is what a
+  walk of every path from every call gives, and the whole-binary tier 3 dump of both
+  fixtures and of the seven app-sweep libraries is byte-identical to main's. CPU seconds,
+  main then this: 250, 500, 1,000 and 2,000 diamonds 0.25, 1.23, 8.05 and 58.07 against
+  0.11, 0.22, 0.44 and 0.88, and 8,000 take 3.90; the pass itself takes 0.01 s at 2,000.
+  The same rows with every eighth join reading d0, so some results are read, print the
+  same lines in 0.22 s at 500, 1.23 on main.
+
 - **A loop that stores over a slot holding a register a join lost lifts.** Two rules
   forget a frame slot at a loop's head: one holding the value of a register a join lost
   goes when the loop writes or carries that register (#140), and one the loop stores a
