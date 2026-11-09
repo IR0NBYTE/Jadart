@@ -421,6 +421,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An element add into its own base or index reads the operand it overwrote.** `add x3,
+  x3, x4, lsl #3` makes an element address in the register its base was in, and the
+  entry read the base after the add had written it, so `ldr x0, [x3, #0x17]` printed
+  `return (x3 + (x4 << 3))[x4];`, and with the index as destination `x3[x3 + (x4 <<
+  3)]` (#314). Both operands are now read before the write: `return x3[x4];`. Against
+  unicorn 2.1.4, a load or two off an element address whose `add` writes its base, its
+  index or neither, lsl or sxtw, 2,000 runs: main reads 535 registers wrong, every one
+  off an add into its own base or index, and this reads all 2,686 right. Against
+  main, 689 lines change in 288 ranges of the nine binaries, classed by script with
+  none left over: 254 an index that held the address and 95 a base that did, now the
+  operand, `t0.field_0x8[t1.toSigned(32) >> 1]` for `t0.field_0x8[t0.field_0x8 +
+  (t1.toSigned(32) >> 1)]`; and 340 in five ranges, one `toDouble` in five apps, where
+  the shorter elements move which values cross the 200 characters past which
+  `State.set` names a value, so the temporaries are spilled and numbered differently.
+  Lifted with no such limit, those five ranges differ in 68 lines, every one an index.
+
 - **The dominator trees are built by Lengauer and Tarjan's algorithm.** `cfg._idoms`,
   behind every dominator and post-dominator tree tier 3 asks, was Cooper, Harvey and
   Kennedy's iteration, which meets a block's predecessors by walking each up the tree

@@ -6192,8 +6192,12 @@ class Lifter:
                 if "offs" not in box:          # once per body, whichever walk asks first
                     box["offs"] = _elem_offsets(self.blocks, self.data_offsets[1])
                 offs = box["offs"].get(here, frozenset())
+            # The base and index are read before `dst` is written, since it can be either
+            # of them: `add x3, x3, x4, lsl #3` read x3 back as the address it had just
+            # made and printed `(x3 + (x4 << 3))[x4]` for element x4 of x3 (#314).
+            base_v, idx_v = g(b), g(c)
             st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
-            st.elem[dst] = (g(b), g(c), scale, offs)
+            st.elem[dst] = (base_v, idx_v, scale, offs)
             return []
         if mn == "sub" and len(ops) >= 3:
             b = g(ops[1])
