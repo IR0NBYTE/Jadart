@@ -15253,6 +15253,117 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
     assert m and f"t0 = {m.group(1)} + {m.group(1)};" in body, body
 
 
+def test_which_call_results_are_read_matches_a_walk_of_every_path():
+    """A guard test (#296). `_d0_result_reads` carried the set of calls whose d0 may still
+    be there forward, and now asks backward whether d0 is live past each call. Both have
+    to be the answer of the plain question: a call in code the entry or a root reaches,
+    on some path from which an instruction reads d0, or a `ret` hands it back, before
+    anything writes it. On 400 random graphs, with loops, edges out of the map, blocks
+    nothing reaches and extra roots, each instruction's kind is known here, and a walk
+    of every path from every call is the oracle."""
+    import random
+    from jadart.cfg import Block
+    from jadart.expr import _d0_result_reads
+    kinds = [("call", "bl", "#0x100"), ("write", "blr", "x9"),
+             ("write", "fmov", "d0, d1"), ("read", "fmov", "d1, d0"),
+             ("both", "fadd", "d0, d0, d1"), ("none", "add", "x1, x1, #1"),
+             ("ret", "ret", "")]
+    seen = {True: 0, False: 0}
+    for seed in range(400):
+        rng = random.Random(seed)
+        n = rng.randrange(1, 14)
+        blocks, kind, returned = {}, {}, {}
+        for i in range(n):
+            b = 0x100 * i
+            insns = []
+            for j in range(rng.randrange(0, 5)):
+                k, mn, op = rng.choice(kinds)
+                a = b + 4 * j
+                insns.append((a, mn, op, ""))
+                if k == "ret":
+                    returned[a] = rng.choice(("d0", "x0"))
+                    k = "read" if returned[a] == "d0" else "none"
+                kind[a] = k
+            succ = [0x100 * rng.randrange(n) for _ in range(rng.randrange(0, 3))]
+            if rng.random() < 0.1:
+                succ.append(0xdead0)                     # out of the map
+            blocks[b] = Block(b, insns, succ)
+        entry = 0 if rng.random() < 0.95 else 0xbeef0
+        roots = tuple(0x100 * rng.randrange(n) for _ in range(rng.randrange(0, 3)))
+
+        def read_after(b, j):
+            # Whether some path from just past instruction j of block b reads d0 before
+            # anything writes it.
+            done, todo = set(), [(b, j)]
+            while todo:
+                b, j = todo.pop()
+                for (a, _mn, _op, _n) in blocks[b].insns[j:]:
+                    if kind[a] in ("read", "both"):
+                        return True
+                    if kind[a] in ("call", "write"):
+                        break
+                else:
+                    for s in blocks[b].succ:
+                        if s in blocks and s not in done:
+                            done.add(s)
+                            todo.append((s, 0))
+            return False
+        reach, todo = set(), [r for r in (entry, *roots) if r in blocks]
+        while todo:
+            b = todo.pop()
+            if b not in reach:
+                reach.add(b)
+                todo += [s for s in blocks[b].succ if s in blocks]
+        want = {a for b in reach for j, (a, _m, _o, _n) in enumerate(blocks[b].insns)
+                if kind[a] == "call" and read_after(b, j + 1)}
+        got = _d0_result_reads(blocks, entry, returned, lambda *_a: True, roots)
+        assert got == want, (seed, sorted(got), sorted(want))
+        for a, k in kind.items():
+            if k == "call":
+                seen[a in want] += 1
+    assert seen[True] > 100 and seen[False] > 100, seen
+
+
+def test_which_call_results_are_read_costs_the_same_per_instruction_at_any_length():
+    """N if/else diamonds in a row with a call in one arm: `_d0_result_reads` carried the
+    set of calls whose d0 may still be there forward, rebuilt at each join and walked
+    again each time it grew, and 1,000 diamonds took 8.05 s where 500 took 1.21 (#296).
+    Counted, not timed: the lines of expr.py run inside the one call, per instruction,
+    at 30 diamonds and at 120. Forward, that was 122 and 358, and growing with the length;
+    backward, each block's bit is set once, and it is 48 and 44."""
+    from jadart import expr
+    from jadart.expr import _d0_result_reads, tier3_graph
+    here = expr.__file__
+
+    def per_instruction(n):
+        rows = []
+        for i in range(n):
+            at = len(rows) * 4
+            rows += [("cbz", f"x{i % 8}, #{at + 12:#x}"), ("ldr", "x10, [x27, #0x10]"),
+                     ("b", f"#{at + 16:#x}"), ("bl", "#0x100"), ("ldur", "x9, [x10, #7]"),
+                     ("stur", "x9, [x19, #7]")]
+        ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])]
+        g = tier3_graph(ann)
+        ran = [0]
+
+        def lines(frame, event, _arg):
+            if event == "line":
+                ran[0] += 1
+            return lines
+
+        def calls(frame, _event, _arg):
+            return lines if frame.f_code.co_filename == here else None
+        sys.settrace(calls)
+        try:
+            got = _d0_result_reads(g.blocks, g.entry, {}, lambda *_a: True, g.roots)
+        finally:
+            sys.settrace(None)
+        assert got == frozenset(), got                 # no d0 is read
+        return ran[0] / len(ann)
+    small, large = per_instruction(30), per_instruction(120)
+    assert large < 1.5 * small, (small, large)
+
+
 def test_a_function_that_hands_back_its_double_argument_returns_d0():
     # `Curve.transform` returns its argument where it is 0.0 or 1.0, and never writes d0
     # itself, so no rule of the function's own code applied and it printed `return x0;`
