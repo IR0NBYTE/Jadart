@@ -685,6 +685,51 @@ def dom_numbers(idom):
     return pre, {n: pre[n] + size[n] for n in seq}, kids
 
 
+def strong_components(nodes, succ) -> list:
+    """The strongly connected pieces of the graph over `nodes` whose edges are `succ(n)`,
+    those into `nodes` only, as lists, each before every piece it has an edge into.
+
+    Tarjan's algorithm, iterative, as a chain of 8,000 loops is a walk that deep. A piece
+    is complete when the walk leaves its first block, after every piece it reaches, so
+    the order it completes them in, reversed, is a topological order of the pieces. Each
+    block and edge is seen once (#289)."""
+    index, low, on, stack, out = {}, {}, set(), [], []
+    for root in nodes:
+        if root in index:
+            continue
+        index[root] = low[root] = len(index)
+        on.add(root)
+        stack.append(root)
+        work = [(root, iter(succ(root)))]
+        while work:
+            n, it = work[-1]
+            for s in it:
+                if s not in nodes:
+                    continue
+                if s not in index:
+                    index[s] = low[s] = len(index)
+                    on.add(s)
+                    stack.append(s)
+                    work.append((s, iter(succ(s))))
+                    break
+                if s in on:
+                    low[n] = min(low[n], index[s])
+            else:
+                work.pop()
+                if work:
+                    m = work[-1][0]
+                    low[m] = min(low[m], low[n])
+                if low[n] == index[n]:
+                    piece, x = [], None
+                    while x != n:
+                        x = stack.pop()
+                        on.discard(x)
+                        piece.append(x)
+                    out.append(piece)
+    out.reverse()
+    return out
+
+
 def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
               rest: bool = False):
     """Return a list of statements. Each is one of:
