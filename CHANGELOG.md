@@ -421,6 +421,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The dominator trees are built by Lengauer and Tarjan's algorithm.** `cfg._idoms`,
+  behind every dominator and post-dominator tree tier 3 asks, was Cooper, Harvey and
+  Kennedy's iteration, which meets a block's predecessors by walking each up the tree
+  it has so far. N checks that branch to one trap after the `ret` walked the trap's N
+  predecessors up a chain N deep, so `tier3_graph` took 0.04, 0.13, 0.49, 1.93 and 8.07
+  s of CPU at 1,000, 2,000, 4,000, 8,000 and 16,000 checks (#319). Semidominators now
+  come from one pass in reverse walk order with path compression, as LLVM's Semi-NCA
+  computes them, and the immediate dominators from Lengauer and Tarjan's buckets rather
+  than Semi-NCA's walk up the tree, which a block whose walk parent lies far below its
+  semidominator can make as long. The answer is the same: on 20,000 random graphs, half
+  of them reversed from a virtual exit, the idoms and the walk order are the
+  iteration's, and the whole-binary tier 3 dump of both fixtures and of the seven
+  app-sweep libraries is byte-identical to main's. Those checks now take 0.01, 0.02,
+  0.04, 0.08 and 0.16 s, and the clean fixture's 25,115 calls 0.340 s where they took
+  0.353.
+
 - **An `ldp` off the pool or an element address loads both registers.** Tier 3 read an
   `ldp` off PP, a far pool base or an element address as a load of its first register
   and returned there, so the second kept what it held: `add x2, x3, x4, lsl #3; ldp x0,

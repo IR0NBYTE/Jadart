@@ -470,48 +470,80 @@ def _conditions_from_the_block_before(blocks, stop=frozenset()) -> None:
 
 
 def _idoms(blocks, entry, succ):
-    """Cooper-Harvey-Kennedy iterative dominators over the graph given by `succ`."""
-    order = []
-    seen = set()
-    stack = [entry]
+    """(idom, order): the immediate dominator of each block the entry reaches over the
+    graph `succ` gives, the entry its own, and those blocks in the order a depth-first
+    walk from the entry first comes to them.
+
+    Lengauer and Tarjan's algorithm, with path compression and no balancing, as LLVM's
+    Semi-NCA computes semidominators (GenericDomTreeConstruction.h). It was the
+    Cooper-Harvey-Kennedy iteration, which meets the predecessors of a block by walking
+    each up the tree it has so far: N checks that branch to one trap after the `ret`
+    walked the trap's N predecessors up a chain N deep, 529,042 lines for 500 of them
+    (#319). Semi-NCA's last step can walk that far too where a block's walk parent lies
+    deep below its semidominator, so the idoms come out of the buckets instead, which
+    costs one `_eval` per block. Iterative throughout, as a chain is as deep as it is
+    long."""
+    # The depth-first walk the order always came from, now with the parent each block
+    # was first reached from: a block taken off the stack was pushed by the block whose
+    # walk it is in, so the parents make a depth-first spanning tree.
+    order, parent = [], []
+    num, stack = {}, [(entry, -1)]
     while stack:
-        n = stack.pop()
-        if n in seen or n not in blocks:
+        n, p = stack.pop()
+        if n in num or n not in blocks:
             continue
-        seen.add(n)
+        num[n] = len(order)
         order.append(n)
+        parent.append(p)
         for s in succ(n):
             if s in blocks:
-                stack.append(s)
-    rpo = {n: i for i, n in enumerate(order)}
-    preds = {n: [] for n in order}
-    for n in order:
+                stack.append((s, num[n]))
+    k = len(order)
+    preds = [[] for _ in range(k)]
+    for v, n in enumerate(order):
         for s in succ(n):
-            if s in preds:
-                preds[s].append(n)
+            w = num.get(s)
+            if w is not None:
+                preds[w].append(v)
+    # Blocks are their walk numbers from here on. `semi[w]` is w's semidominator,
+    # `up` the forest of blocks linked so far, and `label[v]` the block of least
+    # semidominator on the compressed path above v.
+    semi, label, up = list(range(k)), list(range(k)), [-1] * k
+    dom, bucket = [0] * k, [[] for _ in range(k)]
+
+    def _eval(v):
+        # The block of least semidominator on the path from v up to the root of its
+        # tree in `up`, the root left out, pointing each block on it at that root.
+        if up[v] < 0:
+            return v
+        path, x = [], v
+        while up[up[x]] >= 0:
+            path.append(x)
+            x = up[x]
+        for y in reversed(path):
+            a = up[y]
+            if semi[label[a]] < semi[label[y]]:
+                label[y] = label[a]
+            up[y] = up[a]
+        return label[v]
+
+    for w in range(k - 1, 0, -1):
+        for v in preds[w]:
+            u = _eval(v)
+            if semi[u] < semi[w]:
+                semi[w] = semi[u]
+        bucket[semi[w]].append(w)
+        p = parent[w]
+        up[w] = p
+        for v in bucket[p]:
+            u = _eval(v)
+            dom[v] = u if semi[u] < semi[v] else p
+        bucket[p] = []
     idom = {entry: entry}
-
-    def inter(a, b):
-        while a != b:
-            while rpo[a] > rpo[b]:
-                a = idom[a]
-            while rpo[b] > rpo[a]:
-                b = idom[b]
-        return a
-
-    changed = True
-    while changed:
-        changed = False
-        for n in order:
-            if n == entry:
-                continue
-            new = None
-            for p in preds[n]:
-                if p in idom:
-                    new = p if new is None else inter(p, new)
-            if new is not None and idom.get(n) != new:
-                idom[n] = new
-                changed = True
+    for w in range(1, k):
+        if dom[w] != semi[w]:
+            dom[w] = dom[dom[w]]
+        idom[order[w]] = order[dom[w]]
     return idom, order
 
 
