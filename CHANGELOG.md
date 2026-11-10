@@ -421,6 +421,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An element address built with `asr` prints its index shifted.** `add x2, x3, x4, asr
+  #1` adds x4 >> 1, and the element entry kept x4 itself, so `ldrb w0, [x2, #0x17]`
+  printed `return x3[x4];`, what `lsl #0` prints (#315). A right shift scales by no
+  power of two, so the index is the shifted word, one byte a step: `x3[x4 >> 1]`. The
+  VM shifts right by one only to untag a Smi index (`ElementAddressForRegIndex`), but
+  nothing about x4 says it holds one unless the walk saw it tagged (#290); there the
+  index and the address read the Smi's value, `x3[x5.toSigned(31)]` after `sbfiz x4,
+  x5, #1, #0x1f`, and anywhere else the word shifted as the machine shifts it. Against
+  unicorn 2.1.4, a load or two off an `asr` element address, a third of them with the
+  index tagged first, 3,000 runs: main reads 1,844 registers wrong and the fix of #314
+  alone 1,804, and this reads all 4,041 right. Against #314, 149 lines change in 149
+  ranges of the nine binaries, classed by script: 147 the post-indexed load of a copy
+  loop, `t22.field_0x8[t19 << 32 >> 32 >> 1]` for `t22.field_0x8[t19 << 32 >> 32]`,
+  and 2 an add whose value had halved a Smi the walk saw tagged, `(0 + (t0 >> 1))` now
+  `(0 + t0)`, in xyz.deepdaikon.xeonjia.
+
 - **An element add into its own base or index reads the operand it overwrote.** `add x3,
   x3, x4, lsl #3` makes an element address in the register its base was in, and the
   entry read the base after the add had written it, so `ldr x0, [x3, #0x17]` printed

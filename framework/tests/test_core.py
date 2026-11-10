@@ -20812,6 +20812,23 @@ def test_an_element_add_into_its_own_base_or_index_reads_the_operand_it_overwrot
         "return x3[x4] + (x3 + (x4 << 3));"]
 
 
+def test_an_element_address_built_with_asr_prints_its_index_shifted():
+    """`add x2, x3, x4, asr #1` adds x4 >> 1, and the element entry kept x4 itself, so
+    `ldrb w0, [x2, #0x17]` printed `return x3[x4];`, what `lsl #0` prints (#315). The
+    index is the shifted word, one byte a step; it reads as the Smi's value only where
+    the walk saw the register tagged (#290)."""
+    def lift(*rows):
+        return _lift_rows([*rows, ("ret", "")])
+    asr = ("add", "x2, x3, x4, asr #1")
+    assert lift(asr, ("ldrb", "w0, [x2, #0x17]")) == ["return x3[x4 >> 1];"]
+    assert lift(("add", "x2, x3, x4, lsl #0"), ("ldrb", "w0, [x2, #0x17]")) == [
+        "return x3[x4];"]
+    assert lift(asr, ("ldrb", "w0, [x2, #0x17]"), ("ldrb", "w1, [x2, #0x18]"),
+                ("add", "x0, x0, x1")) == ["return x3[x4 >> 1] + x3[(x4 >> 1) + 1];"]
+    assert lift(("sbfiz", "x4, x5, #1, #0x1f"), asr, ("ldrb", "w0, [x2, #0x17]")) == [
+        "return x3[x5.toSigned(31)];"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
