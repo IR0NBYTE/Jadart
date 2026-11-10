@@ -19985,6 +19985,118 @@ def test_dominance_costs_the_same_per_instruction_at_any_length():
         expr.Lifter._own_written = own
 
 
+def test_dominators_are_the_ones_the_iteration_found():
+    """A guard test (#319). `cfg._idoms` was Cooper, Harvey and Kennedy's iteration and
+    is now Lengauer and Tarjan's algorithm. This holds both of what it returns, the
+    immediate dominators and the order of the walk, to the iteration as main had it,
+    copied here, on 20,000 random graphs: up to three edges out of a block, edges out
+    of the map, self loops, an entry that is no block, and the graphs `structure`
+    builds the post-dominators over."""
+    import random
+    from jadart.cfg import _idoms
+
+    def iteration(blocks, entry, succ):
+        order, seen, stack = [], set(), [entry]
+        while stack:
+            n = stack.pop()
+            if n in seen or n not in blocks:
+                continue
+            seen.add(n)
+            order.append(n)
+            stack += [s for s in succ(n) if s in blocks]
+        rpo = {n: i for i, n in enumerate(order)}
+        preds = {n: [] for n in order}
+        for n in order:
+            for s in succ(n):
+                if s in preds:
+                    preds[s].append(n)
+        idom = {entry: entry}
+
+        def inter(a, b):
+            while a != b:
+                while rpo[a] > rpo[b]:
+                    a = idom[a]
+                while rpo[b] > rpo[a]:
+                    b = idom[b]
+            return a
+        changed = True
+        while changed:
+            changed = False
+            for n in order[1:]:
+                new = None
+                for p in preds[n]:
+                    if p in idom:
+                        new = p if new is None else inter(p, new)
+                if new is not None and idom.get(n) != new:
+                    idom[n], changed = new, True
+        return idom, order
+    deep = 0
+    for seed in range(20000):
+        rng = random.Random(seed)
+        n = rng.randrange(1, 40)
+        g = {i: [rng.randrange(n + 3) for _ in range(rng.choice((0, 1, 2, 2, 3)))]
+             for i in range(n)}
+        if seed % 2:                    # reversed, from a virtual exit, as structure does
+            r = {-1: [i for i in g if not g[i]]}
+            for i, ss in g.items():
+                for s in ss:
+                    r.setdefault(s, []).append(i)
+            g, entry, blocks = r, -1, set(range(-1, n))
+        else:
+            entry, blocks = rng.randrange(n + 1), set(range(n))
+        want = iteration(blocks, entry, lambda x: g.get(x, []))
+        assert _idoms(blocks, entry, lambda x: g.get(x, [])) == want, seed
+        depth = {entry: 0}
+        for b in want[1][1:]:
+            d, x = 0, b
+            while want[0][x] != x:
+                d, x = d + 1, want[0][x]
+            depth[b] = d
+        deep += max(depth.values()) >= 5
+    assert deep > 4000, deep
+
+
+def test_dominators_cost_the_same_per_instruction_at_any_length():
+    """N checks that branch to one trap after the `ret`: Cooper, Harvey and Kennedy's
+    iteration met the trap's N predecessors by walking each up the dominator tree it
+    had so far, a chain N deep, so building the trees cost about N * N, 1.93 s of
+    `tier3_graph` at 8,000 checks where 1,000 took 0.04 (#319). Counted, not timed: the
+    lines run inside `cfg._idoms`, per instruction, at 30 checks and at 120. Iterated
+    that was 104 and 194; by Lengauer and Tarjan, 69 and 69."""
+    from jadart import cfg
+    from jadart.expr import tier3_graph
+    ran, inside = [0], [0]
+
+    def lines(frame, event, _arg):
+        if event == "line":
+            ran[0] += 1
+        elif event == "return" and frame.f_code.co_name == "_idoms":
+            inside[0] -= 1
+        return lines
+
+    def calls(frame, _event, _arg):
+        code = frame.f_code
+        if code.co_filename != cfg.__file__:
+            return None
+        if code.co_name == "_idoms":
+            inside[0] += 1
+        return lines if inside[0] else None
+
+    def per_instruction(n):
+        rows = [("cbz", "x9, #END"), ("add", "x2, x2, #1")] * n + [("ret", "")]
+        rows = [(mn, op.replace("END", f"{len(rows) * 4:#x}")) for mn, op in rows]
+        rows.append(("brk", "#0"))
+        ran[0] = 0
+        sys.settrace(calls)
+        try:
+            tier3_graph([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        finally:
+            sys.settrace(None)
+        return ran[0] / len(rows)
+    small, large = per_instruction(30), per_instruction(120)
+    assert 0 < small and large < 1.5 * small, (small, large)
+
+
 def _rows_289(seed):
     """(rows, base, mono) of a random range for #289's guard: branches anywhere, loops,
     gotos into loops, traps, frame stores and calls, and in a third a monomorphic
