@@ -20796,6 +20796,22 @@ def test_an_ldp_off_an_element_address_or_the_pool_loads_both_registers():
         "return pool_0x8010 + pool_0x8018;"]
 
 
+def test_an_element_add_into_its_own_base_or_index_reads_the_operand_it_overwrote():
+    """`add x3, x3, x4, lsl #3` makes the element address in the register its base was
+    in, and the entry read the base after the write, so `ldr x0, [x3, #0x17]` printed
+    `return (x3 + (x4 << 3))[x4];`, and with the index as destination `x3[x3 + (x4 <<
+    3)]` (#314). Both operands are read before the add writes either."""
+    tail = [("ret", "")]
+    assert _lift_rows([("add", "x3, x3, x4, lsl #3"), ("ldr", "x0, [x3, #0x17]")]
+                      + tail) == ["return x3[x4];"]
+    assert _lift_rows([("add", "x4, x3, x4, lsl #3"), ("ldr", "x0, [x4, #0x17]")]
+                      + tail) == ["return x3[x4];"]
+    # The register itself is the address the add made.
+    assert _lift_rows([("add", "x3, x3, x4, lsl #3"), ("ldr", "x0, [x3, #0x17]"),
+                       ("add", "x0, x0, x3")] + tail) == [
+        "return x3[x4] + (x3 + (x4 << 3));"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
