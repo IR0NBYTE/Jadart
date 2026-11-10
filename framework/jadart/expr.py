@@ -5984,11 +5984,17 @@ class Lifter:
             # register and LOADS all three out of the thread, so the same table is
             # consulted on the load path too, and through a copy of the thread as through
             # r10 itself, since the role is the value's (`_byte_off`, #273). Asked only
-            # where the table is the thread's, so an arm64 load reads no more than it did.
+            # where the table is the thread's: arm64's is of addresses, null + 0x20 IS
+            # true, and a load there reads the word inside the object, which `ldr x0,
+            # [x22, #0x20]` printed as `true` (#317). The VM's own decoder names the two
+            # off an `add` alone (instructions_arm64.cc, `IsAddSubImmOp` with Rn NULL_REG,
+            # kTrueOffsetFromNull and kFalseOffsetFromNull in pointer_tagging.h), and so
+            # do aotopsy and blutter.
             role = _T.roles.get(base)
             if _T.consts_base == _THR and g(base).text == _THR:
                 role = _THR
-            if role == _T.consts_base and disp in _T.consts and not index:
+            if (_T.consts_base == _THR and role == _T.consts_base and disp in _T.consts
+                    and not index):
                 st.set(dst, V(_T.consts[disp], P_ATOM))
                 return []
             # `ldp a, b, [base, #d]` loads TWO registers, the second one slot further on.
