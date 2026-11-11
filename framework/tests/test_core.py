@@ -14587,6 +14587,108 @@ def test_a_negative_literal_and_a_32_bit_shift_read_as_dart_reads_them():
                 assert dart(t, x) & mask32 == want & mask32, (mn, n, t, hex(x))
 
 
+def test_a_frame_address_held_in_a_register_is_the_slot_it_names():
+    # `mov x17, #0x238; add x17, x17, x15; str x1, [x17]` stores to the slot
+    # `str x1, [x15, #0x238]` does. The add was read as an element address with the
+    # constant as its base, so the store printed `0x238[SP] = x1;` and the reload of the
+    # slot was not told it had been written (#328).
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])])]
+    for fr in ("x15", "x29"):
+        for build in ([("mov", "x17, #0x238")],
+                      [("mov", "x17, #0x238"), ("movk", "x17, #0, lsl #16")],
+                      [("movz", "x17, #0x1, lsl #16"), ("movk", "x17, #0x238")]):
+            off = 0x10238 if build[0][0] == "movz" else 0x238
+            for add in (f"x17, x17, {fr}", f"x17, {fr}, x17"):
+                for st, ld, pre in (("str x1, [x17]", f"ldr x0, [{fr}, #{off:#x}]", "x1"),
+                                    ("str w1, [x17]", f"ldr w0, [{fr}, #{off:#x}]", "x1"),
+                                    ("str x1, [x17, #8]",
+                                     f"ldr x0, [{fr}, #{off + 8:#x}]", "x1")):
+                    got = lift(build + [("add", add),
+                                        (st.split()[0], st.split(" ", 1)[1]),
+                                        (ld.split()[0], ld.split(" ", 1)[1])])
+                    assert got == [f"return {pre};"], (fr, build, add, st, got)
+    # A pair, loaded back through the displacement, and the slot after it.
+    for w in "xw":
+        got = lift([("mov", "x17, #0xf0"), ("add", "x17, x17, x15"),
+                    ("stp", f"{w}1, {w}2, [x17]"), ("ldp", f"{w}3, {w}4, [x15, #0xf0]"),
+                    ("add", "x0, x3, x4")])
+        assert got == ["return x1 + x2;"], got
+    # Below the frame register: SP less a constant.
+    assert lift([("mov", "x17, #0x80"), ("sub", "x17, x15, x17"), ("str", "x1, [x17]"),
+                 ("ldur", "x0, [x15, #-0x80]")]) == ["return x1;"]
+    # Another slot is another slot, and a held address tracks an add of its own.
+    assert lift([("mov", "x17, #0x238"), ("add", "x17, x17, x15"), ("str", "x1, [x17]"),
+                 ("str", "x2, [x15, #0x240]"),
+                 ("ldr", "x0, [x15, #0x238]")]) == ["return x1;"]
+    assert lift([("mov", "x17, #0x230"), ("add", "x17, x17, x15"),
+                 ("add", "x17, x17, #8"), ("str", "x1, [x17]"),
+                 ("ldr", "x0, [x15, #0x238]")]) == ["return x1;"]
+    # A call may change x17 and a move of SP changes what it was taken off, so the
+    # address is held to the next one of either and no further.
+    for gap in ([("bl", "#0x100")], [("str", "x3, [x15, #-8]!")], [("mov", "x17, x3")]):
+        got = lift([("mov", "x17, #0x238"), ("add", "x17, x17, x15")] + gap
+                   + [("str", "x1, [x17]"), ("ldr", "x0, [x15, #0x238]")])
+        assert "return x1;" not in got, (gap, got)
+    # The same function as the displacement writes it gives the same lines, in a loop
+    # that stores to the outgoing area and calls, which is what _writes_outgoing reads.
+    held = [("mov", "x17, #0x238"), ("add", "x17, x17, x15"), ("str", "x1, [x17]")]
+    direct = [("mov", "x16, #0"), ("mov", "x16, #1"), ("str", "x1, [x15, #0x238]")]
+    for body in ([("bl", "#0x100"), ("ldr", "x0, [x15, #0x238]")],
+                 [("str", "x3, [x15, #0x240]"), ("ldr", "x0, [x15, #0x238]")],
+                 # a loop whose head is the store, so the address is held across the
+                 # back edge into a block of its own
+                 [("sub", "x2, x2, #1"), ("cbnz", "x2, #0x8"),
+                  ("ldr", "x0, [x15, #0x238]")]):
+        assert lift(held + body) == lift(direct + body), body
+    # A call in the loop empties x17 on the back edge, so the store is not folded.
+    got = lift(held + [("bl", "#0x100"), ("cbnz", "x2, #0x8"),
+                       ("ldr", "x0, [x15, #0x238]")])
+    assert "return x1;" not in got, got
+    # ...and across a join, where one arm moves the address, it is not held.
+    got = lift([("mov", "x17, #0x238"), ("add", "x17, x17, x15"), ("cbz", "x2, #0x14"),
+                ("mov", "x17, x3"), ("b", "#0x14"), ("str", "x1, [x17]"),
+                ("ldr", "x0, [x15, #0x238]")])
+    assert "return x1;" not in got, got
+    # A move of SP or FP that strip_boilerplate blanks to a `nop` still moves it: the
+    # store is at old SP + 0x238, new SP + 0x258, so a load of new SP + 0x238 must not
+    # read it back, and every load prints as the `add xD, xF, #imm` spelling does.
+    for fr, imm, move, slots in (("x15", "#0x238", ("sub", "x15, x15, #0x20"),
+                                  ("#0x238", "#0x258")),
+                                 ("x29", "#0x38", ("mov", "x29, x15"), ("#0x38",))):
+        for slot in slots:
+            tail = [move, ("str", "x1, [x17]"), ("ldr", f"x0, [{fr}, {slot}]")]
+            got = lift([("mov", f"x17, {imm}"), ("add", f"x17, x17, {fr}")] + tail)
+            assert got == lift([("add", f"x17, {fr}, {imm}")] + tail), (fr, slot, got)
+            assert got != ["return x1;"], (fr, slot, got)
+
+
+def test_a_constant_is_not_printed_as_the_base_of_an_element():
+    # `mov x17, #0x238; add x17, x17, x3; str x1, [x17]` is x3 plus 0x238, element 0x238
+    # of x3 as `add x17, x3, x17` has always read, not element x3 of the number 0x238.
+    # A shifted index off a number or two numbers is no element address and prints as
+    # the sum it is (#328).
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])])]
+    a = lift([("mov", "x17, #0x238"), ("add", "x17, x17, x3"), ("str", "x1, [x17]")])
+    b = lift([("mov", "x17, #0x238"), ("add", "x17, x3, x17"), ("str", "x1, [x17]")])
+    assert a == b == ["x3[0x238] = x1;", "return x0;"], (a, b)
+    assert lift([("mov", "x17, #0x238"), ("add", "x2, x17, x3"),
+                 ("mov", "x0, x2")]) == ["return 0x238 + x3;"]
+    for rows in ([("mov", "x17, #0x238"), ("add", "x17, x17, x3, lsl #3"),
+                  ("str", "x1, [x17]")],
+                 [("mov", "x17, #0x238"), ("mov", "x16, #8"), ("add", "x17, x17, x16"),
+                  ("str", "x1, [x17]")]):
+        got = lift(rows)
+        assert not re.search(r"0x238\[|8\[", "\n".join(got)), got
+
+
 def test_a_frame_slot_past_the_displacement_is_its_own_slot():
     # A slot too far from FP for the 9-bit displacement is reached through x17: `mov
     # x17, #-0x158; str d0, [x29, x17]`. Read as `[x29]`, every such slot was x29+0, so

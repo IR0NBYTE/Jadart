@@ -421,6 +421,30 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A frame address held in a register is the frame slot it names.** `mov x17, #0x238;
+  add x17, x17, x15; str x1, [x17]` stores to the slot `str x1, [x15, #0x238]` does, and
+  printed `0x238[SP] = x1;`, an element of the number 0x238, while the reload of that
+  slot did not see the store (#328). Before the frame analyses run, a forward
+  must-dataflow over the blocks tracks the constants `mov`, `movz` and `movk` build and
+  the registers an `add` or `sub` of one to x15 or x29 makes, either operand order,
+  intersecting at every join and cleared by a call, a write of the register, or a move
+  of SP or FP, read off the row as it was where strip_boilerplate blanked it. A plain
+  access through such a register is read as `[x15, #imm]` or `[x29, #imm]`, so the
+  slot keys, the reloads, the outgoing arguments and the frame plan are the ones the
+  direct form gets, for `str`, `ldr`, `stp` and `ldp` of x and w. A constant plus any
+  other register prints with the register as the base, `x3[0x238]`, as the swapped
+  spelling always did; a shifted index off a number, or two numbers, is no element
+  address. Against unicorn 2.1.4, a store through the held address reloaded through
+  `[x15, #imm]` or `[x29, #imm]`, both operand orders, x and w, single and pair, and
+  `sub`: main reads back none of the 18, this reads back all 18. With a blanked SP or FP
+  move between the add and the access, 32 cases, none is claimed. Of the nine binaries
+  only tsdm_client adds a constant to x15 or x29 from a register, 4 adds in 1 range;
+  there the eight `0x238[SP] = NULL;` style lines go, 59 reloads of frame slots that
+  stood in for the call's outgoing arguments go, and `ThemeData.(...)` takes the stored
+  values, 68 lines out and 13 in, every one classified. The other eight are
+  byte-identical.
+  None of aotopsy, blutter, flutterdec and unflutter folds such an address into a slot.
+
 - **An offset off the null register carries the tag bias.** x22 holds null, which the VM
   loads from `Thread::object_null_offset()`: an ObjectPtr, tagged like any other object.
   The arm64 table listed it with the untagged roles, so an offset off it printed as
