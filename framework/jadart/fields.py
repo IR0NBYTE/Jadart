@@ -1575,6 +1575,11 @@ def _cast_pass(blocks, entry, casts, sites, declined, cross, moves, clash, stats
 
     Every entry a meet reads and a redefinition scans is charged to `budget`, and
     `_OverBudget` ends the walk once it is spent."""
+    # The registers a cast proves nothing about: the untagged roles, and the null
+    # register, a tagged object that passes a nullable cast and has none of the class's
+    # fields. It left the untagged set in #330 and is kept out of this walk by name.
+    fixed = E._UNTAGGED | {r for r, role in E.ROLE.items() if role == "NULL"}
+
     def charge(n):
         budget[0] -= n
         if budget[0] < 0:
@@ -1759,7 +1764,7 @@ def _cast_pass(blocks, entry, casts, sites, declined, cross, moves, clash, stats
                 return
             bv = locs.get(base)
             if (record and bv is not None and plain and disp >= -1
-                    and base not in E._UNTAGGED):
+                    and base not in fixed):
                 cs = facts.get(bv)
                 if cs:
                     found.add((a, base, disp + 1, cs))
@@ -1818,7 +1823,7 @@ def _cast_pass(blocks, entry, casts, sites, declined, cross, moves, clash, stats
                         define(d, a)
                         fptr.add(d)
                         return defs
-                    if s not in E._UNTAGGED and d not in E._UNTAGGED:
+                    if s not in fixed and d not in fixed:
                         v = get(s, a)
                         sym.pop(d, None)
                         fptr.discard(d)
