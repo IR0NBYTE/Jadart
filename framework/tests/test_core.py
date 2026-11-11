@@ -20239,7 +20239,8 @@ def test_loop_exits_and_goto_joins_answer_what_the_walks_over_ancestors_did():
     regs = ([f"x{i}" for i in range(31) if f"x{i}" not in expr._SPECIAL]
             + [f"d{i}" for i in range(8)])
     exits, kill = expr.Lifter._exit_slots, expr.Lifter._join_kill
-    seen = {"probed": 0, "dropped": 0, "recorded": 0, "joins": 0, "killed": 0}
+    seen = {"probed": 0, "dropped": 0, "recorded": 0, "joins": 0, "killed": 0,
+            "swept": 0}
 
     def exit_slots(self, st, header):
         probe = State()
@@ -20263,6 +20264,13 @@ def test_loop_exits_and_goto_joins_answer_what_the_walks_over_ancestors_did():
         return exits(self, st, header)
 
     def join_kill(self, addr, entry=False):
+        if not getattr(self, "swept_333", False):
+            # Every block, as a join of either kind, the first time a lift asks (#333).
+            self.swept_333 = True
+            for a in sorted(self.blocks):
+                for e in (False, True):
+                    join_kill(self, a, e)
+                    seen["swept"] += 1
         got = kill(self, addr, entry)
         preds = self._preds.get(addr, ())
         if entry:
@@ -20293,14 +20301,21 @@ def test_loop_exits_and_goto_joins_answer_what_the_walks_over_ancestors_did():
     graphs = [_rows_289(seed) for seed in range(300)]
     graphs += [(rows, base, mono) for _n, rows, base, mono, tier3 in _graphs_282()
                if tier3]
+    graphs += [_rows_333(n, form) for n in (3, 12, 40) for form in _FORMS_333]
+    graphs += [_rows_333_random(seed) for seed in range(150)]
     expr.Lifter._exit_slots, expr.Lifter._join_kill = exit_slots, join_kill
+    walk = getattr(expr, "_KILL_WALK", 0)        # absent on main, where every join walks
     try:
-        for rows, base, mono in graphs:
-            lift_function([(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
-                          mono=mono)
+        # Folded from the first join, then walked first as a lift does (_KILL_WALK).
+        for expr._KILL_WALK in (0, walk):
+            for rows, base, mono in graphs:
+                lift_function([(base + i * 4, mn, op, "")
+                               for i, (mn, op) in enumerate(rows)], mono=mono)
     finally:
         expr.Lifter._exit_slots, expr.Lifter._join_kill = exits, kill
+        expr._KILL_WALK = walk
     assert seen["probed"] > 100 and seen["joins"] > 300, seen
+    assert seen["swept"] > 40000, seen
     assert seen["dropped"] > 500 and seen["recorded"] > 100 and seen["killed"] > 100, seen
 
 
@@ -20361,6 +20376,110 @@ def test_loop_exits_and_goto_joins_cost_the_same_per_instruction_at_any_length()
             assert large < 1.5 * small, (goto, small, large)
     finally:
         expr.Lifter._exit_slots, expr.Lifter._join_kill = exits, kill
+
+
+_FORMS_333 = ("plain", "loop", "mono")
+
+
+def _rows_333(n, form):
+    """(rows, base, mono) of #333's shape: `n` conditionals that each jump over their own
+    block and the next conditional, so every join's immediate dominator is the first
+    one; `loop` wraps them in a loop, `mono` puts them behind a monomorphic entry."""
+    base, mono, rows = (0x1000, 0x1008, list(_MONO_ROWS[:6])) if form == "mono" else (
+        0, None, [])
+    start = base + len(rows) * 4
+    for i in range(n):
+        h = base + len(rows) * 4
+        rows += [("cbz", f"x{i % 8}, #{h + 12:#x}"), ("add", "x2, x2, #1")]
+    rows.append(("add", "x2, x2, #1"))
+    if form == "loop":
+        rows += [("cmp", "x2, x1"), ("b.lt", f"#{start:#x}")]
+    return rows + [("ret", "")], base, mono
+
+
+def _rows_333_random(seed):
+    """(rows, base, mono) of a random range for #333's guard: conditionals that jump a
+    row or three on, loops back to anywhere before, gotos, frame and field stores and
+    calls between, in half of them one loop around it all, and in a quarter a
+    monomorphic entry some of the body jumps back into."""
+    import random
+    rng = random.Random(seed)
+    base, mono, rows = 0, None, []
+    if rng.random() < 0.25:
+        base, mono, rows = 0x1000, 0x1008, list(_MONO_ROWS[:6])
+    start = base + len(rows) * 4
+    body = []
+    for _ in range(rng.randrange(3, 40)):
+        h, r, k = start + len(body) * 4, f"x{rng.randrange(8)}", rng.random()
+        put = rng.choice([("add", "x2, x2, #1"), ("stur", f"{r}, [x29, #-8]"),
+                          ("str", f"{r}, [x0, #8]"), ("bl", "#0x100"),
+                          ("mov", f"x{rng.randrange(8)}, {r}")])
+        if k < 0.5:
+            body += [("cbz", f"{r}, #{h + 4 * rng.choice([3, 3, 4, 5]):#x}"), put]
+        elif k < 0.65:
+            back = start + 4 * rng.randrange(len(body) + 1)
+            body += [put, ("cmp", "x2, x1"), ("b.lt", f"#{back:#x}")]
+        elif k < 0.75:
+            body += [("b", f"#{h + 4 * rng.choice([2, 3, 6]):#x}"), put]
+        elif k < 0.8 and mono:
+            into = rng.choice([0x1000, 0x1008, 0x1014, 0x1018, 0x101c])
+            body += [("cbz", f"{r}, #{into:#x}"), put]
+        else:
+            body.append(put)
+    rows += body + [("add", "x2, x2, #1"), ("add", "x3, x3, #1"), ("add", "x2, x2, #1")]
+    if rng.random() < 0.5:
+        rows += [("cmp", "x2, x1"), ("b.lt", f"#{start:#x}")]
+    return rows + [("ret", "")], base, mono
+
+
+def test_overlapping_conditionals_cost_the_same_per_instruction_at_any_length():
+    """N conditionals that each jump over their own block and the next conditional hang
+    every join off the first one, and `_join_kill` walked the blocks between each join
+    and it, most of the function each time: 2.34 s of CPU at 2,000 and about N * N
+    (#333). Counted, not timed: the lines of expr.py and cfg.py `_join_kill` runs, per
+    instruction, at 30 conditionals and at 120, as they are, in a loop, and behind a
+    monomorphic entry. Walked per join that was 477 and 1,805, 1,955 and 8,071, and 450
+    and 1,909; walked until the walks cover eight times the blocks and then folded
+    once over the dominator tree (_KILL_WALK), 362 and 355, 775 and 801, and 181 and
+    177."""
+    from jadart import cfg, expr
+    from jadart.expr import lift_function
+    here = {expr.__file__, cfg.__file__}
+    kill, ran, depth = expr.Lifter._join_kill, [0], [0]
+
+    def lines(frame, event, _arg):
+        if event == "line":
+            ran[0] += 1
+        return lines
+
+    def calls(frame, _event, _arg):
+        return lines if frame.f_code.co_filename in here else None
+
+    def counted(*args, **kw):
+        depth[0] += 1
+        if depth[0] == 1:
+            sys.settrace(calls)
+        try:
+            return kill(*args, **kw)
+        finally:
+            depth[0] -= 1
+            if not depth[0]:
+                sys.settrace(None)
+
+    def per_instruction(n, form):
+        rows, base, mono = _rows_333(n, form)
+        ran[0] = 0
+        lift_function([(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+                      mono=mono)
+        return ran[0] / len(rows)
+    expr.Lifter._join_kill = counted
+    try:
+        got = {form: (per_instruction(30, form), per_instruction(120, form))
+               for form in _FORMS_333}
+    finally:
+        expr.Lifter._join_kill = kill
+    for form, (small, large) in got.items():
+        assert 0 < small and large < 1.5 * small, (form, small, large)
 
 
 def _untag_text(rows, reg="x0"):
