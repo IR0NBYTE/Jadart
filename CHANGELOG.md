@@ -421,6 +421,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **x29 and x30 read as the frame again where the frame chain gives it back.**
+  `ldr x29, [x0, #8]; mov x29, x15; mov x0, x29; ret` printed `return x0.field_0x9;`
+  and the machine returns SP; it now prints `return FP;`, as the same rows without the
+  load always did. The move is the frame chain, which `strip_boilerplate` blanks, so
+  #307 gave the role back but no row wrote x29 in the lifted state, and the register
+  map kept the loaded value as a value, a base and past a join. `Lifter._step` now
+  puts x29 back as FP after a chain row that follows a lost write (the move or add off
+  SP, the epilogue's `ldp x29, x30, [x15], #0x10`), and x30 back as LR after that
+  pop, which `_holds_ra` also reads as a return address; an FFI frame's `ldr x29,
+  [x15], #8` is a load the walk steps and keeps its value. A function that never
+  writes x29 outside the chain is untouched. Against unicorn 2.1.4, straight-line runs
+  of a lost write, a chain row and reads through the register: main printed 1,659 of
+  4,000 wrong values (seed 1) and 1,670 of 4,000 (seed 2), the branch 0 of each, and
+  #307's own oracle still 0 of 3,000 (#331).
+
 - **A load from null plus 0x20 reads the word there.** arm64 code makes `true` and
   `false` with `add xD, x22, #0x20` and `#0x30`, the objects sitting at those offsets
   from null, and the load path read the same table: `ldr x0, [x22, #0x20]`, a word
