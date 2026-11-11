@@ -17,6 +17,9 @@ points), both via the Cooper-Harvey-Kennedy iterative algorithm.
 from __future__ import annotations
 
 import bisect
+import itertools
+from collections import Counter
+from operator import attrgetter
 from dataclasses import dataclass, field
 
 _COND_TERMS = ("cbz", "cbnz", "tbz", "tbnz")
@@ -717,6 +720,117 @@ def dom_numbers(idom):
     return pre, {n: pre[n] + size[n] for n in seq}, kids
 
 
+_SUCC = attrgetter("succ")
+
+
+class LoopNest:
+    """Natural-loop bodies, each the backward closure from its latches that stops at its
+    header, built so that one holding another takes the inner one in whole (#332).
+
+    N loops nested in each other have bodies of N, N - 1, ... blocks, and walking each
+    one by itself walked about N * N / 2 blocks between them: 14 s of CPU at 2,000
+    nested loops, 82% of it under `_render_loop`. Here the walk for an outer loop, at a
+    block a body worked out before holds, adds that whole body at once and goes on from
+    the blocks with an edge into it. That is the same set the plain walk gathers when
+    the inner body is rooted, every block of it reached from its header inside it, and
+    holds neither the outer header nor a block the outer walk would turn away: the
+    plain walk takes the block it is at, so everything that reaches it, the inner header
+    among them, and so every block the inner header reaches. A body counts as rooted
+    (`good`) where its header is above every block of it in a dominator forest whose
+    edges are the walk's: the part of a path from the root to a block after the header's
+    last visit stays inside the body. One built where `num` is None, or that takes in a
+    block the forest has nowhere or does not put under the header, is walked as before
+    and never taken in whole. Asked inner loops first, as `prepare` does, each block is
+    walked by the innermost rooted body holding it and by no other, the way a loop
+    nesting forest is (Havlak 1997; LLVM's LoopInfo builds its loops bottom up too).
+
+    `preds` maps a block to the blocks with an edge into it, `keep(header, n)` says
+    whether the walk for `header` may take `n`, as each caller had it, and `num` is
+    `dom_numbers` of that forest. `kids` and `own` say how each body was put together,
+    for a question folded up the nest in the same way (Lifter._loop_live_in)."""
+
+    def __init__(self, preds, keep, num):
+        self.preds, self.keep = preds, keep
+        self.pre, self.end = (num[0], num[1]) if num is not None else ({}, {})
+        self.body: dict = {}
+        self.front: dict = {}      # the blocks outside a rooted body with an edge into it
+        self.kids: dict = {}       # the bodies a body took in whole, at the time
+        self.own: dict = {}        # the blocks its walk took one at a time, header first
+        self.by_id: dict = {}      # id() of a body -> its header, for Lifter._fold
+        self.good: set = set()     # the rooted bodies
+        self.clean: set = set()    # the rooted bodies none of whose parts overlap
+        self._owner: dict = {}     # block -> a rooted body holding it
+        self._up: dict = {}        # rooted body -> the rooted body that took it in
+
+    def above(self, a, b) -> bool:
+        """`a` is `b`, or above it, in the forest; False for a block in none."""
+        pre = self.pre
+        return a in pre and b in pre and pre[a] <= pre[b] < self.end[a]
+
+    def _find(self, n):
+        """The outermost rooted body found so far that holds `n`, or None."""
+        r = self._owner.get(n)
+        if r is None:
+            return None
+        up, path = self._up, []
+        while r in up:
+            path.append(r)
+            r = up[r]
+        for p in path:
+            up[p] = r
+        return r
+
+    def closure(self, header, latches) -> frozenset:
+        """{header} and every block `keep` lets in that reaches one of `latches` without
+        passing `header`, over `preds`; the walk each caller had, taking rooted bodies
+        in whole."""
+        got = self.body.get(header)
+        if got is not None:
+            return got
+        keep, preds, body, front = self.keep, self.preds, self.body, self.front
+        nodes, own, kids, stack = {header}, [header], [], list(latches)
+        clean = True
+        while stack:
+            n = stack.pop()
+            if n in nodes or not keep(header, n):
+                continue
+            r = self._find(n)
+            if r is not None and header not in body[r] and keep(header, r):
+                inner = body[r]
+                clean = clean and nodes.isdisjoint(inner)
+                nodes |= inner
+                kids.append(r)
+                stack.extend(front[r])
+                continue
+            nodes.add(n)
+            own.append(n)
+            stack.extend(preds.get(n, ()))
+        got = body[header] = frozenset(nodes)
+        self.kids[header], self.own[header] = kids, own
+        self.by_id[id(got)] = header
+        above = self.above
+        if all(above(header, n) for n in own) and all(above(header, r) for r in kids):
+            self.good.add(header)
+            if clean:
+                self.clean.add(header)
+            for n in own:
+                self._owner.setdefault(n, header)
+            for r in kids:
+                self._up[r] = header
+            front[header] = frozenset(itertools.chain(
+                itertools.chain.from_iterable(map(preds.get, own, itertools.repeat(()))),
+                *(front[r] for r in kids))) - got
+        return got
+
+    def prepare(self, headers, ask) -> None:
+        """Ask `ask(h)` of each of `headers` the forest has, lowest in it first, so an
+        inner loop's body is there for the outer one to take in."""
+        pre = self.pre
+        for h in sorted((h for h in headers if h in pre), key=pre.__getitem__,
+                        reverse=True):
+            ask(h)
+
+
 def strong_components(nodes, succ) -> list:
     """The strongly connected pieces of the graph over `nodes` whose edges are `succ(n)`,
     those into `nodes` only, as lists, each before every piece it has an edge into.
@@ -886,18 +1000,35 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
         # header twice, which the walk skips. Not that the order could matter: the walk
         # gathers one set from any order, and it is asked only what is in it and which
         # exit most of its edges take, the lowest address first.
+        #
+        # A frozenset, built once per header, inner loops first, each taking in the bodies
+        # of the loops inside it whole (LoopNest): walked one by one, N nested loops
+        # walked N * N / 2 blocks between them (#332). The callers only ask what is in it.
+        nonlocal nest, walked
         latches = [n for n in preds[header] if dominates(header, n)]
-        nodes = {header}
-        stack = list(latches)
-        while stack:
-            n = stack.pop()
-            if n in nodes:
-                continue
-            nodes.add(n)
-            for p in preds.get(n, ()):
-                if p not in nodes and dominates(header, p):
-                    stack.append(p)
-        return nodes
+        if nest is None:
+            # Walked by itself, as every loop was, while the bodies walked come to no
+            # more than twice the blocks: loops side by side or a few deep. Past
+            # that they are nested deep and the nest is built, which only then saves
+            # more than it keeps (#332).
+            nodes, stack = {header}, latches
+            while stack:
+                n = stack.pop()
+                if n in nodes:
+                    continue
+                nodes.add(n)
+                for p in preds.get(n, ()):
+                    if p not in nodes and dominates(header, p):
+                        stack.append(p)
+            walked += len(nodes)
+            if num is None or walked <= 2 * len(blocks):
+                return nodes
+            nest = LoopNest(preds, dominates, num)
+            nest.prepare(loop_header, loop_nodes)
+            latches = [n for n in preds[header] if dominates(header, n)]
+        return nest.closure(header, latches)
+
+    nest, walked = None, 0
 
     def loop_exit(nodes):
         """Which block the loop is structured to fall out to.
@@ -907,14 +1038,14 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
         most edges take, which is what makes the most of them read as `break`. Ties go to
         the lowest address, which keeps the pick deterministic and, on a compiler that
         lays blocks out in order, is the one the source fell out to."""
-        votes = {}
-        for n in nodes:
-            for s in blocks[n].succ:
-                if s not in nodes:
-                    votes[s] = votes.get(s, 0) + 1
+        # Counted by C loops over the edges, not a line per block: a loop holding N
+        # nested ones counted its N * 2 blocks' edges one by one (#332).
+        edges = itertools.chain.from_iterable(map(_SUCC, map(blocks.__getitem__, nodes)))
+        votes = Counter(itertools.filterfalse(nodes.__contains__, edges))
         if not votes:
             return None
-        return min(votes, key=lambda s: (-votes[s], s))
+        most = max(votes.values())
+        return min(itertools.compress(votes, map(most.__eq__, votes.values())))
 
     visited = set()
     loop_of = {}   # ctx -> node set, for the out-of-loop escape guard
