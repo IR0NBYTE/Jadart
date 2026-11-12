@@ -21529,6 +21529,303 @@ def test_an_offset_off_the_null_register_carries_the_tag_bias():
     assert lift(("add", "x0, x22, #8")) == ["return NULL + 8;"]
 
 
+def _lift_329(*rows):
+    return _lift_rows([*rows, ("ret", "")])
+
+
+def test_tags_is_printed_only_off_an_object_pointer():
+    """`.tags` is the header word of the object a base points at, and offset 0 was
+    spelled that way off any base: AllocateObjectParameterized's `add x5, x0, x5, lsl
+    #2; stur w1, [x5, #-1]`, a type-argument store at an offset read from the class,
+    printed `(t0 + 1 + (... << 2)).tags = x1;` (#329). A value now records that the
+    lifter computed it (`V.calc`), the record follows it through a name, a slot, a
+    32-bit view and a join, and off such a value offset 0 is the access at its address,
+    exact off a tagged base and off an untagged one."""
+    lift = _lift_329
+    # The issue, and the constants of the address made one.
+    assert lift(("add", "x0, x0, #1"), ("add", "x5, x0, x5, lsl #2"),
+                ("stur", "w1, [x5, #-1]")) == [
+        "(x0 + (x5 << 2)).field_0x1 = x1;", "return x0 + 1;"]
+    assert lift(("sub", "x0, x2, #0xf"), ("stur", "x1, [x0, #-1]")) == [
+        "(x2 - 16).field_0x1 = x1;", "return x2 - 15;"]
+    assert lift(("stur", "x1, [x2, #-0x10]")) == ["(x2 - 16).field_0x1 = x1;",
+                                                  "return x0;"]
+    # An untagged base has no tag bias: these read THR + 0 and HEAP + 0, and the first
+    # two printed `THR.field_0x1`, which is THR + 1, in the fix that was reverted.
+    for rows, want in (
+            ([("add", "x0, x26, #1"), ("ldur", "x0, [x0, #-1]")], "THR.field_0x0"),
+            ([("add", "x0, x26, #8"), ("ldr", "x0, [x0, #-8]")],
+             "(THR + 8 - 8).field_0x1"),
+            ([("mov", "x5, x26"), ("add", "x0, x5, #1"), ("ldur", "x0, [x0, #-1]")],
+             "THR.field_0x0"),
+            ([("ldr", "x0, [x26]")], "THR.field_0x0"),
+            ([("add", "x0, x28, #1"), ("ldur", "x0, [x0, #-1]")], "HEAP.field_0x0"),
+            ([("ldr", "x0, [x28]")], "HEAP.field_0x0"),
+            ([("mov", "x5, x28"), ("ldur", "x0, [x5, #-1]")], "(HEAP - 1).field_0x1"),
+            ([("ldr", "x0, [x30]")], "LR.field_0x0")):
+        assert lift(*rows) == [f"return {want};"], rows
+    assert lift(("add", "x0, x26, #1"), ("stur", "x3, [x0, #-1]")) == [
+        "THR.field_0x0 = x3;", "return THR + 1;"]
+    # The constants of a longer sum are one offset.
+    assert lift(("add", "x0, x2, #1"), ("add", "x0, x0, x3"), ("add", "x0, x0, #7"),
+                ("ldur", "x0, [x0, #-1]")) == ["return (x2 + x3).field_0x8;"]
+    # A tagged base carries the bias, a frame register its own convention, and the
+    # null register is an object.
+    for rows, want in (
+            ([("add", "x0, x2, #1"), ("ldur", "x0, [x0, #-1]")], "x2.field_0x1"),
+            ([("add", "x0, x2, #1"), ("ldurb", "w0, [x0, #-1]")], "x2.field1_0x1"),
+            ([("add", "x0, x2, #2"), ("ldur", "x0, [x0, #-1]")], "x2.field_0x2"),
+            ([("add", "x0, x22, #1"), ("ldur", "x0, [x0, #-1]")], "NULL.field_0x1"),
+            ([("add", "x0, x29, #1"), ("ldur", "x0, [x0, #-1]")], "FP.field_0x1"),
+            ([("ldur", "x0, [x22, #-1]")], "NULL.tags"),
+            ([("ldur", "x0, [x1, #-1]")], "x1.tags")):
+        assert lift(*rows) == [f"return {want};"], rows
+    # Arithmetic of any kind, and a 32-bit view of it.
+    for rows, want in (
+            ([("and", "x0, x1, #0xfffffffffffffff0")],
+             "((x1 & 0xfffffffffffffff0) - 1).field_0x1"),
+            ([("lsl", "x0, x1, #3")], "((x1 << 3) - 1).field_0x1"),
+            ([("mul", "x0, x1, x2")], "(x1 * x2 - 1).field_0x1"),
+            ([("neg", "x0, x1")], "(-x1 - 1).field_0x1"),
+            ([("mov", "x0, #0x10")], "15.field_0x1"),
+            ([("add", "w0, w1, #1")], "((x1 + 1).toUnsigned(32) - 1).field_0x1"),
+            ([("add", "x0, x1, x5")], "(x1 + x5 - 1).field_0x1")):
+        assert lift(*rows, ("ldur", "x0, [x0, #-1]")) == [f"return {want};"], rows
+    # A tagged Smi's word is arithmetic. One a Smi check left boxed is the object, and
+    # so is the choice of two object pointers, but not of a pointer and a sum.
+    assert lift(("sbfiz", "x0, x1, #1, #0x1f"), ("ldur", "x0, [x0, #-1]")) == [
+        "return ((x1.toSigned(31) << 1) - 1).field_0x1;"]
+    assert lift(("cmp", "x3, x4"), ("csel", "x0, x1, x2, eq"),
+                ("ldur", "x0, [x0, #-1]")) == ["return (x3 == x4 ? x1 : x2).tags;"]
+    assert lift(("add", "x2, x2, #8"), ("cmp", "x3, x4"), ("csel", "x0, x1, x2, eq"),
+                ("ldur", "x0, [x0, #-1]")) == [
+        "return ((x3 == x4 ? x1 : x2 + 8) - 1).field_0x1;"]
+    assert lift(("cmp", "x3, x4"), ("csinc", "x0, x1, x2, eq"),
+                ("ldur", "x0, [x0, #-1]")) == [
+        "return ((x3 == x4 ? x1 : x2 + 1) - 1).field_0x1;"]
+
+
+def test_a_computed_address_is_one_under_a_name_and_past_a_join():
+    """The record is the value's and not the text's: the type-argument store survived
+    wherever the address was given a name first. The clean fixture's 0x19d860 steps x1
+    by 0x10 round a loop and stores `stur w22, [x1, #-1]`, which printed `t3.tags =
+    NULL;` under `var t3 = t0 + 1 + 16;` (#329). A name carries what its value was, and
+    where the walk has only a register's name, at a loop header, a join or a label,
+    the rows on every way in say whether any of them left arithmetic there
+    (`_addr_facts`)."""
+    lift = _lift_329
+    # The loop cursor: the name is made before the body is walked.
+    assert lift(("add", "x1, x0, #0x10"), ("stur", "w22, [x1, #-1]"),
+                ("add", "x1, x1, #0x10"), ("cmp", "x1, x3"), ("b.lo", "#0x4")) == [
+        "var t0 = x0 + 16;", "while (true) {", "(t0 - 1).field_0x1 = NULL;",
+        "if ((t0 + 16) >= x3) {", "t0 += 16;", "break;", "}", "t0 += 16;", "}",
+        "return x0;"]
+    # Named because a store went by.
+    assert lift(("add", "x0, x0, #1"), ("ldur", "w6, [x5, #0x4f]"),
+                ("add", "x5, x0, x6, lsl #2"), ("stur", "x9, [x7, #0x4f]"),
+                ("stur", "w1, [x5, #-1]"))[-2] == "(t0 - 1).field_0x1 = x1;"
+    # Computed on one way in and an object pointer on the other.
+    assert lift(("cbz", "x5, #0xc"), ("add", "x1, x1, #8"), ("b", "#0xc"),
+                ("ldur", "x0, [x1, #-1]")) == [
+        "var t0 = x1;", "if (x5 != 0) {", "t0 = x1 + 8;", "}",
+        "return (t0 - 1).field_0x1;"]
+    # Spilled and read back, past a call and past a join.
+    spill = [("add", "x0, x1, #0x10"), ("stur", "x0, [x29, #-8]")]
+    back = [("ldur", "x3, [x29, #-8]"), ("ldur", "x0, [x3, #-1]")]
+    assert lift(*spill, ("bl", "#0x1000"), *back)[-1] == "return x1.field_0x10;"
+    assert lift(*spill, ("cbz", "x5, #0x10"), ("bl", "#0x1000"), *back)[-1] == (
+        "return x1.field_0x10;")
+    # A Smi check is the compiler's word that the value is a Dart object: tagged on
+    # one arm, a call's result on the other, the class id is still read off the header,
+    # but only on the edge where the tag bit is set, and only of bit 0.
+    arms = [("cbz", "x5, #0x10"), ("sbfiz", "x0, x1, #1, #0x1f"), ("b", "#0x14"),
+            ("nop", ""), ("bl", "#0x1000")]
+    read = [("ldur", "x2, [x0, #-1]"), ("mov", "x0, x2")]
+    assert "t2 = t1.tags;" in lift(*arms, ("mov", "x2, x0"), ("tbz", "w0, #0, #0x24"),
+                                   *read)
+    assert "t2 = (t1 - 1).field_0x1;" in lift(*arms, ("mov", "x2, x0"),
+                                              ("tbnz", "w0, #0, #0x24"), *read)
+    assert "t2 = (t1 - 1).field_0x1;" in lift(*arms, ("mov", "x2, x0"),
+                                              ("tbz", "w0, #1, #0x24"), *read)
+    # `and w16, w0, w3; tbz w16, #0` is that check of two values at once, the Mint arm
+    # of an integer equality: bit 0 of the AND is set only where it is set in both.
+    both = ("and", "w16, w0, w3")
+    assert "t4 = t2.tags;" in lift(*arms, both, ("tbz", "w16, #0, #0x24"), *read)
+    assert "t4 = (t2 - 1).field_0x1;" in lift(*arms, both, ("tbnz", "w16, #0, #0x24"),
+                                              *read)
+    assert lift(("add", "x0, x1, #8"), ("tbz", "w0, #0, #0x10"), *read)[2] == (
+        "t0 = x1.field_0x8;")
+
+
+def test_a_store_through_a_computed_address_still_names_the_header_read_before_it():
+    """A store at offset 0 off a computed address may write the header a live value
+    read, as the `.tags` it used to be spelled as did, so the read is still named first.
+    The fix that was reverted lost the name: `ldur x3, [x1, #-1]; add x0, x1, #8; sub
+    x0, x0, #8; stur x4, [x0, #-1]; mov x0, x3` returned `x1.tags` read AFTER the store
+    (#329). A sum that comes back to its base is the base, here and in the read."""
+    lift = _lift_329
+    assert lift(("ldur", "x3, [x1, #-1]"), ("add", "x0, x1, #8"), ("sub", "x0, x0, #8"),
+                ("stur", "x4, [x0, #-1]"), ("mov", "x0, x3")) == [
+        "var t0 = x1.tags;", "x1.tags = x4;", "return t0;"]
+    assert lift(("add", "x0, x1, #8"), ("sub", "x0, x0, #8"), ("ldur", "x3, [x0, #-1]"),
+                ("stur", "x4, [x1, #-1]"), ("mov", "x0, x3")) == [
+        "var t0 = x1.tags;", "x1.tags = x4;", "return t0;"]
+    assert lift(("ldur", "x3, [x1, #-1]"), ("add", "x0, x1, x5"),
+                ("stur", "x4, [x0, #-1]"), ("mov", "x0, x3")) == [
+        "var t0 = x1.tags;", "(x1 + x5 - 1).field_0x1 = x4;", "return t0;"]
+    # The other way round: the read is the computed one and the store the header's,
+    # through its own base or any other, at either width. x5 may be 0.
+    assert lift(("add", "x0, x1, x5"), ("ldur", "x3, [x0, #-1]"),
+                ("stur", "x4, [x1, #-1]"), ("mov", "x0, x3")) == [
+        "var t0 = (x1 + x5 - 1).field_0x1;", "x1.tags = x4;", "return t0;"]
+    assert lift(("add", "x0, x1, x5"), ("ldur", "x3, [x0, #-1]"),
+                ("stur", "x4, [x7, #-1]"), ("mov", "x0, x3")) == [
+        "var t0 = (x1 + x5 - 1).field_0x1;", "x7.tags = x4;", "return t0;"]
+    assert lift(("add", "x0, x1, x5"), ("ldurb", "w3, [x0, #-1]"),
+                ("sturb", "w4, [x1, #-1]"), ("mov", "x0, x3")) == [
+        "var t0 = (x1 + x5 - 1).field1_0x1;", "x1.field1_0x0 = x4;", "return t0;"]
+    # No header store, no name.
+    assert lift(("add", "x0, x1, x5"), ("ldur", "x3, [x0, #-1]"), ("mov", "x0, x3")) == [
+        "return (x1 + x5 - 1).field_0x1;"]
+    # And the field at the address it is now spelled as.
+    assert lift(("ldur", "x3, [x1, #0]"), ("add", "x0, x1, #1"),
+                ("stur", "x4, [x0, #-1]"), ("mov", "x0, x3")) == [
+        "var t0 = x1.field_0x1;", "x1.field_0x1 = x4;", "return t0;"]
+
+
+#: `Assembler::TryAllocateObject` and `TryAllocateArray` (assembler_arm64.cc, 3.12.2),
+#: and the register bump of the allocation stubs (stub_code_compiler_arm64.cc,
+#: AllocateArray), each up to the header store.
+_ALLOC_OBJECT = [("ldp", "x0, x1, [x26, #0x50]"), ("add", "x0, x0, #0x20"),
+                 ("cmp", "x1, x0"), ("b.ls", "#0x24"), ("str", "x0, [x26, #0x50]"),
+                 ("sub", "x0, x0, #0x1f"), ("mov", "x2, #0x3e19c"),
+                 ("stur", "x2, [x0, #-1]"), ("ret", ""), ("bl", "#0x1000")]
+_ALLOC_ARRAY = [("ldr", "x0, [x26, #0x50]"), ("adds", "x1, x0, #0x30"),
+                ("b.hs", "#0x2c"), ("ldr", "x2, [x26, #0x58]"), ("cmp", "x1, x2"),
+                ("b.hs", "#0x2c"), ("str", "x1, [x26, #0x50]"), ("add", "x0, x0, #1"),
+                ("mov", "x2, #0x5e09c"), ("stur", "x2, [x0, #-1]"), ("ret", ""),
+                ("bl", "#0x1000")]
+_ALLOC_STUB = [("ldr", "x0, [x26, #0x50]"), ("adds", "x1, x0, x2"), ("b.hs", "#0x2c"),
+               ("ldr", "x3, [x26, #0x58]"), ("cmp", "x1, x3"), ("b.hs", "#0x2c"),
+               ("str", "x1, [x26, #0x50]"), ("add", "x0, x0, #1"),
+               ("orr", "x2, x2, #0x5e09c"), ("stur", "x2, [x0, #-1]"), ("ret", ""),
+               ("bl", "#0x1000")]
+
+
+def test_an_inline_allocation_makes_an_object_pointer_and_nothing_else_does():
+    """An inline allocation is arithmetic that makes an object pointer: top is loaded
+    from a thread field, bumped, stored back to the same field and tagged, and the
+    store after it is the new object's header. Spelling every offset 0 off a sum as an
+    address store, as the fix that was reverted did, rewrote about 16,000 true header
+    stores on the nine binaries, `(t1 + 1).tags = x2 | 0x5e09c;` among them (#329).
+    The rows prove it (`_addr_facts`), on every way in and with no table of thread
+    offsets, and each thing the proof needs is taken away in turn."""
+    lift = _lift_329
+    assert "(t0 - 31).tags = 0x3e19c;   // 127182 if Smi" in lift(*_ALLOC_OBJECT)
+    assert "(t0 + 1).tags = 0x5e09c;   // 192590 if Smi" in lift(*_ALLOC_ARRAY)
+    assert "(t0 + 1).tags = x2 | 0x5e09c;" in lift(*_ALLOC_STUB)
+    load, bump, back, tag, store = (("ldr", "x0, [x26, #0x50]"),
+                                    ("add", "x1, x0, #0x30"),
+                                    ("str", "x1, [x26, #0x50]"), ("add", "x0, x0, #1"),
+                                    ("stur", "x2, [x0, #-1]"))
+    proven = ["var t0 = THR.field_0x50;", "THR.field_0x50 += 48;", "(t0 + 1).tags = x2;",
+              "return t0 + 1;"]
+    assert lift(load, bump, back, tag, store) == proven
+    # The pointer is one in a copy and under a name; a field of it is a field.
+    assert lift(load, bump, back, tag, ("mov", "x4, x0"), ("stur", "x2, [x4, #-1]"),
+                ("mov", "x0, x4")) == proven
+    assert lift(load, bump, back, tag, ("add", "x4, x0, #0x10"),
+                ("stur", "x2, [x4, #-1]"))[2] == "t0.field_0x11 = x2;"
+    for rows, want in (
+            # stored back to another field of the thread, or not stored back
+            ([load, bump, ("str", "x1, [x26, #0x60]"), tag, store],
+             "THR.field_0x50.field_0x1 = x2;"),
+            ([load, bump, tag, store], "THR.field_0x50.field_0x1 = x2;"),
+            # stored back on one way in only
+            ([load, bump, ("cbz", "x5, #0x10"), back, tag, store], "t1.field_0x1 = x2;"),
+            # the bump is not one: nothing added, or the low half stored
+            ([load, ("str", "x0, [x26, #0x50]"), tag, store], "t0.field_0x1 = x2;"),
+            ([load, bump, ("str", "w1, [x26, #0x50]"), tag, store],
+             "t0.field_0x1 = x2;"),
+            # a call between the load and the store back may have moved top
+            ([load, bump, ("bl", "#0x1000"), back, tag, store], "t2.field_0x1 = t1;"),
+            # the start was written before the tag, or tagged with something else
+            ([load, bump, back, ("mov", "x0, x7"), tag, store], "x7.field_0x1 = x2;"),
+            ([load, bump, back, ("add", "x0, x0, #2"), store], "t0.field_0x2 = x2;"),
+            # not the thread
+            ([("ldr", "x0, [x5, #0x50]"), bump, ("str", "x1, [x5, #0x50]"), tag, store],
+             "t0.field_0x1 = x2;"),
+            # the end taken back by the wrong size
+            ([("ldr", "x0, [x26, #0x50]"), ("add", "x0, x0, #0x20"),
+              ("str", "x0, [x26, #0x50]"), ("sub", "x0, x0, #0x1e"), store],
+             "(t0 - 31).field_0x1 = x2;")):
+        got = lift(*rows)
+        assert want in got and not any(".tags" in ln for ln in got), (rows, got)
+
+
+def test_the_address_facts_cost_the_same_per_instruction_at_any_length():
+    """`_addr_facts` is made once for a body, however many rows ask and however many
+    times the body is walked, and each block is taken again only while a register's
+    fact is raised, at most twice. Counted, not timed: the facts met and the constants
+    added per instruction, over runs of add and store pairs, of joins and of loops, in
+    a row and nested, at 40 and at 160 of each (#329). A guard: main has no such
+    analysis, and the fix that was reverted folded text at every store instead, which
+    took add and store pairs 1.65 times as long as main."""
+    from jadart import expr
+    from jadart.expr import lift_function
+    made, work = [0], [0]
+    facts, meet, add = expr._addr_facts, expr._af_meet, expr._af_add
+
+    def counted_facts(*args, **kw):
+        made[0] += 1
+        return facts(*args, **kw)
+
+    def counted_meet(a, b):
+        work[0] += 1 + len(a) + len(b)
+        return meet(a, b)
+
+    def counted_add(f, k):
+        work[0] += 1
+        return add(f, k)
+
+    def shape(name, n):
+        # Each has a read the walk holds only a name for, so the facts are asked for.
+        rows = [("ldur", "x2, [x7, #-1]")] if name == "pairs" else []
+        for i in range(n):
+            at = len(rows) * 4
+            if name == "pairs":
+                rows += [("add", "x0, x0, #8"), ("stur", "x3, [x0, #-1]")]
+            elif name == "joins":
+                rows += [("cbz", "x5, #%#x" % (at + 8)), ("add", "x1, x1, #8"),
+                         ("ldur", "x2, [x1, #-1]")]
+            elif name == "loops":
+                rows += [("stur", "w22, [x1, #-1]"), ("add", "x1, x1, #0x10"),
+                         ("cmp", "x1, x3"), ("b.lo", "#%#x" % at)]
+            elif name == "nested":
+                rows += [("stur", f"w22, [x{1 + i % 6}, #-1]"),
+                         ("add", f"x{1 + i % 6}, x{1 + i % 6}, #0x10")]
+        if name == "nested":
+            for i in range(n):
+                rows += [("cmp", "x1, x9"), ("b.lo", "#%#x" % ((n - 1 - i) * 8))]
+        return rows + [("ret", "")]
+
+    def per_instruction(name, n):
+        rows = shape(name, n)
+        made[0] = work[0] = 0
+        lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        assert made[0] == 1, (name, n, made[0])
+        return work[0] / len(rows)
+
+    expr._addr_facts, expr._af_meet = counted_facts, counted_meet
+    expr._af_add = counted_add
+    try:
+        for name in ("pairs", "joins", "loops", "nested"):
+            small, large = per_instruction(name, 40), per_instruction(name, 160)
+            assert large <= small * 1.25 + 1, (name, small, large)
+    finally:
+        expr._addr_facts, expr._af_meet, expr._af_add = facts, meet, add
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

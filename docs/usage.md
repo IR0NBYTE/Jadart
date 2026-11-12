@@ -114,7 +114,21 @@ spelling, because this target compresses pointers, so a four-byte read is what a
 field read looks like and the lifter prints the pointer it becomes. A sign-extending load
 adds the shift pair that says so, `.field2_0x1 << 48 >> 48`, since the width alone does
 not. In the floating-point file an access narrower than eight declines rather than claim a
-width it cannot spell. An address written off `FP` is in the
+width it cannot spell. `x1.tags` is offset 0 of the object `x1` points at, its header
+word, and it is printed only off a value that holds an object pointer: a register or a
+name no arithmetic made, a field or element read, a call's result, a value a Smi check
+found the tag bit set on, and the pointer an inline allocation makes. An address the
+lifter computed is not one, under a name or past a join as much as in a sum, so an access
+at offset 0 off it is the read at its address in the spelling above, the constants of the
+sum made one: `add x0, x0, #1; add x5, x0, x5, lsl #2; stur w1, [x5, #-1]` prints
+`(x0 + (x5 << 2)).field_0x1 = x1;`, and `sub x0, x2, #15; stur x1, [x0, #-1]` prints
+`(x2 - 16).field_0x1 = x1;` as `stur x1, [x2, #-16]` does. A sum that comes back to its
+base is the base, so `add x0, x1, #8; sub x0, x0, #8; ldur x3, [x0, #-1]` reads `x1.tags`.
+Off the thread there is no tag bias and no header: `add x0, x26, #1; ldur x3, [x0, #-1]`
+reads `THR.field_0x0`. An inline allocation is the one sum that is an object pointer, and
+the rows have to prove it: top loaded from a field of the thread, bumped, stored back to
+that same field on every way in, then tagged, after which `(t0 + 1).tags = 0x5e09c;` is
+the new object's header store. An address written off `FP` is in the
 coordinates of the frame the function
 was ENTERED with, whatever FP and SP do inside it, so one address has one spelling. Past a
 row that puts anything but the frame pointer in x29, a load into it or a move from another

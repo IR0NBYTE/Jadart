@@ -663,6 +663,28 @@ class V:
     #: field, the other half of an unbox. 0 is the value itself. A name given to one
     #: value carries it; two paths that disagree on it keep the value and drop it.
     smi: int = 0
+    #: The value is an address or a number the lifter COMPUTED, arithmetic on something,
+    #: and so not known to be an object pointer (#329). `.tags` is the header word of the
+    #: object a base points at, and off `t0 + 1 + (x5 << 2)` no object is known to start
+    #: there: an access at offset 0 off a computed base prints as the read at its
+    #: address (`Lifter._rebase`). Every operator sets it; an inline allocation the rows
+    #: prove clears it again (`_addr_facts`). It is the value's and not the text's, so a
+    #: name given to the value carries it, as a frame slot and a 32-bit view do, and two
+    #: paths that disagree on it keep it. Left out of the comparison: two values that
+    #: print the same are the same value, and what is known of them is merged
+    #: (`_joined`).
+    calc: bool = field(default=False, compare=False)
+    #: `(base, k, untagged, row)` where the value is `base + k` for a constant k: what
+    #: an `add` or `sub` of an immediate made, and a sum that has one inside. An access
+    #: off it is one off `base` at the displacement plus k, so the constants of the
+    #: address are made one, and a chain that cancels gives `base` back with what is
+    #: known of it. `untagged` is whether `base` was read from a register that holds an
+    #: untagged address (`Lifter._untagged`), whose offsets carry no tag bias. `row` is
+    #: the address of the first add of the chain, where `_addr_facts` says whether the
+    #: register `base` was read from may have held a computed address on some way in.
+    #: Dropped where the value is given a name, since `base` is text and means what it
+    #: meant only until a register in it is written.
+    at: "tuple | None" = field(default=None, compare=False)
 
 
 def _wrap(v: V, ctx: int) -> str:
@@ -708,7 +730,7 @@ def _sext32(v: V) -> bool:
 
 def _to_signed(v: V, k: int) -> V:
     """`v.toSigned(k)`, the low `k` bits of `v` sign-extended, and the bound it proves."""
-    return V(f"{_wrap(v, P_POST)}.toSigned({k})", P_POST, sext=k)
+    return V(f"{_wrap(v, P_POST)}.toSigned({k})", P_POST, sext=k, calc=True)
 
 
 def _signed32(v: V) -> V:
@@ -741,6 +763,25 @@ def _smi_value(v: V) -> V:
     return _to_signed(low, 31)
 
 
+def _to_s64(n: int) -> int:
+    """`n` as the signed 64-bit integer a register holding it reads as."""
+    n &= (1 << 64) - 1
+    return n - (1 << 64) if n >> 63 else n
+
+
+def _whole(ops) -> bool:
+    """Whether no operand of `ops` is the 32-bit view of a register."""
+    return not any(o.strip()[:1] == "w" for o in ops)
+
+
+def _role_address(v: V) -> bool:
+    """Whether `v` is an untagged role register's own address in some other register:
+    `mov x0, x28` holds HEAP, which is no object pointer and has no header. The thread
+    is left out, since a copy of it is read as the thread is (`Lifter._untagged`)."""
+    return (v.prec == P_ATOM and v.text != _THR
+            and any(ROLE.get(r) == v.text for r in _UNTAGGED))
+
+
 def _smi_word(v: V) -> V:
     """The machine word of a register holding `v`: `v` itself, or for a tagged value the
     Smi it is, shifted up one."""
@@ -764,7 +805,8 @@ def _narrow(v: V) -> V:
     TYPE (`unsigned int`, `uint`) and Binary Ninja in the register name; this file has
     neither, so it goes in the expression."""
     return (v if _fits32(v)
-            else V(f"{_wrap(v, P_POST)}{_U32}", P_POST, wide=v, bits=32, smi=v.smi))
+            else V(f"{_wrap(v, P_POST)}{_U32}", P_POST, wide=v, bits=32, smi=v.smi,
+                   calc=True))
 
 
 def _prefix(sym: str, v: V) -> V:
@@ -773,7 +815,7 @@ def _prefix(sym: str, v: V) -> V:
     inner = _wrap(v, P_UNARY)
     if sym == "-" and inner[:1] == "-":
         inner = f"({inner})"
-    return V(sym + inner, P_UNARY)
+    return V(sym + inner, P_UNARY, calc=True)
 
 
 def _bits_of(a: V, op: str, b: V) -> int:
@@ -821,12 +863,12 @@ def _bin(a: V, op: str, b: V, prec: int) -> V:
     k = int(b.text, 0) if op == ">>" and _INT_LITERAL.match(b.text) else -1
     sext = max(1, a.sext - k) if 0 <= k < 64 and a.sext < 64 else 64
     return V(f"{_wrap(a, prec)} {op} {_wrap(b, prec + 1)}", prec, bits=_bits_of(a, op, b),
-             sext=sext)
+             sext=sext, calc=True)
 
 
 def _num(n: int) -> V:
     return V(str(n) if -256 < n < 256 else hex(n), P_ATOM,
-             bits=n.bit_length() if n >= 0 else 64)
+             bits=n.bit_length() if n >= 0 else 64, calc=True)
 
 
 _INT_LITERAL = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)\Z")
@@ -1038,7 +1080,7 @@ class State:
     def get(self, reg: str) -> V:
         reg = canon(reg)
         if reg == "xzr":
-            return V("0", P_ATOM)
+            return V("0", P_ATOM, calc=True)
         if reg in self.reg:
             return self.reg[reg]
         return V(ROLE.get(reg, reg), P_ATOM)
@@ -1210,7 +1252,7 @@ class State:
                 self.spill.append(f"{name} = {v.text};")
             else:
                 self.spill.append(f"var {name} = {v.text};")
-            v = V(name, P_ATOM, smi=v.smi)
+            v = V(name, P_ATOM, smi=v.smi, calc=v.calc)
         self.reg[reg] = v
         self.elem.pop(reg, None)
         self.poolbase.pop(reg, None)
@@ -1476,6 +1518,328 @@ def _call_forgets(mn: str, note: str) -> frozenset:
     return _CALL_CLOBBERS | {_T.ret_int}
 
 
+#: `_addr_facts`' fact for a register that may hold a value arithmetic made.
+_AF_CALC = ("c",)
+
+
+def _af_plain(f) -> bool:
+    """Whether fact `f` is of a value read as it is: nothing known, a thread field as
+    it was loaded, or the tagged pointer to a new object."""
+    return f is None or (f[0] == "t" and f[2] == 0) or (f[0] == "n" and f[1] == 1)
+
+
+def _af_add(f, k):
+    """Fact `f` once the constant `k` is added; a `k` of None is an amount not read."""
+    if k is None or f == _AF_CALC:
+        return _AF_CALC
+    if f is None:
+        return ("o", k) if k else None
+    if f[0] == "o":
+        return ("o", f[1] + k) if f[1] + k else None
+    if f[0] == "t":
+        return ("t", f[1], f[2] + k)
+    if f[0] == "n":
+        return ("n", f[1] + k)
+    return f                          # ("x", field): top plus an amount not known
+
+
+def _af_stale(f):
+    """Fact `f` once the thread field it stands off may hold something else."""
+    if f[0] == "t":
+        return ("o", f[2]) if f[2] else None
+    return _AF_CALC if f[0] == "x" else f
+
+
+def _af_meet(a: dict, b: dict) -> dict:
+    """What two ways in agree on: a fact both hold, nothing where both hold a plain
+    value, and `_AF_CALC` where either may hold a computed one."""
+    out = {}
+    for r in a.keys() | b.keys():
+        x, y = a.get(r), b.get(r)
+        j = x if x == y else None if _af_plain(x) and _af_plain(y) else _AF_CALC
+        if j is not None:
+            out[r] = j
+    return out
+
+
+def _addr_facts(blocks, preds, entries, raw=None) -> tuple:
+    """(computed, fresh): the addresses of the rows that read a register which may hold
+    a computed address, and of the adds and subs that make a new object's pointer (#329).
+
+    `computed` has a load or a store whose BASE, and an `add` or `sub` of an immediate
+    whose SOURCE, may on some path hold a value an arithmetic row made. The walk's own
+    record (`V.calc`) follows a value it tracks; a register it has lost, at a join, a
+    loop header or a label, reads as its bare name or as the name the join gave it,
+    and this says what every way in left there. A may-analysis over the rows: a load
+    and a call's result are plain, a move copies, the decompression `add xD, xN, HEAP,
+    lsl #32` and a `csel` of two plain values are plain, an immediate added and taken
+    off again is plain, and every other write of a general register is computed.
+
+    `fresh` is the inline allocation, which is arithmetic and makes an object pointer.
+    `Assembler::TryAllocateObject` and `TryAllocateArray` (assembler_arm64.cc) and the
+    allocation stubs (stub_code_compiler_arm64.cc: AllocateArray, AllocateContext,
+    AllocateObject, the typed-data and suspend-state ones) all do
+
+        ldr  xS, [THR, #top]        or  ldp xS, xEnd, [THR, #top]
+        add  xE, xS, #size          or  add xE, xS, xSize, either operand order
+        ...                         the comparison with end, and the branch away
+        str  xE, [THR, #top]
+        add  xD, xS, #1             or  sub xD, xE, #(size - 1)
+
+    so a value loaded from a thread field, bumped and stored back to the same field
+    has reserved the bytes between, and the loaded value plus the heap-object tag is
+    the pointer to the object being made there. Read off the rows, with no table of
+    thread offsets: the field is whichever one the store goes back to. A must-analysis
+    in the same pass: the add is fresh only where every way into it loaded, bumped and
+    stored, with no call and no other store between the load and the store back, which
+    could have moved the field; a store back of anything else, a register written on
+    the way, or one path that did not, and it is arithmetic like any other.
+
+    One fact per register and block, raised at most twice (a fact, then plain, then
+    computed), so a block is taken again a bounded number of times and the work is
+    linear in rows plus edges."""
+    thr = next((r for r, v in _T.roles.items() if v == _THR), None)
+    zero = _T.zero or "xzr"
+    roles = frozenset(r for r in _T.roles if r != _lr()) | {zero}
+    wch, word = ("x" if _T.word == 8 else "r"), _T.word
+
+    def full(tok):
+        return tok.strip()[:1] == wch
+
+    def compiled(a, mn, op, note):
+        if mn == "nop" and raw is not None and a in raw:
+            (mn, op), note = raw[a], ""           # a blanked row, as the CPU runs it
+        if mn in _CALLS:
+            return (a, "call",
+                    tuple(r for r in _call_forgets(mn, note) if r not in roles))
+        ops = _split_ops(op)
+        if not ops:
+            return None
+        if any("[" in o for o in ops):
+            got = _addr(ops)
+            defs = tuple(r for r in _def_use(mn, op)[0] if r not in roles)
+            if got is None:
+                return (a, "mem", defs)
+            (base, disp, index, _s, wb), post = got
+            delta = None if post is _BAD_POST else post if post else disp if wb else 0
+            defs = tuple(d for d in defs if d != base or delta == 0)
+            if mn in _LOADS or (mn[:2] == "ld" and not _ATOMIC_OP_RE.match(mn)):
+                gen = ()
+                if base == thr and index is None and delta == 0 and full(ops[0]):
+                    if mn in ("ldr", "ldur"):
+                        gen = ((canon(ops[0]), ("t", disp, 0)),)
+                    elif mn == "ldp" and full(ops[1]):
+                        gen = ((canon(ops[0]), ("t", disp, 0)),
+                               (canon(ops[1]), ("t", disp + word, 0)))
+                return (a, "load", base, defs, gen, delta)
+            if (base == thr and index is None and delta == 0 and mn in ("str", "stur")
+                    and full(ops[0])):
+                return (a, "back", base, disp, canon(ops[0]))
+            return (a, "store", base, defs, delta)
+        defs = _def_use(mn, op)[0]
+        if not defs:
+            return None
+        dst = canon(ops[0])
+        if dst in roles:
+            return (a, "mem", ()) if dst == thr else None
+        m = _FLAG_VALUE.get(mn, mn)
+        if full(ops[0]):
+            src = canon(ops[1]) if len(ops) >= 2 and full(ops[1]) else None
+            if src == zero:
+                src = None
+            if m == "mov" and len(ops) == 2 and src and _imm(ops[1]) is None:
+                return (a, "mov", dst, src)
+            if m in ("add", "sub") and len(ops) >= 3 and src:
+                k = _imm(ops[2])
+                if k is not None:
+                    if len(ops) >= 4 and "lsl" in ops[3]:
+                        k <<= (_imm(ops[3].split("lsl")[-1]) or 0)
+                    role = _T.roles.get(src)
+                    if m == "add" and (role == "PP" or role == _T.consts_base
+                                       and k in _T.consts):
+                        return (a, "plain", dst)      # a pool base, true or false
+                    return (a, "addi", dst, src, k if m == "add" else -k)
+                if m == "add" and _T.roles.get(canon(ops[2])) == "HEAP":
+                    return (a, "mov", dst, src)       # the decompression
+                if m == "add" and len(ops) == 3 and full(ops[2]):
+                    return (a, "addr", dst, src, canon(ops[2]))
+            if (m == "csel" and len(ops) >= 4 and src and full(ops[2])
+                    and canon(ops[2]) != zero):
+                return (a, "csel", dst, src, canon(ops[2]))
+            if (m == "orr" and len(ops) == 3 and canon(ops[1]) == zero
+                    and _imm(ops[2]) is None and full(ops[2]) and canon(ops[2]) != zero):
+                return (a, "mov", dst, canon(ops[2]))
+        return (a, "def", tuple(d for d in defs if d not in roles
+                                and _reg_file(d) == "x"))
+
+    def put(f, r, v):
+        if v is None:
+            f.pop(r, None)
+        else:
+            f[r] = v
+
+    def stale(f, keep=None):
+        for r, v in list(f.items()):
+            if v[0] in "tx" and not (keep is not None and abs(v[1] - keep) >= word):
+                put(f, r, _af_stale(v))
+
+    def step(f, row):
+        kind = row[1]
+        if kind == "mov":
+            put(f, row[2], f.get(row[3]))
+        elif kind == "addi":
+            put(f, row[2], _af_add(f.get(row[3]), row[4]))
+        elif kind == "def":
+            for d in row[2]:
+                f[d] = _AF_CALC
+        elif kind == "load":
+            for d in row[3]:
+                f.pop(d, None)
+            for r, fact in row[4]:
+                f[r] = fact
+            if row[5] != 0:
+                bump(f, row[2], row[5])
+        elif kind == "back":
+            # The store back. Everything read off the field's old value is now an
+            # offset into the bytes reserved; off one of unknown size it is unknown.
+            field, got = row[3], f.get(row[4])
+            if got is not None and got[1:2] == (field,) and (
+                    got[0] == "x" or got[0] == "t" and got[2] > 0):
+                for r, v in list(f.items()):
+                    if v[0] in "tx" and v[1] == field:
+                        f[r] = ("n", v[2]) if v[0] == "t" else _AF_CALC
+                stale(f, field)
+            else:
+                stale(f)
+        elif kind == "store":
+            stale(f)
+            for d in row[3]:
+                f.pop(d, None)
+            if row[4] != 0:
+                bump(f, row[2], row[4])
+        elif kind == "call":
+            # It may allocate, and move what was reserved before it.
+            for r, v in list(f.items()):
+                if v[0] == "n" and v[1] != 1:
+                    f[r] = _AF_CALC
+            stale(f)
+            for d in row[2]:
+                f.pop(d, None)
+        elif kind == "mem":
+            stale(f)
+            for d in row[2]:
+                f.pop(d, None)
+        elif kind == "plain":
+            f.pop(row[2], None)
+        elif kind == "addr":
+            x, y = f.get(row[3]), f.get(row[4])
+            tx, ty = x is not None and x[0] == "t", y is not None and y[0] == "t"
+            f[row[2]] = ("x", (x if tx else y)[1]) if tx != ty else _AF_CALC
+        elif kind == "csel":
+            put(f, row[2], None if _af_plain(f.get(row[3])) and _af_plain(f.get(row[4]))
+                else _AF_CALC)
+
+    def bump(f, base, delta):
+        if base == thr:
+            stale(f)
+        elif base not in roles:
+            put(f, base, _af_add(f.get(base), delta))
+
+    def checked(blk):
+        # (registers, successor) of a Smi check: `tbz xN, #0` falls through, and `tbnz`
+        # branches, only where bit 0 of xN is set. The compiler tests the tag bit of
+        # a Dart value and of nothing else, so what a join left as possibly computed
+        # is on that edge the object the value is boxed in: `sbfiz x0, x1, #1, #31`
+        # on one arm and AllocateMint's result on the other, then `tbz w0, #0` and the
+        # class id out of `[x0, #-1]`. A constant offset is still one (`_af_add`).
+        # `and w16, w5, w0; tbz w16, #0` tests two values at once, the Mint arm of an
+        # integer equality: the bit is set in the AND only where it is set in both.
+        if not blk.insns or blk.insns[-1][1] not in ("tbz", "tbnz"):
+            return None
+        ops = _split_ops(blk.insns[-1][2])
+        if len(ops) != 3 or _imm(ops[1]) != 0 or len(set(blk.succ)) != 2:
+            return None
+        target = _imm(ops[2])
+        if target not in blk.succ:
+            return None
+        hit = target if blk.insns[-1][1] == "tbnz" else next(
+            s for s in blk.succ if s != target)
+        regs = (canon(ops[0]),)
+        if len(blk.insns) >= 2 and blk.insns[-2][1] == "and":
+            both = _split_ops(blk.insns[-2][2])
+            if (len(both) == 3 and canon(both[0]) == regs[0]
+                    and _imm(both[1]) is None and _imm(both[2]) is None):
+                regs += tuple(r for r in map(canon, both[1:]) if r != regs[0])
+        return regs, hit
+
+    rows = {b: [r for r in (compiled(*t) for t in blk.insns) if r is not None]
+            for b, blk in blocks.items()}
+    checks = {b: c for b, blk in blocks.items() if (c := checked(blk)) is not None}
+    # Reverse postorder from the entries, then from every block nothing leads into,
+    # then from whatever is left, a cycle no entry reaches: each starts knowing
+    # nothing, which is what a section no edge leads into is entered with.
+    order, seen, starts = [], set(), []
+    for root in ([e for e in entries if e in blocks]
+                 + [b for b in blocks if not preds.get(b)] + list(blocks)):
+        if root in seen:
+            continue
+        seen.add(root)
+        starts.append(root)
+        stack = [(root, iter(blocks[root].succ))]
+        while stack:
+            b, it = stack[-1]
+            t = next((t for t in it if t in blocks and t not in seen), None)
+            if t is None:
+                order.append(b)
+                stack.pop()
+            else:
+                seen.add(t)
+                stack.append((t, iter(blocks[t].succ)))
+    order.reverse()
+    rank = {b: i for i, b in enumerate(order)}
+    inn = {b: {} for b in starts}
+    heap = sorted(rank[b] for b in inn)
+    queued = set(heap)
+    while heap:
+        i = heapq.heappop(heap)
+        queued.discard(i)
+        b = order[i]
+        f = dict(inn[b])
+        for row in rows[b]:
+            step(f, row)
+        check = checks.get(b)
+        for s in blocks[b].succ:
+            if s not in blocks:
+                continue
+            out = f
+            if check is not None and check[1] == s and any(
+                    f.get(r) == _AF_CALC for r in check[0]):
+                out = {r: v for r, v in f.items()
+                       if v != _AF_CALC or r not in check[0]}
+            old = inn.get(s)
+            new = out if old is None else _af_meet(old, out)
+            if old is not None and new == old:
+                continue
+            inn[s] = new
+            if rank[s] not in queued:
+                queued.add(rank[s])
+                heapq.heappush(heap, rank[s])
+    computed, fresh = set(), set()
+    for b in blocks:
+        f = dict(inn.get(b, ()))
+        for row in rows[b]:
+            kind = row[1]
+            if kind in ("load", "store", "back"):
+                if not _af_plain(f.get(row[2])):
+                    computed.add(row[0])
+            elif kind == "addi" and not _af_plain(f.get(row[3])):
+                computed.add(row[0])
+            step(f, row)
+            if kind == "addi" and f.get(row[2]) == ("n", 1):
+                fresh.add(row[0])
+    return frozenset(computed), frozenset(fresh)
+
+
 def _elem_offsets(blocks, data) -> dict:
     """{address of each `add xD, xB, xI{, shift}`: the members of `data` that some access
     off xD that the add can reach is made at} (#308).
@@ -1623,9 +1987,16 @@ def _joined(a: V, b: V):
     store, a call or a return reads, so the paths agree on it without the record: an
     untag past the join cannot tell which word it reads (`V.smi`, #290)."""
     if a == b:
-        return a
+        # One value by two paths, and what each knew of it: computed on either is
+        # computed, and the constant it stands off its base by holds where both have
+        # the same one (`V.calc`, #329).
+        if a.calc == b.calc and a.at == b.at:
+            return a
+        return replace(a, calc=a.calc or b.calc, at=a.at if a.at == b.at else None)
     if a.smi != b.smi and replace(a, smi=0) == replace(b, smi=0):
-        return replace(a, smi=0)
+        # Where one of them holds the tagged word, the register holds arithmetic.
+        return replace(a, smi=0, at=None,
+                       calc=a.calc or b.calc or _SMI_TAG in (a.smi, b.smi))
     return None
 
 
@@ -3993,7 +4364,7 @@ class Lifter:
                 continue
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
-            st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
+            st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
         return out
 
     def _call_reads(self, insns) -> dict:
@@ -4584,8 +4955,8 @@ class Lifter:
             self.slot_names.add(tmp)
             out.append(decl)
         if st.reg.get(reg) == v:
-            st.reg[reg] = V(tmp, P_ATOM, smi=v.smi)
-        st.slot[key] = V(tmp, P_ATOM, smi=v.smi)
+            st.reg[reg] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+        st.slot[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
         return out
 
     # leaf rendering
@@ -4813,8 +5184,12 @@ class Lifter:
             no = (b if mn == "csel"
                   else _bin(b, "+", V("1", P_ATOM), P_ADD) if mn == "csinc"
                   else _prefix("~" if mn == "csinv" else "-", b))
+        # One of two object pointers is an object pointer; anything else the select
+        # made or chose from is computed (`V.calc`, #329).
+        calc = mn != "csel" or yes.calc or no.calc or bool(yes.smi or no.smi)
         st.set(canon(ops[0]),
-               V(f"{cond} ? {_wrap(yes, P_TERN + 1)} : {_wrap(no, P_TERN + 1)}", P_TERN))
+               V(f"{cond} ? {_wrap(yes, P_TERN + 1)} : {_wrap(no, P_TERN + 1)}", P_TERN,
+                 calc=calc))
         return []
 
     def _raw_write(self, st: State, mn: str, op: str, at=None) -> list:
@@ -5192,7 +5567,7 @@ class Lifter:
                     continue
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
-                holder[key] = V(tmp, P_ATOM, smi=v.smi)
+                holder[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
         for key, (b, i, _s, _f) in list(st.elem.items()):
             if pat.search(b.text) or pat.search(i.text):
                 del st.elem[key]
@@ -5251,7 +5626,7 @@ class Lifter:
                 continue                      # feeds a later self-referential store
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
-            st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
+            st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
             st.elem.pop(key, None)
             st.poolbase.pop(key, None)
         return out
@@ -5262,7 +5637,9 @@ class Lifter:
         `also` is the OTHER spellings of bytes this write covers, which a 16-byte access
         needs because the spelling says the width: a write of `x2.field16_0x8` lands on
         the bytes a live `x2.field_0x8` and `x2.field_0x10` read, and neither text
-        contains the other, so matching one text would miss them (#209).
+        contains the other, so matching one text would miss them (#209). A text that
+        is a bare selector, `.tags`, is one the write may land on under ANY base
+        (`_header_selectors`).
 
         `_pin` is the same argument about a register: the map holds expressions, not
         results, and `x4.field_0x1` only means what it meant while x4 still points where it
@@ -5293,7 +5670,10 @@ class Lifter:
         st.stale_mem()
         # `loc` ends in hex digits, so a bare substring match would let `field_0x8` fire
         # inside `field_0x80`, a different field, and a value that is not stale at all.
-        pat = re.compile("(?:" + "|".join(re.escape(x) for x in (loc,) + tuple(also))
+        # Each text once: `_covers` spells a slot off a nonzero offset twice over, and
+        # the pattern is compiled at every store, at a cost that goes with its length.
+        texts = dict.fromkeys(x for x in (loc, *also) if x[:1] != ".")
+        pat = re.compile("(?:" + "|".join(re.escape(x) for x in texts)
                          + r")(?![0-9a-fA-F])")
         alias = None
         sel = _FIELD_LHS.search(loc)
@@ -5311,8 +5691,8 @@ class Lifter:
             # Not off THR or PP: the same offset is the same slot only where the two bases
             # may be one object, and the thread and the object pool are not Dart objects
             # at all, so no store through a base the lifter tracks can write them.
-            sels = [sel.group(0)] + [m.group(0) for m in
-                                     (_FIELD_LHS.search(x) for x in also) if m]
+            sels = dict.fromkeys((sel.group(0), *(
+                m.group(0) for m in map(_FIELD_LHS.search, also) if m)))
             alias = re.compile(r"(?<!\bTHR)(?<!\bPP)(?:"
                                + "|".join(re.escape(x) for x in sels)
                                + r")(?![0-9a-fA-F])")
@@ -5339,7 +5719,7 @@ class Lifter:
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
             self.raw_names.add(tmp)
-            st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
+            st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
         # A stack slot has no liveness to consult, it is read back by a later load or not
         # at all, so a slot that reads the written location is dropped rather than named.
         # Dropping is honest (the reload renders as the bare destination register) and does
@@ -5416,7 +5796,13 @@ class Lifter:
         return v.text == _THR or (ROLE.get(reg) == "LR" and self._holds_ra())
 
     def _rebase(self, base_reg: str, base_v: V, disp: int) -> tuple:
-        """The (base expression, NON-NEGATIVE field offset) `[base_reg, #disp]` names.
+        """The (base expression, NON-NEGATIVE field offset, whether offset 0 there is an
+        object's header) that `[base_reg, #disp]` names.
+
+        Offset 0 is the header word, `.tags`, only off an object pointer (#329). Off an
+        untagged base it is offset 0 of that address, `THR.field_0x0`. Off a value the
+        lifter computed, or a register some way in left one in (`_computed`), it is the
+        access at its address, spelled as the one below a base is (`_at_address`).
 
         `_frame_read`'s rule, for every base. A displacement that reaches BELOW the base
         goes into the base expression and the offset stays a field offset, so a read at
@@ -5455,11 +5841,118 @@ class Lifter:
         header read and are untouched.
         """
         off = self._byte_off(base_reg, base_v, disp)
-        if off >= 0:
-            return base_v, off
-        return _bin(base_v, "-", _num(-disp), P_ADD), 1
+        if off > 0:
+            return base_v, off, True
+        if off < 0:
+            return _bin(base_v, "-", _num(-disp), P_ADD), 1, True
+        if disp == 0:
+            return base_v, 0, False             # an untagged base: no header at 0
+        if not self._computed(base_reg, base_v):
+            return base_v, 0, True              # the header of the object it points at
+        return self._at_address(base_v, disp)
 
-    def _covers(self, base_v: V, byte_off: int, width: int, cast=None) -> tuple:
+    def _header_selectors(self, width: int) -> tuple:
+        """The selector of every spelling a `width`-byte access at an object's header
+        has. A store that may write a header names each live read of one, whatever its
+        base, and `_pin_mem` matches these for it. Selectors and not whole spellings,
+        made once a body: the text is matched against every live value at every
+        store, and off the address itself a run of add and store pairs took 2.3
+        times as long as it does on main."""
+        got = self._elem_box.get(("header", width))
+        if got is None:
+            base = V("_", P_ATOM)
+            texts = (self._field(base, 0, width).text,) + self._covers(base, 0, width)
+            got = self._elem_box["header", width] = tuple(dict.fromkeys(
+                m.group(0) for m in map(_FIELD_LHS.search, texts) if m))
+        return got
+
+    def _facts(self) -> tuple:
+        """`_addr_facts` of this body, made the first time a row asks."""
+        box = self._elem_box
+        if "facts" not in box:
+            box["facts"] = _addr_facts(self.blocks, self._preds,
+                                       (self.entry, *self.roots), self.raw)
+        return box["facts"]
+
+    def _fresh(self, here) -> bool:
+        """Whether the add or sub at `here` makes the pointer to an object the rows
+        before it allocated (`_addr_facts`). An allocation stores back to a field of
+        the thread, so a body with no such store is not asked."""
+        box = self._elem_box
+        if "back" not in box:
+            thr = next((r for r, v in _T.roles.items() if v == _THR), None)
+            rows = [(mn, op) for blk in self.blocks.values()
+                    for (_a, mn, op, _n) in blk.insns if mn in ("str", "stur")]
+            rows += [r for r in self.raw.values() if r[0] in ("str", "stur")]
+            box["back"] = any((got := _addr(_split_ops(op))) is not None
+                              and got[0][0] == thr for _mn, op in rows)
+        return box["back"] and here in self._facts()[1]
+
+    def _offset(self, total: V, src: V, reg: str, k: int, here, ops) -> V:
+        """`total`, the printed `src + k` that the add or sub of an immediate at `here`
+        made from register `reg`, with what is known of it (`V.at`, #329).
+
+        The sum is `base + k` for the base `src` stands off, so a later access adds its
+        displacement to one constant, and a chain that comes back to the base IS the
+        base: `add x0, x1, #8; sub x0, x0, #8` holds x1, an object pointer if x1 is one,
+        and a store through it is a store through x1. An untagged base other than the
+        thread is not given back bare, because a copy of it is spelled with the tag
+        bias and the register is not (`_byte_off`); the sum keeps its text and its
+        base, and the access is made off that. Where the rows prove an inline
+        allocation the sum is the new object's pointer and not a computed address."""
+        if src.smi or not _whole(ops[:2]):
+            return total                    # a tagged Smi's word, or 32-bit arithmetic
+        base, k0, untagged, at = src.at if src.at is not None else (
+            src, 0, _role_address(src) and src.text not in ("SP", "FP")
+            or self._untagged(reg, src) and not self._frame_base(reg), here)
+        k += k0
+        if self._fresh(here):
+            return replace(total, calc=False, at=(base, k, untagged, None))
+        if k == 0 and (not untagged or base.text == _THR):
+            return replace(base, at=None if at is None else (base, 0, untagged, at))
+        return replace(total, at=(base, k, untagged, at))
+
+    def _computed(self, reg: str, v: V) -> bool:
+        """Whether `reg`, holding `v`, may hold an address the lifter computed and not
+        an object pointer, before the row being stepped: the value's own record, a
+        Smi's tagged word, an untagged role's address in a copy, the register its base
+        was read from, and, since the walk's map holds only what every path agrees on,
+        the rows on every way in (`_addr_facts`). A value a Smi check left boxed is the
+        object (`V.smi`)."""
+        if v.smi:
+            return v.smi == _SMI_TAG
+        if v.calc or _role_address(v):
+            return True
+        computed = self._facts()[0]
+        return self._here in computed or (v.at is not None and v.at[3] in computed)
+
+    def _at_address(self, base_v: V, disp: int) -> tuple:
+        """`_rebase` for a computed base at offset 0: the access at its address.
+
+        The displacement goes into the base, as a negative one does, and the constants
+        are made one off the base the sum stands on (`V.at`), read as that base reads:
+        `add x0, x0, #1; add x5, x0, x5, lsl #2; stur w1, [x5, #-1]` is `(x0 + (x5 <<
+        2)).field_0x1`, `sub x0, x2, #15; stur x1, [x0, #-1]` is `(x2 - 16).field_0x1` as
+        `stur x1, [x2, #-16]` is, and `add x0, x26, #8; ldr x3, [x0, #-8]` is
+        `THR.field_0x0`, with no tag bias off the thread. Only a chain that lands on
+        the header of an object pointer it started from is `.tags`."""
+        v = _smi_word(base_v) if base_v.smi else base_v
+        base, k, untagged, at = v.at if v.at is not None else (v, 0, False, None)
+        k += disp
+        if untagged and k >= 0:
+            return base, k, False
+        if not untagged and k >= 0:
+            return base, k + 1, True
+        if (k == -1 and not untagged and v.at is not None and not base.calc
+                and not base.smi and not _role_address(base)
+                and at not in self._facts()[0]):
+            return base, 0, True
+        if _INT_LITERAL.match(base.text):
+            return _num(_to_s64(int(base.text, 0) + k)), 1, True
+        return _bin(base, "-", _num(-k), P_ADD), 1, True
+
+    def _covers(self, base_v: V, byte_off: int, width: int, cast=None,
+                header: bool = True) -> tuple:
         """The other spellings of the bytes a `width`-byte write at `byte_off` covers.
 
         The width is in the spelling, so one write's bytes have more than one text and no
@@ -5469,7 +5962,7 @@ class Lifter:
         """
         # Four is not in the list: it prints the same text as eight (see `_field`), so
         # the eight-byte spelling already covers a four-byte access at this offset.
-        out = [self._field(base_v, byte_off, w, cast).text
+        out = [self._field(base_v, byte_off, w, cast, header).text
                for w in (1, 2, 8, 16) if w != width]
         if width == 16:
             out.append(self._field(base_v, byte_off + 8, 8, cast).text)   # its top half
@@ -5490,7 +5983,8 @@ class Lifter:
             out += [f"{base}.{n}" for n in sorted(self._named_at.get(off, ()))]
         return tuple(out)
 
-    def _field(self, base_v: V, byte_off: int, width: int = 8, cast=None) -> V:
+    def _field(self, base_v: V, byte_off: int, width: int = 8, cast=None,
+               header: bool = True) -> V:
         """The read or write of `width` bytes at `byte_off` off `base_v`, as text.
 
         `.field_0x8` is eight bytes, the word this machine spills and loads, and every
@@ -5553,7 +6047,8 @@ class Lifter:
         elif width not in (4, 8):
             tag = f".field{width}_0x{byte_off:x}"
         else:
-            tag = ".tags" if byte_off == 0 else f".field_0x{byte_off:x}"
+            # `.tags` only where `_rebase` says offset 0 is an object's header (#329).
+            tag = ".tags" if byte_off == 0 and header else f".field_0x{byte_off:x}"
         return V(f"{_wrap(base_v, P_POST)}{tag}", P_POST)
 
     def _reads_mem(self, text: str) -> bool:
@@ -6144,10 +6639,22 @@ class Lifter:
                 w = _access_width(mn, reg)
                 # `_rebase` and not `_byte_off`: a displacement below the base goes into
                 # the base expression, so the offset is a field offset, never negative.
-                bv, off = self._rebase(base, g(base), d)
-                cast = cast if off == d + 1 else None
-                tgts.append((self._field(bv, off, w, cast), v,
-                             self._covers(bv, off, w, cast)))
+                held = g(base)
+                bv, off, hdr = self._rebase(base, held, d)
+                cast = cast if off == d + 1 and bv is held else None
+                also = self._covers(bv, off, w, cast, hdr)
+                if self._byte_off(base, held, d) == 0 and not (bv is held and hdr):
+                    # Offset 0 spelled as the access at its address. It may write any
+                    # header word a live value read, as the `.tags` it was spelled as
+                    # did: pinned as that spelling pins (#329).
+                    also += self._header_selectors(w)
+                elif self._byte_off(base, held, d) == 0:
+                    # A header store, and the other way round: a read at a computed
+                    # address may be of this header, `(x1 + x5 - 1).field_0x1` where x5
+                    # is 0, and its text does not say `.tags`. Each one this body made
+                    # is pinned, as it was when both were spelled `.tags`.
+                    also += tuple(self._elem_box.get("calc0", ()))
+                tgts.append((self._field(bv, off, w, cast, hdr), v, also))
             out = list(basedecl)
             for tgt, v, also in tgts:
                 # The value being stored was read off the map before this, so `+=` still
@@ -6381,8 +6888,14 @@ class Lifter:
                      else None)
                 if v is None:
                     wk = _access_width(mn, ops[k])
-                    bv, off = self._rebase(base, at_base, d)
-                    v = self._field(bv, off, wk, cast if off == d + 1 else None)
+                    bv, off, hdr = self._rebase(base, at_base, d)
+                    v = self._field(bv, off, wk,
+                                    cast if off == d + 1 and bv is at_base else None, hdr)
+                    if (self._byte_off(base, at_base, d) == 0
+                            and not (bv is at_base and hdr)):
+                        # Offset 0 read at its address: a header store through any base
+                        # may write it, and its spelling is not the header's (#329).
+                        self._elem_box.setdefault("calc0", {})[v.text] = None
                     if sign and wk < 8 and _reg_file(ops[k]) == "x":
                         v = _extended(v, 8 * wk, True)
                 got.append((r, v))
@@ -6453,7 +6966,9 @@ class Lifter:
                 st.poolbase[dst] = imm
                 return []
             if imm is not None:
-                st.set(dst, _bin(g(raw_b), "+", _num(imm), P_ADD))
+                src = g(raw_b)
+                st.set(dst, self._offset(_bin(src, "+", _num(imm), P_ADD), src, b, imm,
+                                         here, ops))
                 return []
             if _T.roles.get(canon(c)) == "HEAP":               # compressed-pointer decompress
                 st.set(dst, g(b))
@@ -6513,7 +7028,13 @@ class Lifter:
                 elif idx_v.smi:
                     val = _bin(_smi_word(idx_v), _SHIFT_SYM[sh], _num(amt), P_SHIFT)
                 idx_v, scale = val, 0
-            st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
+            src, total = g(raw_b), _bin(g(raw_b), "+", val, P_ADD)
+            if src.at is not None and src.at[1] and not src.smi and _whole(ops[:2]):
+                # The constant the base stands off its own base by stays one: `add x0,
+                # x0, #1; add x5, x0, x5, lsl #2` is `x0 + (x5 << 2)` and 1 (`V.at`).
+                total = replace(total, at=(_bin(src.at[0], "+", val, P_ADD), src.at[1],
+                                           False, None))
+            st.set(dst, total)
             if not numeric or swap:
                 st.elem[dst] = (base_v, idx_v, scale, offs)
             return []
@@ -6525,7 +7046,10 @@ class Lifter:
             other = _num(imm) if imm is not None else self._src(ops, 2, st)
             if other is None:
                 return self._raw(st, dst, mn, op)
-            st.set(dst, _bin(b, "-", other, P_ADD))
+            total = _bin(b, "-", other, P_ADD)
+            if imm is not None:
+                total = self._offset(total, b, canon(ops[1]), -imm, here, ops)
+            st.set(dst, total)
             return []
         if mn == "mul" and len(ops) >= 3:
             st.set(dst, _bin(g(ops[1]), "*", g(ops[2]), P_MUL))
@@ -6639,7 +7163,8 @@ class Lifter:
                 st.set(dst, _bin(src, sym, _num(lsb), P_SHIFT))
             elif mn == "ubfx":
                 field = f"0x{(1 << width) - 1:x}"
-                st.set(dst, V(f"({_wrap(src, P_SHIFT)} >> {lsb}) & {field}", P_AND))
+                st.set(dst, V(f"({_wrap(src, P_SHIFT)} >> {lsb}) & {field}", P_AND,
+                              calc=True))
             else:
                 # sbfx carries the field's top bit up, which `& mask` would clear (#124).
                 inner = _bin(src, ">>", _num(lsb), P_SHIFT)
@@ -8306,7 +8831,7 @@ class Lifter:
                     continue
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
-                st.reg[key] = V(tmp, P_ATOM, smi=v.smi)
+                st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
                 st.elem.pop(key, None)
                 st.poolbase.pop(key, None)
         # Anchored above the loop, as a carried name is. A goto out of the loop hands its

@@ -421,6 +421,50 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`.tags` is printed only off an object pointer.** Offset 0 of a tagged pointer is
+  its header word, and every access at offset 0 was spelled that way whatever the base
+  held: `add x0, x0, #1; add x5, x0, x5, lsl #2; stur w1, [x5, #-1]` printed
+  `(x0 + 1 + (x5 << 2)).tags = x1;`, the header of no object, where the store is at the
+  address the sum makes (#329). What the base is now travels with the value, as `V.smi`
+  does (#290): `V.calc` marks a value arithmetic made and `V.at` the base and the
+  constant a sum stands on, kept through names, pins, slots, 32-bit views and joins.
+  The walk's map holds only what every path agrees on, so `_addr_facts`, one forward
+  pass over the body's rows, answers where a name or a join hides the sum: a loop
+  cursor printed `t3.tags = NULL;`. An access at offset 0 off a computed address is the
+  access at that address with the constants made one: `(x0 + (x5 << 2)).field_0x1 = x1;`
+  for the row above, and `sub x0, x2, #15; stur x1, [x0, #-1]` is
+  `(x2 - 16).field_0x1 = x1;` as `stur x1, [x2, #-16]` is. A sum that comes back to its
+  base is the base, so `add x0, x1, #8; sub x0, x0, #8; ldur x3, [x0, #-1]` still reads
+  `x1.tags`, and a store through one still names the reads live before it. Off the
+  thread, the heap base and the link register there is no tag bias to take off:
+  `add x0, x26, #1; ldur x3, [x0, #-1]` reads `THR.field_0x0`, the word the CPU reads.
+  A store through a computed address names every live header read before it, as the
+  `.tags` it was spelled as did. A Smi's tagged word is an address and the object a Smi
+  check found is not, whether `tbz` tests the value or the `and` of two of them; `csel`
+  of two object pointers is one.
+  An inline allocation is the one sum that is an object pointer, and the rows prove it
+  with no table of thread offsets: top loaded from a field of the thread, bumped by a
+  constant or a register, stored back to that same field on every way in, then tagged
+  (`TryAllocateObject` and `TryAllocateArray` in `assembler_arm64.cc`, and the
+  allocation stubs). Such a store keeps `(t1 + 1).tags = x2 | 0x5e09c;`; a bump that is
+  not stored back, or goes to another field, or a 32-bit store, does not.
+  On each fixture 35 lines change in 31 functions of 8,194 (clean) and 8,188
+  (obfuscated): 22 byte accesses at offset 0 off a cursor a loop advances
+  (`t7.field1_0x0 = t8.field1_0x0;` is `(t7 - 1).field1_0x1 = (t8 - 1).field1_0x1;`),
+  11 sums whose constants cancel (`x9 - 1 + 1` is `x9`), one header store through a
+  named cursor and the issue's line. `.tags` lines go from 3,483 to 3,481 and from 3,482
+  to 3,480. Of the 11,657 accesses at offset 0 in the clean build 46 are an address,
+  and a backward search of the disassembly over every way in, sharing nothing with the
+  lifter but the registers a call clobbers, finds an object pointer under each of the
+  other 11,610: 622 of them a proven allocation. The same search on the commit before
+  flags those 46 and nothing else. Against Unicorn, 45 shapes each print the address
+  the CPU reads; the commit before misses four of them, all off THR, HEAP, LR or a Smi.
+  The pass is linear in the rows (work per instruction is the same at 40 and at 160
+  rows on four shapes), and three alternating lifts of the clean build average 24.23 s
+  of CPU against 23.78 s on main, 1.9% more. A header store names each live read at
+  a computed address before it too, whatever the store's base: `(x1 + x5 - 1)` is
+  x1's header where x5 is 0, and the two spellings no longer look alike.
+
 - **Deeply nested loop bodies are built inner loops first and what they hold is folded
   up the nest.** Tier 3 walked each loop's body back from its latches on its own, then
   walked it again for what it writes, what it keeps live at the header and which slots
