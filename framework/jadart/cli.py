@@ -31,7 +31,7 @@ EXIT_INTERNAL = 3    # a bug in jadart, not a problem with the input
 _COMMANDS = ("info", "libraries", "classes", "disasm", "lift", "decompile",
              "selectors", "strings", "constants", "verify", "export", "xrefs",
              "signatures",
-             "functions", "ffi", "symbols", "hook")
+             "functions", "ffi", "symbols", "hook", "serve")
 
 _EXAMPLES = """\
 examples:
@@ -46,6 +46,8 @@ examples:
   jadart verify libapp.so                  byte-exact acceptance gates
   jadart symbols libapp.so --format r2     radare2 script naming every function (also ida, ghidra)
   jadart hook app.apk Foo.bar > hook.js    Frida script logging one function's calls
+  jadart serve libapp.so --socket ~/.jadart/s   keep the binary loaded for the
+  jadart --server ~/.jadart/s lift libapp.so f    commands that name the socket
 
 Exit code is `0` on success, `1` when nothing in the binary matched what you asked for
 or an acceptance gate failed, `2` when the input will not parse or the command line is
@@ -71,6 +73,14 @@ def emit(obj, code: int = EXIT_OK) -> int:
     return code
 
 
+def _terminal(stream) -> bool:
+    """Whether `stream` is a terminal. A closed one, or one that cannot say, is not."""
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
 def _write_json(obj) -> None:
     """One JSON document and a newline on stdout, indented only for a person.
 
@@ -79,11 +89,7 @@ def _write_json(obj) -> None:
     tokens. Indentation was a quarter of the bytes of `lift -j` (93,263 B against
     70,984 B over ten functions), and an agent pays for every byte it reads."""
     import json
-    try:
-        tty = sys.stdout.isatty()
-    except (AttributeError, ValueError):
-        tty = False
-    if tty:
+    if _terminal(sys.stdout):
         json.dump(obj, sys.stdout, indent=2, sort_keys=False, default=str)
     else:
         json.dump(obj, sys.stdout, separators=(",", ":"), sort_keys=False, default=str)
@@ -182,8 +188,11 @@ def cmd_classes(args) -> int:
         return _fail(e)
 
     if args.library:
+        # A copy with fewer classes, not the program with some removed: a session hands
+        # the same program to the next command (#352).
+        from dataclasses import replace
         keep = {k.name for k in prog.classes if args.library in k.library}
-        prog.classes = [k for k in prog.classes if k.name in keep]
+        prog = replace(prog, classes=[k for k in prog.classes if k.name in keep])
     ucs = prog.user_classes()
     nmembers = sum(len(k.members) for k in ucs)
     if getattr(args, "json", False):
@@ -306,8 +315,7 @@ def cmd_lift(args) -> int:
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import (recover_accessors, recover_allocations, recover_casts,
-                         recover_fields)
+    from .fields import lift_tables
     try:
         image, fr, hdr = load_instructions(args.libapp)
     except JadartError as e:
@@ -327,15 +335,12 @@ def cmd_lift(args) -> int:
     if signote and not getattr(args, "json", False):
         print(comment(f"// {signote}"))
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
-    from .program import EntryNames
+    from .program import entry_names
     arity = make_arity_resolver(image)
-    entry = EntryNames(image, fr, hdr.epoch, arity)
+    entry = entry_names(image, fr, hdr, arity)
     returns = make_return_resolver(image)
     selectors = recover_selectors(image, fr, hdr)
-    layout = recover_fields(fr, getattr(image, "arch", None))
-    layout.add_accessor_names(recover_accessors(image, fr, layout))
-    allocs = recover_allocations(image, fr, layout)
-    casts = recover_casts(image, fr, layout)
+    layout, allocs, casts = lift_tables(image, fr, True)
     out = []
     for nm, cr in ranges:
         dis = disassemble_range(image, cr)
@@ -934,9 +939,8 @@ def cmd_ffi(args) -> int:
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import (recover_accessors, recover_allocations, recover_casts,
-                         recover_fields)
-    from .program import EntryNames
+    from .fields import lift_tables
+    from .program import entry_names
     try:
         image, fr, hdr = load_instructions(args.libapp)
     except JadartError as e:
@@ -956,13 +960,10 @@ def cmd_ffi(args) -> int:
     if by_fn:
         pc_to_name, _note = names_with_signatures(image, fr, getattr(args, "sigs", None))
         arity = make_arity_resolver(image)
-        entry = EntryNames(image, fr, hdr.epoch, arity)
+        entry = entry_names(image, fr, hdr, arity)
         returns = make_return_resolver(image)
         selectors = recover_selectors(image, fr, hdr)
-        layout = recover_fields(fr, getattr(image, "arch", None))
-        layout.add_accessor_names(recover_accessors(image, fr, layout))
-        allocs = recover_allocations(image, fr, layout)
-        casts = recover_casts(image, fr, layout)
+        layout, allocs, casts = lift_tables(image, fr, True)
         lit = _literal_re()
         for pc, cr in by_fn.items():
             dis = disassemble_range(image, cr)
@@ -1353,6 +1354,58 @@ def _xrefs_unloaded_note(n, alone):
             f"runtime can still reach {it}); -j lists {it} under \"unloaded\"")
 
 
+#: The commands a server does not answer. `export` writes a tree, to a path the caller
+#: means relative to itself; `serve` is the server.
+_UNSERVED = ("export", "serve")
+
+
+def _servable(args) -> bool:
+    """Whether a `jadart serve` process may answer this command line (serve.py)."""
+    return bool(getattr(args, "libapp", None)
+                and getattr(args, "command", None) not in _UNSERVED
+                and not getattr(args, "sigs", None))
+
+
+def _answer(parser, argv, src, color, room):
+    """One command line a client sent, run inside the server on the server's copy of
+    the binary: its exit code, or None for a line this server does not take. The parser
+    and `_run` are the ones a process answering for itself goes through.
+
+    `room` is how many calls deep the client could have gone from where it would have
+    run the command. The server stands a few frames deeper, and tier 3 prints a body
+    flat when its recursion runs out, so the limit moves by the difference and the
+    command has here the depth it would have had there."""
+    from .serve import headroom
+    try:
+        asked = parser.parse_args(argv)
+    except SystemExit:
+        return None                   # the client parsed it first, so not its line
+    if not _servable(asked):
+        return None
+    console.force(*color)
+    _JSON[0] = bool(getattr(asked, "json", False))
+    limit = sys.getrecursionlimit()
+    try:
+        # One more than the difference: `_run` is called from here, and from `main`
+        # in the client, where `_ask_server` measured one call below `main`.
+        sys.setrecursionlimit(limit + room - headroom() + 1)
+        return _run(asked, src)
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+def cmd_serve(args) -> int:
+    """Hold one binary and answer commands about it until stopped (#352)."""
+    from .serve import serve
+    parser = build_parser()
+    try:
+        return serve(args.libapp, args.socket, args.idle,
+                     lambda argv, src, color, room: _answer(parser, argv, src,
+                                                            color, room))
+    except JadartError as e:
+        return _fail(e)
+
+
 def cmd_verify(args) -> int:
     """The acceptance gates. Is this snapshot being parsed with the right grammar?"""
     from .verify import verify_file
@@ -1428,6 +1481,32 @@ class _VersionAction(argparse.Action):
 
 # ----------------------------------------------------------------- parser
 
+def _seconds(text) -> float:
+    """How long to wait for a server: a number of seconds above 0, at most a day."""
+    import math
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not 0 < value <= 86400:        # false for nan as well
+        raise argparse.ArgumentTypeError(f"is {text!r}, not a time in seconds from "
+                                         f"above 0 to 86400")
+    return value
+
+
+def _minutes(text) -> float:
+    """How long a server may sit idle: minutes, 0 for no limit, at most a year."""
+    import math
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not 0 <= value <= 525600:      # false for nan as well, and for inf
+        raise argparse.ArgumentTypeError(f"is {text!r}, not a time in minutes from 0 "
+                                         f"(no limit) to 525600")
+    return value
+
+
 def _common() -> argparse.ArgumentParser:
     """Options accepted both before and after the command word.
 
@@ -1442,6 +1521,17 @@ def _common() -> argparse.ArgumentParser:
     p.add_argument("-j", "--json", action="store_true", default=argparse.SUPPRESS,
                    help="emit JSON on stdout instead of a report, for scripting. Errors "
                         "become JSON too, so a caller never has to read stderr")
+    p.add_argument("--server", default=argparse.SUPPRESS, metavar="SOCKET",
+                   help="ask the `jadart serve` process listening on SOCKET, which keeps "
+                        "this binary loaded, and print its answer: the same bytes, "
+                        "without the setup. Falls back to answering here, with a line "
+                        "on stderr, when it cannot. JADART_SERVER sets it for every "
+                        "command")
+    p.add_argument("--server-wait", type=_seconds, default=argparse.SUPPRESS,
+                   metavar="SECONDS",
+                   help="how long to wait for the server's answer before answering "
+                        "here instead (default 10). JADART_SERVER_WAIT sets it for "
+                        "every command")
     return p
 
 
@@ -1644,6 +1734,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_verify)
 
+    p = _add(sub, common, "serve",
+             "keep one binary loaded and answer commands sent with --server")
+    p.add_argument("--socket", required=True, metavar="SOCKET",
+                   help="path of the unix socket to create and listen on, in a "
+                        "directory only you can write. It is the only thing written, "
+                        "mode 0600, and is removed on exit")
+    p.add_argument("--idle", type=_minutes, default=30.0, metavar="MINUTES",
+                   help="stop after this long with no request (default 30, 0 never)")
+    p.set_defaults(func=cmd_serve)
+
     return ap
 
 
@@ -1752,12 +1852,62 @@ def main(argv=None) -> int:
     # no reason behind it. The container is read in place: nothing is written to disk, so
     # there is no temp directory to remove and nothing is left behind if this process is
     # killed rather than allowed to exit.
+    src = None
     if getattr(args, "libapp", None):
         from .source import open_source
         try:
             src = open_source(args.libapp)
         except InputError as e:
             return _fail(e)
+
+    try:
+        if src is not None:
+            code = _ask_server(args, argv, src)
+            if code is not None:
+                return code
+        return _run(args, src)
+    except BrokenPipeError:
+        # `jadart classes lib | head` closes the pipe on us. That's the reader's
+        # choice, not a failure. Point stdout at devnull so the interpreter's exit
+        # flush has somewhere to go, otherwise Python prints "Exception ignored".
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return EXIT_OK
+    except KeyboardInterrupt:
+        error("interrupted")
+        return 130
+
+
+def _ask_server(args, argv, src):
+    """The exit code of a command a `jadart serve` process answered, its output already
+    printed, or None when this process is to answer it (serve.py).
+
+    JADART_DEBUG asks for this process's own traceback, so it answers here too."""
+    path = getattr(args, "server", None) or os.environ.get("JADART_SERVER")
+    if not path or not _servable(args) or os.environ.get("JADART_DEBUG"):
+        return None
+    from .serve import ANSWER_SECONDS, ask, headroom
+    wait = getattr(args, "server_wait", None)
+    if wait is None:
+        try:
+            wait = _seconds(os.environ.get("JADART_SERVER_WAIT") or ANSWER_SECONDS)
+        except argparse.ArgumentTypeError as e:
+            error(f"server at {path} not used, JADART_SERVER_WAIT {e}; "
+                  f"answering without it")
+            return None
+    code, out = ask(path, argv, src, (console.enabled(), console.enabled(True)),
+                    headroom(), wait, (_terminal(sys.stdout), _terminal(sys.stderr)))
+    if code is None:
+        error(f"server at {path} not used, {out}; answering without it")
+        return None
+    for fd, text in out:
+        (sys.stdout if fd == 1 else sys.stderr).write(text)
+    return code
+
+
+def _run(args, src=None) -> int:
+    """Run one parsed command and return its exit code: `main` for a process answering
+    for itself, and `jadart serve` for each command line it is sent."""
+    if src is not None:
         if src.member:
             print(comment(f"// {os.path.basename(src.member)} from "
                           f"{os.path.basename(src.origin)}"), file=sys.stderr)
@@ -1768,15 +1918,8 @@ def main(argv=None) -> int:
 
     try:
         return args.func(args)
-    except BrokenPipeError:
-        # `jadart classes lib | head` closes the pipe on us. That's the reader's
-        # choice, not a failure. Point stdout at devnull so the interpreter's exit
-        # flush has somewhere to go, otherwise Python prints "Exception ignored".
-        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-        return EXIT_OK
-    except KeyboardInterrupt:
-        error("interrupted")
-        return 130
+    except (BrokenPipeError, KeyboardInterrupt):
+        raise                         # main's to handle, and a server's to stop on
     except Exception as e:
         from .disasm import UnsupportedArch, MissingDisassembler
         if isinstance(e, MissingDisassembler):

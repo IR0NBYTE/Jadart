@@ -23085,6 +23085,880 @@ def test_naming_at_a_frame_move_costs_the_same_per_row_at_any_length():
         expr._names_role = real
 
 
+# -- jadart serve: the setup is done once, and the answer is the fresh one (#352) --
+
+def _fresh(argv, tty=False):
+    """(exit code, stdout, stderr) of one command line answered by a process of its
+    own, which is what `cli.main` is with no server named. `tty` is whether its stdout
+    says it is a terminal."""
+    import contextlib
+    import io
+    from jadart import cli
+
+    class Out(io.StringIO):
+        def isatty(self):
+            return tty
+
+    out, err = Out(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cli.main(list(argv))
+    return rc, out.getvalue(), err.getvalue()
+
+
+class _Served:
+    """What `jadart serve` does with each request, without the socket: one session on
+    one binary, and serve._reply for every command line."""
+
+    def __init__(self, path):
+        from jadart import cli, keep, serve
+        from jadart.source import open_source
+        self.src = open_source(path)
+        self.sha = serve.digest(self.src.data)
+        self.parser = cli.build_parser()
+        self.session = keep.open_session(self.src.data)
+
+    def reply(self, line, **over):
+        import json
+        from jadart import cli, serve
+        req = {"build": serve.build_id(), "sha256": self.sha, "argv": line,
+               "origin": self.src.origin, "path": self.src.path,
+               "member": self.src.member, "color": [False, False],
+               "tty": [False, False], "room": serve.headroom()}
+        req.update(over)
+        return serve._reply(self.src, self.sha, json.dumps(req).encode("ascii"),
+                            lambda a, s, c, r: cli._answer(self.parser, a, s, c, r))
+
+    def ask(self, argv, **over):
+        r = self.reply(argv, **over)
+        assert r["ok"] is True, (argv, r)
+        return (r["exit"], "".join(t for fd, t in r["out"] if fd == 1),
+                "".join(t for fd, t in r["out"] if fd == 2))
+
+    def close(self):
+        from jadart import keep
+        keep.close_session()
+
+
+def _serve_lines(lib, fn, klass, needle):
+    """One line or more for every command a server answers, hits and misses."""
+    return [
+        ["info", lib], ["-j", "info", lib], ["libraries", lib, "-a"],
+        ["classes", lib, "-l", "package:"], ["classes", lib, "-f", klass],
+        ["-j", "classes", lib, "-f", klass], ["functions", lib, "-f", fn],
+        ["-j", "functions", lib, "-n", "3", "-s", "size"],
+        ["functions", lib, "--named", "-s", "callers", "-n", "5"],
+        ["-j", "functions", lib, "-f", fn], ["xrefs", lib, "function", fn],
+        ["symbols", lib, "--format", "r2", "-n", "5"], ["hook", lib, fn],
+        ["lift", lib, fn], ["-j", "lift", lib, fn], ["lift", lib, "no_such_function"],
+        ["disasm", lib, fn], ["-j", "disasm", lib, fn],
+        ["decompile", lib, klass], ["decompile", lib, klass, "-t", "2"],
+        ["decompile", lib, klass, "-t", "1"], ["-j", "decompile", lib, "NoSuchClass"],
+        ["selectors", lib], ["constants", lib], ["strings", lib, "-g", needle],
+        ["xrefs", lib, "string", needle], ["-j", "xrefs", lib, "function", fn],
+        ["xrefs", lib, "string", "no such string at all"], ["xrefs", lib, needle],
+        ["ffi", lib], ["verify", lib], ["--color", "always", "lift", lib, fn],
+    ]
+
+
+def _check_served_is_fresh(lines, monkeypatch):
+    served = _Served(lines[0][1])
+    try:
+        # `-j` is indented for a terminal and compact for anything else (#378), and the
+        # server writes to neither: it is told which the client's stdout is.
+        monkeypatch.setenv("NO_COLOR", "1")
+        documents = [argv for argv in lines if argv[0] == "-j"]
+        assert len(documents) > 5
+        for argv in documents:
+            wide = _fresh(argv, tty=True)
+            assert served.ask(argv, tty=[True, False]) == wide, argv
+            assert wide[1].startswith("{\n  ") and wide != _fresh(argv), argv
+        monkeypatch.delenv("NO_COLOR")
+        fresh = [_fresh(argv) for argv in lines]
+        # Twice, the second time backwards: a kept table one command changed would show
+        # in a later command's answer, and a later command is a different one each way.
+        for order in (range(len(lines)), reversed(range(len(lines)))):
+            for i in order:
+                colour = lines[i][0] == "--color"
+                assert served.ask(lines[i], color=[colour, colour]) == fresh[i], lines[i]
+        assert {rc for rc, _o, _e in fresh} == {0, 1}      # hits and misses, both ways
+    finally:
+        served.close()
+
+
+def test_a_served_answer_is_the_fresh_one_on_clean(monkeypatch):
+    """Every command `jadart serve` answers, on the clean fixture: exit code, stdout and
+    stderr are what a process of its own gives, byte for byte (#352)."""
+    _needs_capstone()
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+    _check_served_is_fresh(
+        _serve_lines(CLEAN, "benchWithdraw", "BenchAccount", "bench"), monkeypatch)
+
+
+def test_a_served_answer_is_the_fresh_one_on_obf(monkeypatch):
+    """The same on the obfuscated fixture, where a function is asked for by address."""
+    _needs_capstone()
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+    _check_served_is_fresh(_serve_lines(OBF, "0xf4190", "AE", "flutter"), monkeypatch)
+
+
+def test_a_session_does_the_setup_once(monkeypatch):
+    """`lift` of a 200 byte function on a 26 MB app was 1.35 s, 0.004 s of it the lift:
+    the snapshot walk, the selector, cast and pool tables and the call graph were built
+    again by every command, and every `xrefs` scanned the code again (#352). In a
+    session they are built by the first command that needs them. Counted as calls, not
+    timed."""
+    _needs_capstone()
+    import importlib
+    from jadart import callgraph, disasm, dispatch, fields, fillwalk
+    program = importlib.import_module("jadart.program")    # jadart.program is a function
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+    calls = {}
+
+    def counted(module, name):
+        real = getattr(module, name)
+
+        def wrapper(*a, **k):
+            calls[name] = calls.get(name, 0) + 1
+            return real(*a, **k)
+        monkeypatch.setattr(module, name, wrapper)
+
+    counted(fillwalk, "walk_fill")                 # the snapshot walk
+    counted(program, "walk_fill")                  # and where `classes` reaches it
+    counted(dispatch, "build_selector_map")        # selector recovery
+    counted(fields, "recover_casts")               # cast recovery
+    counted(disasm, "_pool_label")                 # the pool map, per entry
+    counted(callgraph, "_read_words")              # the call graph, per code range
+    counted(disasm, "_pool_loads")                 # the scan for what loads a pool entry
+    lines = [["lift", CLEAN, "benchWithdraw"], ["lift", CLEAN, "build"],
+             ["disasm", CLEAN, "benchWithdraw"], ["decompile", CLEAN, "BenchAccount"],
+             ["xrefs", CLEAN, "function", "benchWithdraw"],
+             ["xrefs", CLEAN, "string", "bench"], ["xrefs", CLEAN, "string", "flutter"],
+             ["functions", CLEAN, "-f", "bench"], ["classes", CLEAN, "-f", "Bench"],
+             ["libraries", CLEAN, "-a"], ["strings", CLEAN, "-g", "bench"]]
+    served = _Served(CLEAN)
+    try:
+        for argv in lines:
+            served.ask(argv)
+        first = dict(calls)
+        kept = len(served.session.memo)
+        for argv in lines + lines:
+            served.ask(argv)
+        assert calls == first, (first, calls)       # nothing was built a second time
+        assert len(served.session.memo) == kept     # and nothing more is held for it
+    finally:
+        served.close()
+    # Three walks: the one the code is read from, the one `classes` and `libraries`
+    # read, and the one `strings` reads. Two cast tables: with accessor names, without.
+    assert first["walk_fill"] == 3 and first["recover_casts"] == 2, first
+    assert first["_pool_loads"] == 1, first
+    assert first["_read_words"] > 8000 and first["_pool_label"] > 1000, first
+    # No session, no keeping: a process of its own builds what it always built.
+    calls.clear()
+    for argv in lines[:2]:
+        assert _fresh(argv)[0] == 0
+    assert calls["walk_fill"] == 2, calls
+
+
+def test_a_session_keeps_the_whole_call_graph_and_never_a_part(monkeypatch):
+    """`functions -f NAME` and `xrefs function NAME` build the graph for that name alone
+    (#353), and a session keeps what it builds. A part kept and then read by `functions`
+    would print counts nobody computed, so a session builds the whole graph for either
+    question and keeps only that. The whole one is not the part where a range will not
+    decode: the whole graph names it in a note and drops its calls, and a part that had
+    no reason to decode it does neither, so there the part is built for each question,
+    as it is by a process of its own. Counted in ranges decoded, not timed."""
+    _needs_capstone()
+    from jadart import callgraph
+    from jadart.disasm import load_instructions
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+    real = callgraph.disassemble_range
+    tried, broken = [], set()
+
+    def decode(image, cr, *limit):
+        tried.append(cr.pc_offset)
+        if cr.pc_offset in broken:
+            raise ValueError("will not decode")
+        return real(image, cr, *limit)
+
+    monkeypatch.setattr(callgraph, "disassemble_range", decode)
+    image, fr, _hdr = load_instructions(CLEAN)
+    target = next(pc for pc, nm in sorted(callgraph.range_names(image, fr).items())
+                  if nm[0] == "benchWithdraw")
+    callgraph.build_index(image, fr)
+    whole = set(tried)
+    del tried[:]
+    callgraph.build_index(image, fr, only={target})
+    part = set(tried)
+    assert part < whole and len(whole) > 1000, (len(part), len(whole))
+
+    narrow = [["functions", CLEAN, "-f", "benchWithdraw"],
+              ["-j", "functions", CLEAN, "-f", "benchWithdraw"],
+              ["xrefs", CLEAN, "function", "benchWithdraw"]]
+    wide = [["functions", CLEAN, "-n", "0"], ["-j", "functions", CLEAN, "-s", "callers"]]
+    fresh = {tuple(argv): _fresh(argv) for argv in narrow + wide}
+    for first, then in ((narrow, wide), (wide, narrow)):
+        del tried[:]
+        served = _Served(CLEAN)
+        try:
+            for i, argv in enumerate(first + then + first):
+                assert served.ask(argv) == fresh[tuple(argv)], argv
+                # the first question, wide or narrow, builds the whole graph and the
+                # rest are read off it
+                assert set(tried) == whole and len(tried) == len(whole), (i, argv)
+        finally:
+            served.close()
+
+    # One range the whole graph decodes and the part for this name does not.
+    broken.add(min(whole - part))
+    fresh = {tuple(argv): _fresh(argv) for argv in narrow + wide}
+    assert "would not decode" in fresh[tuple(wide[0])][1]
+    assert "would not decode" not in fresh[tuple(narrow[0])][1]
+    for first, then in ((narrow, wide), (wide, narrow)):
+        served = _Served(CLEAN)
+        try:
+            for argv in first + then + first:
+                assert served.ask(argv) == fresh[tuple(argv)], argv
+        finally:
+            served.close()
+
+
+def test_a_session_keeps_only_what_is_about_its_binary():
+    """What a session hands back twice is a result about the bytes it was opened on.
+    The same bytes under another name are those bytes; another binary, or a path the
+    session has not read, is answered as if there were no session, and is not held."""
+    from jadart import keep
+    from jadart.disasm import build_pool_map, load_instructions
+    from jadart.source import Source, open_source
+    src, other = open_source(CLEAN), open_source(OBF)
+    assert load_instructions(src) is not load_instructions(src)     # no session
+    session = keep.open_session(src.data)
+    try:
+        image, fr, hdr = loaded = load_instructions(src)
+        assert load_instructions(src) is loaded
+        renamed = Source(data=src.data, origin="elsewhere/libapp.so", path="x.so")
+        assert load_instructions(renamed) is loaded
+        pool = build_pool_map(fr, image.arch)
+        assert build_pool_map(fr, image.arch) is pool
+        held = len(session.memo)
+        # a path: the file behind it can change between two calls
+        assert load_instructions(CLEAN) is not loaded
+        assert load_instructions(CLEAN) is not load_instructions(CLEAN)
+        # another binary, and what is built from it
+        theirs = load_instructions(other)
+        assert theirs is not loaded and load_instructions(other) is not theirs
+        assert theirs[2].version_hash == hdr.version_hash          # same release, even
+        assert build_pool_map(theirs[1], theirs[0].arch) is not \
+            build_pool_map(theirs[1], theirs[0].arch)
+        # equal bytes in another object are not the session's bytes
+        copy = Source(data=bytes(bytearray(src.data)), origin=CLEAN, path=CLEAN)
+        assert load_instructions(copy) is not loaded
+        assert len(session.memo) == held
+    finally:
+        keep.close_session()
+    assert load_instructions(src) is not loaded                     # closed: no session
+
+
+def test_a_server_answers_only_for_its_own_bytes_and_build(monkeypatch):
+    """A request is answered when it is about the bytes the server holds, from the same
+    build of jadart, and is a command a server takes. Anything else gets a reason and no
+    output, and the client then answers for itself."""
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+    from jadart import serve
+    from jadart.source import open_source
+    line = ["classes", CLEAN, "-f", "Bench"]
+    fresh = _fresh(line)
+    served = _Served(CLEAN)
+    try:
+        assert served.ask(line) == fresh
+        refused = [
+            ({"sha256": serve.digest(open_source(OBF).data)}, "different binary"),
+            ({"sha256": served.sha[:-1]}, "different binary"),
+            ({"sha256": None}, "different binary"),
+            ({"build": "0" * 64}, "different build"),
+            ({"argv": ["export", CLEAN, "-o", "out"]}, "does not answer"),
+            ({"argv": ["serve", CLEAN, "--socket", "s"]}, "does not answer"),
+            ({"argv": ["lift", CLEAN, "f", "--sigs", "lib.json"]}, "does not answer"),
+            ({"argv": ["--version"]}, "does not answer"),
+            ({"argv": ["classes"]}, "does not answer"),
+            ({"argv": ["no-such-command", CLEAN]}, "does not answer"),
+            ({"argv": "classes"}, "could not read"),
+            ({"argv": ["classes", 7]}, "could not read"),
+            ({"origin": None}, "could not read"),
+            ({"path": 3}, "could not read"),
+            ({"color": [1, 0]}, "could not read"),
+            ({"color": [True]}, "could not read"),
+            ({"tty": [1, 0]}, "could not read"), ({"tty": None}, "could not read"),
+            ({"room": None}, "could not read"), ({"room": 0}, "could not read"),
+            ({"room": True}, "could not read"), ({"room": 1 << 21}, "could not read"),
+        ]
+        for over, why in refused:
+            r = served.reply(line, **over)
+            assert r["ok"] is False and why in r["why"], (over, r)
+            assert set(r) == {"ok", "why"}, (over, r)
+        # 200 KB of brackets is nested deeper than the parser follows: that was a
+        # RecursionError out of the server, which stopped it
+        for raw in (b"", b"[]", b"{", b"\xff\xfe", b'"classes"', b"null",
+                    b"[" * 200_000, b'{"a":' * 100_000):
+            r = serve._reply(served.src, served.sha, raw, lambda *a: 1 / 0)
+            assert r == {"ok": False, "why": "the server could not read the request"}
+        assert served.ask(line) == fresh               # and it still answers
+        # the client's name for the file is the one the output carries
+        assert served.ask(["verify", CLEAN], origin="app/renamed.so",
+                          path="app/renamed.so")[1].startswith("renamed.so ")
+    finally:
+        served.close()
+    # The same source under an interpreter with no disassembler is another build: it
+    # answers `verify` with fewer gates, and `lift` not at all.
+    import importlib.machinery
+    import types
+    ids = []
+    for origin in ("/somewhere/capstone/__init__.py", None):
+        fake = None
+        if origin:
+            fake = types.ModuleType("capstone")
+            fake.__spec__ = importlib.machinery.ModuleSpec("capstone", None,
+                                                           origin=origin)
+        monkeypatch.setitem(sys.modules, "capstone", fake)
+        monkeypatch.setattr(serve, "_BUILD", None)
+        ids.append(serve.build_id())
+    assert len(set(ids)) == 2 and all(len(i) == 64 for i in ids), ids
+    # ... and so is the same source with another capstone installed at the same path:
+    # the digest held where capstone was, which an upgrade in place does not move
+    import shutil
+    import tempfile
+    site = tempfile.mkdtemp()
+    try:
+        os.makedirs(os.path.join(site, "capstone"))
+        origin = os.path.join(site, "capstone", "__init__.py")
+
+        def installed(version, record, source="CS_VERSION = 5\n"):
+            for name in os.listdir(site):
+                if name.endswith(".dist-info"):
+                    shutil.rmtree(os.path.join(site, name))
+            os.makedirs(os.path.join(site, f"capstone-{version}.dist-info"))
+            with open(os.path.join(site, f"capstone-{version}.dist-info", "RECORD"),
+                      "w") as fh:
+                fh.write(record)
+            with open(origin, "w") as fh:
+                fh.write(source)
+            fake = types.ModuleType("capstone")
+            fake.__spec__ = importlib.machinery.ModuleSpec("capstone", None,
+                                                           origin=origin)
+            monkeypatch.setitem(sys.modules, "capstone", fake)
+            monkeypatch.setattr(serve, "_BUILD", None)
+            return serve.build_id()
+
+        ids = [installed("5.0.1", "a"), installed("5.0.9", "a"),
+               installed("5.0.9", "b"), installed("5.0.9", "b", "CS_VERSION = 6\n")]
+        assert len(set(ids)) == 4 and installed("5.0.1", "a") == ids[0], ids
+    finally:
+        shutil.rmtree(site)
+    monkeypatch.setattr(serve, "_BUILD", None)
+
+
+def _socket_dir():
+    """A short directory for a unix socket (its path is limited to about 100 bytes, and
+    pytest's tmp_path is longer than that on macOS), or a skip where there are none."""
+    import socket
+    import tempfile
+    if not hasattr(socket, "AF_UNIX"):
+        _skip(f"  SKIP {sys._getframe(1).f_code.co_name} (no unix sockets)")
+    return tempfile.mkdtemp(prefix="jd", dir="/tmp" if os.path.isdir("/tmp") else None)
+
+
+def test_a_client_answers_for_itself_when_the_server_is_no_use(monkeypatch):
+    """Nothing listening, a file that is no socket, a link to a socket, a directory
+    others can write, another user's socket, a reply cut short, too long, nested past
+    parsing or of the wrong shape, a refusal, no reply in the time allowed: each is one
+    line on stderr and then the answer a process of its own gives. No part of a bad
+    reply is printed."""
+    import json
+    import shutil
+    import socket
+    import threading
+    from jadart import serve
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+    line = ["classes", CLEAN, "-f", "Bench"]
+    fresh = _fresh(line)
+    assert fresh[0] == 0 and "BenchAccount" in fresh[1]
+    d = _socket_dir()
+
+    def fallen_back(path, why, wait=None):
+        extra = ["--server-wait", wait] if wait else []
+        rc, out, err = _fresh(["--server", path] + extra + line)
+        assert (rc, out) == fresh[:2], why
+        note = f"jadart: server at {path} not used, "
+        assert err.startswith(note) and why in err.splitlines()[0], err
+        assert err.split("\n", 1)[1] == fresh[2], err
+        # the environment names a server, and how long to wait, as the options do
+        monkeypatch.setenv("JADART_SERVER", path)
+        if wait:
+            monkeypatch.setenv("JADART_SERVER_WAIT", wait)
+        assert _fresh(line) == (rc, out, err)
+        monkeypatch.delenv("JADART_SERVER")
+        monkeypatch.delenv("JADART_SERVER_WAIT", raising=False)
+
+    try:
+        fallen_back(os.path.join(d, "none"), "nothing is there")
+        plain = os.path.join(d, "file")
+        with open(plain, "w") as fh:
+            fh.write("not a socket")
+        fallen_back(plain, "not a socket")
+
+        stale = os.path.join(d, "stale")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.bind(stale)
+        fallen_back(stale, "nothing is listening")
+
+        good = json.dumps({"ok": True, "exit": 0, "out": [[1, "FORGED\n"]]}).encode()
+        monkeypatch.setattr(serve, "MAX_REPLY", 300_000)
+        replies = [
+            (b"", "cut short"), (good[:-3], "cut short"), (b"\xff", "cut short"),
+            # brackets nested past parsing were a traceback and exit 1, not a fallback
+            (b"[" * 200_000, "cut short"), (b" " * 300_000 + good, "too long"),
+            (b'{"ok": false, "why": "' + b"x" * 500 + b'"}', "not one"),
+            (b'{"ok": false, "why": "a\\u001b[2Jb"}', "not one"),
+            (b"[1, 2]", "not one"), (b'{"ok": 1, "exit": 0, "out": []}', "not one"),
+            (b'{"ok": true, "exit": "0", "out": []}', "not one"),
+            (b'{"ok": true, "exit": true, "out": []}', "not one"),
+            (b'{"ok": true, "exit": 0, "out": [[3, "x"]]}', "not one"),
+            (b'{"ok": true, "exit": 0, "out": [[1, 5]]}', "not one"),
+            (b'{"ok": true, "exit": 0, "out": "FORGED"}', "not one"),
+            (b'{"ok": false, "why": "it holds a different binary"}', "different binary"),
+            (b'{"ok": false, "why": 9}', "not one"),
+        ]
+        path = os.path.join(d, "fake")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(path)
+        listener.listen(8)
+        seen, reply, hold = [], [None], threading.Event()
+
+        def fake():
+            while True:
+                conn, _ = listener.accept()
+                with conn:
+                    raw = b""
+                    while chunk := conn.recv(65536):
+                        raw += chunk
+                    if raw == b"stop":
+                        return
+                    seen.append(json.loads(raw))
+                    try:
+                        if reply[0] is None:
+                            hold.wait(60)           # a server that does not answer
+                        else:
+                            conn.sendall(reply[0])
+                    except OSError:
+                        pass                        # the client stopped waiting
+
+        t = threading.Thread(target=fake, daemon=True)
+        t.start()
+        try:
+            for reply[0], why in replies:
+                fallen_back(path, why)
+            # a link to the socket is not the socket: the client does not follow it
+            link = os.path.join(d, "link")
+            os.symlink(path, link)
+            fallen_back(link, "not a socket")
+            # a well formed reply from the user's own socket is printed: that much is
+            # the trust the option asks for, and the rest of this test is its edge
+            reply[0] = good
+            seen.clear()
+            assert _fresh(["--server", path] + line) == (0, "FORGED\n", "")
+            req = seen[0]
+            # ... but not from a directory someone else could have put it in
+            os.chmod(d, 0o777)
+            fallen_back(path, "other users can write to its directory")
+            os.chmod(d, 0o700)
+            # ... and not from a socket some other user owns
+            mine = os.getuid()
+            monkeypatch.setattr(serve.os, "getuid", lambda: mine + 1)
+            fallen_back(path, "another user")
+            monkeypatch.setattr(serve.os, "getuid", lambda: mine)
+            # a server that takes the request and says nothing is waited for as long
+            # as the client was told to, and no longer
+            reply[0] = None
+            fallen_back(path, "no answer in 0.2 s", "0.2")
+            monkeypatch.setenv("JADART_SERVER_WAIT", "soon")
+            rc, out, err = _fresh(["--server", path] + line)
+            monkeypatch.delenv("JADART_SERVER_WAIT")
+            assert (rc, out) == fresh[:2] and "JADART_SERVER_WAIT is 'soon'" in err
+        finally:
+            hold.set()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(path)
+                s.sendall(b"stop")
+            t.join(10)
+            listener.close()
+        # what the client sends: its own build, the digest of the bytes it read, the
+        # command line as typed after the option, the name it was given, its colours,
+        # whether its streams are terminals, how deep it could still have gone
+        assert req["build"] == serve.build_id() and len(req["build"]) == 64
+        assert req["sha256"] == serve.digest(open(CLEAN, "rb").read())
+        assert req["argv"] == ["--server", path] + line and req["origin"] == CLEAN
+        assert type(req["room"]) is int and req["room"] > 100
+        assert req["color"] == req["tty"] == [False, False] and set(req) == {
+            "build", "sha256", "argv", "origin", "path", "member", "color", "tty", "room"}
+        # a command a server does not take is not sent, and nothing is said about it
+        seen.clear()
+        rc, _out, err = _fresh(["--server", os.path.join(d, "none"), "lift", CLEAN,
+                                "benchWithdraw", "--sigs", os.path.join(d, "none")])
+        assert "server at" not in err and not seen
+    finally:
+        shutil.rmtree(d)
+
+
+class _Servers:
+    """The `jadart serve` processes a test starts. `close` stops every one that is
+    still running, so a test that fails leaves none behind."""
+
+    def __init__(self, env, cwd=None):
+        self.env, self.cwd, self.started = env, cwd, []
+
+    def start(self, lib, path, *extra):
+        import socket
+        import subprocess
+        import time
+        p = subprocess.Popen([sys.executable, "-m", "jadart", "serve", lib, "--socket",
+                              path, *extra], env=self.env, cwd=self.cwd,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.started.append(p)
+        for _ in range(800):                   # until it answers, or has given up
+            if p.poll() is not None:
+                break
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.connect(path)
+                break
+            except OSError:
+                time.sleep(0.025)
+        return p
+
+    def stop(self, p, sig=None):
+        import signal
+        p.send_signal(sig or signal.SIGTERM)
+        out, err = p.communicate(timeout=30)
+        return p.returncode, out, err
+
+    def close(self):
+        for p in self.started:
+            if p.poll() is None:
+                p.kill()
+            p.communicate()
+
+
+def test_serve_over_its_socket(monkeypatch):
+    """The real thing: a `jadart serve` process, and commands sent to it. The socket is
+    the only thing it writes, mode 0600, and it is gone when the server stops. A second
+    server does not take a live socket, and takes a dead one. A file at the path that
+    is not a socket, a symbolic link, a directory others can write and an idle time
+    that is no time are refused, with nothing made and nothing left."""
+    import shutil
+    import signal
+    import stat
+    # The server is a process of its own with its own capstone, and one that has it is
+    # another build to a suite run without (conftest.py), so it would not be asked.
+    _needs_capstone()
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+    d = _socket_dir()
+    env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), ".."))
+    env.pop("JADART_SERVER", None)
+    servers = _Servers(env)
+    start, stop = servers.start, servers.stop
+
+    sock = os.path.join(d, "s")
+    try:
+        server = start(CLEAN, sock)
+        assert os.listdir(d) == ["s"]
+        mode = os.lstat(sock).st_mode
+        assert stat.S_ISSOCK(mode) and stat.S_IMODE(mode) == 0o600
+        for line in (["classes", CLEAN, "-f", "Bench"], ["-j", "info", CLEAN],
+                     ["verify", CLEAN], ["strings", CLEAN, "-g", "bench"],
+                     ["classes", CLEAN, "-f", "NoSuchClassAtAll"]):
+            assert _fresh(["--server", sock] + line) == _fresh(line), line
+        # the old flag form is rewritten before it is sent, as it is before it is run
+        assert _fresh(["--server", sock, "classes", CLEAN, "-f", "Bench"])[1] == \
+            _fresh([CLEAN, "--tier0", "--filter", "Bench"])[1]
+        # the same bytes under another name: answered, and under the name asked with
+        other = os.path.join(d, "renamed.so")
+        shutil.copyfile(CLEAN, other)
+        assert _fresh(["--server", sock, "verify", other]) == _fresh(["verify", other])
+        assert _fresh(["verify", other])[1].startswith("renamed.so ")
+        # another binary: not the server's to answer, whatever it is called
+        shutil.copyfile(OBF, other)
+        rc, out, err = _fresh(["--server", sock, "verify", other])
+        assert (rc, out) == _fresh(["verify", other])[:2]
+        assert "holds a different binary" in err.splitlines()[0]
+        os.unlink(other)
+        # a second server does not take the path while the first has it
+        second = start(CLEAN, sock)
+        assert second.wait(30) == 2
+        assert "already listening" in second.stderr.read()
+        plain = _fresh(["-j", "info", CLEAN])
+        assert _fresh(["--server", sock, "-j", "info", CLEAN]) == plain
+        rc, out, err = stop(server)
+        assert rc == 0 and out == "" and err.startswith("jadart: serving ")
+        assert os.listdir(d) == []
+        # killed outright, a server leaves its socket; the next one takes it over
+        server = start(CLEAN, sock, "--idle", "0")
+        stop(server, signal.SIGKILL)
+        assert os.listdir(d) == ["s"]
+        server = start(CLEAN, sock)
+        plain = _fresh(["-j", "info", CLEAN])
+        assert _fresh(["--server", sock, "-j", "info", CLEAN]) == plain
+        assert stop(server, signal.SIGINT)[0] == 0 and os.listdir(d) == []
+        # a file that is not a socket is not jadart's to replace
+        with open(sock, "w") as fh:
+            fh.write("mine")
+        refused = start(CLEAN, sock)
+        assert refused.wait(30) == 2 and "not a socket" in refused.stderr.read()
+        assert open(sock).read() == "mine"
+        os.unlink(sock)
+        # a link is not followed: binding through one made the socket at its target
+        os.symlink(os.path.join(d, "elsewhere"), sock)
+        refused = start(CLEAN, sock)
+        assert refused.wait(30) == 2 and "symbolic link" in refused.stderr.read()
+        assert os.listdir(d) == ["s"] and os.path.islink(sock)
+        os.unlink(sock)
+        # a directory another user can write is where they could have left one
+        os.chmod(d, 0o777)
+        refused = start(CLEAN, sock)
+        assert refused.wait(30) == 2
+        assert "other users can write to its directory" in refused.stderr.read()
+        os.chmod(d, 0o700)
+        # an idle time that is not one is a usage error: `inf` was an OverflowError
+        # after the socket was made, and the socket stayed
+        for idle in ("inf", "nan", "-1", "soon"):
+            refused = start(CLEAN, sock, "--idle", idle)
+            assert refused.wait(30) == 2, idle
+            assert "argument --idle" in refused.stderr.read(), idle
+        assert os.listdir(d) == []
+    finally:
+        servers.close()
+        shutil.rmtree(d)
+
+
+def test_a_served_command_has_the_depth_a_fresh_one_has(monkeypatch):
+    """Tier 3 lifts a body by recursion and prints it flat when the interpreter's limit
+    stops it, so how deep a command may go is part of its answer: 494 nested
+    conditionals come out structured and 495 flat. A served command starts under the
+    server's own frames, ten deep where a fresh one is four, and those six were enough
+    to move that line. It is given the limit that leaves it what its client had.
+    Counted in calls, on a command that goes down until it is stopped, with the server
+    standing 0, 1, 7 and 40 frames deeper than it does."""
+    import json
+    from jadart import cli, serve
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+
+    def probe(args):
+        def down(n):
+            try:
+                return down(n + 1)
+            except RecursionError:
+                return n
+        print(down(0))
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_info", probe)
+    served = _Served(CLEAN)
+    extra = [0]
+
+    def exchange(path, request, wait):
+        def answer(a, s, c, r):
+            return cli._answer(served.parser, a, s, c, r)
+
+        def deeper(n):
+            if n:
+                return deeper(n - 1)
+            return serve._reply(served.src, served.sha, request, answer)
+        return json.dumps(deeper(extra[0])).encode("ascii"), None
+
+    monkeypatch.setattr(serve, "_exchange", exchange)
+    limit = sys.getrecursionlimit()
+    try:
+        fresh = _fresh(["info", CLEAN])
+        assert fresh[0] == 0 and int(fresh[1]) > 100, fresh
+        for extra[0] in (0, 1, 7, 40):
+            assert _fresh(["--server", "any", "info", CLEAN]) == fresh, extra
+            assert sys.getrecursionlimit() == limit
+        # what the client measured is what the command gets, to the call
+        assert served.ask(["info", CLEAN], room=5) == (0, "5\n", "")
+        assert served.ask(["info", CLEAN], room=2000) == (0, "2000\n", "")
+        assert sys.getrecursionlimit() == limit
+    finally:
+        served.close()
+
+
+def test_a_server_is_the_build_it_started_as(monkeypatch):
+    """The digest a server answers to is taken when it starts, with every module
+    loaded. It was taken at the first request: a server started from one copy of
+    jadart, whose cli.py was then edited, matched the first client of the edited copy
+    and answered it with the code it had loaded before the edit, exit 1 where the
+    client's own answer was exit 7, and no warning."""
+    import shutil
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    d = _socket_dir()
+    copy = os.path.join(d, "fw")
+    shutil.copytree(os.path.join(here, "..", "jadart"), os.path.join(copy, "jadart"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    env = dict(os.environ, PYTHONPATH=copy)
+    env.pop("JADART_SERVER", None)
+    servers = _Servers(env, cwd=d)     # not here: `-m` looks beside where it is run
+    sock = os.path.join(d, "s")
+    lib = os.path.abspath(CLEAN)
+
+    def client():
+        out = subprocess.run([sys.executable, "-m", "jadart", "--server", sock,
+                              "classes", lib, "-f", "Bench"], env=env, cwd=d,
+                             capture_output=True, text=True, timeout=120)
+        return out.returncode, out.stdout, out.stderr
+
+    cli_py = os.path.join(copy, "jadart", "cli.py")
+    lazy_py = os.path.join(copy, "jadart", "interop.py")   # not loaded by `classes`
+    try:
+        servers.start(lib, sock)
+        for edited in (cli_py, lazy_py):
+            was = open(edited).read()
+            with open(edited, "a") as fh:
+                fh.write("\n# edited after the server started\n")
+            rc, out, err = client()                 # the first request it gets
+            assert rc == 0 and "BenchAccount" in out
+            assert "it is a different build of jadart" in err.splitlines()[0], err
+            with open(edited, "w") as fh:
+                fh.write(was)
+            assert client() == (rc, out, "")        # the copy it started as: answered
+    finally:
+        servers.close()
+        shutil.rmtree(d)
+
+
+def test_a_request_is_whole_and_soon_or_it_is_not_one(monkeypatch):
+    """What a connection can do to a server is cost itself the answer. A request nested
+    past parsing was a RecursionError that stopped the server, one past the size limit
+    gets a refusal, and a client that sends a byte now and then, which held the server
+    for as long as it kept sending, is dropped when the time for a request is up.
+    Counted in bytes the server waited for, not timed."""
+    import json
+    import socket
+    import threading
+    import time
+    from jadart import serve
+    from jadart.source import open_source
+    if not hasattr(socket, "socketpair"):
+        _skip("  SKIP test_a_request_is_whole_and_soon_or_it_is_not_one (no socketpair)")
+    src = open_source(CLEAN)
+    sha = serve.digest(src.data)
+    ran = []
+
+    def one(send):
+        """What the server sends back to a client that does `send(sock)`."""
+        ours, theirs = socket.socketpair()
+
+        def server():
+            with theirs:
+                serve._serve_one(theirs, src, sha, lambda *a: ran.append(a) or 0)
+
+        t = threading.Thread(target=server, daemon=True)
+        t.start()
+        try:
+            send(ours, t)
+            try:
+                ours.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass                             # the server has already hung up
+            raw = b""
+            while chunk := ours.recv(65536):
+                raw += chunk
+        finally:
+            ours.close()
+            t.join(30)
+        assert not t.is_alive()
+        return raw
+
+    unread = {"ok": False, "why": "the server could not read the request"}
+    for junk in (b"[" * 200_000, b'{"a":' * 150_000, b"\xff" * 10):
+        assert json.loads(one(lambda s, t: s.sendall(junk))) == unread
+    good = json.dumps({
+        "build": serve.build_id(), "sha256": sha, "argv": ["info", CLEAN],
+        "origin": src.origin, "path": src.path, "member": src.member,
+        "color": [False, False], "tty": [False, False],
+        "room": serve.headroom()}).encode("ascii")
+    assert json.loads(one(lambda s, t: s.sendall(good)))["ok"] is True
+    assert len(ran) == 1 and ran.pop()[0] == ["info", CLEAN]
+    monkeypatch.setattr(serve, "MAX_REQUEST", 4096)
+    assert len(good) < 4096                      # the same request, made too long
+    assert json.loads(one(lambda s, t: s.sendall(good + b" " * 5000))) == unread
+
+    monkeypatch.setattr(serve, "REQUEST_SECONDS", 0.3)
+    sent = []
+
+    def trickle(s, t):
+        for _ in range(400):                     # 40 s of it, if the server lets it
+            if not t.is_alive():
+                return
+            s.sendall(b" ")
+            sent.append(1)
+            time.sleep(0.1)
+
+    assert one(trickle) == b"" and 0 < len(sent) < 400, len(sent)
+    assert ran == []                             # and none of it ran a command
+
+
+def test_a_session_keeps_a_layout_for_each_way_it_is_finished():
+    """`lift` folds accessor names into the field layout and `decompile` does not. In a
+    session each has its own, so the one `decompile` reads is the one a fresh process
+    builds whether or not a `lift` came first. The fixtures print the same either way,
+    so this looks at the tables: one layout handed to both would hold the names."""
+    _needs_capstone()
+    from jadart import keep
+    from jadart.disasm import load_instructions
+    from jadart.fields import lift_tables, recover_fields
+    from jadart.source import open_source
+
+    def size(layout):
+        return sum(len(m) for m in layout.by_class.values())
+
+    src = open_source(CLEAN)
+    keep.open_session(src.data)
+    try:
+        image, fr, hdr = load_instructions(src)
+        named = lift_tables(image, fr, True)[0]        # what `lift` builds, first
+        plain = lift_tables(image, fr, False)[0]       # what `decompile` then reads
+        fresh = recover_fields(fr, getattr(image, "arch", None))
+        assert plain is not named
+        assert size(plain) == size(fresh) < size(named), (size(plain), size(named))
+        assert lift_tables(image, fr, False)[0] is plain
+        assert lift_tables(image, fr, True)[0] is named
+    finally:
+        keep.close_session()
+
+
+def test_a_served_failure_is_json_only_when_this_command_asked(monkeypatch):
+    """`-j` turns a failure into a JSON document, and the flag is the command's own:
+    a server answers a `-j` line and then a plain one, and the plain one's failure is
+    text. Left set by the line before, it was a document nobody asked for."""
+    from jadart import cli
+    from jadart.errors import InputError
+    monkeypatch.delenv("JADART_SERVER", raising=False)
+
+    def cannot(args):
+        raise InputError("this snapshot cannot be read")
+
+    monkeypatch.setattr(cli, "cmd_selectors", cannot)
+    lines = [["-j", "selectors", CLEAN], ["selectors", CLEAN],
+             ["-j", "selectors", CLEAN], ["selectors", CLEAN]]
+    fresh = [_fresh(line) for line in lines]
+    assert fresh[0][1].startswith("{") and fresh[1][1] == "" and fresh[1][2], fresh
+    served = _Served(CLEAN)
+    try:
+        for order in (range(4), reversed(range(4))):
+            for i in order:
+                assert served.ask(lines[i]) == fresh[i], lines[i]
+    finally:
+        served.close()
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

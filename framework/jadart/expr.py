@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, replace
 from sys import intern
 from typing import NamedTuple
 
+from .keep import kept
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
                   cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
                   entry_reach, UNREACHED, cut_off, dominator_forest, dom_numbers,
@@ -10694,6 +10695,7 @@ def _entry_read(ann: list, cut: bool) -> tuple:
                       _fpu_args_live(blocks, entry)), args
 
 
+@kept
 def make_arity_resolver(image):
     """Build a cached `pc -> arity` resolver over a whole instruction image, mapping a
     call target to the covering function's register-argument count. A call site uses it
@@ -10761,6 +10763,7 @@ def _read_after_call(rows):
     return None
 
 
+@kept
 def make_return_resolver(image):
     """Build a cached `pc -> "x0" | "d0" | None` resolver over a whole instruction image:
     which register the code after a direct `bl` to the function covering `pc` reads the

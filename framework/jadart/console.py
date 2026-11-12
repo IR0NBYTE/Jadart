@@ -54,6 +54,13 @@ def configure(mode: str = "auto", stdout=None, stderr=None) -> None:
     _err = _resolve(mode, sys.stderr if stderr is None else stderr)
 
 
+def force(out: bool, err: bool) -> None:
+    """Set colour for both streams outright. `jadart serve` writes for a terminal it
+    cannot see, so the process that asked says what its own two streams resolved to."""
+    global _out, _err
+    _out, _err = bool(out), bool(err)
+
+
 def enabled(stream_err: bool = False) -> bool:
     return _err if stream_err else _out
 

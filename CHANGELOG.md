@@ -13,6 +13,41 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
+- **`jadart serve` keeps one binary loaded, and `--server` asks it (#352).** Every
+  command is a process of its own, and it spent nearly all of its time on work that does
+  not depend on the question: `lift` of a 200 byte function out of FluffyChat's 26 MB
+  `libapp.so` was 1.38 s, 0.004 s of it the lift. `jadart serve <libapp> --socket PATH`
+  holds the binary in one process, and a command given `--server PATH`, or run with
+  `JADART_SERVER=PATH`, prints what that process answers. The output, stderr and exit
+  code are the ones the command gives on its own: compared byte for byte on 79 command
+  lines per fixture and 128 on FluffyChat, 20 functions of 8 to 901,452 bytes among
+  them, three passes each in different orders, no difference. On FluffyChat, each call a
+  fresh process, best of 3, on its own and then through a server that has answered it
+  once: `lift` 1.38 s and 0.09 s, `disasm` 0.81 and 0.09, `decompile` of a class 1.58
+  and 0.16, `xrefs string` 1.23 and 0.07, `xrefs function` 2.51 and 0.10, `functions`
+  5.54 and 0.07, `functions -f` 2.70 and 0.08, `classes -f` 0.69 and 0.08, `strings -g`
+  0.68 and 0.16. `lift` of the 28 KB function is 1.94 and 0.35, which is the lift
+  itself, `symbols -f` 1.00 and 0.27, and `info` is 0.05 and 0.07. The server keeps the
+  whole call graph and never a part of one, so the first `functions` or `xrefs function`
+  it is asked takes 5.5 s there even when it names one function. A command with no
+  server named is unchanged: nine commands timed against the commit before in
+  alternation, best times within 1.1 percent.
+
+  Nothing is written but the socket, mode 0600, at the path given, and what the server
+  keeps is in its memory (813 MB for FluffyChat after all of the above) and is never
+  stored or read back. The socket has to be in a directory only its user can write,
+  which `/tmp` is not, and a symbolic link at its path is not followed. A client is
+  answered only by a server that read the same bytes (it sends the SHA-256 of its
+  file), is the same build of jadart under the same Python and capstone as the server
+  was when it started, and whose socket belongs to the same user; otherwise it says why
+  in one line on stderr and answers by itself. It does the same when no answer has come
+  in 10 seconds (`--server-wait`, `JADART_SERVER_WAIT`), and a server gives a client 5
+  seconds to send its request. A served command may recurse exactly as deep as its
+  client could have, so a body tier 3 prints flat for want of depth is the same body
+  either way, and `-j` is indented or compact by what the client's stdout is. `export`
+  and any command with `--sigs` always answer by themselves. The server stops after 30
+  idle minutes (`--idle`). Unix sockets only, so not Windows.
+
 - `constants <libapp.so> OFFSET` prints the one const list at that pool offset, the
   `@0xb9b0` a body prints in `const[47] @0xb9b0{...}`, with or without the `@`, in text
   and in `-j`. Following one label used to cost the whole listing: 173,012 bytes on

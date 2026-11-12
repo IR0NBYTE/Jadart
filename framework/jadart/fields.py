@@ -50,6 +50,8 @@ import bisect
 import re
 from dataclasses import dataclass, field as _dcfield
 
+from .keep import kept
+
 #: Field::StaticBit, object.h:4938-4940. `ConstBit` is bit 0 with no explicit position and
 #: `StaticBit = ConstBit::kNextBit`, so bit 1. Not trusted on faith: every field this bit
 #: calls an instance field has to place inside its owner's instance geometry, and the whole
@@ -2065,3 +2067,18 @@ def cast_extends(c: CastClass, o: CastClass) -> bool:
     """True when class `c` extends class `o`: every class extending c extends o, c's own
     id among them."""
     return c.subclasses <= o.subclasses
+
+
+@kept
+def lift_tables(image, fr, accessors: bool) -> tuple:
+    """(layout, allocs, casts): the three tables tier 3 reads beside the selectors.
+
+    `accessors` folds the implicit accessors' names into the field layout before the
+    other two are built over it, which is what `lift` and `ffi` have always done and
+    `decompile` has not. The two are kept apart, in a `jadart serve` session as well,
+    so neither command's output moves (keep.py)."""
+    layout = recover_fields(fr, getattr(image, "arch", None))
+    if accessors:
+        layout.add_accessor_names(recover_accessors(image, fr, layout))
+    allocs = recover_allocations(image, fr, layout)
+    return layout, allocs, recover_casts(image, fr, layout)

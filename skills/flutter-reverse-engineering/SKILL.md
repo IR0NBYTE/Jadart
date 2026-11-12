@@ -164,6 +164,7 @@ will bury the answer along with your context budget.
 | Where is this function in IDA, Ghidra or radare2? | `jadart symbols <path> -f <name>` |
 | Name every function inside one of those | `jadart symbols <path> --format r2\|ghidra\|ida` |
 | Watch a function at run time | `jadart hook <path> <Class.method>` |
+| Many calls on one binary | `jadart serve <path> --socket <s> &`, then `--server <s>` |
 
 `symbols` gives the real virtual address, file offset and size of every code range, and
 `--format` writes a script that names them inside the tool. Addresses are relative to
@@ -301,6 +302,41 @@ You are working with a large binary and a limited context.
   one table you want.
 - When you need the whole tree, `export` it to disk and read individual files, rather than
   bringing all of it into context at once.
+
+### Many calls on one binary
+
+Every call reads the binary again before it answers. On a 26 MB app that is 0.8 to
+1.6 s per `lift`, `disasm`, `decompile` or `xrefs ... string`, 2.5 s per
+`xrefs ... function` or `functions -f NAME` and 5.5 s per `functions`, whatever you
+asked for. When you expect more than a handful of calls on one binary, start a server
+once, in the background, and name its socket on every call after that:
+
+```
+mkdir -m 700 -p ~/.jadart
+jadart serve app.apk --socket ~/.jadart/app.sock >/dev/null 2>&1 &
+jadart --server ~/.jadart/app.sock lift app.apk Vault.unlock
+jadart --server ~/.jadart/app.sock xrefs app.apk function Vault.unlock
+```
+
+The output is identical to the same command without `--server`, so everything else in
+this file applies unchanged. The first call that needs a table builds it; later calls
+take about 0.1 s. The socket must be in a directory only you can write, so not in
+`/tmp`, where another user could put their own at that path: jadart refuses a shared
+directory. Keep the path short (about 100 bytes at most).
+
+- A line `jadart: server at ... not used, <reason>; answering without it` on stderr means
+  the answer below it is still correct and was computed the slow way. Start the server
+  again if you have more calls to make.
+- One server holds one binary, and holds its tables in memory: 813 MB for that 26 MB
+  app once every kind of command has been asked. For a second binary start a second
+  server on another socket path, and expect that much again.
+- A call waits 10 s for the server, then answers the slow way with that same line. The
+  first `functions` or `xrefs ... function` builds the whole call graph, 5.5 s on that
+  app even when it names one function, and can take longer on a larger one: give that
+  call `--server-wait 60`.
+- `export` and anything with `--sigs` never use the server.
+- The server stops by itself after 30 minutes without a request. Stop it sooner with
+  `kill` when you are done, which also gives the memory back.
 
 ---
 
