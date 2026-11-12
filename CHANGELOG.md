@@ -421,6 +421,34 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A conditional whose arms meet far below it finds the join without scanning down to
+  it.** `follow` pushes a tag per arm forward in reverse postorder until a block the
+  conditional dominates carries both, so it passed every block between a branch and its
+  join, and N conditionals whose joins are N blocks on cost N * N: N checks in a row that
+  each jump to a block of their own after all of them, then N more that jump to the same
+  blocks (#342). The CLI nests 248 of those, and past that prints the function's rows as
+  they are, having scanned for 248 of them first: at 1,000, 4,000, 16,000 and 64,000 rows
+  a lift took 0.08, 0.73, 3.45 and 15.61 s of CPU, 94 to 98% of it in `follow`, 75 to 244
+  us per row where the clean fixture's functions average 51; at 245 checks, which still
+  nest, 147 us per row, 47% of it in `follow`. The join is a child of the conditional in
+  the dominator tree, and every block below one child carries that child's tags, so the
+  first child in reverse postorder that both arms reach by forward edges is the answer,
+  read off the children and their edges in alone. Once the scans of a function have
+  passed twice its blocks (`FOLLOW_SWEPT`), `follow` reads it there. The same lifts take
+  0.01, 0.03, 0.09 and 0.40 s, 6 to 10 us per row, and 81 us per row at 245 checks; with
+  the recursion limit raised, 250, 500, 1,000 and 2,000 checks took 0.15, 0.54, 2.09 and
+  8.18 s and take 0.08, 0.27, 0.98 and 3.63, what is left being the 64 MB of nested text
+  at 2,000. Counted in lines run inside `follow` per instruction, 30 and 120 checks took
+  548 and 2,171 and take 96 and 101. The answer is the same: on 4,000 random graphs, a
+  quarter with every join read off the tree and a quarter with every one scanned, each is
+  what the scan to the end of the function gives; over the 290,872 calls of it in the
+  tier 2 graphs of both fixtures and the seven app-sweep libraries the scan, the tree and
+  the change-over agree on every one; and the whole-binary tier 3 dump of all nine is
+  byte-identical to main's, as is that of both fixtures with every join read off the
+  tree. Ordinary code costs no more: three alternating tier 3 dumps of the clean fixture
+  average 24.59 s against 24.91 s on main, and the clean fixture's 11,126 calls of
+  `follow` take 47 ms where they took 51.
+
 - **`.tags` is printed only off an object pointer.** Offset 0 of a tagged pointer is
   its header word, and every access at offset 0 was spelled that way whatever the base
   held: `add x0, x0, #1; add x5, x0, x5, lsl #2; stur w1, [x5, #-1]` printed

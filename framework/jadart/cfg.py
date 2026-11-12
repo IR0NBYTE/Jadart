@@ -883,6 +883,11 @@ def strong_components(nodes, succ) -> list:
 #: CPU on main, 0.068 s with that asked of every block, and 0.054 s with this.
 FOLLOW_NEAR = 16
 
+#: How many blocks `structure`'s `follow` may scan past in one function, as a multiple of
+#: its blocks, before it reads each join off the dominator tree instead (#342). Twice,
+#: as a loop nest is built once the loops walked come to twice the blocks (#332).
+FOLLOW_SWEPT = 2
+
 
 def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
               rest: bool = False):
@@ -1061,6 +1066,44 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
             k = forward_in[n] = sum(p in rpo and rpo[p] < rpo[n] for p in preds[n])
         return k
 
+    swept = 0
+
+    def meet(cur, here, succs):
+        """`follow`'s answer read off the dominator tree, with no scan (#342).
+
+        The block the scan stops at is a child of `cur` in that tree. Say its immediate
+        dominator were another block d below `cur`: each arm's way to it goes through d,
+        forward all the way, so d carries both bits, `cur` dominates it, and it comes
+        first. And every block below one child carries that child's bits and no other:
+        a forward way from an arm to it passes the child, and the depth-first walk the
+        order comes from goes down from the child to it by forward edges alone. So the
+        tags of the children are enough. Each is the bit of the arm it is, and the tags
+        of the children its forward edges in come from below, found by where the
+        source's number falls among the children's. They are taken in reverse postorder,
+        as the scan takes them, and the first with both is the answer.
+
+        A child is asked once, by its one parent, and an edge once, so every call of a
+        function together costs its blocks and edges, however far the joins are."""
+        pre, kids = num[0], num[2].get(cur)
+        if not kids:
+            return None
+        mine = {s: 1 << bit for bit, s in enumerate(succs)
+                if rpo.get(s, -1) > here and idom.get(s) == cur}
+        if len(mine) < 2:
+            return None
+        lo, hi = pre[cur], num[1][cur]
+        firsts = sorted(map(pre.__getitem__, kids))
+        tags = {}
+        for c in sorted(kids, key=rpo.__getitem__):
+            t, at = mine.get(c, 0), rpo[c]
+            for p in preds[c]:
+                if lo < pre.get(p, -1) < hi and rpo[p] < at:
+                    t |= tags[firsts[bisect.bisect_right(firsts, pre[p]) - 1]]
+            if t == 3:
+                return c
+            tags[pre[c]] = t
+        return None
+
     def follow(cur):
         """Where the two arms of `cur` come back together, when the post-dominator says
         nothing. Cifuentes 1994 ch.6 calls this the follow node.
@@ -1117,7 +1160,19 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
         # One block is taken off `ready` per tagged block the scan visits, first in
         # first out, so an arm that does run on is walked no faster than the scan, which
         # stops no later than it did.
+        #
+        # The scan still passes every block between `cur` and a join far below it, so N
+        # conditionals whose joins are N blocks on cost N * N (#342). `swept` counts the
+        # blocks the scans of this function have passed, and past FOLLOW_SWEPT times its
+        # blocks the answer comes from `meet`, which passes none. Until then a call
+        # pays one addition for it.
+        nonlocal swept
         here = rpo[cur]
+        if num is not None and swept > FOLLOW_SWEPT * len(by_rpo):
+            m = meet(cur, here, succs)
+            if m is not None:
+                follow_memo[cur] = m
+            return m
         near = here + FOLLOW_NEAR
         pre = num[0] if num is not None else None
         lo, hi = (pre[cur], num[1][cur]) if pre is not None and cur in pre else (0, 0)
@@ -1152,10 +1207,12 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
                         n = m
                         break
                 else:
+                    swept += i - here
                     return None
                 t = tag[n]
                 if t == 3 and dominates(cur, n):
                     follow_memo[cur] = n
+                    swept += i - here
                     return n
             t, rn = tag[n], rpo[n]
             live[0] -= t & 1
@@ -1177,6 +1234,7 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
                 if rs > near and tag[s] < 3 and seen[s] == (forward_in.get(s)
                                                              or edges_in(s)):
                     ready.append(s)
+        swept += i - here
         return None
 
     def merge_point(cur, ctx):
