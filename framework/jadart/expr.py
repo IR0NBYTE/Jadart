@@ -30,6 +30,7 @@ x22=NULL (true=+0x20, false=+0x30), x21=DISPATCH_TABLE.
 from __future__ import annotations
 
 import bisect
+import collections
 import contextlib
 import heapq
 import re
@@ -3292,7 +3293,7 @@ _REG_ONLY = re.compile(r"[xd](?:3[01]|[12]\d|\d)\Z")
 _ANY_REG = re.compile(r"\b[xwdsqhbv](?:3[01]|[12]\d|\d)\b")
 
 
-def _fold_frame_offsets(blocks) -> None:
+def _fold_frame_offsets(blocks, entry=None, raw=None) -> None:
     """Write a frame offset held in a register into the access, in place.
 
     A frame slot past the 9-bit displacement is reached as `mov x17, #-0x158; str d0,
@@ -3314,6 +3315,165 @@ def _fold_frame_offsets(blocks) -> None:
             val = _imm(ops[1]) if len(ops) == 2 and ops[0].strip()[:1] == "x" else None
             prev = None if val is None else (
                 canon(ops[0]), val - (1 << 64 if val >= 1 << 63 else 0))
+    _fold_held_frame_addresses(blocks, frame, entry, raw or {})
+
+
+_MEM_PLAIN_RE = re.compile(r"\[(\w+)(?:, #(-?(?:0x[0-9a-f]+|\d+)))?\]\Z")
+
+
+def _held_step(const, held, k, insn, frame, out=None, raw=None):
+    """One instruction of `_fold_held_frame_addresses`: what it leaves in `const` (a
+    register's constant) and `held` (a register's frame register and offset), and, where
+    `out` is given, the instruction rewritten into it at index `k`. A row
+    strip_boilerplate blanked is read as it was (`raw`) for what it writes: a `nop` that
+    was `sub x15, x15, #0x20` or `mov x29, x15` still moves the frame register."""
+    a, mn, op, note = insn
+    if raw and a in raw:
+        rmn, rop = raw[a]
+        rdefs = set(_def_use(rmn, rop)[0])
+        if rmn in _LOADS or rmn in _STORES:
+            rdefs.add(_writeback_base(_split_ops(rop)))
+        if rmn in _CALLS or rdefs & frame:
+            const.clear()
+            held.clear()
+        for r in rdefs:
+            const.pop(r, None)
+            held.pop(r, None)
+    ops = _split_ops(op)
+    if out is not None and (mn in _LOADS or mn in _STORES) and held and ops:
+        m = _MEM_PLAIN_RE.match(ops[-1].strip())
+        if m and canon(m.group(1)) in held:
+            fr, off = held[canon(m.group(1))]
+            at = off + (_imm(m.group(2)) if m.group(2) else 0)
+            regs = ", ".join(o.strip() for o in ops[:-1])
+            out[k] = (a, mn, f"{regs}, [{fr}, #{at:#x}]" if at
+                      else f"{regs}, [{fr}]", note)
+    if mn in _CALLS:
+        const.clear()
+        held.clear()
+        return
+    defs = set(_def_use(mn, op)[0])
+    if mn in _LOADS or mn in _STORES:
+        defs.add(_writeback_base(ops))
+    was, was_held = dict(const), dict(held)           # what the operands read
+    if defs & frame:
+        held.clear()
+    for r in defs:
+        const.pop(r, None)
+        held.pop(r, None)
+    if len(ops) < 2 or ops[0].strip()[:1] != "x" or canon(ops[0]) in frame:
+        return
+    d = canon(ops[0])
+    if mn in ("mov", "movz", "movk") and len(ops) in (2, 3):
+        v = _imm(ops[1])
+        if len(ops) == 3 and "lsl" not in ops[2]:
+            return
+        sh = _imm(ops[2].split("lsl")[-1]) if len(ops) == 3 else 0
+        if v is None or sh is None:
+            return
+        if mn == "movk":
+            if d in was:
+                v = (was[d] & ~(0xffff << sh) & ((1 << 64) - 1)) | ((v & 0xffff) << sh)
+                const[d] = v - (1 << 64) if v >= 1 << 63 else v
+            return
+        v = v - (1 << 64) if v >= 1 << 63 else v
+        const[d] = (v << sh) if mn == "movz" else v
+        return
+    if mn not in ("add", "sub") or len(ops) not in (3, 4):
+        return
+    a_, b_ = canon(ops[1]), canon(ops[2])
+    sh = 0
+    if len(ops) == 4:
+        t = ops[3].strip()
+        sh = _imm(t.split("lsl")[-1]) if t.startswith("lsl") else None
+        if sh is None:
+            return
+    if ops[2].strip().startswith("#"):
+        v = _imm(ops[2])
+        if v is None or a_ not in was_held or (sh and sh != 12):
+            return
+        fr, off = was_held[a_]
+        held[d] = (fr, off + (v << sh if mn == "add" else -(v << sh)))
+        return
+    if ops[1].strip()[:1] not in ("x", "s") or ops[2].strip()[:1] not in ("x", "s"):
+        return
+    if a_ in frame and b_ in was:
+        at, fr = was[b_] << sh, a_
+    elif mn == "add" and b_ in frame and a_ in was and not sh:
+        at, fr = was[a_], b_
+    else:
+        return
+    at = at if mn == "add" else -at
+    at = (at + (1 << 63)) % (1 << 64) - (1 << 63)
+    held[d] = (fr, at)
+    if out is not None:
+        rw = "add" if at >= 0 else "sub"
+        out[k] = (a, rw, f"{ops[0].strip()}, {fr}, #{abs(at):#x}", note)
+
+
+def _fold_held_frame_addresses(blocks, frame, entry=None, raw=None) -> None:
+    """Read SP or FP plus a constant held in a register as the frame slot it is (#328).
+
+    A slot past the displacement is also reached by building the address, `mov x17,
+    #0x238; add x17, x17, x15; str x1, [x17]`. `_step_rest` took the `add` for an element
+    address with the constant as its base and SP as its index, so the store printed
+    `0x238[SP] = x1;`, and a load of `[x15, #0x238]` was never told the slot had been
+    written. The `add` is now `add x17, x15, #0x238` and each plain access through x17
+    after it, `[x17]` or `[x17, #8]`, is `[x15, #0x238]` or `[x15, #0x240]`: the one text
+    every analysis over the slots reads (_frame_plan, _rekeyed, _frame_moved,
+    _writes_outgoing). The constant is a `mov`, a `movz` or a `movk`, in either operand
+    order, scaled by `lsl`, or taken off the frame register with `sub`.
+
+    Held along every path to the access and no further: a block starts with what all its
+    predecessors leave, a call or a write of the register empties it, and a write of the
+    frame register it was taken off, as SP or FP may have moved, does too, read off the
+    row as it was where strip_boilerplate blanked it (`raw`); x16 and x17 are scratch
+    registers a callee may change. An access with a write-back keeps its text."""
+    if not any(mn in ("add", "sub") and "#" not in op and any(
+            r in op for r in ("x15", "x29", "sp"))
+            for blk in blocks.values() for (_a, mn, op, _n) in blk.insns):
+        return
+    preds = {b: [] for b in blocks}
+    for b, blk in blocks.items():
+        for t in blk.succ:
+            if t in preds:
+                preds[t].append(b)
+    into = {}                       # block -> (const, held) at its start; absent = unseen
+    done = {}                       # block -> (const, held) at its end
+    work = collections.deque(blocks)
+    queued = set(work)
+    while work:
+        b = work.popleft()
+        queued.discard(b)
+        seen = [done[p] for p in preds[b] if p in done]
+        if b == entry or not preds[b]:
+            seen.append(({}, {}))           # the function's own start holds nothing
+        if not seen:
+            continue                        # nothing has reached it yet
+        c = {r: v for r, v in seen[0][0].items() if all(o[0].get(r) == v for o in seen)}
+        h = {r: v for r, v in seen[0][1].items() if all(o[1].get(r) == v for o in seen)}
+        if into.get(b) == (c, h):
+            continue
+        into[b] = (c, h)
+        c, h = dict(c), dict(h)
+        for k, insn in enumerate(blocks[b].insns):
+            _held_step(c, h, k, insn, frame, raw=raw)
+        if done.get(b) != (c, h):
+            done[b] = (c, h)
+            for t in blocks[b].succ:
+                if t in blocks and t not in queued:
+                    queued.add(t)
+                    work.append(t)
+    for b, (c, h) in into.items():
+        if not (c or h) and not any(mn in ("add", "sub") for (_a, mn, _o, _n)
+                                    in blocks[b].insns):
+            continue
+        c, h = dict(c), dict(h)
+        out = {}
+        for k, insn in enumerate(blocks[b].insns):
+            _held_step(c, h, k, insn, frame, out, raw)
+        for k, insn in out.items():
+            blocks[b].insns[k] = insn
 
 
 #: The stub kinds that never return; see Lifter._loop_rewrites.
@@ -6245,6 +6405,16 @@ class Lifter:
             # of the thread holds one as x26 does (`_byte_off`, #273), read before `dst`,
             # which can be the base, is written, and so does LR where it holds a return
             # address and nowhere else (#280).
+            # A constant is not an address to take an element of (#328). Where the base
+            # holds a number and the other register does not, and no shift scales it, the
+            # sum is the same either way round, so it is recorded the way `add xD, xN,
+            # xM` with the number in xM already was: element 0x238 of x3, not element x3
+            # of 0x238. A shifted index off a number, or two numbers, is no element
+            # address at all: the sum is the value and nothing is recorded.
+            numeric = _imm(g(b).text) is not None
+            swap = numeric and len(ops) < 4 and _imm(g(c).text) is None
+            if swap:
+                b = canon(c)
             untagged = self._untagged(b, g(b))
             # The 4th field is what `_elem_access` reads the displacement against: None
             # off an untagged base, where there is no header and an element is at 0,
@@ -6259,7 +6429,7 @@ class Lifter:
             # The base and index are read before `dst` is written, since it can be either
             # of them: `add x3, x3, x4, lsl #3` read x3 back as the address it had just
             # made and printed `(x3 + (x4 << 3))[x4]` for element x4 of x3 (#314).
-            base_v, idx_v = g(b), g(c)
+            base_v, idx_v = (g(canon(c)), g(canon(raw_b))) if swap else (g(b), g(c))
             # A right shift scales by no power of two, so the index is the shifted value
             # itself, one byte a step: `add x2, x3, x4, asr #1` printed `x3[x4]`, the
             # element `lsl #0` names (#315). The VM shifts right by one only to untag a
@@ -6276,7 +6446,8 @@ class Lifter:
                     val = _bin(_smi_word(idx_v), _SHIFT_SYM[sh], _num(amt), P_SHIFT)
                 idx_v, scale = val, 0
             st.set(dst, _bin(g(raw_b), "+", val, P_ADD))
-            st.elem[dst] = (base_v, idx_v, scale, offs)
+            if not numeric or swap:
+                st.elem[dst] = (base_v, idx_v, scale, offs)
             return []
         if mn == "sub" and len(ops) >= 3:
             b = g(ops[1])
@@ -9737,8 +9908,8 @@ def tier3_graph(ann, cut_end=None, mono=None):
                               ends=_path_ends(stripped))
     if not blocks:
         return None
-    _fold_frame_offsets(blocks)
     raw = {t[0]: t[1:3] for t, s in zip(ann, stripped) if s[1:3] != t[1:3]}
+    _fold_frame_offsets(blocks, entry, raw)
     # Every block, as tier 2 places them (#67): what no edge reaches goes after the body,
     # each section under a note. Placing only what the entry reaches dropped the body
     # behind a monomorphic entry and the catch entries after a `ret` or a `b` without a
