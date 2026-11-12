@@ -9,7 +9,22 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
-## Unreleased
+## 1.4.0 - 2026-11-12
+
+Upgrading from 1.3.0. The commands and their options are the same. A few things a script
+may hold on to are different:
+
+- Tier 3 bodies name more values, so temporaries such as `t3` are numbered differently in
+  a few thousand functions. Match on what a line does, not on the number.
+- The first line of a function lists the arguments its body reads, `name(a1) {` where it
+  was `name() {`.
+- A 32 bit result prints `.toUnsigned(32)`.
+- `jadart.decompile()` and the JSON of `lift` gain `params`. `jadart.header()` has no
+  `vm` entry on a Dart 3.13 library, which holds one snapshot.
+- A header that declares a snapshot kind other than kFullAOT, and a symbol shorter than
+  the image it holds, are refused where they used to be read.
+- `info --lenient` prints `?1` to `?3` for a snapshot kind it cannot be sure of, where it
+  used to print a name.
 
 ### Added
 
