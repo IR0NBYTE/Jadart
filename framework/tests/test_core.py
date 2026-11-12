@@ -20715,6 +20715,44 @@ def test_a_read_through_x29_past_a_write_that_is_not_the_frame_reads_its_value()
         "return (x0 - 8).field_0x1;"]
 
 
+def test_x29_and_x30_read_as_their_role_again_where_the_frame_chain_gives_it_back():
+    """`ldr x29, [x0, #8]; mov x29, x15; mov x0, x29` printed `return x0.field_0x9;`: the
+    move is the frame chain, which strip_boilerplate blanks, so the role came back (#307)
+    and no row wrote x29 in the lifted state, which kept the loaded value. The machine
+    returns SP. A frame-chain row that gives the role back puts x29 back as FP: as a
+    value, as a base, and at a join one way into which lost it; and x30 the same where
+    the epilogue's pair pop puts the return address back (#331)."""
+    from jadart.expr import lift_function
+
+    def lift(rows):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
+    lose = ("ldr", "x29, [x0, #8]")
+    for back in ([("mov", "x29, x15")], [("add", "x29, x15, #0")],
+                 [("ldp", "x29, x30, [x15], #0x10")],
+                 [("mov", "x15, x29"), ("ldr", "x29, [x15], #8")]):  # its load is its own
+        want = lift([*back, ("mov", "x0, x29"), ("ret", "")])
+        assert lift([lose, *back, ("mov", "x0, x29"), ("ret", "")]) == want, back
+        want = lift([*back, ("ldur", "x0, [x29, #-8]"), ("ret", "")])
+        assert lift([lose, *back, ("ldur", "x0, [x29, #-8]"), ("ret", "")]) == want, back
+    assert lift([lose, ("mov", "x29, x15"), ("mov", "x0, x29"), ("ret", "")]) == [
+        "return FP;"]
+    # A move that is not the chain keeps the value, as #307 prints it.
+    assert lift([lose, ("mov", "x29, x1"), ("mov", "x0, x29"), ("ret", "")]) == [
+        "return x1;"]
+    # At a join: the way that lost it and got it back, and the one that never lost it.
+    assert lift([("cbz", "x2, #0x10"), lose, ("nop", ""), ("mov", "x29, x15"),
+                 ("mov", "x0, x29"), ("ret", "")]) == ["return FP;"]
+    # And the way that lost it and did not is still a register where they meet.
+    assert lift([("cbz", "x2, #0xc"), lose, ("mov", "x0, x29"), ("ret", "")]) == [
+        "return x0;"]
+    # LR: the pair's pop puts the return address back.
+    assert lift([("ldr", "x30, [x0, #8]"), ("ldp", "x29, x30, [x15], #0x10"),
+                 ("mov", "x0, x30"), ("ret", "")]) == ["return LR;"]
+    assert lift([("ldr", "x30, [x0, #8]"), ("mov", "x0, x30"), ("ret", "")]) == [
+        "return x0.field_0x9;"]
+
+
 def test_an_element_access_off_the_data_offset_prints_the_address_it_reads():
     """An element address, `add x2, x3, x4, lsl #3`, is read at the data offset less the
     tag, and only that access is element x4. Tier 3 dropped every displacement, so

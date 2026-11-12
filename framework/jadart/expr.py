@@ -1033,6 +1033,18 @@ class State:
             return self.reg[reg]
         return V(ROLE.get(reg, reg), P_ATOM)
 
+    def restore(self, reg: str):
+        """`reg` holds what it held on entry again: the frame chain put it back, so it
+        reads as its role (FP, LR) and not as the last value a row wrote there (#331)."""
+        self.reg.pop(reg, None)
+        self.elem.pop(reg, None)
+        self.poolbase.pop(reg, None)
+        self._unpair(reg)
+        self._other_views(reg)
+        self._stale_lost(reg)
+        self.lost.discard(reg)
+        self.opaque.discard(reg)
+
     def forget(self, reg: str):
         """Drop what is known about `reg` WITHOUT touching `result`.
 
@@ -1269,7 +1281,17 @@ def _lr_write(mn: str, op: str, lr: str):
     return None
 
 
-def _lr_return_address(blocks, preds, entries) -> dict:
+def _lr_row(a, mn: str, op: str, lr: str, raw):
+    """`_lr_write` for the row at `a`, a blanked frame-chain pop of the pair read as it
+    was: it puts the return address the prologue pushed back in LR (#331)."""
+    if mn == "nop" and raw is not None and a in raw:
+        pmn, pop = raw[a]
+        if pmn == "ldp" and lr in _def_use(pmn, pop)[0]:
+            return True
+    return _lr_write(mn, op, lr)
+
+
+def _lr_return_address(blocks, preds, entries, raw=None) -> dict:
     """{block: whether LR holds a return address on entry to it, on every way in} (#280).
 
     LR holds the caller's return address at each of `entries`, where the function is
@@ -1289,8 +1311,8 @@ def _lr_return_address(blocks, preds, entries) -> dict:
     last = {}
     for b, blk in blocks.items():
         got = None
-        for (_a, mn, op, _n) in blk.insns:
-            w = _lr_write(mn, op, lr)
+        for (a, mn, op, _n) in blk.insns:
+            w = _lr_row(a, mn, op, lr, raw)
             if w is not None:
                 got = w
         last[b] = got
@@ -5122,12 +5144,12 @@ class Lifter:
         if rows is None:
             if self._lr_in is None:
                 self._lr_in = _lr_return_address(self.blocks, self._preds,
-                                                  (self.entry, *self.roots))
+                                                  (self.entry, *self.roots), self.raw)
             lr, cur, rows = _lr(), self._lr_in.get(self._last_block, False), []
             # Once per block, so a block of N reads through LR costs N and not N squared.
-            for (_a, mn, op, _n) in self._insns:
+            for (a, mn, op, _n) in self._insns:
                 rows.append(cur)
-                w = _lr_write(mn, op, lr)
+                w = _lr_row(a, mn, op, lr, self.raw)
                 if w is not None:
                     cur = w
             self._lr_at[self._last_block] = rows
@@ -5518,9 +5540,37 @@ class Lifter:
         # untruncated; the result is then truncated again here. The mask lands at the end
         # of a chain of 32-bit operations rather than on every step of it, which is where
         # a type-carrying decompiler puts its cast too (#235).
+        self._here = addr
+        gave = self._chain_gives(addr, mn, op)
+        out = self._step_row(st, addr, mn, op, note)
+        for r in gave:
+            st.restore(r)
+        return out
+
+    def _chain_gives(self, addr, mn: str, op: str) -> tuple:
+        """The registers the frame chain row being stepped gives back their role: FP
+        where it is a write of the chain (`_fp_write` False) past one that was not, and
+        LR where the pop is of the pair, and the register holds a value some row put
+        there. The row is blanked or spelled off SP, so the register map still holds
+        what the other write put there and would read it as the frame (#331)."""
+        if mn != "nop" and "29" not in op and "30" not in op:
+            return ()
+        raw = self.raw.get(addr) if mn == "nop" else None
+        if mn == "nop" and raw is None:
+            return ()
+        out = []
+        # An FFI frame's pop is a load the walk steps, and x29 holds what it loads.
+        if self._fp_lost() and not (mn in _LOADS):
+            prev = self._insns[self._at - 1] if self._at else None
+            if _fp_write(addr, mn, op, self.raw, prev) is False:
+                out.append(_frame_regs()[1])
+        if raw is not None and raw[0] == "ldp" and _lr() in _def_use(*raw)[0]:
+            out.append(_lr())
+        return tuple(out)
+
+    def _step_row(self, st: State, addr, mn, op, note) -> list:
         ops = _split_ops(op)
         g = lambda r: self._leaf(r, st)
-        self._here = addr
 
         # A trap renders nothing, like a nop: the machine never runs past brk, hlt, udf,
         # bkpt or trap, so none leaves text. Only brk and hlt were named here, so udf and
