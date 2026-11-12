@@ -128,15 +128,40 @@ Off the thread there is no tag bias and no header: `add x0, x26, #1; ldur x3, [x
 reads `THR.field_0x0`. An inline allocation is the one sum that is an object pointer, and
 the rows have to prove it: top loaded from a field of the thread, bumped, stored back to
 that same field on every way in, then tagged, after which `(t0 + 1).tags = 0x5e09c;` is
-the new object's header store. An address written off `FP` is in the
-coordinates of the frame the function
-was ENTERED with, whatever FP and SP do inside it, so one address has one spelling. Past a
-row that puts anything but the frame pointer in x29, a load into it or a move from another
-register, an access through x29 is spelled off the value it holds, as through any other
-register, and claims no slot. A read
-still written off `SP` is one whose place in that frame the analysis could not fix: `SP`
-there means SP at that line, and two such reads of different addresses can print the same
-text. The name is what carries the value; the text says where it came from.
+the new object's header store.
+
+`SP` and `FP` in a text are the frame registers at the line the text is printed on. `SP`
+is x15 at that line. `FP` is the frame pointer of the frame in force at that line, where
+x29 was when that frame began: a function's frame begins at its prologue and ends at its
+epilogue's restore, and a move of x29 by an amount the frame analysis does not follow
+begins another. Inside a frame one address has one spelling. An FFI call gives the C
+call a frame of its own, `str x29, [x15, #-8]!; mov x29, x15` to `ldr x29, [x15], #8`,
+and what is read or built through x29 there is written off the FP of the function's
+frame: under 0x40 bytes of locals that frame is 72 bytes down, so `ldr x0, [x29, #8]`
+reads `(FP - 64).field_0x1` and `add x0, x29, #8` is `FP - 64`.
+
+A value is printed only on lines where its text is right, so one that names a frame
+register does not cross a move of that register as it stands. Where the value is the
+register plus a constant and the row says how far the register moves, the constant
+takes the move: `add x0, x15, #0x238; sub x15, x15, #0x20; ret` prints
+`return SP + 0x258;`, and a push, a pop and a pair with write-back move it the same way.
+Any other value is declared under a name on the line before the move, where its text
+is still right, and read by the name after: `var t0 = SP + (x2 << 3);` before a push,
+`var t0 = SP + 0x238;` before `and x15, x15, #0xfffffffffffffff0`, which does not say
+how far SP goes, and `var t0 = FP + 8;` before a row that begins or ends a frame. A
+slot holds such a value by name, and a loop that moves the register names it before
+the loop. Where two ways into a join moved the register apart and no name was written,
+the register is printed bare. x15 itself is `SP` on every line and is never carried
+through a join as a variable, but for one case: a row printed raw that writes it, `mrs
+x15, nzcv`, leaves `x15`, and a value spelled with that is named before the next move
+as one spelled with `SP` is.
+
+Past a row that puts anything but the frame pointer in x29, a load into it or a move
+from another register, an access through x29 is spelled off the value it holds, as
+through any other register, and claims no slot. A read still written off `SP` is one
+whose place in the frame the analysis could not fix: it is declared on the line of the
+load, where `SP` is SP at that line, and two such reads of different addresses can print
+the same text. The name is what carries the value; the text says where it came from.
 
 Two things sit outside the tier ladder and matter a lot in practice.
 

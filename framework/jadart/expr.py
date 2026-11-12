@@ -782,6 +782,61 @@ def _role_address(v: V) -> bool:
             and any(ROLE.get(r) == v.text for r in _UNTAGGED))
 
 
+#: Role name -> a matcher for it standing as a value in a text (_names_role).
+_ROLE_RE: dict = {}
+_QUOTED_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _names_role(v: V, role: str) -> bool:
+    """Whether the text of `v` names the frame register `role`, `SP` or `FP`.
+
+    `SP` in a text is SP at the line it is printed on, and `FP` the frame pointer of the
+    frame in force there, so a value that names one says something else once that
+    register moves (#340). A name given to the value does not, and a 32-bit view prints
+    the value it narrows. Not a field or a member called the same, nor the word in a
+    string constant."""
+    text = v.text
+    if role not in text:
+        return False
+    if '"' in text:
+        text = _QUOTED_RE.sub('""', text)
+    pat = _ROLE_RE.get(role)
+    if pat is None:
+        pat = _ROLE_RE[role] = re.compile(rf"(?<![\w$.]){role}(?![\w$@])")
+    return pat.search(text) is not None
+
+
+def _names_frame(v: V, role: str) -> bool:
+    """`_names_role`, or the register of `role` by its machine name: one the step forgot
+    is printed bare, and a text spelled with that says something else past a move of
+    the register as surely as one spelled with the role (#340)."""
+    text, reg = v.text, _frame_regs()[role == "FP"]
+    if role not in text and reg not in text:
+        return False
+    return _names_role(v, role) or _names_role(v, reg)
+
+
+def _role_sum(v: V, role: str):
+    """`(base, k, untagged, row)` where `v` is the frame register `role` plus a constant
+    by its own record, `V.at` off the register's address or that address itself; None
+    for any other value, whatever its text."""
+    if v.smi or v.wide is not None:
+        return None
+    if v.at is None:
+        return (v, 0, False, None) if _role_address(v) and v.text == role else None
+    base = v.at[0]
+    return v.at if _role_address(base) and base.text == role else None
+
+
+def _off_role(base: V, k: int, untagged: bool, row) -> V:
+    """The value `base + k` with its record, as `Lifter._offset` leaves one."""
+    if k == 0:
+        return replace(base, at=None if row is None else (base, 0, untagged, row))
+    total = (_bin(base, "+", _num(k), P_ADD) if k > 0
+             else _bin(base, "-", _num(-k), P_ADD))
+    return replace(total, at=(base, k, untagged, row))
+
+
 def _smi_word(v: V) -> V:
     """The machine word of a register holding `v`: `v` itself, or for a tagged value the
     Smi it is, shifted up one."""
@@ -3093,6 +3148,12 @@ def _frame_slots(mn: str, op: str):
     return base, [(f"{base}{at + i * width:+d}", width) for i in range(n)]
 
 
+def _frame_roles(regs) -> tuple:
+    """The frame roles, `SP` and `FP`, whose registers are among `regs`."""
+    sp, fp = _frame_regs()
+    return (("SP",) if sp in regs else ()) + (("FP",) if fp in regs else ())
+
+
 def _frame_regs() -> tuple:
     """(SP, FP) on the current target, by machine name."""
     got = _FRAME_REGS.get(id(_T))
@@ -3218,14 +3279,18 @@ def _save_wrapped_calls(rows) -> set:
     return out
 
 
-def _frame_moves(blocks, raw) -> dict:
+def _frame_moves(blocks, raw, wrote=None) -> dict:
     """{address: (whether FP moves, how far SP moves)} for each instruction that moves
     a frame register where `_step` does not see it move (#165). `_step` follows the
     write-back of a load or store through SP or FP and nothing else. strip_boilerplate
     blanks every `mov x29, x15` and every `add` or `sub` of SP, not only the prologue's,
     and `raw` (address -> mnemonic and operands) gives them back. An FFI call's frame
     ends with `ldr x29, [x15], #8` and aligns SP with `and`, which `_step` reads as a
-    register like any other. How far SP moves is None where it is not known."""
+    register like any other. How far SP moves is None where it is not known.
+
+    `wrote`, a dict, is given every row that writes SP or FP, seen by `_step` or not,
+    as (whether it writes FP, how far it moves SP): the rows a value naming one has to
+    be looked at before (`Lifter._frame_shift`), a visible write-back among them."""
     sp, fp = _frame_regs()
     out = {}
     for blk in blocks.values():
@@ -3242,10 +3307,13 @@ def _frame_moves(blocks, raw) -> dict:
                 if regs:
                     out[a] = (mn == "pop" and fp in regs,
                               _T.word * len(regs) * (1 if mn == "pop" else -1))
+                if wrote is not None:
+                    wrote[a] = out.get(a, (False, None))
                 continue
             moved = _def_use(mn, op)[0] & {sp, fp}
             if not moved:
                 continue
+            wrote_fp, wrote_sp = fp in moved, sp in moved
             ops = _split_ops(op)
             delta = None
             got = _addr(ops) if any(o.lstrip().startswith("[") for o in ops) else None
@@ -3261,6 +3329,8 @@ def _frame_moves(blocks, raw) -> dict:
                                                             canon(ops[1])} == {sp}:
                 imm = _imm(ops[2])
                 delta = None if imm is None else imm if mn == "add" else -imm
+            if wrote is not None:
+                wrote[a] = (wrote_fp, delta if wrote_sp else 0)
             if moved:
                 out[a] = (fp in moved, (delta if sp in moved else 0))
     return out
@@ -3587,7 +3657,8 @@ def _frame_plan(blocks, entry, raw, lost=frozenset()):
     at one of `lost`, the rows where FP may hold something other than the frame pointer
     (`_fp_lost_at`), rewritten or counted: it is off the value FP holds there (#307)."""
     sp, fp = _frame_regs()
-    moves = _frame_moves(blocks, raw)
+    wrote = {}
+    moves = _frame_moves(blocks, raw, wrote)
     inner, pushes = 0, False    # FP moves but an epilogue's restore before a return
     for blk in blocks.values():
         insns = blk.insns
@@ -3607,15 +3678,17 @@ def _frame_plan(blocks, entry, raw, lost=frozenset()):
                 elif got[0][0] == sp and mn in _STORES:
                     pushes = True
     if inner < 2 and not pushes:
-        return frozenset(), moves, frozenset(), {}, {}
+        return frozenset(), moves, frozenset(), {}, {}, None, wrote
     passed = _frame_pass(blocks, entry, raw)
     into, _steps, _fixed, clash = passed
-    cross, spat = {}, {}
+    cross, spat, fpat = {}, {}, {}
     for b, blk in blocks.items():
         d = into[b]
         for k, t in enumerate(blk.insns):
             mn, op = raw.get(t[0], t[1:3]) if t[1] == "nop" else t[1:3]
             where = d[3]
+            if d[4] and t[1] != "nop":
+                fpat[t[0]] = d[4]       # where a row that reads FP finds it (#340)
             # Not where FP may hold something other than the frame pointer: the access
             # is off the value there, and keeps its operands and its write-back (#307).
             if t[1] != "nop" and t[0] not in lost and (mn in _STORES or mn in _LOADS):
@@ -3647,7 +3720,8 @@ def _frame_plan(blocks, entry, raw, lost=frozenset()):
         if blocks[b].insns:
             a = blocks[b].insns[0][0]
             moves[a] = (True, moves.get(a, (False, 0))[1])
-    return _frame_meets(blocks, entry, raw, passed), moves, clash, cross, spat
+    return (_frame_meets(blocks, entry, raw, passed), moves, clash, cross, spat, fpat,
+            wrote)
 
 
 def _rekeyed(mn: str, op: str, f: int):
@@ -4167,6 +4241,19 @@ class Lifter:
         #: address -> where SP sits there against the frame the function was entered
         #: with, exact only (None where unknown or merely bounded by an alignment) (#207).
         self.sp_at: dict = {}
+        #: address -> how far FP is from where its frame started, where that is not 0;
+        #: None where `_frame_plan` did not follow FP through the function (#340).
+        self.fp_at = None
+        #: (join, whether as a loop's entry) -> the frame roles moved on a way into it
+        #: (_join_kill).
+        self._killroles: dict = {}
+        #: The rows that write a frame register or are one of `frame_moves`, each with
+        #: (whether it writes FP, how far it moves SP, None for not known): a value
+        #: naming the register is seen to before each (`_frame_shift`).
+        self.shift_rows: dict = {}
+        #: FP's machine name where `fp_at` is kept, for `_leaf`.
+        self._fp_leaf = None
+        self._sp_reg, self._fp_reg = _frame_regs()
         #: The instructions strip_boilerplate changed, as they were (_lift_function).
         self.raw: dict = {}
         self._trips: dict = {}
@@ -4942,7 +5029,11 @@ class Lifter:
             st.note_slot(key, v)
             return []
         st.lost_slot.pop(key, None)
-        if (at, key) not in self._slot_crossings() or not self._reads_mem(v.text):
+        # A value that names SP is given a name where it is spilled: the slot outlives
+        # the next move of SP, and the text would then read as SP there (#340).
+        off_sp = _names_frame(v, "SP")
+        if not off_sp and (
+                (at, key) not in self._slot_crossings() or not self._reads_mem(v.text)):
             st.slot[key] = v
             if fp is not None and key.startswith(fp):
                 st.note_slot(key, v)
@@ -4952,7 +5043,9 @@ class Lifter:
         if tmp is None:
             tmp, decl = self._mint(st, v.text)
             named[v.text] = tmp
-            self.slot_names.add(tmp)
+            # Not a slot name where it names SP: one is folded back into the statement
+            # after it, and SP may move between the two.
+            (self.raw_names if off_sp else self.slot_names).add(tmp)
             out.append(decl)
         if st.reg.get(reg) == v:
             st.reg[reg] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
@@ -4970,6 +5063,14 @@ class Lifter:
         if reg in self.alias and reg not in st.reg:
             return V(self.alias[reg], P_ATOM)
         v = st.get(reg)
+        if reg == self._fp_leaf:
+            # FP where an FFI or a leaf call's frame has moved it: an address off `FP`
+            # is one off where the frame started, as an access through it is, and
+            # `_frame_plan` knows how far FP is from there at this row whatever the
+            # walk holds for the register (#340). Not where FP holds another value.
+            got = _role_sum(v, "FP")
+            if got is not None:
+                v = _off_role(got[0], self.fp_at.get(self._here, 0), False, None)
         return v.wide if narrow and v.wide is not None else v
 
     def _sub(self, pc_offset: int) -> str:
@@ -5478,6 +5579,90 @@ class Lifter:
         sp, fpr = _frame_regs()
         return ({fpr} if fp else set()) | ({sp} if delta != 0 else set())
 
+    def _role_stale(self, st: State, role: str, live: int, shift=None, row=None,
+                    keep=()) -> list:
+        """Before the frame register `role` moves: every value in the register map
+        whose text names it is made right for the lines after (#340).
+
+        `SP` is SP at the line and `FP` the frame in force there, so a text naming one
+        means another address past the move. A value that is the register plus a
+        constant by its record (`_role_sum`) has the constant taken on by `shift`, how
+        far the register moves, where that is known: `add x0, x15, #0x238; sub x15, x15,
+        #0x20` holds `SP + 0x258`. Any other is given a name while its text is still
+        right, where a later line reads it (`live`, a register mask) or the moving row
+        itself does (`row`, as written), and a register nothing reads again drops to its
+        own name.
+        `live` of None names nothing: at a join the ways in moved the register apart,
+        and no one text is right on all of them. A text spelled with the bare register,
+        which a row printed raw leaves, is named or dropped the same way. `keep` are
+        registers a loop carries, which it names itself. The slot map holds no such
+        value (`_name_slot`)."""
+        if self._flags is not None and any(_names_frame(v, role)
+                                           for v in self._flags[2].values()):
+            self._flags = None
+        out, reg = [], self._fp_reg if role == "FP" else self._sp_reg
+        # The two words looked for here and not in a call: this runs at every row that
+        # moves a frame register, over every register, and few of them hold either.
+        held = [(r, v) for r, v in st.reg.items() if role in v.text or reg in v.text]
+        held.sort()         # by register: no two are the same, so no V is compared
+        uses = _def_use(*row)[1] if held and row is not None else ()
+        for r, v in held:
+            if ROLE.get(r) == role or r in keep or not _names_frame(v, role):
+                continue
+            got = _role_sum(v, role) if shift is not None and r not in uses else None
+            if got is not None:
+                st.reg[r] = _off_role(got[0], got[1] - shift, got[2], got[3])
+            elif live is not None and (r in uses or live & _reg_mask((r,))):
+                tmp, decl = self._mint(st, v.text)
+                self.raw_names.add(tmp)     # one only the moving row read goes unread
+                out.append(decl)
+                st.reg[r] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                st.elem.pop(r, None)
+                st.poolbase.pop(r, None)
+            else:
+                st.forget(r)
+        if st.elem:
+            for key, (b, i, _s, _f) in list(st.elem.items()):
+                if _names_frame(b, role) or _names_frame(i, role):
+                    del st.elem[key]
+        return out
+
+    def _frame_shift(self, st: State, a, mn: str, op: str) -> list:
+        """`_role_stale` for the row at `a`, which writes a frame register or is one of
+        `frame_moves`, before it is stepped. SP moves by what a write-back through it
+        or `_frame_moves` says, not known where neither does. FP starts a frame of its
+        own where `_frame_plan` says so, or, where it did not follow FP, at any write
+        of it; a move inside its frame changes no text, as `FP` is where the frame
+        started (`_leaf`)."""
+        wrote_fp, delta = self.shift_rows[a]
+        got = self.frame_moves.get(a)
+        out = []
+        if delta != 0:
+            out = self._role_stale(st, "SP", self._live_after, delta, (mn, op))
+        if got[0] if got is not None else (
+                wrote_fp and mn != "nop" and self.fp_at is None):
+            out += self._role_stale(st, "FP", self._live_after, None, (mn, op))
+        return out
+
+    def _frame_reads(self, st: State, a, mn: str) -> None:
+        """After the row at `a` wrote a frame register: the register reads as its
+        role again. `and x15, x15, #-16` left the walk holding `SP & 0xfffffffffffffff0`
+        for x15, the SP of the row before, on every line after; SP at a line is the
+        register there, whatever wrote it. Not where the step forgot it, a row
+        printed raw or a load with a write-back into it: that stays the bare register,
+        which says no more than the row does. FP likewise where the row starts a frame
+        of its own and left it a value that names the frame before, and past a `mov
+        x29, x15` strip_boilerplate blanked, which the walk did not step (#340)."""
+        sp, fp = self._sp_reg, self._fp_reg
+        if sp in st.reg and st.reg[sp].text != sp:
+            st.restore(sp)
+        if fp not in st.reg:
+            return
+        if mn == "nop" and self.shift_rows[a][0]:
+            st.restore(fp)
+        elif self.frame_moves.get(a, (False,))[0] and _names_role(st.reg[fp], "FP"):
+            st.restore(fp)
+
     def _bump(self, st: State, base: str, delta: int) -> list:
         """The base-register update half of a writeback addressing mode.
 
@@ -5910,6 +6095,10 @@ class Lifter:
             return replace(total, calc=False, at=(base, k, untagged, None))
         if k == 0 and (not untagged or base.text == _THR):
             return replace(base, at=None if at is None else (base, 0, untagged, at))
+        if src.at is not None and _role_address(base) and base.text in ("SP", "FP"):
+            # Off a frame register the constants are printed as one, the text a move
+            # of the register leaves (`_role_stale`), so two ways in agree on it (#340).
+            return _off_role(base, k, untagged, at)
         return replace(total, at=(base, k, untagged, at))
 
     def _computed(self, reg: str, v: V) -> bool:
@@ -7576,8 +7765,10 @@ class Lifter:
                 if self._kwalked >= _KILL_WALK * len(self.blocks) else None)
         if mask is not None:
             # The same three answers, off the dominator tree and no walk (#333).
+            regs = _kill_regs(mask)
+            self._killroles[(addr, entry)] = _frame_roles(regs)
             self._killcache[(addr, entry)] = hit = (
-                _kill_regs(mask) - _SPECIAL,
+                regs - _SPECIAL,
                 bool(mask & _KILL_STACK) or self._frame_escaped(),
                 bool(mask & _KILL_HEAP))
             return hit
@@ -7614,7 +7805,9 @@ class Lifter:
         # join where every other line says `SP`. A role is a display constant, not a
         # tracked value, and 4,114 of the corpus's 5,002 writeback sites are the SP of a
         # push or a pop.
-        self._killcache[(addr, entry)] = hit = (frozenset(self._written(back)) - _SPECIAL,
+        regs = frozenset(self._written(back))
+        self._killroles[(addr, entry)] = _frame_roles(regs)
+        self._killcache[(addr, entry)] = hit = (regs - _SPECIAL,
                                        self._writes_stack(back),
                                        self._writes_heap(back))
         return hit
@@ -7978,6 +8171,9 @@ class Lifter:
         # put a dead `var tN = this.field_0x8;` in front of every compound assignment,
         # benchWithdraw's `balance -= amount` grows two of them, one for each register that
         # mentions the field. And an instruction printed raw can be anywhere (_verbatim).
+        # The rows that move a frame register, by a write of it or out of `_step`'s
+        # sight: a value whose text names it is seen to before each (`_frame_shift`).
+        shifts = self.shift_rows
         if insns:
             after, m = [0] * len(insns), self._liveout.get(addr, 0)
             more = self._printed_liveness()[0].get(addr, {})
@@ -7995,6 +8191,7 @@ class Lifter:
                             if len(self._preds.get(s, ())) > 1)
         if addr in self.frame_joins:
             _forget_frame(st)       # paths meet here from frames apart (_frame_plan)
+            self._role_stale(st, "FP", None)
         for k, (a, mn, op, note) in enumerate(insns):
             self._at = k
             self._live_after = after[k] if after is not _NO_LIVE else 0
@@ -8003,6 +8200,9 @@ class Lifter:
                 if mn == "b" and a in self.raw:
                     self._box_cut(st, a, insns)
                 break                                          # branch is structural
+            shift = a in shifts
+            if shift:
+                lines.extend(self._frame_shift(st, a, mn, op))
             # Name-first (#187): a reassignment of a register (a load's unrelated value, a
             # move, or a computed result) leaves a computed expression that still names it
             # stale. Write such a value out first, so a later read gets what it held, not
@@ -8039,8 +8239,10 @@ class Lifter:
                         continue
                     lines.extend(self._name_stale_reg(st, q, plive, mn not in _LOADS))
             lines.extend(self._step(st, a, mn, op, note))
-            if a in self.frame_moves:
-                self._moved_unseen(st, *self.frame_moves[a])
+            if shift:
+                if a in self.frame_moves:
+                    self._moved_unseen(st, *self.frame_moves[a])
+                self._frame_reads(st, a, mn)
             if st.slot_by_reg and mn not in _CALLS:
                 # A slot whose text names a register this instruction reassigns now reads
                 # the new register, not the value stored: `stur x6; mov x6, x1; ldur x3`
@@ -8544,6 +8746,10 @@ class Lifter:
                 # into every line of the body.
                 if join:
                     kill, mem, heap = self._join_kill(s[1])
+                    # A frame register a way in moved: no text naming it is right on
+                    # every one of them (#340).
+                    for role in self._killroles[(s[1], False)]:
+                        self._role_stale(st, role, None)
                     # Each register the join disagrees about and the code after it
                     # reads is one the first walk recorded for a phi; the second walk
                     # wrote a name on every edge in (above and at each goto), so the join
@@ -8668,6 +8874,8 @@ class Lifter:
                     # goto join's meet, over the ways in and not the latches, before the
                     # loop binds its names from it (#125).
                     kill, mem, heap = self._join_kill(s[1], entry=True)
+                    for role in self._killroles[(s[1], True)]:
+                        self._role_stale(st, role, None)
                     for r in sorted(kill):
                         st.forget(r)
                     if mem:
@@ -8819,6 +9027,12 @@ class Lifter:
         out = []
         for r in sorted(self._written(trip) - (_SPECIAL - {_lr()})):
             out += self._pin(st, r, live, regs=True)
+        # A frame register the loop moves: a value naming it is right before the loop
+        # and on no trip after the first, so it is named here as well (#340). Over the
+        # whole body, where a slow path may move one too.
+        moved = _frame_roles(self._written(trip) | self._written(self._back_loop(header)))
+        for role in moved:
+            out += self._role_stale(st, role, live, keep=carried)
         # A call stores wherever its callee does, which is `_writes_heap`'s own
         # over-approximation reached by the other door.
         if self._writes_heap(trip) or self._any_block(
@@ -11280,7 +11494,12 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                               if t in placed and t not in trapped)
     dispatch = detect_dispatch(stripped)
     fp_lost = _fp_lost_at(blocks, raw)
-    meets, moves, joins, cross, spat = _frame_plan(blocks, entry, raw, fp_lost)
+    meets, moves, joins, cross, spat, fpat, wrote = _frame_plan(blocks, entry, raw,
+                                                                fp_lost)
+    # Every row a value naming a frame register is looked at before: the ones that
+    # write one, and the ones `_frame_plan` starts a frame at.
+    shift_rows = {a: (False, 0) for a in moves.keys() - wrote.keys()}
+    shift_rows.update(wrote)
     save_wrapped = _save_wrapped_calls(stripped)
     cast_at = {}
     if casts is not None and casts.pool:
@@ -11303,6 +11522,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.frame_joins = joins
         lifter.frame_cross = cross
         lifter.sp_at = spat
+        lifter.fp_at = fpat
+        lifter.shift_rows = shift_rows
+        lifter._fp_leaf = None if fpat is None else lifter._fp_reg
         lifter.raw = raw
         lifter._fp_lost_set = fp_lost
         lifter.fp_moves = frozenset(a for a, (fp, _d) in moves.items() if fp)
