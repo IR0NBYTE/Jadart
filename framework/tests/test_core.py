@@ -20890,10 +20890,44 @@ def test_a_load_from_null_plus_a_bool_offset_reads_the_word_there():
     as well (#317). The table of offsets off NULL names objects only for the `add`."""
     def lift(*rows):
         return _lift_rows([*rows, ("ret", "")])
-    assert lift(("ldr", "x0, [x22, #0x20]")) == ["return NULL.field_0x20;"]
-    assert lift(("ldr", "x0, [x22, #0x30]")) == ["return NULL.field_0x30;"]
+    assert lift(("ldr", "x0, [x22, #0x20]")) == ["return NULL.field_0x21;"]
+    assert lift(("ldr", "x0, [x22, #0x30]")) == ["return NULL.field_0x31;"]
     assert lift(("add", "x0, x22, #0x20")) == ["return true;"]
     assert lift(("add", "x0, x22, #0x30")) == ["return false;"]
+
+
+def test_an_offset_off_the_null_register_carries_the_tag_bias():
+    """x22 holds null, loaded from `Thread::object_null_offset()` and so a tagged
+    ObjectPtr like any other object, but the arm64 table listed it as untagged and an
+    offset off it printed as written: `ldurb w0, [x22, #-1]`, null's header byte, read
+    `(NULL - 1).field1_0x1`, where the same load off x1 reads `x1.field1_0x0` (#330).
+    Every access off x22 is now spelled as the access off any other object, and as a copy
+    of x22 already was, while the `add` that makes true and false is unchanged."""
+    def lift(*rows):
+        return _lift_rows([*rows, ("ret", "")])
+    for rows in ([("ldurb", "w0, [{}, #-1]")], [("ldur", "x0, [{}, #-1]")],
+                 [("ldr", "x0, [{}, #0x20]")], [("ldr", "w0, [{}, #7]")],
+                 [("ldrb", "w0, [{}, #0xf]")], [("ldr", "x0, [{}, #-8]")],
+                 [("ldp", "x0, x2, [{}, #0x10]"), ("add", "x0, x0, x2")],
+                 [("str", "x2, [{}, #0xf]"), ("mov", "x0, x2")],
+                 [("stp", "x2, x3, [{}, #0x10]"), ("mov", "x0, x2")],
+                 [("add", "x3, {}, x2, lsl #3"), ("ldur", "x0, [x3, #0x17]")],
+                 [("mov", "x3, {}"), ("ldr", "x0, [x3, #0x20]")]):
+        off_x1 = lift(*[(m, o.format("x1")) for m, o in rows])
+        assert lift(*[(m, o.format("x22")) for m, o in rows]) == [
+            re.sub(r"\bx1\b", "NULL", ln) for ln in off_x1], rows
+    assert lift(("ldurb", "w0, [x22, #-1]")) == ["return NULL.field1_0x0;"]
+    assert lift(("ldur", "x0, [x22, #-1]")) == ["return NULL.tags;"]
+    # The class id out of that tags word selects a dispatch-table row as any receiver's
+    # does: the walk that follows it was keyed on the same set.
+    call = [("ldur", "x0, [{}, #-1]"), ("ubfx", "x0, x0, #0xc, #0x14"),
+            ("sub", "x30, x0, #0x30"), ("ldr", "x30, [x21, x30, lsl #3]"), ("blr", "x30")]
+    assert lift(*[(m, o.format("x1")) for m, o in call]) == ["return x1.sel_m0x30(...);"]
+    assert lift(*[(m, o.format("x22")) for m, o in call]) == [
+        "return NULL.sel_m0x30(...);"]
+    assert lift(("add", "x0, x22, #0x20")) == ["return true;"]
+    assert lift(("add", "x0, x22, #0x30")) == ["return false;"]
+    assert lift(("add", "x0, x22, #8")) == ["return NULL + 8;"]
 
 
 if __name__ == "__main__":

@@ -250,11 +250,20 @@ class Target:
 
 #: constants_arm64.h. x15 is Dart's SP (the hardware SP is used only in the prologue),
 #: x22 is NULL with the Bool singletons just above it, x21 is the dispatch table.
+#:
+#: Untagged, each from the VM's assembler_arm64.cc: SP and FP are stack addresses, THR is
+#: the Thread*, PP has the tag taken off (`sub(PP, PP, Operand(kHeapObjectTag)); // Pool
+#: in PP is untagged!`), x21 is `Thread::dispatch_table_array()`, a `const uword*`, and
+#: x28 is HEAP_BITS, mask and heap base bits, not an object (`RestorePinnedRegisters`).
+#: NOT x22: it is loaded from `Thread::object_null_offset()`, an ObjectPtr, so null is
+#: a tagged pointer like any other and a field off it carries the bias (#330). true and
+#: false are `NULL_REG + kTrueOffsetFromNull` and `+ kFalseOffsetFromNull`, offsets
+#: between two tagged pointers, which the `add` reads from `consts` and not from here.
 ARM64 = Target(
     name="arm64",
     roles={"x15": "SP", "x29": "FP", "x30": "LR", "x26": "THR", "x27": "PP",
            "x28": "HEAP", "x22": "NULL", "x21": "DISPATCH"},
-    untagged=frozenset({"x15", "x21", "x22", "x26", "x27", "x28", "x29"}),
+    untagged=frozenset({"x15", "x21", "x26", "x27", "x28", "x29"}),
     arg_regs=("x1", "x2", "x3", "x5", "x6", "x7"),
     zero="xzr",
     aliases={"wzr": "xzr", "xzr": "xzr", "wsp": "x15", "sp": "x15"},

@@ -421,6 +421,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An offset off the null register carries the tag bias.** x22 holds null, which the VM
+  loads from `Thread::object_null_offset()`: an ObjectPtr, tagged like any other object.
+  The arm64 table listed it with the untagged roles, so an offset off it printed as
+  written: `ldurb w0, [x22, #-1]`, null's header byte, read `(NULL - 1).field1_0x1`
+  where the same load off x1 reads `x1.field1_0x0`, and `ldr x0, [x22, #0x20]` read
+  `NULL.field_0x20` where a copy of x22 already read `NULL.field_0x21` (#330). x22 is
+  out of the set, so a load, a store, a pair and an element address off it are spelled
+  as off any tagged pointer: `NULL.field1_0x0`, `NULL.tags`, `NULL.field_0x21`,
+  `NULL[x2]`. `add x0, x22, #0x20` and `#0x30` still print `true` and `false`:
+  `kTrueOffsetFromNull` and `kFalseOffsetFromNull` (`pointer_tagging.h`, two and three
+  times `kObjectAlignment`, 0x20 and 0x30 on a 64-bit target) are distances between two
+  tagged pointers, and that table is not keyed on the set. aotopsy and flutterdec seed
+  x22 as the value `null` and take a field off it down the tagged path; blutter names
+  the two Bools off the `add` alone. arm32 has no null register. On the nine binaries
+  one line changes in each, nine in all, the header-byte read:
+  `(NULL - 1).field1_0x1` to `NULL.field1_0x0`.
+
 - **x29 and x30 read as the frame again where the frame chain gives it back.**
   `ldr x29, [x0, #8]; mov x29, x15; mov x0, x29; ret` printed `return x0.field_0x9;`
   and the machine returns SP; it now prints `return FP;`, as the same rows without the
