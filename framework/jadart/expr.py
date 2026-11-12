@@ -68,6 +68,7 @@ _SPLIT_CACHE_MAX = 16384
 _IMM_CACHE: dict = {}
 _MEM_CACHE: dict = {}
 _DEFUSE_CACHE: dict = {}          # mnemonic -> operand string -> (defs, uses)
+_AF_ROW_CACHE: dict = {}          # mnemonic -> operand string -> `_af_row`'s answer
 _REGSET_INTERN: dict = {}         # frozenset -> the one copy of it
 _DEFUSE_INTERN: dict = {}         # (defs, uses) -> the one copy of it
 _USE_RE: dict = {}                # register name -> a word-boundary matcher for it
@@ -627,6 +628,10 @@ def _folds_into(sym: str, rest: str) -> bool:
     return True
 
 
+#: How a frozen dataclass stores a field (`V.__init__`).
+_SETATTR = object.__setattr__
+
+
 @dataclass(frozen=True)
 class V:
     text: str
@@ -685,6 +690,31 @@ class V:
     #: Dropped where the value is given a name, since `base` is text and means what it
     #: meant only until a register in it is written.
     at: "tuple | None" = field(default=None, compare=False)
+
+    def __init__(self, text, prec=P_ATOM, wide=None, bits=64, sext=64, smi=0,
+                 calc=False, at=None):
+        # Written out, and not the one the dataclass makes, which stores every field
+        # through `object.__setattr__` whatever it holds. A lift builds about two
+        # million of these and nearly all of them are a text and a precedence, so a
+        # field left at its default is not stored: it reads off the class, where the
+        # dataclass keeps each default, and compares, hashes and prints as before.
+        # `V("x0", 0)` took 288 ns with five fields, 377 with seven, and takes 142
+        # (#346).
+        put = _SETATTR
+        put(self, "text", text)
+        put(self, "prec", prec)
+        if wide is not None:
+            put(self, "wide", wide)
+        if bits != 64:
+            put(self, "bits", bits)
+        if sext != 64:
+            put(self, "sext", sext)
+        if smi != 0:
+            put(self, "smi", smi)
+        if calc is not False:
+            put(self, "calc", calc)
+        if at is not None:
+            put(self, "at", at)
 
 
 def _wrap(v: V, ctx: int) -> str:
@@ -778,8 +808,18 @@ def _role_address(v: V) -> bool:
     """Whether `v` is an untagged role register's own address in some other register:
     `mov x0, x28` holds HEAP, which is no object pointer and has no header. The thread
     is left out, since a copy of it is read as the thread is (`Lifter._untagged`)."""
-    return (v.prec == P_ATOM and v.text != _THR
-            and any(ROLE.get(r) == v.text for r in _UNTAGGED))
+    if v.prec != P_ATOM:
+        return False
+    got = _UNTAGGED_ROLES.get(id(_T))
+    if got is None:
+        got = _UNTAGGED_ROLES[id(_T)] = (frozenset(
+            ROLE[r] for r in _UNTAGGED if r in ROLE) - {_THR}, _T)
+    return v.text in got[0]
+
+
+#: Per target, the role names `_role_address` answers yes to, made once, and the
+#: target, kept so that its id stays its own.
+_UNTAGGED_ROLES: dict = {}
 
 
 #: Role name -> a matcher for it standing as a value in a text (_names_role).
@@ -931,6 +971,28 @@ _FRAME_ROOT = re.compile(r"\(*(?:FP|SP)(?: [-+] [^.()\[\]]+)*\)*\Z")
 #: A read of the frame inside a value's text, which a store to the heap does not write:
 #: `FP.field_0x21`, `(FP - 0x340).field_0x1`, and the `FP[` of a slot at an index, whose
 #: index may itself read the heap and stays (#341).
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _spelled(texts: tuple, text: str, whole=False) -> bool:
+    """Whether `text` has one of `texts` in it with no hex digit after it, which is
+    what `(?:a|b)(?![0-9a-fA-F])` of them finds: a spelling ends in hex digits, so
+    `field_0x8` must not be found inside `field_0x80`. With `whole`, and nothing a
+    name is made of before it either, the lookbehind for a word character, `$` or
+    `@` that an element's pattern had. An empty one is found at the end of any text,
+    as the pattern finds it."""
+    n = len(text)
+    for x in texts:
+        i = text.find(x)
+        while i >= 0:
+            j = i + len(x)
+            if (j == n or text[j] not in _HEX_DIGITS) and not (
+                    whole and i and ((c := text[i - 1]) in "_$@" or c.isalnum())):
+                return True
+            i = text.find(x, i + 1)
+    return False
+
+
 _FRAME_READ = re.compile(r"\((?:FP|SP)(?: [-+] (?:0x[0-9a-fA-F]+|\d+))?\)\.field\d*_0x"
                          r"[0-9a-fA-F]+|\b(?:FP|SP)\.field\d*_0x[0-9a-fA-F]+|\b(?:FP|SP)\[")
 
@@ -1375,8 +1437,16 @@ def _mentions(names):
 
 
 def _lr() -> str:
-    """The link register's machine name on the current target."""
-    return next(r for r, v in _T.roles.items() if v == "LR")
+    """The link register's machine name on the current target. Looked up once for a
+    target, which is kept beside the answer so its id stays its own: about 700,000
+    rows of a lift ask (#346)."""
+    got = _LR_REG.get(id(_T))
+    if got is None:
+        got = _LR_REG[id(_T)] = (next(r for r, v in _T.roles.items() if v == "LR"), _T)
+    return got[0]
+
+
+_LR_REG: dict = {}
 
 
 def _is_lr_spill(reg: str, st: State) -> bool:
@@ -1632,6 +1702,106 @@ def _af_meet(a: dict, b: dict) -> dict:
     return out
 
 
+def _af_target() -> tuple:
+    """(the thread register, the zero register, the registers `_addr_facts` keeps no
+    fact for, the first letter of a full-width register, the word size): the same for
+    every body of one target, so made once for it (`use_target`)."""
+    got = _AF_ROW_CACHE.get(None)
+    if got is None:
+        zero = _T.zero or "xzr"
+        got = _AF_ROW_CACHE[None] = (
+            next((r for r, v in _T.roles.items() if v == _THR), None), zero,
+            frozenset(r for r in _T.roles if r != _lr()) | {zero},
+            "x" if _T.word == 8 else "r", _T.word)
+    return got
+
+
+def _af_row(mn: str, op: str, note: str):
+    """What the row `mn op` does to `_addr_facts`' facts, as `(kind, ...)`, or None
+    where it does nothing to them. A row's text says all of it but for a call, whose
+    note names the stub, so the answer is kept by text, as `_def_use`'s is: the lift
+    reads the same few thousand rows over and over, and compiling each one again for
+    every body that asked was half of what the analysis cost (#346)."""
+    if mn in _CALLS:
+        roles = _af_target()[2]
+        return ("call", tuple(r for r in _call_forgets(mn, note) if r not in roles))
+    by_op = _AF_ROW_CACHE.get(mn)
+    if by_op is None:
+        by_op = _AF_ROW_CACHE[mn] = {}
+    else:
+        hit = by_op.get(op, _MISS)
+        if hit is not _MISS:
+            return hit
+    thr, zero, roles, wch, word = _af_target()
+
+    def full(tok):
+        return tok.strip()[:1] == wch
+
+    def row():
+        ops = _split_ops(op)
+        if not ops:
+            return None
+        if any("[" in o for o in ops):
+            got = _addr(ops)
+            defs = tuple(r for r in _def_use(mn, op)[0] if r not in roles)
+            if got is None:
+                return ("mem", defs)
+            (base, disp, index, _s, wb), post = got
+            delta = None if post is _BAD_POST else post if post else disp if wb else 0
+            defs = tuple(d for d in defs if d != base or delta == 0)
+            if mn in _LOADS or (mn[:2] == "ld" and not _ATOMIC_OP_RE.match(mn)):
+                gen = ()
+                if base == thr and index is None and delta == 0 and full(ops[0]):
+                    if mn in ("ldr", "ldur"):
+                        gen = ((canon(ops[0]), ("t", disp, 0)),)
+                    elif mn == "ldp" and full(ops[1]):
+                        gen = ((canon(ops[0]), ("t", disp, 0)),
+                               (canon(ops[1]), ("t", disp + word, 0)))
+                return ("load", base, defs, gen, delta)
+            if (base == thr and index is None and delta == 0 and mn in ("str", "stur")
+                    and full(ops[0])):
+                return ("back", base, disp, canon(ops[0]))
+            return ("store", base, defs, delta)
+        defs = _def_use(mn, op)[0]
+        if not defs:
+            return None
+        dst = canon(ops[0])
+        if dst in roles:
+            return ("mem", ()) if dst == thr else None
+        m = _FLAG_VALUE.get(mn, mn)
+        if full(ops[0]):
+            src = canon(ops[1]) if len(ops) >= 2 and full(ops[1]) else None
+            if src == zero:
+                src = None
+            if m == "mov" and len(ops) == 2 and src and _imm(ops[1]) is None:
+                return ("mov", dst, src)
+            if m in ("add", "sub") and len(ops) >= 3 and src:
+                k = _imm(ops[2])
+                if k is not None:
+                    if len(ops) >= 4 and "lsl" in ops[3]:
+                        k <<= (_imm(ops[3].split("lsl")[-1]) or 0)
+                    role = _T.roles.get(src)
+                    if m == "add" and (role == "PP" or role == _T.consts_base
+                                       and k in _T.consts):
+                        return ("plain", dst)         # a pool base, true or false
+                    return ("addi", dst, src, k if m == "add" else -k)
+                if m == "add" and _T.roles.get(canon(ops[2])) == "HEAP":
+                    return ("mov", dst, src)          # the decompression
+                if m == "add" and len(ops) == 3 and full(ops[2]):
+                    return ("addr", dst, src, canon(ops[2]))
+            if (m == "csel" and len(ops) >= 4 and src and full(ops[2])
+                    and canon(ops[2]) != zero):
+                return ("csel", dst, src, canon(ops[2]))
+            if (m == "orr" and len(ops) == 3 and canon(ops[1]) == zero
+                    and _imm(ops[2]) is None and full(ops[2]) and canon(ops[2]) != zero):
+                return ("mov", dst, canon(ops[2]))
+        return ("def", tuple(d for d in defs if d not in roles
+                             and _reg_file(d) == "x"))
+
+    by_op[op] = out = row()
+    return out
+
+
 def _addr_facts(blocks, preds, entries, raw=None) -> tuple:
     """(computed, fresh): the addresses of the rows that read a register which may hold
     a computed address, and of the adds and subs that make a new object's pointer (#329).
@@ -1668,79 +1838,13 @@ def _addr_facts(blocks, preds, entries, raw=None) -> tuple:
     One fact per register and block, raised at most twice (a fact, then plain, then
     computed), so a block is taken again a bounded number of times and the work is
     linear in rows plus edges."""
-    thr = next((r for r, v in _T.roles.items() if v == _THR), None)
-    zero = _T.zero or "xzr"
-    roles = frozenset(r for r in _T.roles if r != _lr()) | {zero}
-    wch, word = ("x" if _T.word == 8 else "r"), _T.word
-
-    def full(tok):
-        return tok.strip()[:1] == wch
+    thr, _zero, roles, _wch, word = _af_target()
 
     def compiled(a, mn, op, note):
         if mn == "nop" and raw is not None and a in raw:
             (mn, op), note = raw[a], ""           # a blanked row, as the CPU runs it
-        if mn in _CALLS:
-            return (a, "call",
-                    tuple(r for r in _call_forgets(mn, note) if r not in roles))
-        ops = _split_ops(op)
-        if not ops:
-            return None
-        if any("[" in o for o in ops):
-            got = _addr(ops)
-            defs = tuple(r for r in _def_use(mn, op)[0] if r not in roles)
-            if got is None:
-                return (a, "mem", defs)
-            (base, disp, index, _s, wb), post = got
-            delta = None if post is _BAD_POST else post if post else disp if wb else 0
-            defs = tuple(d for d in defs if d != base or delta == 0)
-            if mn in _LOADS or (mn[:2] == "ld" and not _ATOMIC_OP_RE.match(mn)):
-                gen = ()
-                if base == thr and index is None and delta == 0 and full(ops[0]):
-                    if mn in ("ldr", "ldur"):
-                        gen = ((canon(ops[0]), ("t", disp, 0)),)
-                    elif mn == "ldp" and full(ops[1]):
-                        gen = ((canon(ops[0]), ("t", disp, 0)),
-                               (canon(ops[1]), ("t", disp + word, 0)))
-                return (a, "load", base, defs, gen, delta)
-            if (base == thr and index is None and delta == 0 and mn in ("str", "stur")
-                    and full(ops[0])):
-                return (a, "back", base, disp, canon(ops[0]))
-            return (a, "store", base, defs, delta)
-        defs = _def_use(mn, op)[0]
-        if not defs:
-            return None
-        dst = canon(ops[0])
-        if dst in roles:
-            return (a, "mem", ()) if dst == thr else None
-        m = _FLAG_VALUE.get(mn, mn)
-        if full(ops[0]):
-            src = canon(ops[1]) if len(ops) >= 2 and full(ops[1]) else None
-            if src == zero:
-                src = None
-            if m == "mov" and len(ops) == 2 and src and _imm(ops[1]) is None:
-                return (a, "mov", dst, src)
-            if m in ("add", "sub") and len(ops) >= 3 and src:
-                k = _imm(ops[2])
-                if k is not None:
-                    if len(ops) >= 4 and "lsl" in ops[3]:
-                        k <<= (_imm(ops[3].split("lsl")[-1]) or 0)
-                    role = _T.roles.get(src)
-                    if m == "add" and (role == "PP" or role == _T.consts_base
-                                       and k in _T.consts):
-                        return (a, "plain", dst)      # a pool base, true or false
-                    return (a, "addi", dst, src, k if m == "add" else -k)
-                if m == "add" and _T.roles.get(canon(ops[2])) == "HEAP":
-                    return (a, "mov", dst, src)       # the decompression
-                if m == "add" and len(ops) == 3 and full(ops[2]):
-                    return (a, "addr", dst, src, canon(ops[2]))
-            if (m == "csel" and len(ops) >= 4 and src and full(ops[2])
-                    and canon(ops[2]) != zero):
-                return (a, "csel", dst, src, canon(ops[2]))
-            if (m == "orr" and len(ops) == 3 and canon(ops[1]) == zero
-                    and _imm(ops[2]) is None and full(ops[2]) and canon(ops[2]) != zero):
-                return (a, "mov", dst, canon(ops[2]))
-        return (a, "def", tuple(d for d in defs if d not in roles
-                                and _reg_file(d) == "x"))
+        row = _af_row(mn, op, note)
+        return None if row is None else (a, *row)
 
     def put(f, r, v):
         if v is None:
@@ -3907,9 +4011,16 @@ def _fold_held_frame_addresses(blocks, frame, entry=None, raw=None) -> None:
     frame register it was taken off, as SP or FP may have moved, does too, read off the
     row as it was where strip_boilerplate blanked it (`raw`); x16 and x17 are scratch
     registers a callee may change. An access with a write-back keeps its text."""
-    if not any(mn in ("add", "sub") and "#" not in op and any(
-            r in op for r in ("x15", "x29", "sp"))
-            for blk in blocks.values() for (_a, mn, op, _n) in blk.insns):
+    # A loop and not a generator: every row of every body is asked this (#346).
+    for blk in blocks.values():
+        for (_a, mn, op, _n) in blk.insns:
+            if ((mn == "add" or mn == "sub") and "#" not in op
+                    and ("x15" in op or "x29" in op or "sp" in op)):
+                break
+        else:
+            continue
+        break
+    else:
         return
     preds = {b: [] for b in blocks}
     for b, blk in blocks.items():
@@ -5883,11 +5994,11 @@ class Lifter:
         st.stale_mem()
         # `loc` ends in hex digits, so a bare substring match would let `field_0x8` fire
         # inside `field_0x80`, a different field, and a value that is not stale at all.
-        # Each text once: `_covers` spells a slot off a nonzero offset twice over, and
-        # the pattern is compiled at every store, at a cost that goes with its length.
-        texts = dict.fromkeys(x for x in (loc, *also) if x[:1] != ".")
-        pat = re.compile("(?:" + "|".join(re.escape(x) for x in texts)
-                         + r")(?![0-9a-fA-F])")
+        # Each text once: `_covers` spells a slot off a nonzero offset twice over.
+        # Looked for as text (`_spelled`), where a pattern was compiled at every
+        # store: nearly every store has its own, so the 512 that `re` keeps were no
+        # help, and compiling them was 4% of the time tier 3 takes (#346).
+        texts = tuple(dict.fromkeys(x for x in (loc, *also) if x[:1] != ".")) or ("",)
         alias = None
         sel = _FIELD_LHS.search(loc)
         if sel:
@@ -5899,7 +6010,7 @@ class Lifter:
             # live, and those are one address whenever the argument is the receiver. 700
             # store sites in 286 of the 8,194 functions in the 3.12.2 clean build, against
             # 1,146 for the exact case, and covering them cost 356 more lines, 0.2%.
-            # Every covered spelling's selector too, for the same reason as `pat`, and
+            # Every covered spelling's selector too, for the same reason as `texts`, and
             # `_covers` gives both kinds of spelling a slot has, its name and its offset.
             # Not off THR or PP: the same offset is the same slot only where the two bases
             # may be one object, and the thread and the object pool are not Dart objects
@@ -5914,23 +6025,26 @@ class Lifter:
             # of that base, so every read through the same base goes.
             alias = re.compile(re.escape(loc.split("[", 1)[0]) + r"\[")
         out = []
-        at, maybe = self._at_reads(), self._at_reads("maybe_sel")
-        el = self._at_reads("elem") if elems else None
+        # Asked for only where the body has made such a read: most have none (#346).
+        box = self._elem_box
+        at = self._at_reads() if "at" in box else None
+        maybe = self._at_reads("maybe_sel") if "maybe_sel" in box else None
+        el = self._at_reads("elem") if elems and "elem" in box else None
 
         def reads(text):
             # The two tests that need `_addr_facts` (`_at_computed`) come last and ask
             # only once a text depends on them, so a body pays for the analysis only
             # where a live value could be named by it.
             nonlocal at, maybe, anywhere
-            if (pat.search(text) or (alias is not None and alias.search(text))
-                    or (at is not None and at.search(text))
-                    or (el is not None and el.search(text))):
+            if (_spelled(texts, text) or (alias is not None and alias.search(text))
+                    or (at is not None and _spelled(at, text))
+                    or (el is not None and _spelled(el, text, True))):
                 return True
-            if (maybe is not None and maybe.search(text)
+            if (maybe is not None and _spelled(maybe, text)
                     and any(x in text for x in self._elem_box["maybe"])):
                 self._settle_reads()
                 at, maybe = self._at_reads(), None
-                if at is not None and at.search(text):
+                if at is not None and _spelled(at, text):
                     return True
             if not anywhere or "." not in text and "[" not in text:
                 return False                  # every read of the heap has one of them
@@ -5967,29 +6081,21 @@ class Lifter:
         return out
 
     def _at_reads(self, kind="at"):
-        """A pattern matching every read this body made at a computed address, or None
-        where it made none (#341), with `kind` "elem" every element read (#343), or
-        with `kind` "maybe_sel" the selector of every read put off by `_at_computed`.
-        Each such read is recorded where it is made, by its text, and the pattern is
-        made again only when one is added. An element's text starts with its base's
-        name, so it is matched as a whole name, `t3[x4]` and not the end of `at3[x4]`."""
+        """The text of every read this body made at a computed address, or None where
+        it made none (#341), with `kind` "elem" of every element read (#343), or with
+        `kind` "maybe_sel" the selector of every read put off by `_at_computed`. Each
+        such read is recorded where it is made, by its text, and they are looked for
+        as text (`_spelled`): a pattern of them was compiled again in every body, and
+        again whenever a read was added, 0.6% of the time tier 3 takes (#346). An
+        element's text starts with its base's name, so it is looked for as a whole
+        name, `t3[x4]` and not the end of `at3[x4]`."""
         box = self._elem_box
         got = box.get(kind)
         if not got:
             return None
         made = box.get(kind + "_re")
         if made is None or made[0] != len(got):
-            # The selectors are few and the same few in most bodies, so their pattern
-            # is kept across bodies, as `_use_re`'s are.
-            key = (kind, *sorted(got)) if kind == "maybe_sel" else None
-            pat = _USE_RE.get(key) if key else None
-            if pat is None:
-                pat = re.compile((r"(?<![\w$@])" if kind == "elem" else "")
-                                 + "(?:" + "|".join(re.escape(t) for t in got)
-                                 + r")(?![0-9a-fA-F])")
-                if key:
-                    _USE_RE[key] = pat
-            made = box[kind + "_re"] = (len(got), pat)
+            made = box[kind + "_re"] = (len(got), tuple(got))
         return made[1]
 
     def _at_read(self, text: str, got) -> None:
@@ -5998,7 +6104,7 @@ class Lifter:
         if got is True:
             self._elem_box.setdefault("at", {})[text] = None
         elif got:
-            # By its selector too, few enough to make a pattern of, and all most
+            # By its selector too, few enough to look for at every store, and all most
             # stores need to see that none of these is live. A text that holds one
             # only may hold the read, which is enough to decide whether to ask.
             box = self._elem_box
@@ -6008,8 +6114,7 @@ class Lifter:
     def _settle(self, rows) -> bool:
         """`_computed`'s last test, put off by `_at_computed`: whether `_addr_facts`
         has any of `rows` reading a register that may hold a computed address."""
-        computed = self._facts()[0]
-        return any(r in computed for r in rows)
+        return any(self._row_computed(r) for r in rows)
 
     def _settle_reads(self) -> None:
         """The reads put off by `_at_computed`, now decided."""
@@ -6047,7 +6152,9 @@ class Lifter:
         # rows it would be asked about are given back, and asked about once a live
         # value depends on the answer (`_pin_mem`). Where it was made, it is asked.
         rows = (self._here,) if base_v.at is None else (self._here, base_v.at[3])
-        return self._settle(rows) if "facts" in self._elem_box else rows
+        if "facts" in self._elem_box:
+            return self._settle(rows)
+        return False if all(map(self._row_plain, rows)) else rows
 
     def _byte_off(self, base_reg: str, base_v: V, disp: int) -> int:
         # tagged object pointers carry kHeapObjectTag=1, so a field at object offset F is
@@ -6192,6 +6299,133 @@ class Lifter:
                                        (self.entry, *self.roots), self.raw)
         return box["facts"]
 
+    #: How many rows `_row_plain` reads back for one row, and how many ways into the
+    #: blocks it passes it follows, before `_addr_facts` is made.
+    _PLAIN_ROWS = 64
+
+    def _row_computed(self, a) -> bool:
+        """Whether `_addr_facts` has the row at `a` reading a register that may hold a
+        computed address. Asked of the rows before it first (`_row_plain`), and of the
+        analysis where they do not say or it is already made."""
+        box = self._elem_box
+        if "facts" not in box and self._row_plain(a):
+            return False
+        return a in self._facts()[0]
+
+    def _row_plain(self, a) -> bool:
+        """True where the rows on every way into the row at `a` show `_addr_facts`
+        holds no fact for the register it reads, which is a plain value, without the
+        analysis being made (#346).
+
+        Nearly every body reads a class id, `ldur x2, [x1, #-1]`, and each asked for
+        the analysis of the whole body to learn that x1 was loaded two rows up. A fact
+        is put on a register only by a row that writes it: the rows that go on to
+        change a fact change one that is there. So the rows are read back from `a` to
+        the nearest write of the register on each way in, through a move to its
+        source, and where each is a load, a call or another write that leaves no fact,
+        there is none at `a` on any path, which is what the fixpoint holds. Anything
+        else, arithmetic, a thread field loaded, a base that moves, a role register or
+        more than `_PLAIN_ROWS` rows to read or ways in to follow, is the analysis's to
+        say: a join has as many ways in as the body has branches to it, and reading
+        each for every row under it would be quadratic. A way in with no write on it
+        comes from a block nothing leads into, which the analysis starts with no fact
+        at all. What a walk proved of a block's end is kept for the body, and the rows
+        read and the ways in followed per asking row are bounded, so the cost stays
+        linear."""
+        box = self._elem_box
+        at = box.get("rowat", _MISS)
+        if at is _MISS:
+            at = {}
+            for b, blk in self.blocks.items():
+                for i, t in enumerate(blk.insns):
+                    at[t[0]] = None if t[0] in at else (b, i)
+            box["rowat"] = at
+        pos = at.get(a, _MISS)
+        if pos is _MISS:
+            return True                     # no row of the body: the analysis has none
+        if pos is None:
+            return False                    # in two blocks, and the analysis reads both
+        blocks, raw = self.blocks, self.raw
+        b, i = pos
+        _a, mn, op, note = blocks[b].insns[i]
+        if mn == "nop" and a in raw:
+            (mn, op), note = raw[a], ""       # a blanked row, as the CPU runs it
+        got = _af_row(mn, op, note)
+        kind = got[0] if got is not None else None
+        if kind in ("load", "store", "back"):
+            r = got[1]
+        elif kind == "addi":
+            r = got[2]
+        else:
+            return True                     # not a row `computed` can hold
+        roles = _af_target()[2]
+        if r in ROLE or r in roles:
+            return False
+        proven = box.setdefault("plain", set())
+        left, seen, work = self._PLAIN_ROWS, set(), [(b, i, r)]
+        ways = left
+        while work:
+            b, i, r = work.pop()
+            insns = blocks[b].insns
+            while i:
+                i -= 1
+                left -= 1
+                if left < 0:
+                    return False
+                at, mn, op, note = insns[i]
+                if mn == "nop" and at in raw:
+                    (mn, op), note = raw[at], ""
+                if mn in _CALLS:
+                    # `r` is no role register, so the call's row has it where the
+                    # call forgets it, and the row is not made for the asking.
+                    if r in _call_forgets(mn, note):
+                        break
+                    continue
+                got = _af_row(mn, op, note)
+                if got is None:
+                    continue
+                kind = got[0]
+                if kind == "mov":
+                    if got[1] == r:
+                        r = got[2]
+                        if r in ROLE or r in roles:
+                            return False
+                elif kind == "load":
+                    if got[1] == r and got[4] != 0:
+                        return False
+                    for g in got[3]:
+                        if g[0] == r:
+                            return False
+                    if r in got[2]:
+                        break
+                elif kind == "store":
+                    if got[1] == r and got[3] != 0:
+                        return False
+                    if r in got[2]:
+                        break
+                elif kind == "mem":
+                    if r in got[1]:
+                        break
+                elif kind == "plain":
+                    if got[1] == r:
+                        break
+                elif kind == "def":
+                    if r in got[1]:
+                        return False
+                elif kind != "back" and got[1] == r:
+                    return False            # addi, addr, csel: arithmetic
+            else:
+                into = self._preds.get(b, ())
+                ways -= len(into)
+                if ways < 0:
+                    return False
+                for p in into:
+                    if (p, r) not in seen and (p, r) not in proven:
+                        seen.add((p, r))
+                        work.append((p, len(blocks[p].insns), r))
+        proven |= seen
+        return True
+
     def _fresh(self, here) -> bool:
         """Whether the add or sub at `here` makes the pointer to an object the rows
         before it allocated (`_addr_facts`). An allocation stores back to a field of
@@ -6245,8 +6479,8 @@ class Lifter:
             return v.smi == _SMI_TAG
         if v.calc or _role_address(v):
             return True
-        computed = self._facts()[0]
-        return self._here in computed or (v.at is not None and v.at[3] in computed)
+        return self._row_computed(self._here) or (
+            v.at is not None and self._row_computed(v.at[3]))
 
     def _at_address(self, base_v: V, disp: int) -> tuple:
         """`_rebase` for a computed base at offset 0: the access at its address.
@@ -6267,7 +6501,7 @@ class Lifter:
             return base, k + 1, True
         if (k == -1 and not untagged and v.at is not None and not base.calc
                 and not base.smi and not _role_address(base)
-                and at not in self._facts()[0]):
+                and not self._row_computed(at)):
             return base, 0, True
         if _INT_LITERAL.match(base.text):
             return _num(_to_s64(int(base.text, 0) + k)), 1, True
@@ -8308,6 +8542,9 @@ class Lifter:
         # The rows that move a frame register, by a write of it or out of `_step`'s
         # sight: a value whose text names it is seen to before each (`_frame_shift`).
         shifts = self.shift_rows
+        if self._fp_lost_set is None:
+            self._fp_lost_set = _fp_lost_at(self.blocks, self.raw)
+        fp_lost, raw = self._fp_lost_set, self.raw
         if insns:
             after, m = [0] * len(insns), self._liveout.get(addr, 0)
             more = self._printed_liveness()[0].get(addr, {})
@@ -8372,7 +8609,15 @@ class Lifter:
                                                 for s in uses):
                         continue
                     lines.extend(self._name_stale_reg(st, q, plive, mn not in _LOADS))
-            lines.extend(self._step(st, a, mn, op, note))
+            if (a not in raw) if mn == "nop" else (
+                    a not in fp_lost or "29" not in op and "30" not in op):
+                # No row that gives a role back (`_chain_gives`): not one that was
+                # blanked, and FP not lost before it or neither frame chain register
+                # in it. Stepped as it is, without two more calls on every row (#346).
+                self._here = a
+                lines.extend(self._step_row(st, a, mn, op, note))
+            else:
+                lines.extend(self._step(st, a, mn, op, note))
             if shift:
                 if a in self.frame_moves:
                     self._moved_unseen(st, *self.frame_moves[a])
@@ -11380,7 +11625,8 @@ def use_target(tgt: Target):
         yield
         return
     prev = (_T, ROLE, _SPECIAL, _UNTAGGED, ARG_REGS, _CALL_CLOBBERS, _RET_USES,
-            dict(_CANON_CACHE), dict(_MEM_CACHE), dict(_DEFUSE_CACHE))
+            dict(_CANON_CACHE), dict(_MEM_CACHE), dict(_DEFUSE_CACHE),
+            dict(_AF_ROW_CACHE))
     _T = tgt
     ROLE, _SPECIAL, _UNTAGGED = tgt.roles, set(tgt.special), tgt.untagged
     ARG_REGS = tgt.arg_regs
@@ -11393,17 +11639,20 @@ def use_target(tgt: Target):
     _CANON_CACHE.clear()
     _MEM_CACHE.clear()
     _DEFUSE_CACHE.clear()
+    _AF_ROW_CACHE.clear()
     try:
         yield
     finally:
         (_T, ROLE, _SPECIAL, _UNTAGGED, ARG_REGS, _CALL_CLOBBERS,
-         _RET_USES, cache, mem, defuse) = prev
+         _RET_USES, cache, mem, defuse, af_rows) = prev
         _CANON_CACHE.clear()
         _CANON_CACHE.update(cache)
         _MEM_CACHE.clear()
         _MEM_CACHE.update(mem)
         _DEFUSE_CACHE.clear()
         _DEFUSE_CACHE.update(defuse)
+        _AF_ROW_CACHE.clear()
+        _AF_ROW_CACHE.update(af_rows)
 
 
 class Tier3Graph(NamedTuple):

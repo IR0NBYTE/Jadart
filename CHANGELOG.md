@@ -345,6 +345,41 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **Tier 3 lifts ordinary code about as fast as it did eight fixes ago, and prints what
+  it printed.** The fixes from #329 to #343 each added a little to every row or every
+  store, none of it seen by a test, and together the clean fixture came to lift in about
+  24.0 s of CPU where it had taken 22.1. Lift CPU seconds of the clean fixture in three
+  alternating runs, 01a6769 then this: 21.96 and 22.23, 22.10 and 22.30, 22.16 and
+  22.45, so 0.9% to 1.3% over where it was. After #343 then this: 24.01 and 22.43, 24.07
+  and 23.18, 24.84 and 22.56. Tier 3 of both fixtures and of the seven app-sweep
+  libraries is byte-identical to what #343 left. What went, largest first. The address
+  analysis of #329 (`_addr_facts`) was made for the whole body by 462 of every 1,024
+  bodies, nearly always to learn that the register a class id is read off was loaded a
+  row or two up. `Lifter._row_plain` reads back from the row to the nearest write of
+  that register on every way in, 64 rows and 64 ways in at most, and answers where each
+  is a load, a call or another write that leaves no fact: 85 of the 1,024 still make the
+  analysis, and its rows are compiled once per text (`_af_row`), not once per body. Of
+  the 457,622 rows of the clean fixture it calls 330,765 plain, and none of them is one
+  of the 9,255 the analysis has reading a computed address. `_pin_mem` compiled a
+  pattern of the spellings a store covers at every store, 3,906 compiles of 1,808
+  patterns in those 1,024 bodies and 4% of the lift. That one is older than the eight
+  fixes: `re` keeps 512 patterns, and nearly every store has its own. `_spelled` looks
+  for the same texts as text, and for the reads a body made at computed addresses and
+  its element reads (#341, #343), whose patterns were compiled again in every body, and
+  only in a body that made such a read: 180 of the 1,024, from 462. `V` is built about
+  2.1 million times in a lift, and its `__init__` stores only the fields that are not at
+  their defaults: 377 ns each to 142 ns. A row is stepped without the two calls that
+  came to stand in front of every one (`_chain_gives`), which only a blanked row, or one
+  that names x29 or x30 past a lost frame pointer, needs. A body that makes a read at a
+  computed address every few rows had the pattern of all of them compiled again for each
+  one: near the 4,000 rows the CLI takes, three crafted shapes lifted in 1.76, 1.32 and
+  2.38 s, and take 0.14, 0.13 and 0.08 s. A test now counts the Python calls made in
+  jadart's own code to lift forty ordinary bodies, 58,032 where it was 60,408, and fails
+  at 1% over. The count is the same on Python 3.9, 3.11, 3.12, 3.13, 3.14 and 3.15 and
+  under any hash seed; it does not see time inside `re` or a set, and it sees only the
+  shapes those forty bodies have. What is left of the difference is spread thin over the
+  checks the eight fixes make at every row and every store (#346).
+
 - **`check.sh` runs the suite with capstone blocked, as CI does.** CI's
   install-without-capstone job requires every test that decodes an instruction to skip
   there rather than fail, and nothing local ran that: a cast-channel test that loaded the
