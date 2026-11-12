@@ -926,6 +926,21 @@ def _num(n: int) -> V:
              bits=n.bit_length() if n >= 0 else 64, calc=True)
 
 
+#: The root of an address off the frame, `FP`, `SP`, `(FP - 8)` (#341).
+_FRAME_ROOT = re.compile(r"\(*(?:FP|SP)(?: [-+] [^.()\[\]]+)*\)*\Z")
+#: A read of the frame inside a value's text, which a store to the heap does not write:
+#: `FP.field_0x21`, `(FP - 0x340).field_0x1`, and the `FP[` of a slot at an index, whose
+#: index may itself read the heap and stays (#341).
+_FRAME_READ = re.compile(r"\((?:FP|SP)(?: [-+] (?:0x[0-9a-fA-F]+|\d+))?\)\.field\d*_0x"
+                         r"[0-9a-fA-F]+|\b(?:FP|SP)\.field\d*_0x[0-9a-fA-F]+|\b(?:FP|SP)\[")
+
+
+def _fresh_v(v) -> bool:
+    """Whether `v` is the pointer an inline allocation made (`Lifter._offset`, #329): a
+    store off it cannot reach memory older than the object (#341)."""
+    return not v.calc and v.at is not None and v.at[3] is None
+
+
 _INT_LITERAL = re.compile(r"-?(?:0x[0-9a-fA-F]+|\d+)\Z")
 #: A store target that is a field of an object. The third alternative is a field the
 #: snapshot still names (fields.py): `this.balance = 8` is the same store as
@@ -5816,8 +5831,16 @@ class Lifter:
             st.poolbase.pop(key, None)
         return out
 
-    def _pin_mem(self, st: State, loc: str, also=()) -> list:
+    def _pin_mem(self, st: State, loc: str, also=(), anywhere=False) -> list:
         """Give a name to every LIVE tracked value that reads `loc`, before `loc` changes.
+
+        Two more ways a store reaches a read, both because an access at a COMPUTED
+        address is spelled by its address and not by a field of an object (#341). A
+        store to the heap names each read this body made at such an address
+        (`_at_reads`), whatever its spelling: `(x1 + x5 - 1).field_0x1` is
+        `x1.field_0x8` when x5 is 8. And `anywhere`, a store AT such an address, may
+        write any field of any object, so it names every live value that reads the heap
+        (`_reads_mem`), as a store the lifter prints raw does (`_raw_write`).
 
         `also` is the OTHER spellings of bytes this write covers, which a 16-byte access
         needs because the spelling says the width: a write of `x2.field16_0x8` lands on
@@ -5886,9 +5909,29 @@ class Lifter:
             # of that base, so every read through the same base goes.
             alias = re.compile(re.escape(loc.split("[", 1)[0]) + r"\[")
         out = []
+        at, maybe = self._at_reads(), self._at_reads("maybe_sel")
 
         def reads(text):
-            return bool(pat.search(text) or (alias is not None and alias.search(text)))
+            # The two tests that need `_addr_facts` (`_at_computed`) come last and ask
+            # only once a text depends on them, so a body pays for the analysis only
+            # where a live value could be named by it.
+            nonlocal at, maybe, anywhere
+            if (pat.search(text) or (alias is not None and alias.search(text))
+                    or (at is not None and at.search(text))):
+                return True
+            if (maybe is not None and maybe.search(text)
+                    and any(x in text for x in self._elem_box["maybe"])):
+                self._settle_reads()
+                at, maybe = self._at_reads(), None
+                if at is not None and at.search(text):
+                    return True
+            if not anywhere or "." not in text and "[" not in text:
+                return False                  # every read of the heap has one of them
+            if self._reads_mem(_FRAME_READ.sub("", text)):
+                if anywhere is not True:
+                    anywhere = self._settle(anywhere)
+                return anywhere
+            return False
 
         # sorted, for the reason _pin and _merge are: this hands out temporary names, and
         # taking them in map order would make the numbering depend on Python's per-process
@@ -5915,6 +5958,79 @@ class Lifter:
             if reads(b.text) or reads(i.text):
                 del st.elem[key]
         return out
+
+    def _at_reads(self, kind="at"):
+        """A pattern matching every read this body made at a computed address, or None
+        where it made none (#341), or with `kind` "maybe_sel" the selector of every
+        read put off by `_at_computed`. Each such read is recorded where it is made, by
+        its text, and the pattern is made again only when one is added."""
+        box = self._elem_box
+        got = box.get(kind)
+        if not got:
+            return None
+        made = box.get(kind + "_re")
+        if made is None or made[0] != len(got):
+            # The selectors are few and the same few in most bodies, so their pattern
+            # is kept across bodies, as `_use_re`'s are.
+            key = (kind, *sorted(got)) if kind != "at" else None
+            pat = _USE_RE.get(key) if key else None
+            if pat is None:
+                pat = re.compile("(?:" + "|".join(re.escape(t) for t in got)
+                                 + r")(?![0-9a-fA-F])")
+                if key:
+                    _USE_RE[key] = pat
+            made = box[kind + "_re"] = (len(got), pat)
+        return made[1]
+
+    def _at_read(self, text: str, got) -> None:
+        """Record `text`, a read `_at_computed` gave `got` for: one at a computed
+        address, or one that is where `_addr_facts` says so."""
+        if got is True:
+            self._elem_box.setdefault("at", {})[text] = None
+        elif got:
+            # By its selector too, few enough to make a pattern of, and all most
+            # stores need to see that none of these is live. A text that holds one
+            # only may hold the read, which is enough to decide whether to ask.
+            box = self._elem_box
+            box.setdefault("maybe", {}).setdefault(text, set()).update(got)
+            box.setdefault("maybe_sel", {})[text[text.rfind("."):]] = None
+
+    def _settle(self, rows) -> bool:
+        """`_computed`'s last test, put off by `_at_computed`: whether `_addr_facts`
+        has any of `rows` reading a register that may hold a computed address."""
+        computed = self._facts()[0]
+        return any(r in computed for r in rows)
+
+    def _settle_reads(self) -> None:
+        """The reads put off by `_at_computed`, now decided."""
+        box = self._elem_box
+        box.pop("maybe_sel", None), box.pop("maybe_sel_re", None)
+        for text, rows in box.pop("maybe", {}).items():
+            if self._settle(rows):
+                box.setdefault("at", {})[text] = None
+
+    def _at_computed(self, base_reg: str, base_v: V, spelled: V):
+        """Whether an access off `base_reg`, holding `base_v`, and spelled off `spelled`
+        (`_rebase`), is made at an address the lifter computed, which may be any field
+        of any object (#341): a displacement folded into the base, or a base that may
+        hold a computed address (`_computed`). Not off an untagged role's own address,
+        DISPATCH or HEAP, which is no Dart object, as THR and PP are not (`_pin_mem`),
+        and not off the frame: SP, FP or a sum of one, `(FP - 8).field_0x1`, which no
+        heap store reaches. Or the rows to ask `_settle` about, where only the analysis
+        of the whole body can say and it has not been made."""
+        if self._frame_base(base_reg) or _FRAME_ROOT.match(spelled.text):
+            return False
+        if spelled is not base_v:
+            return True
+        if _role_address(base_v):
+            return False
+        if base_v.smi or base_v.calc:
+            return self._computed(base_reg, base_v)
+        # Only `_addr_facts` can say, which is an analysis of the whole body, so the
+        # rows it would be asked about are given back, and asked about once a live
+        # value depends on the answer (`_pin_mem`). Where it was made, it is asked.
+        rows = (self._here,) if base_v.at is None else (self._here, base_v.at[3])
+        return self._settle(rows) if "facts" in self._elem_box else rows
 
     def _byte_off(self, base_reg: str, base_v: V, disp: int) -> int:
         # tagged object pointers carry kHeapObjectTag=1, so a field at object offset F is
@@ -6823,7 +6939,7 @@ class Lifter:
             for d, reg, v in words:
                 elem = self._elem_access(base, index, scale, st, d) if on_elem else None
                 if elem is not None:                          # element store
-                    tgts.append((elem, v, ()))
+                    tgts.append((elem, v, (), False))
                     continue
                 w = _access_width(mn, reg)
                 # `_rebase` and not `_byte_off`: a displacement below the base goes into
@@ -6837,19 +6953,16 @@ class Lifter:
                     # header word a live value read, as the `.tags` it was spelled as
                     # did: pinned as that spelling pins (#329).
                     also += self._header_selectors(w)
-                elif self._byte_off(base, held, d) == 0:
-                    # A header store, and the other way round: a read at a computed
-                    # address may be of this header, `(x1 + x5 - 1).field_0x1` where x5
-                    # is 0, and its text does not say `.tags`. Each one this body made
-                    # is pinned, as it was when both were spelled `.tags`.
-                    also += tuple(self._elem_box.get("calc0", ()))
-                tgts.append((self._field(bv, off, w, cast, hdr), v, also))
+                # A store at a computed address, at any offset, may be to any field of
+                # any object, so every live read of the heap is named first (#341).
+                tgts.append((self._field(bv, off, w, cast, hdr), v, also,
+                             not _fresh_v(held) and self._at_computed(base, held, bv)))
             out = list(basedecl)
-            for tgt, v, also in tgts:
+            for tgt, v, also, anywhere in tgts:
                 # The value being stored was read off the map before this, so `+=` still
                 # renders: the rhs keeps the field's own spelling even when a register
                 # holding it is pinned on the way past.
-                out.extend(self._pin_mem(st, tgt.text, also))
+                out.extend(self._pin_mem(st, tgt.text, also, anywhere))
                 out.append(self._assign(tgt, v))
             self._last_mem = ("store", base, disp, src0)
             return out + self._bump(st, base, delta)
@@ -7080,11 +7193,10 @@ class Lifter:
                     bv, off, hdr = self._rebase(base, at_base, d)
                     v = self._field(bv, off, wk,
                                     cast if off == d + 1 and bv is at_base else None, hdr)
-                    if (self._byte_off(base, at_base, d) == 0
-                            and not (bv is at_base and hdr)):
-                        # Offset 0 read at its address: a header store through any base
-                        # may write it, and its spelling is not the header's (#329).
-                        self._elem_box.setdefault("calc0", {})[v.text] = None
+                    # A read at its address, at any offset: a store through any base
+                    # may write it, and its spelling is no field of that base (#329,
+                    # #341).
+                    self._at_read(v.text, self._at_computed(base, at_base, bv))
                     if sign and wk < 8 and _reg_file(ops[k]) == "x":
                         v = _extended(v, 8 * wk, True)
                 got.append((r, v))

@@ -421,6 +421,32 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A read at a computed address is named before a store that may write it.** A store
+  names the live values that read what it writes, matched by the field's spelling or
+  selector. A read at an address the lifter computed, `(x1 + x5 - 1).field_0x1`, is
+  spelled off no field, so no store matched it: `add x0, x1, x5; ldur x3, [x0, #-1];
+  stur x4, [x1, #7]` printed `x1.field_0x8 = x4;` and then
+  `return (x1 + x5 - 1).field_0x1;`, the word as it is after the store, where the
+  machine returns it as it was before (#341). The lifter assumes Dart's object model,
+  where two fields never overlap and a proven element `x3[x4]` is no field, and only an
+  access spelled as a raw address is outside it. So a read at a raw address is recorded
+  where it is made and named before any store to the heap, and a store at a raw address
+  names every live read of the heap first: fields, elements and raw reads. A store off
+  an object the body just allocated (#329) names nothing more, since it cannot reach
+  older memory. Reads and stores of the frame, `FP.field_0x8` and `(FP - 8).field_0x1`,
+  stay out, and fields against elements are unchanged. Over the two fixtures and the
+  seven app-sweep libraries, 3,443 bodies change and 1,661 values gain a name: 1,137
+  raw reads, 375 fields, 25 elements, and 124 join values the new names move. Every
+  other line is main's once the new names are inlined and temporaries renumbered, save
+  where a frame slot holding a heap read is dropped and its reload prints as the frame
+  word, as a slot the store's spelling reads always was (14 bodies), and where a name
+  made on one arm makes a join of it, so a later line names a part (10). The
+  unicorn oracle, with runs where a proven element overlaps a plain field set aside,
+  went from 169, 166 and 160 wrong of 3,000 on three seeds to none. The analysis that
+  decides a raw address is made only where a live value could be named by it, so a
+  tier 3 dump of the clean fixture takes 24.60, 24.53 and 24.64 s against main's 24.38,
+  24.36 and 24.05 in three alternating pairs, 1.3% more in all.
+
 - **A value that names `SP` or `FP` is right on every line it is printed on.** `SP` in
   a text is SP at that line, and a value built off it kept its text when SP moved:
   `add x0, x15, #0x238; sub x15, x15, #0x20; ret` printed `return SP + 0x238;` where the

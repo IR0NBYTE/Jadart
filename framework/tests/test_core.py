@@ -5060,7 +5060,7 @@ def test_the_memory_oracle_catches_a_stale_field_expression():
 
     pin = expr.Lifter._pin_mem
     try:
-        expr.Lifter._pin_mem = lambda self, st, loc, also=(): []
+        expr.Lifter._pin_mem = lambda self, st, loc, also=(), anywhere=False: []
         assert irfuzz.run_mem(count=40, trials=20, seed=7, verbose=False) != 0, (
             "the memory oracle passed with the staleness defect put back")
     finally:
@@ -5107,7 +5107,7 @@ def test_the_control_flow_memory_oracle_catches_every_defect_it_found():
 
     pin, copy = expr.Lifter._pin_mem, expr.Lifter._parallel_copy
     try:
-        expr.Lifter._pin_mem = lambda self, st, loc, also=(): []
+        expr.Lifter._pin_mem = lambda self, st, loc, also=(), anywhere=False: []
         for count, seed in ((60, 1), (150, 2), (200, 46)):
             assert irfuzz.run_cfgmem(count, 25, seed, False) != 0, (
                 f"the oracle passed at seed {seed} with the stale field read put back")
@@ -7468,7 +7468,7 @@ def _cfgmem_drawn(irfuzz, expr, ablate: bool) -> tuple:
     import io, contextlib
     real = expr.Lifter._pin_mem
     if ablate:
-        expr.Lifter._pin_mem = lambda self, st, loc, also=(): []
+        expr.Lifter._pin_mem = lambda self, st, loc, also=(), anywhere=False: []
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -21883,6 +21883,68 @@ def test_a_store_through_a_computed_address_still_names_the_header_read_before_i
     assert lift(("ldur", "x3, [x1, #0]"), ("add", "x0, x1, #1"),
                 ("stur", "x4, [x0, #-1]"), ("mov", "x0, x3")) == [
         "var t0 = x1.field_0x1;", "x1.field_0x1 = x4;", "return t0;"]
+
+
+def test_a_store_names_a_live_read_made_at_a_computed_address():
+    """A read at a computed address is spelled by its address and not by a field, so a
+    store matching fields by spelling did not name it: `add x0, x1, x5; ldur x3, [x0,
+    #-1]; stur x4, [x1, #7]; mov x0, x3` returned `(x1 + x5 - 1).field_0x1` read AFTER
+    the store, which writes it when x5 is 8 (#341). Each such read is recorded and every
+    heap store names it, and the mirror: a store at a computed address may write any
+    field of any object, so it names every live read of the heap. The frame and a
+    proven element stay out, as two fields of the object model do."""
+    lift = _lift_329
+    comp = ("add", "x0, x1, x5")
+    for read, store, decl, line in (
+            # the issue, at each width, and its stores: a pair, an unrelated base,
+            # an element
+            (("ldur", "x3, [x0, #-1]"), ("stur", "x4, [x1, #7]"),
+             "(x1 + x5 - 1).field_0x1", "x1.field_0x8 = x4;"),
+            (("ldur", "w3, [x0, #-1]"), ("stur", "w4, [x1, #7]"),
+             "(x1 + x5 - 1).field_0x1", "x1.field_0x8 = x4;"),
+            (("ldurb", "w3, [x0, #-1]"), ("sturb", "w4, [x1, #7]"),
+             "(x1 + x5 - 1).field1_0x1", "x1.field1_0x8 = x4;"),
+            (("ldur", "x3, [x0, #7]"), ("stur", "x4, [x1, #0xf]"),
+             "(x1 + x5).field_0x8", "x1.field_0x10 = x4;"),
+            (("ldur", "x3, [x0, #-1]"), ("stp", "x4, x6, [x1, #7]"),
+             "(x1 + x5 - 1).field_0x1", "x1.field_0x8 = x4;"),
+            (("ldur", "x3, [x0, #-1]"), ("stur", "x4, [x2, #7]"),
+             "(x1 + x5 - 1).field_0x1", "x2.field_0x8 = x4;"),
+            (("ldur", "x3, [x0, #-1]"), ("str", "x4, [x2, x6, lsl #3]"),
+             "(x1 + x5 - 1).field_0x1", "x2[x6] = x4;"),
+            # the mirror: the store is the computed one, at offset 0 and past it, a
+            # pair, a displacement below the base, an element
+            (("ldur", "x3, [x1, #7]"), ("stur", "x4, [x0, #-1]"),
+             "x1.field_0x8", "(x1 + x5 - 1).field_0x1 = x4;"),
+            (("ldur", "w3, [x1, #0xf]"), ("stur", "w4, [x0, #7]"),
+             "x1.field_0x10", "(x1 + x5).field_0x8 = x4;"),
+            (("ldurb", "w3, [x2, #7]"), ("sturb", "w4, [x0, #-1]"),
+             "x2.field1_0x8", "(x1 + x5 - 1).field1_0x1 = x4;"),
+            (("ldur", "x3, [x2, #0xf]"), ("stp", "x4, x6, [x0, #-1]"),
+             "x2.field_0x10", "(x1 + x5 - 1).field_0x1 = x4;"),
+            (("ldur", "x3, [x2, #7]"), ("stur", "x4, [x1, #-0x10]"),
+             "x2.field_0x8", "(x1 - 16).field_0x1 = x4;"),
+            (("ldr", "x3, [x2, x6, lsl #3]"), ("stur", "x4, [x0, #-1]"),
+             "x2[x6]", "(x1 + x5 - 1).field_0x1 = x4;")):
+        got = lift(comp, read, store, ("mov", "x0, x3"))
+        assert got[0] == f"var t0 = {decl};" and line in got and got[-1] == (
+            "return t0;"), (read, store, got)
+    # A frame slot is not the heap, two plain fields at different offsets are two
+    # addresses, and a field is not an element: nothing is named for any of them.
+    assert lift(comp, ("ldur", "x3, [x0, #-1]"), ("stur", "x4, [x29, #-8]"),
+                ("mov", "x0, x3")) == ["return (x1 + x5 - 1).field_0x1;"]
+    assert lift(("sub", "x0, x29, #0x10"), ("ldur", "x3, [x0, #0xf]"),
+                ("stur", "x4, [x1, #7]"), ("mov", "x0, x3")) == [
+        "x1.field_0x8 = x4;", "return (FP - 16).field_0x10;"]
+    assert lift(("add", "x0, x29, #8"), ("ldur", "x3, [x1, #0xf]"),
+                ("stur", "x4, [x0, #-1]"), ("mov", "x0, x3")) == [
+        "FP.field_0x8 = x4;", "return x1.field_0x10;"]
+    assert lift(("ldr", "x3, [x2, x6, lsl #3]"), ("stur", "x4, [x1, #7]"),
+                ("mov", "x0, x3")) == ["x1.field_0x8 = x4;", "return x2[x6];"]
+    assert lift(("ldur", "x3, [x1, #0x17]"), ("str", "x4, [x2, x6, lsl #3]"),
+                ("mov", "x0, x3")) == ["x2[x6] = x4;", "return x1.field_0x18;"]
+    assert lift(("ldur", "x3, [x1, #7]"), ("stur", "x4, [x2, #0xf]"),
+                ("mov", "x0, x3")) == ["x2.field_0x10 = x4;", "return x1.field_0x8;"]
 
 
 #: `Assembler::TryAllocateObject` and `TryAllocateArray` (assembler_arm64.cc, 3.12.2),
