@@ -421,6 +421,34 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A goto join's kill set is folded over the dominator tree, not walked per join.**
+  `_join_kill` asks what the blocks between a join and its immediate dominator write, and
+  #289 bounded that walk by the tree. N conditionals that each jump over their own block
+  and the next conditional hang every join off the first one, so that region was most of
+  the function for each join, and `lift_function` took 0.05, 0.16, 0.62 and 2.41 s of CPU
+  at 250, 500, 1,000 and 2,000 conditionals; 0.18, 0.65, 2.55 and 10.06 s with a loop
+  around them, and 0.06, 0.21, 0.78 and 3.03 s behind a monomorphic entry (#333). The
+  region is the blocks below the dominator that reach the join, and where the dominator
+  is on a cycle, what it reaches of its strongly connected piece without the join. What
+  reaches each block from below its own dominator is now worked out once, in piece order,
+  and a join folds it up the tree from each way in, in jumps of a power of two; a piece's
+  blocks are looked up by their numbers in the tree, and what a dominator reaches past
+  its own subtree is worked out once per dominator. Another root's tree takes the same
+  path where no path leaves it and comes back, as a mono entry's body is; a tree one does
+  come back into, and a block in no tree, are walked as before. The three answers are the
+  walk's on every block of 11,000 random ranges, asked as a join of either kind, and the
+  whole-binary tier 3 dump of both fixtures and of the seven app-sweep libraries is
+  byte-identical to main's. A function walks its joins as before until the walks have
+  covered eight times its blocks (`_KILL_WALK`) and builds the fold only then, so the
+  walks stay linear and a function whose joins sit close under their dominators never
+  pays for it: with every function folded the clean fixture lifted 1.4% slower, 23.74 s
+  of CPU against 23.40 s over three alternating runs, and walked first it lifts in 23.09
+  s against 23.36 s. `_join_kill` ran 477 and 1,805 lines per instruction at 30 and 120
+  conditionals and now runs 362 and 355; in a loop 1,955 and 8,071, now 775 and 801.
+  Those sizes now take 0.02, 0.08, 0.26 and 0.99 s, 0.07, 0.24, 0.85 and 3.25 s, and
+  0.03, 0.08, 0.27 and 0.96 s. What is left grows with the output: 2,000 conditionals
+  nest 2,000 deep and print 20 MB, nearly all of it indentation.
+
 - **A frame address held in a register is the frame slot it names.** `mov x17, #0x238;
   add x17, x17, x15; str x1, [x17]` stores to the slot `str x1, [x15, #0x238]` does, and
   printed `0x238[SP] = x1;`, an element of the number 0x238, while the reload of that

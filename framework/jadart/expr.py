@@ -2623,6 +2623,24 @@ def _raw_store(mn: str) -> bool:
 
 _RAW_STORE: dict = {}
 
+#: `Lifter._kill_bits`: a block's stores that `_writes_stack` and `_writes_heap` count,
+#: and a bit per register it writes, given out as registers turn up.
+_KILL_STACK, _KILL_HEAP = 1, 2
+#: How many blocks `Lifter._join_kill` walks, per block of the function, before it
+#: builds `_kill_fold`. The fold costs a pass over the function, and a function whose
+#: joins sit close under their dominators never earns it back: with every function
+#: folded, the clean fixture lifted 1.4% slower. Walked first, a function pays for the
+#: fold only once its walks have cost this many passes, so the walks stay linear too.
+_KILL_WALK = 8
+_KILL_BIT: dict = {}
+_KILL_REG: list = []
+
+
+def _kill_regs(mask) -> frozenset:
+    """The registers of a `Lifter._kill_bits` mask."""
+    mask >>= 2
+    return frozenset(r for i, r in enumerate(_KILL_REG) if mask >> i & 1)
+
 
 def _off_frame(ops) -> bool:
     """Whether the memory operand in `ops` may be off SP or FP: it is, or it does not
@@ -3797,6 +3815,10 @@ class Lifter:
         #: per block, what its subtree of `_idom` writes; see _region_written.
         self._regions: dict = {}
         self._own_sub: dict = {}
+        #: what `_join_kill` asks of the blocks between a join and its dominator, folded
+        #: over the dominator tree once; see _kill_fold.
+        self._kfold = None
+        self._kwalked = 0
         self._defs: dict = {}
         self._frame_list: dict = {}
         self._reload_ops: dict = {}
@@ -6979,6 +7001,15 @@ class Lifter:
         if entry:
             preds = [p for p in preds if not self._dominates(addr, p)]
         d = self._idom.get(addr)
+        mask = (self._kill_mask(addr)
+                if self._kwalked >= _KILL_WALK * len(self.blocks) else None)
+        if mask is not None:
+            # The same three answers, off the dominator tree and no walk (#333).
+            self._killcache[(addr, entry)] = hit = (
+                _kill_regs(mask) - _SPECIAL,
+                bool(mask & _KILL_STACK) or self._frame_escaped(),
+                bool(mask & _KILL_HEAP))
+            return hit
         if d is not None and d != addr and addr not in self._root_of:
             back = self._between(d, addr, preds)
         else:
@@ -6989,6 +7020,7 @@ class Lifter:
                     continue
                 back.add(n)
                 stack.extend(self._preds.get(n, ()))
+        self._kwalked += len(back) + 1
         if d is not None and d != addr and addr in self._root_of:
             # forward from the dominator, which is where the paths part. The dominator
             # itself is one block with one exit state, so what IT writes is agreed on.
@@ -6999,6 +7031,7 @@ class Lifter:
                     continue
                 fwd.add(n)
                 stack.extend(s for s in self.blocks[n].succ if s in self.blocks)
+            self._kwalked += len(fwd)
             back &= fwd
         # A spill slot one of those blocks rewrote says nothing either, which is the rule
         # `_render_loop` already applies to a loop body that stores. Only a store that can
@@ -7058,6 +7091,258 @@ class Lifter:
                 back.add(n)
                 stack.extend(self._preds.get(n, ()))
         return back
+
+    def _kill_mask(self, addr):
+        """What `_join_kill` asks of the blocks between `addr` and its immediate
+        dominator `d`, as one mask (_kill_bits), or None where it has to walk them.
+
+        Walked once per join, those blocks made N conditionals that each jump over the
+        next cost about N * N, as each one's join hangs off the first conditional and the
+        blocks between are most of the function (#333). They are the ones on a path from
+        `d` into `addr` that passes neither again, and in the entry's tree, where every
+        such block is below `d` or in `d`'s strongly connected piece (_between), that is:
+
+          T1, the blocks below `d` and not below `addr` that reach `addr`, and
+          T2, where `d` is on a cycle that `addr` is not on, all of `d`'s piece, which
+              reaches `d`, as `d` reaches it, without passing `addr`.
+
+        Where `addr` is on no cycle, T1 is what each way in reaches from below `d`:
+        `chain` up the tree from that way in, each block's `kin` saying what reaches it
+        from below its own dominator (_kill_fold). Where `addr` is on one and
+        `d` is not, `addr` is a way into its piece and T1 is the rest of the piece and
+        what reaches the piece from below `d`. Where both are on the same cycle, T1 is
+        the piece below `d` and not below `addr`, and T2 what `d` reaches of the rest
+        without `addr`, which is `escape`'s. Another root's tree is the entry's case where
+        no path leaves it and comes back, as a mono entry's body is. A block in no tree,
+        in a tree a path comes back into, or in one that is no forest (cfg.dom_numbers),
+        is walked as it was."""
+        fold = self._kill_fold()
+        if fold is None:
+            return None
+        depth, kin, chain, span, outside, live, escape = fold
+        pre, end, _kids = self._dnum
+        if addr not in kin:
+            return None
+        d = self._idom[addr]
+        piece, order = self._pieces()
+        home, there = piece[addr], piece[d]
+        if home == there:
+            return (span(home, pre[d] + 1, pre[addr]) | span(home, end[addr], end[d])
+                    | escape(d, pre[addr], end[addr]))
+        if live(addr):
+            mask = (span(home, pre[d] + 1, pre[addr]) | span(home, end[addr], end[d])
+                    | outside(home, d))
+        else:
+            mask = 0
+            for p in self._preds.get(addr, ()):
+                if p in pre and pre[d] < pre[p] < end[d]:
+                    mask |= chain(p, d)
+        if live(d):
+            mask |= span(there, -1, len(pre))
+        return mask
+
+    def _kill_fold(self):
+        """(depth, kin, chain, span, outside, live, escape) for `_kill_mask`, once:
+
+        `kin[v]` says what the blocks below `e`, the immediate dominator of `v`, that
+        reach `v` or are `v` write. A block `m` below `e` that reaches a way into `v`,
+        `p`, is either below `p`'s own dominator `q`, and so in `kin[p]`, or reaches `q`,
+        as the path from the entry to `m` passes `q` by and the one on to `p` cannot. So
+        what `m`s there are is `kin` of each block from `p` up the tree to just below `e`,
+        and `chain(p, e)` folds that, in jumps of a power of two up the tree. On a cycle,
+        `v`'s piece is in it, or the part of it below `e` where `e` is on the cycle too;
+        `e` is above every block of the piece where it is not, and what reaches the
+        piece from outside is `outside`. The pieces come in order, each after every piece
+        with an edge into it, and a block's dominators are in its piece or earlier ones,
+        so each `kin` is done before a `chain` asks for it. Where `e` is on a cycle `v` is
+        not on, the part of `e`'s piece below it reaches `v` through `e`, and those are
+        the only ones that reach it only that way.
+
+        `span(piece, lo, hi)` is what that piece's blocks numbered in [lo, hi) write
+        (cfg.dom_numbers), and `live(n)` whether `n` is on a cycle. Each block and edge
+        is seen once, and each `chain` takes a jump per bit of a depth. None where the
+        tree is no forest.
+
+        `escape(d, lo, hi)`, for a `d` on a cycle, is what the blocks of its piece that
+        are not below it, `d` among them, write where `d` reaches them by a path that
+        leaves its subtree by an edge from a block not numbered in [lo, hi). From such a
+        block, `rest`, the path can only come back below `d` through `d`, which leaves by
+        the same edges, so it is what each edge's target reaches within `rest`. Worked
+        out once per `d`, over its piece."""
+        if self._kfold is not None:
+            return self._kfold or None
+        if self._idom is None:
+            self._dom_tree()
+        num = self._dnum
+        if num is None:
+            self._kfold = ()
+            return None
+        pre, end, kids = num
+        idom, root_of, preds = self._idom, self._root_of, self._preds
+        piece, order = self._pieces()
+        # Nothing below holds the lifter, which would keep it past its walk in a cycle.
+        blocks, own = self.blocks, {b: self._kill_bits(b) for b in pre}.__getitem__
+        depth: dict = {}
+        for n in sorted(pre, key=pre.get):
+            d = idom[n]
+            depth[n] = 0 if d == n else depth[d] + 1
+
+        def live(n):
+            return len(order[piece[n]]) > 1 or n in blocks[n].succ
+
+        tables: dict = {}
+
+        def span(i, lo, hi):
+            got = tables.get(i)
+            if got is None:
+                members = sorted((m for m in order[i] if m in pre), key=pre.get)
+                keys = [pre[m] for m in members]
+                rows = [[own(m) for m in members]]
+                w = 1
+                while 2 * w <= len(members):
+                    last = rows[-1]
+                    rows.append([last[j] | last[j + w] for j in range(len(last) - w)])
+                    w *= 2
+                got = tables[i] = (keys, rows)
+            keys, rows = got
+            a, b = bisect.bisect_right(keys, lo - 1), bisect.bisect_left(keys, hi)
+            if a >= b:
+                return 0
+            k = (b - a).bit_length() - 1
+            return rows[k][a] | rows[k][b - (1 << k)]
+
+        kin: dict = {}
+        up, acc = [idom], [kin]
+
+        def jump(v, j):
+            while len(acc) <= j:
+                up.append({})
+                acc.append({})
+            got = acc[j].get(v)
+            if got is None:
+                u, w = jump(v, j - 1)
+                w2, m2 = jump(u, j - 1)
+                up[j][v], acc[j][v] = w2, (got := w | m2)
+                return w2, got
+            return up[j][v], got
+
+        def step(v, j):
+            if j == 0:
+                return idom[v], kin[v]
+            return jump(v, j)
+
+        def chain(p, e):
+            steps, j, mask = depth[p] - depth[e], 0, 0
+            while steps:
+                if steps & 1:
+                    p, got = step(p, j)
+                    mask |= got
+                steps >>= 1
+                j += 1
+            return mask
+
+        outs: dict = {}
+
+        def outside(i, e):
+            got = outs.get((i, e))
+            if got is None:
+                got = 0
+                for w in order[i]:
+                    for p in preds.get(w, ()):
+                        if piece[p] == i or p not in pre:
+                            continue
+                        if pre[e] < pre[p] < end[e]:
+                            got |= chain(p, e)
+                outs[(i, e)] = got
+            return got
+
+        # Another root's tree is one as the entry's is only where no path leaves it and
+        # comes back, which would pass its dominators by: no edge comes in from outside
+        # but to its root, and none of its blocks is on a cycle with one outside.
+        trees: dict = {}
+        for n, r in root_of.items():
+            trees.setdefault(r, []).append(n)
+        shut = {r for r, ns in trees.items()
+                if all((n == r or all(root_of.get(p) == r for p in preds.get(n, ())))
+                       and all(root_of.get(m) == r for m in order[piece[n]])
+                       for n in ns)}
+        for i, members in enumerate(order):
+            for v in members:
+                if (v not in pre or idom[v] == v
+                        or (v in root_of and root_of[v] not in shut)):
+                    continue
+                e = idom[v]
+                if not live(v):
+                    mask = own(v)
+                    for p in preds.get(v, ()):
+                        if p in pre and pre[e] < pre[p] < end[e]:
+                            mask |= chain(p, e)
+                elif piece[e] == i:
+                    mask = span(i, pre[e] + 1, end[e])
+                else:
+                    mask = span(i, pre[e], end[e]) | outside(i, e)
+                if piece[e] != i and live(e):
+                    mask |= span(piece[e], pre[e] + 1, end[e])
+                kin[v] = mask
+        exits: dict = {}
+
+        def escape(d, lo, hi):
+            got = exits.get(d)
+            if got is None:
+                i = piece[d]
+                rest = {m for m in order[i] if not pre[d] < pre[m] < end[d]}
+                parts = strong_components(
+                    rest, lambda n: [s for s in blocks[n].succ if s in rest])
+                at = {m: j for j, ms in enumerate(parts) for m in ms}
+                reach = [0] * len(parts)
+                for j in range(len(parts) - 1, -1, -1):
+                    mask = 0
+                    for m in parts[j]:
+                        mask |= own(m)
+                        for s in blocks[m].succ:
+                            if s in at and at[s] != j:
+                                mask |= reach[at[s]]
+                    reach[j] = mask
+                edges = sorted((pre[u], reach[at[s]]) for u in order[i]
+                               if pre[d] <= pre[u] < end[d]
+                               for s in blocks[u].succ if s in at)
+                keys = [k for k, _m in edges]
+                rows = [[m for _k, m in edges]]
+                w = 1
+                while 2 * w <= len(edges):
+                    last = rows[-1]
+                    rows.append([last[j] | last[j + w] for j in range(len(last) - w)])
+                    w *= 2
+                got = exits[d] = (keys, rows)
+            keys, rows = got
+
+            def run(a, b):
+                a, b = bisect.bisect_left(keys, a), bisect.bisect_left(keys, b)
+                if a >= b:
+                    return 0
+                k = (b - a).bit_length() - 1
+                return rows[k][a] | rows[k][b - (1 << k)]
+            return run(pre[d], lo) | run(hi, end[d])
+
+        self._kfold = (depth, kin, chain, span, outside, live, escape)
+        return self._kfold
+
+    def _kill_bits(self, b) -> int:
+        """What block `b` writes as `_join_kill` counts it, as a mask: a bit per register
+        `_written` gives it (_KILL_BIT), and _KILL_STACK and _KILL_HEAP where one of its
+        stores is one `_writes_stack` or `_writes_heap` counts."""
+        mask = 0
+        for r in self._written((b,)):
+            bit = _KILL_BIT.get(r)
+            if bit is None:
+                bit = _KILL_BIT[r] = 1 << (len(_KILL_REG) + 2)
+                _KILL_REG.append(r)
+            mask |= bit
+        if self._stores_frame(b):
+            mask |= _KILL_STACK
+        if self._writes_heap((b,)):
+            mask |= _KILL_HEAP
+        return mask
 
     def _join_write(self, addr, st: State, pad: str, src=None) -> list:
         """Write each phi register of goto-join `addr` to its shared name, from `st`.
@@ -8519,16 +8804,19 @@ class Lifter:
         A store whose address this cannot parse counts, because "I could not read the base"
         is not evidence about where it points.
         """
-        for b in nodes:
-            for (_a, mn, op, _n) in self.blocks[b].insns:
-                if mn not in _STORES and not _raw_store(mn):
-                    continue
-                got = _addr(_split_ops(op))
-                if got is None or got[1] is _BAD_POST:
-                    return True
-                if _T.roles.get(got[0][0]) in ("SP", "FP"):
-                    return True
-        return self._frame_escaped()
+        return any(self._stores_frame(b) for b in nodes) or self._frame_escaped()
+
+    def _stores_frame(self, b) -> bool:
+        """`_writes_stack` of block `b` before it asks `_frame_escaped`."""
+        for (_a, mn, op, _n) in self.blocks[b].insns:
+            if mn not in _STORES and not _raw_store(mn):
+                continue
+            got = _addr(_split_ops(op))
+            if got is None or got[1] is _BAD_POST:
+                return True
+            if _T.roles.get(got[0][0]) in ("SP", "FP"):
+                return True
+        return False
 
     def _writes_heap(self, nodes) -> bool:
         """True when a store in `nodes` could land in memory a tracked value READS.
