@@ -7062,6 +7062,198 @@ def test_a_follow_node_costs_the_same_where_an_arm_ends_after_the_rest():
         assert 0 < small and large < 1.5 * small, (shared, small, large)
 
 
+def test_a_follow_node_is_the_scan_s_where_it_is_read_off_the_dominator_tree():
+    """A guard test (#342). Past `cfg.FOLLOW_SWEPT` times a function's blocks scanned,
+    `follow` reads the join off the dominator tree: the first child of the conditional,
+    in reverse postorder, that both arms reach by forward edges. This holds each answer
+    to the scan run to the end of the function, on 4,000 random graphs of three kinds:
+    code as a compiler lays it out, with returns part way down an arm; checks in a row
+    that jump to blocks after them all, so that the joins are far below; and branches
+    to anywhere, with ends that several share. Each with a few edges moved, which makes
+    loops with two ways in, and with second entries. A quarter of them with every
+    answer read off the tree, a quarter with every one scanned, and the rest changing
+    over part way, at the budget and at half a block; half with `cfg.FOLLOW_NEAR` at
+    0. Traced at the return, as #302's guard is."""
+    import random
+    from jadart import cfg
+    from jadart.cfg import Block, structure
+    seen = {"found": 0, "none": 0, "far": 0, "read": 0, "read found": 0, "scan": 0,
+            "both": 0}
+
+    def scanned(cur, blocks, rpo, dominates):
+        succs = blocks[cur].succ
+        if len(succs) != 2 or succs[0] == succs[1] or cur not in rpo:
+            return None
+        tag = {s: 1 << bit for bit, s in enumerate(succs) if rpo.get(s, -1) > rpo[cur]}
+        for n in sorted(rpo, key=rpo.get):
+            t = tag.get(n, 0) if rpo[n] > rpo[cur] else 0
+            if t == 3 and dominates(cur, n):
+                return n
+            for s in blocks[n].succ if t else ():
+                if s in rpo and rpo[s] > rpo[n]:
+                    tag[s] = tag.get(s, 0) | t
+        return None
+
+    def returned(frame, event, arg):
+        if event == "return":
+            cur, up = frame.f_locals["cur"], frame
+            while up.f_code.co_name != "structure":
+                up = up.f_back
+            f = up.f_locals                     # the graph `structure` was handed
+            want = scanned(cur, f["blocks"], f["rpo"], f["dominates"])
+            assert arg == want, (cur, arg, want)
+            seen["found" if want is not None else "none"] += 1
+            if want is not None:
+                seen["far"] += f["rpo"][want] - f["rpo"][cur] > 16
+                seen["read found"] += "near" not in frame.f_locals
+            seen["scan"] += "near" in frame.f_locals
+            how.add("near" in frame.f_locals)
+        return returned
+
+    def calls(frame, _event, _arg):
+        code = frame.f_code
+        if code.co_filename == cfg.__file__:
+            if code.co_name == "follow":
+                return returned
+            seen["read"] += code.co_name == "meet"
+        return None
+
+    def written(rng):
+        # What a compiler lays out: statements in a row, if and else, loops, and
+        # returns part way down an arm, which leave the conditional above no
+        # post-dominator. Built last statement first, block 0 the entry.
+        succs = [None]
+
+        def block(*to):
+            succs.append(list(to))
+            return len(succs) - 1
+
+        def row(k, after, deep):
+            for _ in range(k):
+                after = one(after, deep)
+            return after
+
+        def one(after, deep):
+            r = rng.random()
+            if deep > 4 or r < 0.25:
+                return block(after)
+            if r < 0.35:
+                return block()
+            if r < 0.50:
+                return block(block(), after)
+            if r < 0.90:
+                return block(row(rng.randrange(4), after, deep + 1),
+                             row(rng.randrange(4), after, deep + 1))
+            head = block()
+            succs[head] = [row(rng.randrange(1, 4), head, deep + 1), after]
+            return head
+        succs[0] = [row(rng.randrange(2, 9), block(), 0)]
+        return succs
+
+    def laddered(rng):
+        # Checks in a row that each jump to one of the blocks after them all, twice
+        # over, so the arms of one meet below every check after it.
+        n, m = rng.randrange(2, 30), rng.randrange(1, 12)
+        succs = [[2 * n + rng.randrange(m), i + 1] for i in range(2 * n)]
+        return succs + [[2 * n + j + 1] if j + 1 < m and rng.random() < 0.3 else []
+                        for j in range(m)]
+
+    def tangled(rng):
+        # Branches a few blocks back or any distance on, and ends after the rest.
+        n, m = rng.randrange(2, 50), rng.randrange(1, 8)
+        reach = rng.choice((6, 6, n, 2 * n))
+        succs = []
+        for i in range(n):
+            k = rng.choice((0, 1, 2, 2, 2, 2))
+            succs.append([n + rng.randrange(m) if rng.random() < 0.15 else
+                          min(n - 1, max(0, i + rng.randrange(-3, reach)))
+                          for _ in range(k)])
+        for j in range(m):
+            k = rng.choice((0, 0, 1, 2))
+            succs.append([rng.randrange(n + j + 1, n + m) if j + 1 < m else
+                          rng.randrange(n) for _ in range(k)])
+        return succs
+    near, swept = getattr(cfg, "FOLLOW_NEAR", None), getattr(cfg, "FOLLOW_SWEPT", None)
+    sys.settrace(calls)
+    try:
+        for seed in range(4000):
+            cfg.FOLLOW_SWEPT = (-1, 1e18, swept, 0.5)[seed % 4]
+            cfg.FOLLOW_NEAR = near if seed // 4 % 2 else 0
+            rng = random.Random(seed)
+            succs = (written, laddered, tangled)[seed // 8 % 3](rng)
+            for _ in range(rng.choice((0, 0, 1, 3))):        # and a few edges moved
+                at = rng.choice([sc for sc in succs if sc] or [[0]])
+                at[rng.randrange(len(at))] = rng.randrange(len(succs))
+            blocks = {}
+            for i, sc in enumerate(succs):
+                a, k = 0x100 * i, len(sc)
+                blocks[a] = Block(a, [(a, "nop", "", "")], [0x100 * t for t in sc],
+                                  "b.ne" if k == 2 else "b" if k else "ret",
+                                  "x0 != 0" if k == 2 else "")
+            roots = tuple(0x100 * rng.randrange(len(succs))
+                          for _ in range(rng.randrange(0, 3)))
+            how = set()
+            structure(blocks, 0, orphans=True, entries=roots)
+            seen["both"] += len(how) == 2
+    finally:
+        sys.settrace(None)
+        cfg.FOLLOW_NEAR = near
+        if swept is None:
+            del cfg.FOLLOW_SWEPT
+        else:
+            cfg.FOLLOW_SWEPT = swept
+    assert seen["found"] > 7000 and seen["none"] > 50000 and seen["far"] > 4000, seen
+    if swept is not None:
+        assert seen["read"] > 25000 and seen["read found"] > 3500, seen
+        assert seen["scan"] > 16000 and seen["both"] > 1400, seen
+
+
+def test_a_follow_node_costs_the_same_where_the_joins_are_far_below():
+    """N checks in a row that each jump to a block of their own after all of them, and
+    N more that jump to the same blocks: every one of the first N meets its other arm
+    in its block, N or more blocks below it, and `follow` scanned all of those for each
+    (#342). Counted, not timed: the lines run inside `follow`, per instruction, at 30
+    checks and at 120. Scanned that was 548 and 2,171; with the join read off the
+    dominator tree once the scans have passed twice the function's blocks, 96 and 101."""
+    from jadart import cfg
+    from jadart.expr import tier3_graph
+    ran, inside = [0], [0]
+
+    def lines(frame, event, _arg):
+        if event == "line":
+            ran[0] += 1
+        elif event == "return" and frame.f_code.co_name == "follow":
+            inside[0] -= 1
+        return lines
+
+    def calls(frame, _event, _arg):
+        code = frame.f_code
+        if code.co_filename != cfg.__file__:
+            return None
+        if code.co_name == "follow":
+            inside[0] += 1
+        return lines if inside[0] else None
+
+    def per_instruction(n):
+        rows, joins = [], 2 * n * 4
+        for mn in ("cbz", "cbnz"):
+            rows += [(mn, f"x{k % 8}, #{joins + k * 8:#x}") for k in range(n)]
+        for _ in range(n):
+            rows += [("add", "x2, x2, #1"), ("ret", "")]
+        ran[0] = 0
+        sys.settrace(calls)
+        try:
+            g = tier3_graph([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        finally:
+            sys.settrace(None)
+        # the first check's two arms meet in its own block, the first after the checks
+        assert [s[0] for s in g.stmts] == ["asm", "if", "asm"], g.stmts
+        assert g.stmts[-1] == ("asm", joins) and str(g.stmts).count("('if'") == 2 * n
+        return ran[0] / len(rows)
+    small, large = per_instruction(30), per_instruction(120)
+    assert 0 < small and large < 1.5 * small, (small, large)
+
+
 def test_json_and_text_agree_on_exit_codes():
     # `jadart -j verify` printed "ok": false on a failed gate and exited 0, so a script
     # branching on $? saw success where a human reading the same run saw failure.
