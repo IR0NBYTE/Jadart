@@ -22079,8 +22079,10 @@ def test_the_address_facts_cost_the_same_per_instruction_at_any_length():
         return add(f, k)
 
     def shape(name, n):
-        # Each has a read the walk holds only a name for, so the facts are asked for.
-        rows = [("ldur", "x2, [x7, #-1]")] if name == "pairs" else []
+        # Each has a read the walk holds only a name for, off a register one way in
+        # adds to, so the facts are asked for and no nearest write answers it (#346).
+        rows = [("cbz", "x5, #0x8"), ("add", "x7, x7, #8"),
+                ("ldur", "x2, [x7, #-1]")] if name == "pairs" else []
         for i in range(n):
             at = len(rows) * 4
             if name == "pairs":
@@ -22114,6 +22116,411 @@ def test_the_address_facts_cost_the_same_per_instruction_at_any_length():
             assert large <= small * 1.25 + 1, (name, small, large)
     finally:
         expr._addr_facts, expr._af_meet, expr._af_add = facts, meet, add
+
+
+_PRO_346 = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+            ("sub", "x15, x15, #0x20")]
+_EPI_346 = [("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")]
+
+
+def _ordinary_346(i):
+    """Body `i` of a corpus of ordinary code, as `lift_function` takes it: a frame, a
+    field read off an argument, and by `i` a class id tested, calls with their results
+    kept in the frame, a counted loop over an array, an object allocated and its fields
+    stored, or Smi arithmetic and a test."""
+    f, g, cid = 7 + 8 * (i % 4), 0xf + 8 * (i % 3), 0x40 + i
+    rows = _PRO_346 + [("ldr", "x1, [x29, #0x10]"), ("ldur", f"x2, [x1, #{f:#x}]")]
+    at, kind = len(rows) * 4, i % 5
+    if kind == 0:
+        rows += [("ldur", "x3, [x2, #-1]"), ("ubfx", "x3, x3, #0xc, #0x14"),
+                 ("cmp", f"x3, #{cid:#x}"), ("b.ne", f"#{at + 24:#x}"),
+                 ("ldur", f"x0, [x2, #{g:#x}]"), ("stur", "x0, [x1, #0x2f]"),
+                 ("mov", "x0, x2")]
+    elif kind == 1:
+        rows += [("mov", "x0, x2"), ("bl", f"#{0x9000 + 0x40 * i:#x}"),
+                 ("stur", "x0, [x29, #-8]"), ("ldr", "x1, [x29, #0x10]"),
+                 ("ldur", f"x0, [x1, #{g:#x}]"), ("bl", f"#{0xa000 + 0x40 * i:#x}"),
+                 ("ldur", "x1, [x29, #-8]"), ("stur", f"x0, [x1, #{f:#x}]")]
+    elif kind == 2:
+        rows += [("ldur", "x3, [x2, #0xf]"), ("mov", "x4, #0"), ("mov", "x0, #0"),
+                 ("cmp", "x4, x3"), ("b.ge", f"#{at + 40:#x}"),
+                 ("add", "x16, x2, x4, lsl #2"), ("ldur", "x5, [x16, #0x17]"),
+                 ("add", "x0, x0, x5"), ("add", "x4, x4, #2"),
+                 ("b", f"#{at + 12:#x}")]
+    elif kind == 3:
+        rows += [("stur", "x2, [x29, #-8]"), ("bl", f"#{0xb000 + 0x40 * i:#x}"),
+                 ("ldur", "x2, [x29, #-8]"), ("stur", f"x2, [x0, #{f:#x}]"),
+                 ("ldr", "x3, [x29, #0x18]"), ("stur", f"x3, [x0, #{g:#x}]"),
+                 ("ldur", "x4, [x3, #-1]"), ("ubfx", "x4, x4, #0xc, #0x14"),
+                 ("stur", "x4, [x0, #0x2f]")]
+    else:
+        rows += [("ldur", f"x3, [x1, #{g:#x}]"), ("asr", "x2, x2, #1"),
+                 ("asr", "x3, x3, #1"), ("add", "x4, x2, x3"),
+                 ("cmp", f"x4, #{cid:#x}"), ("b.le", f"#{at + 28:#x}"),
+                 ("sub", "x4, x4, x2"), ("lsl", "x0, x4, #1")]
+    return [(k * 4, mn, op, "") for k, (mn, op) in enumerate(rows + _EPI_346)]
+
+
+def test_a_class_id_read_off_a_loaded_register_asks_for_no_address_facts():
+    """Nearly every body reads a class id, `ldur x3, [x2, #-1]`, and each one asked
+    `_addr_facts` for the whole body to learn that x2 was loaded a row or two up, which
+    was 2.9% of the time tier 3 takes on the clean fixture. The rows before the read
+    say so (`Lifter._row_plain`), and the analysis is made for none of the twenty
+    ordinary bodies here, where it was made for eight of them, and no line they print
+    differs from asking it at every row (#346)."""
+    from jadart import expr
+    made, facts = [0], expr._addr_facts
+
+    def counted(*args, **kw):
+        made[0] += 1
+        return facts(*args, **kw)
+
+    bodies = [_ordinary_346(i) for i in range(20)]
+    expr._addr_facts = counted
+    try:
+        out = [expr.lift_function(b) for b in bodies]
+        assert made[0] == 0, made[0]
+        assert "  if (((t0.field_0x8.tags >> 12) & 0xfffff) == 0x40) {" in out[0]
+        assert "  t2.field_0x30 = (t3.tags >> 12) & 0xfffff;" in out[3]
+        plain = expr.Lifter._row_plain
+        expr.Lifter._row_plain = lambda self, a: False
+        try:
+            assert [expr.lift_function(b) for b in bodies] == out
+        finally:
+            expr.Lifter._row_plain = plain
+        assert made[0] == 8, made[0]
+    finally:
+        expr._addr_facts = facts
+
+
+def _shapes_346(name, n):
+    """Bodies for the rows read before the analysis, `n` of each: `far`, a class id
+    read 60 rows after its base was loaded; `reads`, every class id off one base
+    loaded once at the top; `ladder`, a read under a run of branches that all meet
+    above it; `moved`, a read off a copy of an address a loop adds to; `calls`, a read
+    off a register a call forgot, and one off a register it kept; `made`, a read off
+    a shift's result; `thread`, off a field of the thread once more is stored back;
+    `stepped`, off the base a load and a store moved as they went."""
+    rows = [("ldur", "x1, [x0, #7]")] if name == "reads" else []
+    for i in range(n):
+        at = len(rows) * 4
+        if name == "far":
+            rows += [("ldur", "x1, [x0, #7]")] + [("add", "x9, x9, #1")] * 60
+            rows += [("ldur", "x2, [x1, #-1]"), ("stur", "x2, [x0, #0xf]")]
+        elif name == "reads":
+            rows += [("ldur", "x2, [x1, #-1]"), ("ubfx", "x2, x2, #0xc, #0x14"),
+                     ("stur", "x2, [x0, #0xf]")]
+        elif name == "ladder":
+            rows += [("ldur", "x1, [x0, #7]")]
+            for k in range(6):
+                rows += [("cbz", f"x{3 + k}, #{at + 12 + 8 * k:#x}"),
+                         ("add", "x9, x9, #1")]
+            rows += [("ldur", "x2, [x1, #-1]"), ("stur", "x2, [x0, #0xf]")]
+        elif name == "moved":
+            rows += [("mov", "x6, x1"), ("ldur", "x2, [x6, #-1]"),
+                     ("stur", "x2, [x0, #0xf]"), ("add", "x1, x1, #0x10"),
+                     ("cmp", "x1, x3"), ("b.lo", f"#{at:#x}")]
+        elif name == "calls":
+            rows += [("add", "x1, x1, #8"), ("add", "x20, x20, #8"),
+                     ("bl", "#0x90000"), ("ldur", "x2, [x1, #-1]"),
+                     ("ldur", "x3, [x20, #-1]"), ("stur", "x2, [x0, #0xf]"),
+                     ("stur", "x3, [x0, #0x17]")]
+        elif name == "made":
+            rows += [("lsl", "x1, x3, #1"), ("ldur", "x2, [x1, #-1]"),
+                     ("stur", "x2, [x0, #0xf]")]
+        elif name == "thread":
+            rows += [("ldr", "x1, [x26, #0x48]"), ("add", "x5, x1, #0x20"),
+                     ("str", "x5, [x26, #0x48]"), ("ldur", "x2, [x1, #-1]"),
+                     ("stur", "x2, [x0, #0xf]")]
+        elif name == "stepped":
+            rows += [("ldur", "x1, [x0, #7]"), ("ldr", "x3, [x1], #8"),
+                     ("ldur", "x2, [x1, #-1]"), ("stur", "x2, [x0, #0xf]"),
+                     ("ldur", "x4, [x0, #7]"), ("str", "x3, [x4, #8]!"),
+                     ("ldur", "x2, [x4, #-1]"), ("stur", "x2, [x0, #0x17]")]
+    return [(k * 4, mn, op, "") for k, (mn, op) in enumerate(rows + [("ret", "")])]
+
+
+def test_the_rows_before_a_read_never_say_plain_where_the_address_facts_do_not():
+    """`Lifter._row_plain` answers for `_addr_facts` without making it, so it may say
+    a row reads a plain value only where the analysis has no computed address there.
+    Asked of every row of every body here, ordinary ones and ones made to mislead it,
+    against the analysis made in full: no row both. A guard: main has no such
+    shortcut (#346)."""
+    from jadart import expr
+    real = expr.Lifter._lift_block
+    plain, computed, both = [0], [0], []
+
+    def checked(self, *args, **kw):
+        box = self._elem_box
+        if "checked_346" not in box:
+            box["checked_346"] = True
+            rows = [t[0] for blk in self.blocks.values() for t in blk.insns]
+            said = {r for r in rows if self._row_plain(r)}
+            held = expr._addr_facts(self.blocks, self._preds,
+                                    (self.entry, *self.roots), self.raw)[0]
+            plain[0] += len(said)
+            computed[0] += len(held)
+            both.extend(sorted(said & held))
+        return real(self, *args, **kw)
+
+    expr.Lifter._lift_block = checked
+    try:
+        for i in range(10):
+            expr.lift_function(_ordinary_346(i))
+        for name in ("far", "reads", "ladder", "moved", "calls", "made", "thread",
+                     "stepped"):
+            for n in (1, 2, 5, 12):
+                expr.lift_function(_shapes_346(name, n))
+    finally:
+        expr.Lifter._lift_block = real
+    assert not both, both
+    assert plain[0] > 200 and computed[0] > 20, (plain[0], computed[0])
+
+
+def test_the_rows_read_before_the_address_facts_are_made_stay_bounded():
+    """What `Lifter._row_plain` reads for one row is capped, `_PLAIN_ROWS`, and past
+    the cap the analysis is made once and asked from then on, so the shortcut adds at
+    most a constant per row however the body is shaped: every read 60 rows from its
+    base's load, every read off one base at the top of the body, which read back to
+    the top each time would be quadratic, and reads under a run of joins. Counted, not
+    timed, at 40 and at 160 of each. A guard: main has no such shortcut (#346)."""
+    from jadart import expr
+    plain, row, forgets = expr.Lifter._row_plain, expr._af_row, expr._call_forgets
+    inside, asks, read = [False], [0], [0]
+
+    def counted_plain(self, a):
+        asks[0] += 1
+        inside[0] = True
+        try:
+            return plain(self, a)
+        finally:
+            inside[0] = False
+
+    def counted_row(*args):
+        read[0] += inside[0]
+        return row(*args)
+
+    def counted_forgets(*args):
+        read[0] += inside[0]
+        return forgets(*args)
+
+    def per_instruction(name, n):
+        rows = _shapes_346(name, n)
+        asks[0] = read[0] = 0
+        expr.lift_function(rows)
+        assert asks[0] and read[0] <= asks[0] * (expr.Lifter._PLAIN_ROWS + 1), (
+            name, n, asks[0], read[0])
+        return read[0] / len(rows)
+
+    expr.Lifter._row_plain, expr._af_row = counted_plain, counted_row
+    expr._call_forgets = counted_forgets
+    try:
+        for name in ("far", "reads", "ladder", "moved", "calls"):
+            small, large = per_instruction(name, 40), per_instruction(name, 160)
+            assert large <= small * 1.25 + 1, (name, small, large)
+    finally:
+        expr.Lifter._row_plain, expr._af_row = plain, row
+        expr._call_forgets = forgets
+
+
+def _fanin_346(ways, depth):
+    """A join with `ways` one-row blocks leading into it, and under it a tree of blocks
+    `depth` deep, each reading a field off a register that no row after the frame is
+    set up writes."""
+    rows = _PRO_346 + [("ldr", "x1, [x29, #0x10]")]
+    join = (len(rows) + ways) * 4
+    rows += [("cbz", f"x5, #{join:#x}")] * ways
+
+    def under(d):
+        at = len(rows) * 4
+        if not d:
+            rows.extend([("ldur", "x2, [x1, #0xf]"), ("ret", "")])
+            return
+        rows.extend([("ldur", "x2, [x1, #0xf]"),
+                     ("cbz", f"x5, #{at + 8 + (2 ** d - 1) * 8:#x}")])
+        under(d - 1)
+        under(d - 1)
+
+    under(depth)
+    return [(k * 4, mn, op, "") for k, (mn, op) in enumerate(rows)]
+
+
+def test_a_join_with_many_ways_in_is_not_read_again_for_every_row_under_it():
+    """`Lifter._row_plain` follows the ways into a block as it reads its rows, and a
+    join has as many as the body has branches to it. With only the rows capped, every
+    way in was followed again for every read under the join: 400 ways into one block
+    and 1,023 reads under it, 2,450 rows and about as many ways in as lift at Python's
+    own recursion limit, took 0.132 s where the body took 0.054 s before the shortcut.
+    The ways in are capped as the rows are, and it takes 0.062 s. Counted, not timed:
+    what `_row_plain` itself calls, per row of the body, at 75 ways in and at 300. A
+    guard: main has no such shortcut (#346)."""
+    from jadart import expr
+    steps = [0]
+
+    def count(frame, event, arg):
+        if event == "c_call" and frame.f_code.co_name == "_row_plain":
+            steps[0] += 1
+
+    def per_row(ways, depth):
+        rows = _fanin_346(ways, depth)
+        steps[0] = 0
+        was = sys.getprofile()
+        sys.setprofile(count)
+        try:
+            expr.lift_function(rows)
+        finally:
+            sys.setprofile(was)
+        assert steps[0], (ways, depth)
+        return steps[0] / len(rows)
+
+    small, large = per_row(75, 5), per_row(300, 7)
+    assert large <= small * 1.5 + 1, (small, large)
+
+
+def test_a_body_that_keeps_reading_computed_addresses_costs_the_same_per_row():
+    """A read at a computed address is kept by its text, for a store to find it live
+    (#341), and the pattern of them was compiled again each time one was added. A body
+    that makes such a read every few rows compiled a pattern of all it had made so far
+    for each one: near the 4,000 rows the CLI takes, the `moved`, `calls` and `thread`
+    shapes lifted in 1.76, 1.32 and 2.38 s. They are looked for as text (`_spelled`),
+    and take 0.14, 0.13 and 0.08 s. Counted, not timed: the Python calls made to lift
+    each shape, per row, at about 1,000 rows and at about 4,000. On main the larger
+    takes 36, 22 and 57 times the calls per row of the smaller (#346)."""
+    from jadart import expr
+    calls = [0]
+
+    def count(frame, event, arg):
+        if event == "call":
+            calls[0] += 1
+
+    def per_row(name, n):
+        rows = _shapes_346(name, n)
+        expr.lift_function(rows)                # the memos, filled
+        calls[0] = 0
+        was = sys.getprofile()
+        sys.setprofile(count)
+        try:
+            expr.lift_function(rows)
+        finally:
+            sys.setprofile(was)
+        return calls[0] / len(rows)
+
+    for name, small, large in (("moved", 160, 660), ("calls", 140, 570),
+                               ("thread", 200, 799)):
+        few, many = per_row(name, small), per_row(name, large)
+        assert many <= few * 1.25 + 1, (name, few, many)
+
+
+def test_a_value_built_with_its_defaults_is_the_value_it_was():
+    """`V` is built about two million times lifting the clean fixture, nearly always
+    with nothing but a text and a precedence, and its `__init__` stores only the fields
+    that are not at their defaults (#346). A guard that nothing else about it moved:
+    what it compares and hashes as, what it prints, every field read, `replace`, a
+    copy and a pickle, and that it is still frozen."""
+    import copy
+    import dataclasses
+    import pickle
+    from jadart.expr import V, P_ATOM, _SMI_TAG
+    bare, full = V("x0"), V("x0", P_ATOM, None, 64, 64, 0, False, None)
+    names = [f.name for f in dataclasses.fields(V)]
+    assert names == ["text", "prec", "wide", "bits", "sext", "smi", "calc", "at"]
+    assert [getattr(bare, n) for n in names] == ["x0", P_ATOM, None, 64, 64, 0, False,
+                                                 None]
+    assert bare == full and hash(bare) == hash(full) and repr(bare) == repr(full)
+    assert repr(bare) == ("V(text='x0', prec=%d, wide=None, bits=64, sext=64, smi=0, "
+                          "calc=False, at=None)" % P_ATOM)
+    assert dataclasses.replace(bare, text="x1") == V("x1")
+    assert dataclasses.asdict(bare) == dict(zip(names, ["x0", P_ATOM, None, 64, 64, 0,
+                                                        False, None]))
+    assert copy.copy(bare) == bare and pickle.loads(pickle.dumps(bare)) == bare
+    other = V("x0", 3, V("x9"), 32, 31, _SMI_TAG, True, (1, 2, 3, 4))
+    assert [getattr(other, n) for n in names] == ["x0", 3, V("x9"), 32, 31, _SMI_TAG,
+                                                  True, (1, 2, 3, 4)]
+    assert dataclasses.replace(other, text="x1").wide == V("x9")
+    assert pickle.loads(pickle.dumps(other)) == other
+    for field, value in (("prec", 3), ("wide", V("x9")), ("bits", 32), ("sext", 32),
+                         ("smi", _SMI_TAG)):
+        assert V("x0", **{field: value}) != bare, field
+        assert getattr(dataclasses.replace(bare, **{field: value}), field) == value
+    # `calc` and `at` say where a value came from and are no part of what it is.
+    assert V("x0", calc=True, at=(1, 2, 3, 4)) == bare
+    assert hash(V("x0", calc=True, at=(1, 2, 3, 4))) == hash(bare)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        bare.text = "x1"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        bare.bits = 32
+
+
+def test_a_store_finds_the_spellings_it_covers_as_its_pattern_did():
+    """`_pin_mem` compiled `(?:a|b)(?![0-9a-fA-F])` of the spellings a store covers at
+    every store, to ask each live value whether it reads one, and compiling them was
+    4% of the time tier 3 takes on the clean fixture. `_spelled` looks for the same
+    texts as text, and for the reads a body made at computed addresses and its
+    element reads, whose pattern asked for a whole name. A guard that it finds
+    exactly what each pattern does: every text of up to four pieces against every one
+    and two spellings, the pieces chosen so one spelling sits inside another, ends at
+    a hex digit, follows what a name is made of or is empty (#346)."""
+    import itertools
+    from jadart.expr import _spelled
+    pieces = ("x1", ".field_0x8", ".field_0x80", "0", "g", "[", "_", "$", "@",
+              "\u00e9", "\u00b2", "")
+    texts = sorted({"".join(t) for k in range(5)
+                    for t in itertools.product(pieces[:11], repeat=k)})
+    spellings = [(a,) for a in pieces] + list(itertools.permutations(
+        ("x1.field_0x8", ".field_0x8", "x1", "x1[", "0", ""), 2))
+    for whole in (False, True):
+        found = 0
+        for spelling in spellings:
+            pat = re.compile((r"(?<![\w$@])" if whole else "") + "(?:"
+                             + "|".join(map(re.escape, spelling))
+                             + r")(?![0-9a-fA-F])")
+            for text in texts:
+                want = pat.search(text) is not None
+                assert _spelled(spelling, text, whole) is want, (spelling, text, whole)
+                found += want
+        assert 0 < found < len(spellings) * len(texts)
+    assert _spelled(("t3[x4]",), "t3[x4] + 1", True)
+    assert not _spelled(("t3[x4]",), "at3[x4] + 1", True)
+    assert _spelled(("x1.field_0x8",), "x1.field_0x8 + x1.field_0x80")
+    assert not _spelled(("x1.field_0x8",), "x1.field_0x80 + x1.field_0x8a")
+
+
+#: Python calls made in jadart's own code to lift `_ordinary_346`'s forty bodies, as
+#: recorded when #346 took the lift back to what it cost: 60,408 before it. Moved only
+#: by a change that means to make ordinary code cost more, and says so.
+_CALLS_346 = 58032
+
+
+def test_ordinary_code_lifts_in_the_python_calls_it_was_recorded_at():
+    """Tier 3 came to lift ordinary code 7% slower over eight fixes, none of which
+    showed up in a test: each added a little to every row. This counts the work, not
+    the time, so it is the same number on every machine: the Python calls made in
+    jadart's own modules to lift forty ordinary bodies, with the memos filled by a
+    first pass so the order tests run in does not move it, and without the frames of
+    generators and comprehensions, which Python versions count differently (the same
+    count on 3.9, 3.11, 3.12, 3.13, 3.14 and 3.15). More than 1% over `_CALLS_346`
+    fails. It sees what Python runs, which is where the 7% was, not time inside a
+    regular expression or a set, and only the shapes `_ordinary_346` has (#346)."""
+    from jadart import expr
+    frames = ("<genexpr>", "<listcomp>", "<dictcomp>", "<setcomp>")
+    calls = [0]
+
+    def count(frame, event, arg):
+        if event == "call" and frame.f_code.co_name not in frames and (
+                frame.f_globals.get("__name__", "").startswith("jadart")):
+            calls[0] += 1
+
+    bodies = [_ordinary_346(i) for i in range(40)]
+    for b in bodies:
+        expr.lift_function(b)
+    was = sys.getprofile()
+    sys.setprofile(count)
+    try:
+        for b in bodies:
+            expr.lift_function(b)
+    finally:
+        sys.setprofile(was)
+    assert calls[0] <= _CALLS_346 * 1.01, (calls[0], _CALLS_346)
 
 
 _PRO_340 = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
