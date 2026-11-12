@@ -421,6 +421,30 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Deeply nested loop bodies are built inner loops first and what they hold is folded
+  up the nest.** Tier 3 walked each loop's body back from its latches on its own, then
+  walked it again for what it writes, what it keeps live at the header and which slots
+  it stores, so N loops nested in one another cost about N * N to lift: counted in
+  lines of `expr.py` and `cfg.py` run, a lift took 2,973 lines per instruction at 30
+  deep and 8,160 at 120 (#332). Once the bodies walked come to more than twice the
+  function's blocks, `cfg.LoopNest` builds each body once, taking in an inner body
+  whole when its header dominates it, and the lifter folds the registers written, the
+  stores, calls and slots of a body from its own blocks and its inner bodies' answers;
+  the live registers at a header come from a summary per inner loop of what is live at
+  its header and what each exit leaves unwritten. The same lifts take 1,721 and 1,734
+  lines. In CPU, 30, 120, 240 and 490 deep, the last the deepest the CLI structures,
+  took 83, 177, 315 and 588 us per row and take 67, 81, 113 and 175; with the recursion
+  limit raised, 250, 500, 1,000 and 2,000 deep took 0.24, 0.92, 3.52 and 14.07 s and
+  take 0.09, 0.27, 0.94 and 3.54. Past the CLI's depth cap the growth that remains is
+  the size of the output: 2,000 loops deep print 32.2 million characters, most of them
+  indentation, and the passes that read them back. Ordinary code is walked as it was:
+  of the 721 functions with a loop in the clean fixture none walks its loops twice
+  over, and lifting every range of it took 22.53 s of CPU before and 22.54 s after,
+  the mean of three alternating runs each. Bodies whose header does not reach every
+  block, as in irreducible code, are walked as before too. No output changes: the nine
+  binaries lift to the same text, and a new test holds every changed walk to the old
+  one inside lifts of random loop nests.
+
 - **A goto join's kill set is folded over the dominator tree, not walked per join.**
   `_join_kill` asks what the blocks between a join and its immediate dominator write, and
   #289 bounded that walk by the tree. N conditionals that each jump over their own block

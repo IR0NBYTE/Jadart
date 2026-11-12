@@ -42,7 +42,7 @@ from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, 
                   cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
                   entry_reach, UNREACHED, cut_off, dominator_forest, dom_numbers,
                   second_reach, strong_components, past_trap, _cond_for, checks_into,
-                  _conditions_from_the_block_before)
+                  _conditions_from_the_block_before, LoopNest)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -3809,8 +3809,18 @@ class Lifter:
         self._near: dict = {}
         self._piece: dict = {}
         self._piece_order: list = []
-        #: loop header -> its natural body; see _back_loop.
+        #: loop header -> its natural body; see _back_loop. The LoopNest that builds
+        #: them, the one `_trip_nodes` builds its own with, and what each rooted body's
+        #: blocks read and leave written; see _loop_live_in.
         self._backloops: dict = {}
+        self._bnest = self._tnest = None
+        #: Whether the loops asked for so far were walked through more than _NEST_AFTER
+        #: times the function's blocks, which takes loops nested deeper than that: only
+        #: then are bodies built as a nest and folded, and the dicts for it made, as a
+        #: loop by itself or a few deep is cheaper walked (_go_nested). Before that,
+        #: how many blocks the bodies and the trips walked.
+        self._nested = False
+        self._looped = self._tripped = 0
         #: loop header -> the blocks it can reach while it runs; see _loop_region. And
         #: per block, what its subtree of `_idom` writes; see _region_written.
         self._regions: dict = {}
@@ -3820,6 +3830,13 @@ class Lifter:
         self._kfold = None
         self._kwalked = 0
         self._defs: dict = {}
+        #: per block, whether it stores where `_writes_stack`, `_writes_heap` and
+        #: `_writes_outgoing` ask, calls (`_CALLS`, or `bl`/`blr`), or what `_exit_slots`
+        #: makes of its stores; see _any_block.
+        self._stack_blocks = self._heap_blocks = self._out_blocks = None
+        self._call_blocks = self._bl_blocks = self._thru_blocks = None
+        self._slot_stores = self._folds = self._livesum = self._usedef = None
+        self._quiet_set = None
         self._frame_list: dict = {}
         self._reload_ops: dict = {}
         #: (header, {reg: name}, copied) for each loop being walked, innermost last. An
@@ -4264,8 +4281,7 @@ class Lifter:
         nodes = self._trip_nodes(header)
         if not nodes:
             return []
-        if any(self._through_frame(a, mn, op) for b in nodes
-               for (a, mn, op, _n) in self.blocks[b].insns):
+        if self._any_block(self._thru_blocks, self._thru_block, nodes):
             return keys
         written, new = None, set()
         held, wide = set(keys), self._wide_slots()
@@ -4325,16 +4341,34 @@ class Lifter:
                     return False
                 n = up
             return True
-        nodes, stack = {header}, [p for p in self._preds.get(header, ())
-                                  if p not in ended and dominated(p)]
-        if not stack:
-            nodes = set()
-        while stack:
-            n = stack.pop()
-            if n not in nodes and n not in ended:
-                nodes.add(n)
-                stack.extend(self._preds.get(n, ()))
-        got = self._trips[header] = frozenset(nodes)
+        latches = [p for p in self._preds.get(header, ())
+                   if p not in ended and dominated(p)]
+        if not latches:
+            got = self._trips[header] = frozenset()
+            return got
+        if not self._nested:
+            nodes, stack = {header}, latches[:]
+            while stack:
+                n = stack.pop()
+                if n not in nodes and n not in ended:
+                    nodes.add(n)
+                    stack.extend(self._preds.get(n, ()))
+            self._tripped += len(nodes)
+            if self._tripped <= _NEST_AFTER * len(self.blocks):
+                got = self._trips[header] = frozenset(nodes)
+                return got
+            self._go_nested()
+        nest = self._tnest
+        if nest is None:
+            # As `_back_loop` builds its bodies (#332), over `_ridom`.
+            nest = self._tnest = LoopNest(self._preds, lambda _h, n: n not in ended, num)
+            nest.prepare([h for h, ps in self._preds.items()
+                          if any(p != h and nest.above(h, p) for p in ps)],
+                         self._trip_nodes)
+            got = self._trips.get(header)
+            if got is not None:
+                return got
+        got = self._trips[header] = nest.closure(header, latches)
         return got
 
     def _ended_blocks(self) -> set:
@@ -4352,6 +4386,13 @@ class Lifter:
         if got is not None:
             return got
         trip = self._trip_nodes(header)
+        nest = self._tnest
+        if trip and nest is not None and header in nest.good and (
+                nest.body[header] is trip):
+            # Rooted: the header reaches every block of it inside it (LoopNest), so the
+            # walk below would gather it all, one block at a time per loop (#332).
+            self._bodies[header] = trip
+            return trip
         seen, stack = set(), [header] if trip else []
         while stack:
             n = stack.pop()
@@ -4394,6 +4435,11 @@ class Lifter:
                     and len(files.get(k, ())) == 1
                     and not _ANY_REG.search(v.text) and not self._reads_mem(v.text)):
                 held[k] = v.text
+        # A trip only drops what is held, so where no register holds one of these
+        # already there is nothing to ask of the trip's blocks (#332).
+        values = set(held.values())
+        if not any(st.get(r).text in values for r in regs):
+            return set()
         for b in trip:
             insns = self.blocks[b].insns
             for i, keys, delta, ops, backs in self._accesses(b):
@@ -8250,9 +8296,8 @@ class Lifter:
             out += self._pin(st, r, live, regs=True)
         # A call stores wherever its callee does, which is `_writes_heap`'s own
         # over-approximation reached by the other door.
-        if self._writes_heap(trip) or any(
-                mn in _CALLS for b in trip if b in self.blocks
-                for (_a, mn, _o, _n) in self.blocks[b].insns):
+        if self._writes_heap(trip) or self._any_block(
+                self._call_blocks, self._calls_in, trip):
             for key in sorted(st.reg):
                 v = st.reg[key]
                 if v.text == key or not live & _reg_mask((key,)):
@@ -8287,8 +8332,7 @@ class Lifter:
         nodes = self._back_loop(header)
         carried = self.carried.get(header)
         if carried is None:
-            carried = (_live_in_header(self.blocks, nodes, header, self._preds,
-                                       self._printed_liveness()[0])
+            carried = (self._loop_live_in(header, nodes)
                        & self._written(nodes)) - (_SPECIAL - {_lr()})
             carried |= self.carry_more.get(header, frozenset())     # see below
             self.carried[header] = carried
@@ -8513,16 +8557,181 @@ class Lifter:
         latches = [p for p in self._preds.get(header, ())
                    if p not in self._idom or self._root_of.get(p) != tree
                    or self._dominates(header, p)]
-        nodes, stack = {header}, latches
-        while stack:
-            n = stack.pop()
-            if n not in nodes and n in self.blocks:
-                nodes.add(n)
-                stack.extend(self._preds.get(n, ()))
+        if not self._nested:
+            # Walked by itself, as every loop was, while the bodies walked come to no
+            # more than _NEST_AFTER times the function: loops side by side or a few deep
+            # cost a few walks of it, and a nest has more to keep than it saves there.
+            # Past that the loops are nested deep, and the nest is turned on (#332).
+            nodes, stack = {header}, latches[:]
+            while stack:
+                n = stack.pop()
+                if n not in nodes and n in self.blocks:
+                    nodes.add(n)
+                    stack.extend(self._preds.get(n, ()))
+            self._looped += len(nodes)
+            if self._looped <= _NEST_AFTER * len(self.blocks):
+                got = self._backloops[header] = frozenset(nodes)
+                return got
+            self._go_nested()
+        nest = self._bnest
+        if nest is None:
+            # Inner loops first, each taken in whole by the loops around it (LoopNest):
+            # walked one by one, N nested loops walked N * N / 2 blocks (#332).
+            blocks = self.blocks
+            nest = self._bnest = LoopNest(self._preds, lambda _h, n: n in blocks,
+                                          self._dnum)
+            nest.prepare([h for h, ps in self._preds.items()
+                          if any(p != h and nest.above(h, p) for p in ps)],
+                         self._back_loop)
+            got = self._backloops.get(header)
+            if got is not None:
+                return got
         # Remembered, as `_loop_nodes` is: `_leaves_loop` asks this once per goto inside
         # a loop now, not once per loop (#129).
-        got = self._backloops[header] = frozenset(nodes)
+        got = self._backloops[header] = nest.closure(header, latches)
         return got
+
+    def _go_nested(self) -> None:
+        """Turn on the nest of loops for this function: from here `_back_loop` and
+        `_trip_nodes` build bodies inner loops first, and what a body holds is folded
+        from the bodies inside it. The bodies walked so far are asked again, to be part
+        of it; they come out the same sets."""
+        self._nested = True
+        self._backloops.clear()
+        self._trips.clear()
+        self._bodies.clear()
+        self._stack_blocks, self._heap_blocks, self._out_blocks = {}, {}, {}
+        self._call_blocks, self._bl_blocks, self._thru_blocks = {}, {}, {}
+        self._slot_stores, self._folds, self._livesum, self._usedef = {}, {}, {}, {}
+
+    def _loop_live_in(self, header, nodes) -> frozenset:
+        """`_live_in_header` of the loop at `header` over its body `nodes`, the registers
+        a trip may read before it writes them, folded up the nest of loops (#332).
+
+        Asked of each body, N nested loops ran the dataflow over N * N / 2 blocks between
+        them. A rooted body (LoopNest) is entered at its header alone, so to the loop
+        around it the body is one node: what it reads from its header on, `live`, and
+        for each block outside it an edge leaves to, the registers some path from the
+        header to that edge does not write, `through`. The loop around it reads through
+        it what the block past the edge reads and the path leaves alone. Both are unions
+        over paths of a write-kills-a-read transfer, so each is exact where the blocks
+        are, and the dataflow of the outer loop over its own blocks and these nodes has
+        the fixed point the one over every block had (Kildall; Tarjan's path expressions
+        fold a reducible graph the same way). A body that is not rooted, or whose parts
+        overlap, is asked as it was."""
+        reads = self._printed_liveness()[0]
+        nest = self._bnest
+        if nest is None or header not in nest.clean or nest.body.get(header) is not nodes:
+            return _live_in_header(self.blocks, nodes, header, self._preds, reads)
+        memo, todo, stack = self._livesum, [], [header]
+        while stack:                       # the nest below `header`, outer bodies first
+            h = stack.pop()
+            if h not in memo:
+                todo.append(h)
+                stack.extend(nest.kids[h])
+        for h in reversed(todo):
+            if h not in memo:
+                memo[h] = self._live_fold(h, reads)
+        got = memo[header]
+        if got is None:
+            return _live_in_header(self.blocks, nodes, header, self._preds, reads)
+        return _mask_regs(got[0])
+
+    def _live_fold(self, h, reads):
+        """(live, through) of the rooted body at `h`, from its own blocks and the
+        (live, through) of the bodies it took in whole; see _loop_live_in. None where
+        a part is not one (#332)."""
+        nest, memo, blocks, usedef = self._bnest, self._livesum, self.blocks, self._usedef
+        if h not in nest.clean:
+            return None
+        body, kids = nest.body[h], nest.kids[h]
+        parts = {}
+        for k in kids:
+            got = memo.get(k)
+            if got is None:
+                return None
+            parts[k] = got
+        own = nest.own[h]
+        for b in own:
+            if b not in usedef:
+                u = d = 0
+                more = reads.get(b, {}) if reads else {}
+                for i, (_a, mn, o, _n) in enumerate(blocks[b].insns):
+                    de, us = _def_use_masks(mn, o)
+                    u |= (us | more.get(i, 0)) & ~d
+                    d |= de
+                usedef[b] = (u, d)
+        # Each edge, from a block of this body or a body inside it, to a node of this
+        # level, a block or the header of a body taken in, or out of the body.
+        node = set(own) | set(kids)
+        edges, out = {}, []
+        for b in own:
+            mine = edges[b] = []
+            for s in blocks[b].succ:
+                if s in node:
+                    mine.append(s)
+                elif s not in body:
+                    out.append((b, s, -1))
+                else:
+                    return None            # into a body other than at its header
+        for k in kids:
+            mine = edges[k] = []
+            for s, m in parts[k][1].items():
+                if s in node:
+                    mine.append((s, m))
+                elif s not in body:
+                    out.append((k, s, m))
+                else:
+                    return None
+        order = sorted(node, reverse=True)
+        live = dict.fromkeys(node, 0)
+        changed = True
+        while changed:
+            changed = False
+            for b in order:
+                if b in parts:
+                    v = parts[b][0]
+                    for s, m in edges[b]:
+                        v |= live[s] & m
+                else:
+                    lo = 0
+                    for s in edges[b]:
+                        lo |= live[s]
+                    u, d = usedef[b]
+                    v = u | (lo & ~d)
+                if v != live[b]:
+                    live[b] = v
+                    changed = True
+        # Forward: what some path from the header to the end of each node leaves alone.
+        clear = dict.fromkeys(node, 0)
+        clear[h] = -1
+        order.reverse()
+        changed = True
+        while changed:
+            changed = False
+            for b in order:
+                if b in parts:
+                    for s, m in edges[b]:
+                        v = clear[s] | (clear[b] & m)
+                        if v != clear[s]:
+                            clear[s] = v
+                            changed = True
+                else:
+                    left = clear[b] & ~usedef[b][1]
+                    for s in edges[b]:
+                        v = clear[s] | left
+                        if v != clear[s]:
+                            clear[s] = v
+                            changed = True
+        # Only an edge to a block of a rooted body around this one is asked again.
+        top = nest._find(h)
+        around = nest.body[top] if top is not None and top != h else ()
+        through: dict = {}
+        for b, s, m in out:
+            if s in around:
+                left = clear[b] & m if b in parts else clear[b] & ~usedef[b][1]
+                through[s] = through.get(s, 0) | left
+        return live[h], through
 
     def _call_written(self, nodes) -> frozenset:
         """The registers a call inside `nodes` may leave holding something the reader
@@ -8574,12 +8783,57 @@ class Lifter:
         x2 and x3 its slot was computed from. A block with a trap or a throw is left out
         there, as no path runs on from it, but its stores and calls count, for a handler
         the graph does not show may run after them."""
-        loop = {b for b in self._back_loop(header) if not self._quiet(b)}
         fp = next((r for r, v in _T.roles.items() if v == "FP"), None)
         sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
-        if fp is None or self._frame_escaped() or fp in self._written(loop):
+        body = self._back_loop(header)
+        if not self._nested:
+            if not self._exit_walk(st, body, fp, sp):
+                written, unsafe = self._near_written(header)
+                self._stale_slots(st, written, unsafe=unsafe)
+            return
+        # In a nest of loops, what each block writes and what its stores do are the same
+        # for every loop holding it, and a drop is a drop in any order, so each block is
+        # read once and the loop's answer folded up the nest (#332). A block that clears
+        # the map clears it whatever the others drop.
+        quiet, stores = self._quiet_blocks(), self._slot_stores
+
+        def one(b):
+            if b in quiet:
+                return _NO_EXIT
+            got = stores.get(b, False)
+            if got is False:
+                got = stores[b] = self._slot_store(b, fp) if fp is not None else None
+            return (self._block_defs(b), got,
+                    self._flag(self._heap_blocks, self._heap_block, b),
+                    self._flag(self._bl_blocks, self._bl_in, b))
+        got = self._fold(body, "exit", one, _exit_join)
+        if got is None:
+            got = _exit_join([one(b) for b in sorted(body)])
+        if fp is None or self._frame_escaped() or fp in got[0]:
             st.slot.clear()
             return
+        if sp is not None:
+            for k in [k for k in st.slot if k.startswith(sp)]:
+                del st.slot[k]
+        if got[1] is None:
+            st.slot.clear()
+            return
+        for k in [k for k in st.slot if k in got[1]]:
+            del st.slot[k]
+        if got[2] or got[3]:
+            for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
+                del st.slot[k]
+        written, unsafe = self._near_written(header)
+        self._stale_slots(st, written, unsafe=unsafe)
+
+    def _exit_walk(self, st: State, body, fp, sp) -> bool:
+        """`_exit_slots` up to `_near_written` for a loop by itself, block by block, as
+        it was for every loop; True where it cleared the map. A loop with none inside
+        it is asked once, and stops at the first block that clears."""
+        loop = {b for b in body if not self._quiet(b)}
+        if fp is None or self._frame_escaped() or fp in self._written(loop):
+            st.slot.clear()
+            return True
         if sp is not None:
             for k in [k for k in st.slot if k.startswith(sp)]:
                 del st.slot[k]
@@ -8591,11 +8845,11 @@ class Lifter:
                     got = _addr(_split_ops(op))
                     if got is None or got[1] is _BAD_POST:
                         st.slot.clear()
-                        return
+                        return True
             for i, keys, delta, ops, backs in self._accesses(b):
                 if delta:
                     st.slot.clear()
-                    return
+                    return True
                 if backs is not None:
                     lo = int(keys[0][len(fp):])
                     _drop_stored(st.slot, fp, lo,
@@ -8607,8 +8861,48 @@ class Lifter:
                                           for (_a, mn, _o, _n) in self.blocks[b].insns):
             for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
                 del st.slot[k]
-        written, unsafe = self._near_written(header)
-        self._stale_slots(st, written, unsafe=unsafe)
+        return False
+
+    def _slot_store(self, b, fp):
+        """The frame slots block `b`'s stores drop in `_exit_slots`, or None where one
+        of them clears the map: a store whose address does not parse or moves the frame
+        after it, or one at a displacement the frame moved by."""
+        insns = self.blocks[b].insns
+        for (_a, mn, op, _n) in insns:
+            if mn in _STORES:
+                got = _addr(_split_ops(op))
+                if got is None or got[1] is _BAD_POST:
+                    return None
+        gone, wide = set(), self._wide_slots()
+        for i, keys, delta, ops, backs in self._accesses(b):
+            if delta:
+                return None
+            if backs is not None:
+                lo = int(keys[0][len(fp):])
+                hi = lo + _access_width(insns[i][1], ops[0]) * len(keys)
+                gone.update(f"{fp}{off:+d}" for off in range(lo - 7, hi))
+                gone.update(k for k in (f"{fp}{off:+d}" for off in range(lo - 15, lo - 7))
+                            if k in wide)
+        return frozenset(gone)
+
+    def _quiet_blocks(self) -> frozenset:
+        """The blocks `_quiet` says yes to, once."""
+        if self._quiet_set is None:
+            self._quiet_set = frozenset(b for b in self.slow_paths
+                                        if b in self.blocks and self._quiet(b))
+        return self._quiet_set
+
+    def _thru_block(self, b) -> bool:
+        return any(self._through_frame(a, mn, op)
+                   for (a, mn, op, _n) in self.blocks[b].insns)
+
+    def _calls_in(self, b) -> bool:
+        """Whether `b` calls; False for a block the graph does not have, as `_pin_loop`
+        asks of a trip, which may hold one."""
+        return b in self.blocks and any(t[1] in _CALLS for t in self.blocks[b].insns)
+
+    def _bl_in(self, b) -> bool:
+        return any(t[1] in ("bl", "blr") for t in self.blocks[b].insns)
 
     def _near_written(self, header) -> tuple:
         """(`_written` less _SPECIAL, `_call_written`) of the blocks `_exit_slots` calls
@@ -8804,7 +9098,8 @@ class Lifter:
         A store whose address this cannot parse counts, because "I could not read the base"
         is not evidence about where it points.
         """
-        return any(self._stores_frame(b) for b in nodes) or self._frame_escaped()
+        return self._any_block(self._stack_blocks, self._stores_frame, nodes) or (
+            self._frame_escaped())
 
     def _stores_frame(self, b) -> bool:
         """`_writes_stack` of block `b` before it asks `_frame_escaped`."""
@@ -8817,6 +9112,55 @@ class Lifter:
             if _T.roles.get(got[0][0]) in ("SP", "FP"):
                 return True
         return False
+
+    def _any_block(self, memo: dict, test, nodes) -> bool:
+        """Whether `test` holds of a block of `nodes`, each block's answer worked out once
+        and remembered in `memo`. Over a loop's body it is folded up the nest (_fold),
+        and over any other set asked by C loops and not a line per block: N nested loops
+        asked it of N * N / 2 blocks (#332). A block that is not one raises KeyError, as
+        the walk over its instructions did."""
+        if not self._nested:
+            return any(map(test, nodes))       # a loop by itself: stop at the first
+        got = self._fold(nodes, id(memo), lambda b: self._flag(memo, test, b), any)
+        if got is not None:
+            return got
+        for b in nodes - memo.keys():
+            memo[b] = test(b)
+        return any(map(memo.__getitem__, nodes))
+
+    @staticmethod
+    def _flag(memo: dict, test, b) -> bool:
+        got = memo.get(b)
+        if got is None:
+            got = memo[b] = test(b)
+        return got
+
+    def _fold(self, nodes, name, leaf, join):
+        """`join` of `leaf` of each block of `nodes` where `nodes` is a rooted body a
+        LoopNest built (`_back_loop`, `_trip_nodes`, `_trip_body`), else None. A rooted
+        body is its own blocks and the bodies it took in whole, so its answer is joined
+        from theirs, each body's worked out once under `name`: N nested loops asked each
+        body's every block (#332). `join` is a union or an `any`, which a block in two
+        of the parts does not change."""
+        for nest in (self._bnest, self._tnest):
+            h = nest.by_id.get(id(nodes)) if nest is not None else None
+            if h is not None and nest.body[h] is nodes and h in nest.good:
+                break
+        else:
+            return None
+        memo = self._folds.setdefault((name, id(nest)), {})
+        if h not in memo:
+            todo, stack = [], [h]
+            while stack:                   # the nest below `h`, outer bodies first
+                n = stack.pop()
+                if n not in memo:
+                    todo.append(n)
+                    stack.extend(nest.kids[n])
+            for n in reversed(todo):
+                if n not in memo:
+                    memo[n] = join([*map(leaf, nest.own[n]),
+                                    *(memo[k] for k in nest.kids[n])])
+        return memo[h]
 
     def _writes_heap(self, nodes) -> bool:
         """True when a store in `nodes` could land in memory a tracked value READS.
@@ -8835,21 +9179,24 @@ class Lifter:
         the frame counts, including one whose address does not parse, because "I could not
         read the base" is not evidence about where it points. Nor is FP's role, past a
         write that put something else there (#307)."""
-        for b in nodes:
-            for (a, mn, op, _n) in self.blocks[b].insns:
-                if mn not in _STORES and not _raw_store(mn):
-                    continue
-                got = _addr(_split_ops(op))
-                if got is None or got[1] is _BAD_POST:
+        return self._any_block(self._heap_blocks, self._heap_block, nodes)
+
+    def _heap_block(self, b) -> bool:
+        """_writes_heap of block `b` alone."""
+        for (a, mn, op, _n) in self.blocks[b].insns:
+            if mn not in _STORES and not _raw_store(mn):
+                continue
+            got = _addr(_split_ops(op))
+            if got is None or got[1] is _BAD_POST:
+                return True
+            role = _T.roles.get(got[0][0])
+            if role not in ("SP", "FP"):
+                return True
+            if role == "FP":
+                if self._fp_lost_set is None:
+                    self._fp_lost_set = _fp_lost_at(self.blocks, self.raw)
+                if a in self._fp_lost_set:
                     return True
-                role = _T.roles.get(got[0][0])
-                if role not in ("SP", "FP"):
-                    return True
-                if role == "FP":
-                    if self._fp_lost_set is None:
-                        self._fp_lost_set = _fp_lost_at(self.blocks, self.raw)
-                    if a in self._fp_lost_set:
-                        return True
         return False
 
     def _stale_slots(self, st: State, written, unsafe=None) -> None:
@@ -8979,36 +9326,54 @@ class Lifter:
         return w
 
     def _written(self, nodes) -> set:
-        w = set()
-        for b in nodes:
-            got = self._defs.get(b)
-            if got is None:
-                got = self._defs[b] = frozenset().union(
-                    *(_def_use(mn, o)[0] for (_a, mn, o, _n) in self.blocks[b].insns),
-                    *(self._moved_regs(a) for (a, _m, _o, _n) in self.blocks[b].insns
-                      if a in self.frame_moves))
-            w |= got
-        return w
+        """What the instructions in `nodes` write, a call's clobbers and a frame move's
+        registers counted. Each block's worked out once, and joined by C loops and not a
+        line per block (#332)."""
+        defs = self._defs
+        if not self._nested:
+            w = set()
+            for b in nodes:
+                got = defs.get(b)
+                w |= got if got is not None else self._block_defs(b)
+            return w
+        got = self._fold(nodes, "written", self._block_defs, _union)
+        if got is not None:
+            return set(got)
+        for b in nodes - defs.keys():
+            self._block_defs(b)
+        return set().union(*map(defs.__getitem__, nodes))
+
+    def _block_defs(self, b) -> frozenset:
+        got = self._defs.get(b)
+        if got is None:
+            got = self._defs[b] = frozenset().union(
+                *(_def_use(mn, o)[0] for (_a, mn, o, _n) in self.blocks[b].insns),
+                *(self._moved_regs(a) for (a, _m, _o, _n) in self.blocks[b].insns
+                  if a in self.frame_moves))
+        return got
 
     def _writes_outgoing(self, nodes) -> bool:
         """Whether `nodes` hold a call, or a store that may write a slot off SP: one
         through SP, one `_step` prints raw, one through a frame register at an offset
         held in a register, or one _frame_meets found; or a frame move `_step` does not
         see (_frame_moves)."""
+        return self._any_block(self._out_blocks, self._out_block, nodes)
+
+    def _out_block(self, b) -> bool:
+        """_writes_outgoing of block `b` alone."""
         sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
-        for b in nodes:
-            for (a, mn, op, _n) in self.blocks[b].insns:
-                if mn in _CALLS or a in self.frame_meets or a in self.frame_moves:
+        for (a, mn, op, _n) in self.blocks[b].insns:
+            if mn in _CALLS or a in self.frame_meets or a in self.frame_moves:
+                return True
+            if mn in _STORES or _raw_store(mn):
+                if self._through_frame(a, mn, op):
                     return True
-                if mn in _STORES or _raw_store(mn):
-                    if self._through_frame(a, mn, op):
-                        return True
-                    got = _addr(_split_ops(op))
-                    if got is None or got[0][0] == sp or (
-                            _T.roles.get(got[0][0]) == "FP" and got[0][2] is not None):
-                        return True
-                    if _raw_store(mn) and _T.roles.get(got[0][0]) in ("SP", "FP"):
-                        return True
+                got = _addr(_split_ops(op))
+                if got is None or got[0][0] == sp or (
+                        _T.roles.get(got[0][0]) == "FP" and got[0][2] is not None):
+                    return True
+                if _raw_store(mn) and _T.roles.get(got[0][0]) in ("SP", "FP"):
+                    return True
         return False
 
     def _accesses(self, b) -> list:
@@ -9645,6 +10010,30 @@ def _stmt_blocks(stmts, blocks) -> set:
 def _agree(maps: list) -> dict:
     """The entries all of `maps` hold alike."""
     return {k: v for k, v in maps[0].items() if all(m.get(k) == v for m in maps)}
+
+
+#: How many times over the bodies of a function's loops may walk its blocks, one loop
+#: at a time, before they are built as a nest; see Lifter._back_loop. Of the 721
+#: functions with a loop in the clean fixture, 21 walk theirs more than once over, 2
+#: more than one and a half times and none twice.
+_NEST_AFTER = 2
+
+
+def _union(parts) -> frozenset:
+    return frozenset().union(*parts)
+
+
+#: What a block `_exit_slots` leaves out adds to its answer: nothing.
+_NO_EXIT = (frozenset(), frozenset(), False, False)
+
+
+def _exit_join(parts) -> tuple:
+    """(written, the frame slots dropped or None for all of them, stores to the heap,
+    calls) of a loop, from those of its parts; see Lifter._exit_slots."""
+    gone = [p[1] for p in parts]
+    return (frozenset().union(*(p[0] for p in parts)),
+            None if None in gone else frozenset().union(*gone),
+            any(p[2] for p in parts), any(p[3] for p in parts))
 
 
 def _drop_stored(held: dict, fp: str, lo: int, hi: int):

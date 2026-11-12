@@ -20381,6 +20381,384 @@ def test_loop_exits_and_goto_joins_cost_the_same_per_instruction_at_any_length()
 _FORMS_333 = ("plain", "loop", "mono")
 
 
+def _rows_332(seed):
+    """(rows, base, mono) of a random nest of loops for #332's guard: loops up to six
+    deep, each with a latch at its end, between them frame and heap stores and loads,
+    calls, traps and moves, and branches out of a loop, past several, back into one or
+    into another's body, to anywhere; in a quarter a monomorphic entry."""
+    import random
+    rng = random.Random(seed)
+    base, mono, rows = 0, None, []
+    if rng.random() < 0.25:
+        base, mono, rows = 0x1000, 0x1008, list(_MONO_ROWS[:6])
+    jumps = []
+
+    def line():
+        r, q = f"x{rng.randrange(1, 8)}", f"x{rng.randrange(1, 8)}"
+        return rng.choice([
+            ("add", f"{r}, {r}, #1"), ("mov", f"{r}, {q}"), ("add", f"{r}, {q}, {r}"),
+            ("stur", f"{r}, [x29, #-{rng.randrange(1, 5) * 8}]"),
+            ("ldur", f"{r}, [x29, #-{rng.randrange(1, 5) * 8}]"),
+            ("str", f"{r}, [x0, #{rng.randrange(4) * 8 + 8}]"),
+            ("ldr", f"{r}, [x0, #{rng.randrange(4) * 8 + 8}]"),
+            ("str", f"{r}, [sp, #8]"), ("bl", "#0x100"), ("blr", "x5"), ("brk", "#0")])
+
+    def loop(depth):
+        head = len(rows)
+        rows.append(line())
+        for _ in range(rng.randrange(1, 4)):
+            if depth < 6 and rng.random() < 0.6:
+                loop(depth + 1)
+            else:
+                rows.append(line())
+            if rng.random() < 0.3:
+                jumps.append(len(rows))
+                rows.append(("cbz", f"x{rng.randrange(1, 8)}, T"))
+        rows.append(("cmp", "x2, x1"))
+        rows.append(("b.lt", f"#{base + head * 4:#x}"))
+
+    for _ in range(rng.randrange(1, 3)):
+        loop(0)
+        rows.append(line())
+    rows.append(("ret", ""))
+    for i in jumps:
+        mn, op = rows[i]
+        rows[i] = (mn, op.replace("T", f"#{base + rng.randrange(len(rows)) * 4:#x}"))
+    return rows, base, mono
+
+
+def test_nested_loop_bodies_and_what_they_hold_answer_what_the_walks_did():
+    """A guard test (#332). Each loop's natural body, the body a second trip runs and
+    the part of it the header reaches, what the loop reads before it writes, and what
+    a set of blocks writes, stores or calls, were each worked out per loop by walking
+    every block of it; the bodies are now built inner loops first taking the inner
+    ones in whole, the liveness folded up that nest, and the rest read once per block.
+    This holds each to the walk main had, in the middle of real lifts of 300 random
+    nests of loops, 300 of #289's random ranges and _graphs_282's, and holds the
+    structurer's output with the bodies built whole to its output with them walked.
+    A loop exit is asked again of a state holding a slot at each frame offset the
+    ranges store to, as well as of the walk's."""
+    from jadart import cfg, expr
+    from jadart.expr import V, P_ATOM, State, lift_function
+    L = expr.Lifter
+    old = {n: getattr(L, n) for n in (
+        "_back_loop", "_trip_nodes", "_trip_body", "_written", "_writes_heap",
+        "_writes_stack", "_writes_outgoing", "_exit_slots", "_reloads", "_render_loop")}
+    seen = dict.fromkeys(("bodies", "nested", "trips", "live", "slots", "reloads"), 0)
+    special = expr._SPECIAL - {expr._lr()}
+
+    def roles(name):
+        return next((r for r, v in expr._T.roles.items() if v == name), None)
+
+    def written(self, nodes):
+        w = set()
+        for b in nodes:
+            w |= set().union(
+                *(expr._def_use(mn, o)[0] for (_a, mn, o, _n) in self.blocks[b].insns),
+                *(self._moved_regs(a) for (a, _m, _o, _n) in self.blocks[b].insns
+                  if a in self.frame_moves))
+        return w
+
+    def stores(self, nodes):
+        for b in nodes:
+            for (a, mn, op, _n) in self.blocks[b].insns:
+                if mn in expr._STORES or expr._raw_store(mn):
+                    yield a, mn, op, expr._addr(expr._split_ops(op))
+
+    def heap(self, nodes):
+        for a, _mn, _op, got in stores(self, nodes):
+            if got is None or got[1] is expr._BAD_POST:
+                return True
+            role = expr._T.roles.get(got[0][0])
+            if role not in ("SP", "FP"):
+                return True
+            if role == "FP":
+                if self._fp_lost_set is None:
+                    self._fp_lost_set = expr._fp_lost_at(self.blocks, self.raw)
+                if a in self._fp_lost_set:
+                    return True
+        return False
+
+    def stack(self, nodes):
+        for _a, _mn, _op, got in stores(self, nodes):
+            if got is None or got[1] is expr._BAD_POST:
+                return True
+            if expr._T.roles.get(got[0][0]) in ("SP", "FP"):
+                return True
+        return self._frame_escaped()
+
+    def outgoing(self, nodes):
+        sp = roles("SP")
+        for b in nodes:
+            for (a, mn, op, _n) in self.blocks[b].insns:
+                if mn in expr._CALLS or a in self.frame_meets or a in self.frame_moves:
+                    return True
+                if mn in expr._STORES or expr._raw_store(mn):
+                    if self._through_frame(a, mn, op):
+                        return True
+                    got = expr._addr(expr._split_ops(op))
+                    if got is None or got[0][0] == sp or (
+                            expr._T.roles.get(got[0][0]) == "FP"
+                            and got[0][2] is not None):
+                        return True
+                    if expr._raw_store(mn) and expr._T.roles.get(got[0][0]) in (
+                            "SP", "FP"):
+                        return True
+        return False
+
+    def back_walk(self, header):
+        tree = self._root_of.get(header)
+        nodes, stack = {header}, [p for p in self._preds.get(header, ())
+                                  if p not in self._idom or self._root_of.get(p) != tree
+                                  or self._dominates(header, p)]
+        while stack:
+            n = stack.pop()
+            if n not in nodes and n in self.blocks:
+                nodes.add(n)
+                stack.extend(self._preds.get(n, ()))
+        return nodes
+
+    def trip_walk(self, header):
+        idom, ended, num = self._ridom, self._ended, self._rnum
+
+        def dominated(n):
+            if num is not None:
+                return n == header or (header in num[0] and n in num[0]
+                                       and num[0][header] <= num[0][n] < num[1][header])
+            while n != header:
+                up = idom.get(n)
+                if up is None or up == n:
+                    return False
+                n = up
+            return True
+        nodes, stack = {header}, [p for p in self._preds.get(header, ())
+                                  if p not in ended and dominated(p)]
+        if not stack:
+            return set()
+        while stack:
+            n = stack.pop()
+            if n not in nodes and n not in ended:
+                nodes.add(n)
+                stack.extend(self._preds.get(n, ()))
+        return nodes
+
+    def back_loop(self, header):
+        got = old["_back_loop"](self, header)
+        want = back_walk(self, header)
+        assert got == want, (header, sorted(got), sorted(want))
+        seen["bodies"] += 1
+        seen["nested"] += any(h != header and h in got and back_walk(self, h) - {h}
+                              for h in got)
+        return got
+
+    def trip_nodes(self, header):
+        got = old["_trip_nodes"](self, header)
+        assert got == trip_walk(self, header), header
+        seen["trips"] += bool(got)
+        return got
+
+    def trip_body(self, header):
+        got = old["_trip_body"](self, header)
+        trip = trip_walk(self, header)
+        reach, stack = set(), [header] if trip else []
+        while stack:
+            n = stack.pop()
+            if n not in reach:
+                reach.add(n)
+                stack.extend(s for s in self.blocks[n].succ if s in trip)
+        assert got == reach, header
+        return got
+
+    def checked(name, ref):
+        def run(self, nodes):
+            got = old[name](self, nodes)
+            assert got == ref(self, nodes), (name, sorted(nodes))
+            return got
+        return run
+
+    def exit_walk(self, st, header):
+        loop = {b for b in self._back_loop(header) if not self._quiet(b)}
+        fp, sp = roles("FP"), roles("SP")
+        if fp is None or self._frame_escaped() or fp in written(self, loop):
+            st.slot.clear()
+            return
+        if sp is not None:
+            for k in [k for k in st.slot if k.startswith(sp)]:
+                del st.slot[k]
+        wide = self._wide_slots()
+        for b in sorted(loop):
+            insns = self.blocks[b].insns
+            for (_a, mn, op, _n) in insns:
+                if mn in expr._STORES:
+                    got = expr._addr(expr._split_ops(op))
+                    if got is None or got[1] is expr._BAD_POST:
+                        st.slot.clear()
+                        return
+            for i, keys, delta, ops, backs in self._accesses(b):
+                if delta:
+                    st.slot.clear()
+                    return
+                if backs is not None:
+                    lo = int(keys[0][len(fp):])
+                    expr._drop_stored(st.slot, fp, lo, lo + expr._access_width(
+                        insns[i][1], ops[0]) * len(keys))
+                    for off in range(lo - 15, lo - 7):
+                        if f"{fp}{off:+d}" in wide:
+                            st.slot.pop(f"{fp}{off:+d}", None)
+        if heap(self, loop) or any(mn in ("bl", "blr") for b in loop
+                                   for (_a, mn, _o, _n) in self.blocks[b].insns):
+            for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
+                del st.slot[k]
+        w, unsafe = self._near_written(header)
+        self._stale_slots(st, w, unsafe=unsafe)
+
+    def exit_slots(self, st, header):
+        probe = State()
+        for off in range(-48, 8, 4):
+            probe.slot[f"x29{off:+d}"] = V(rng_text[off % 3], P_ATOM)
+        for state in (probe, st):
+            want = state.copy()
+            exit_walk(self, want, header)
+            got = state.copy() if state is probe else state
+            old["_exit_slots"](self, got, header)
+            assert (got.slot, got.dropped) == (want.slot, want.dropped), header
+            seen["slots"] += state is probe and len(want.slot) < len(probe.slot)
+
+    def reloads(self, header, trip, st, regs):
+        got = old["_reloads"](self, header, trip, st, regs)
+        want = reload_walk(self, header, trip, st, regs)
+        assert got == want, (header, got, want)
+        seen["reloads"] += 1
+        return got
+
+    def reload_walk(self, header, trip, st, regs):
+        fp = roles("FP")
+        if fp is None or self._frame_escaped() or fp in written(self, trip):
+            return set()
+        held = {}
+        narrow, files = self._narrow_slots(), self._slot_widths()[4]
+        for k, v in st.slot.items():
+            if (k.startswith(fp) and k[len(fp):][:1] in "+-" and k not in narrow
+                    and len(files.get(k, ())) == 1
+                    and not expr._ANY_REG.search(v.text)
+                    and not self._reads_mem(v.text)):
+                held[k] = v.text
+        for b in trip:
+            insns = self.blocks[b].insns
+            for i, keys, delta, ops, backs in self._accesses(b):
+                if delta:
+                    return set()
+                if backs is not None and held:
+                    lo = int(keys[0][len(fp):])
+                    expr._drop_stored(held, fp, lo, lo + expr._access_width(
+                        insns[i][1], ops[0]) * len(keys))
+        values = set(held.values())
+        start = {r: st.get(r).text for r in regs if st.get(r).text in values}
+        if not start:
+            return set()
+        return old["_reloads"](self, header, trip, st, regs)
+
+    def render_loop(self, header, body, st, indent, depth):
+        fresh = header not in self.carried
+        out = old["_render_loop"](self, header, body, st, indent, depth)
+        if fresh:
+            nodes = back_walk(self, header)
+            live = expr._live_in_header(self.blocks, nodes, header, self._preds,
+                                        self._printed_liveness()[0])
+            folded = getattr(self, "_loop_live_in", None)       # #332's, not on main
+            if folded is not None:
+                assert folded(header, self._back_loop(header)) == live, header
+            want = ((live & written(self, nodes)) - special) | self.carry_more.get(
+                header, frozenset())
+            assert self.carried[header] == want, (header, self.carried[header], want)
+            seen["live"] += bool(want)
+        return out
+
+    rng_text = ["x1 + 1", "x3", "x2.field_0x8"]
+    graphs = [_rows_332(seed) for seed in range(300)]
+    graphs += [_rows_289(seed) for seed in range(300)]
+    graphs += [(rows, base, mono) for _n, rows, base, mono, _t in _graphs_282()]
+    patched = dict(old, _back_loop=back_loop, _trip_nodes=trip_nodes,
+                   _trip_body=trip_body, _written=checked("_written", written),
+                   _writes_heap=checked("_writes_heap", heap),
+                   _writes_stack=checked("_writes_stack", stack),
+                   _writes_outgoing=checked("_writes_outgoing", outgoing),
+                   _exit_slots=exit_slots, _reloads=reloads, _render_loop=render_loop)
+    nest = getattr(cfg, "LoopNest", None)
+    if nest is not None:
+        closure = nest.closure
+
+        def walked(self, header, latches):
+            nodes, stack = {header}, list(latches)
+            while stack:
+                n = stack.pop()
+                if n in nodes or not self.keep(header, n):
+                    continue
+                nodes.add(n)
+                stack.extend(self.preds.get(n, ()))
+            return frozenset(nodes)
+    try:
+        for name, fn in patched.items():
+            setattr(L, name, fn)
+        for rows, base, mono in graphs:
+            ann = [(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
+            blocks, entry = cfg.build_cfg(ann)
+            got = cfg.structure(blocks, entry, orphans=True)
+            if nest is not None:
+                nest.closure = walked
+                try:
+                    assert cfg.structure(blocks, entry, orphans=True) == got
+                finally:
+                    nest.closure = closure
+            lift_function(ann, mono=mono)
+    finally:
+        for name, fn in old.items():
+            setattr(L, name, fn)
+    assert seen["bodies"] > 2000 and seen["nested"] > 500 and seen["trips"] > 1000, seen
+    assert seen["live"] > 500 and seen["slots"] > 300 and seen["reloads"] > 300, seen
+
+
+def test_nested_loops_cost_the_same_per_instruction_at_any_depth():
+    """N loops nested in each other, their headers in a row and their latches after them
+    innermost first, cost about N * N to lift: 14 s of CPU at 2,000 where 250 took 0.23,
+    `_render_loop` 82% of it (#332). Each loop walked its whole body to find it, again
+    for the body a second trip runs and the part of it the header reaches, ran the
+    liveness dataflow over it, and asked each of its blocks what it writes, stores and
+    calls; the structurer walked it and counted its exits. Counted, not timed: the lines
+    of expr.py and cfg.py the whole lift runs, per instruction, at 30 loops and at 120,
+    with one counter and with six. Walked per loop that was 2,973 and 8,160 lines with
+    one, and 3,698 and 9,221 with six; built inner loops first and folded up the nest,
+    1,721 and 1,734, and 2,375 and 2,455."""
+    from jadart import cfg, expr
+    from jadart.expr import lift_function
+    here = {expr.__file__, cfg.__file__}
+    ran = [0]
+
+    def lines(frame, event, _arg):
+        if event == "line":
+            ran[0] += 1
+        return lines
+
+    def calls(frame, _event, _arg):
+        return lines if frame.f_code.co_filename in here else None
+
+    def per_instruction(n, regs):
+        rows = [("add", f"x{2 + i % regs}, x{2 + i % regs}, #1") for i in range(n)]
+        for i in range(n):
+            rows += [("cmp", "x2, x1"), ("b.lt", f"#{(n - 1 - i) * 4:#x}")]
+        rows.append(("ret", ""))
+        ran[0] = 0
+        sys.settrace(calls)
+        try:
+            lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        finally:
+            sys.settrace(None)
+        return ran[0] / len(rows)
+    for regs in (1, 6):
+        small, large = per_instruction(30, regs), per_instruction(120, regs)
+        assert 0 < small and large < 1.5 * small, (regs, small, large)
+
+
 def _rows_333(n, form):
     """(rows, base, mono) of #333's shape: `n` conditionals that each jump over their own
     block and the next conditional, so every join's immediate dominator is the first
