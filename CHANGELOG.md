@@ -24,6 +24,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **`follow` finds a join one way, off the dominator tree, and the scan is gone.** It had
+  two: a scan that pushed a tag per arm forward in reverse postorder, and `meet`, which
+  reads the same join off the dominator tree and which took over once the scans of a
+  function had passed twice its blocks (#342). The scan, `FOLLOW_NEAR`, `FOLLOW_SWEPT`
+  and what kept count for them go, 143 lines of `cfg.py` for 24, and with them the walk
+  up `idom` that `structure` kept for a numbering it could not get: `_idoms` gives every
+  block an idom numbered before it and the trees of the forest share no block, so
+  `dom_numbers` never returns None there. Tier 3 of both fixtures and the seven
+  app-sweep libraries is byte-identical to 1.4.0. Three alternating lifts of the clean
+  fixture, 1.4.0 against it with every join read off the tree, took 23.76 and 23.40,
+  23.31 and 23.25, 23.30 and 23.34 s of CPU. The crafted shapes, CPU microseconds per row at 500,
+  1,000, 2,000 and 4,000 loops, 1.4.0 then this: #302's 4.7, 4.9, 4.9, 5.6 and 4.7, 4.9,
+  5.1, 5.7; #311's 5.1, 5.4, 5.2, 5.7 and 4.8, 4.9, 4.9, 5.6, and with the trap shared
+  5.1, 5.4, 5.5, 5.4 and 4.5, 4.8, 4.9, 5.1; #342's at 240, 500, 1,000 and 2,000 checks,
+  the recursion limit raised, 7.2, 7.5, 8.9, 12.0 and 5.6, 6.1, 7.4, 10.4. Lines run
+  inside `follow` per instruction, at 30 and 120: #302's 13.1 and 13.2 to 2.4 and 2.4,
+  `meet` not counted; #311's 20.9 and 16.2 to 11.5 and 11.6, and 40.8 and 37.4 to 10.7
+  and 10.7; #342's 96.4 and 101.4 to 15.2 and 15.2.
+
 - **`xrefs` names the function behind each reference, so its printed output changes.** A
   reference printed as `0x23b720       168 bytes` now prints as `0x23b720       168 bytes
   FluBenchApp.build`: the name `functions` gives the range, after the class that owns it

@@ -7037,7 +7037,8 @@ def test_a_follow_node_costs_the_same_per_instruction_at_any_length():
     at 1,000 loops and 9.50 s of `tier3_graph` at 4,000 where 1,000 took 0.63 (#302).
     Counted, not timed: the lines `structure`'s `follow` runs, per instruction, at 30
     loops and at 120, an arm that traps and one that returns. Scanned to the end that was
-    215 and 845 each; stopped once one arm's tag is gone, 8.5 and 8.6."""
+    215 and 845 each; stopped once one arm's tag is gone, 8.5 and 8.6; read off the
+    dominator tree, 2.4 and 2.4, `meet`'s own lines not counted."""
     from jadart import cfg
     from jadart.expr import tier3_graph
     ran = [0]
@@ -7074,13 +7075,13 @@ def test_a_follow_node_costs_the_same_per_instruction_at_any_length():
 
 
 def test_a_follow_node_is_the_scan_s_where_an_arm_ends_late_or_shares_its_end():
-    """A guard test (#311). `follow` takes a block as done before the scan reaches it
-    where `cur` does not dominate it, or where it carries one bit and every edge into it
-    comes from a block done with. This holds each answer to the scan run to the end of
+    """A guard test (#311). An arm that ends in a block laid out after the rest of the
+    function, or in one other branches share, is where a scan ran on to the end. This
+    holds each answer `follow` reads off the dominator tree to the scan run to the end of
     the function, on 3,000 random graphs built the way those blocks come about: arms
     that end in a chain of blocks laid out after everything else, ends that several
-    branches share, loops, and second entries; half of them with `cfg.FOLLOW_NEAR` at 0,
-    so that every block is asked. Traced at the return, as #302's guard is."""
+    branches share, loops, and second entries. Traced at the return, as #302's guard
+    is."""
     import random
     from jadart import cfg
     from jadart.cfg import Block, structure
@@ -7123,12 +7124,9 @@ def test_a_follow_node_is_the_scan_s_where_an_arm_ends_late_or_shares_its_end():
         if code.co_name == "follow" and code.co_filename == cfg.__file__:
             return returned
         return None
-    near = getattr(cfg, "FOLLOW_NEAR", None)
     sys.settrace(calls)
     try:
         for seed in range(3000):
-            # Every other graph with every block asked, as these are small.
-            cfg.FOLLOW_NEAR = near if seed % 2 else 0
             rng = random.Random(seed)
             n, m = rng.randrange(2, 30), rng.randrange(1, 8)
             ends = [0x100 * (n + j) for j in range(m)]       # after everything else
@@ -7154,7 +7152,6 @@ def test_a_follow_node_is_the_scan_s_where_an_arm_ends_late_or_shares_its_end():
             structure(blocks, 0, orphans=True, entries=roots)
     finally:
         sys.settrace(None)
-        cfg.FOLLOW_NEAR = near
     assert seen["found"] > 400 and seen["none"] > 3000, seen
     assert seen["undominated"] > 1000 and seen["late"] > 1000, seen
 
@@ -7167,7 +7164,8 @@ def test_a_follow_node_costs_the_same_where_an_arm_ends_after_the_rest():
     (#311). Counted, not timed: the lines run inside `follow`, per instruction, at 30
     loops and at 120. Scanned to the trap that was 156 and 606, and 154 and 582 with the
     trap shared; with the trap done with once nothing more can reach it, and the shared
-    one never tagged where the check does not dominate it, 20 and 15, and 48 and 38."""
+    one never tagged where the check does not dominate it, 20 and 15, and 48 and 38;
+    with the join read off the dominator tree, 11.5 and 11.6, and 10.7 and 10.7."""
     from jadart import cfg
     from jadart.expr import tier3_graph
     ran, inside = [0], [0]
@@ -7214,22 +7212,18 @@ def test_a_follow_node_costs_the_same_where_an_arm_ends_after_the_rest():
 
 
 def test_a_follow_node_is_the_scan_s_where_it_is_read_off_the_dominator_tree():
-    """A guard test (#342). Past `cfg.FOLLOW_SWEPT` times a function's blocks scanned,
-    `follow` reads the join off the dominator tree: the first child of the conditional,
-    in reverse postorder, that both arms reach by forward edges. This holds each answer
-    to the scan run to the end of the function, on 4,000 random graphs of three kinds:
-    code as a compiler lays it out, with returns part way down an arm; checks in a row
-    that jump to blocks after them all, so that the joins are far below; and branches
-    to anywhere, with ends that several share. Each with a few edges moved, which makes
-    loops with two ways in, and with second entries. A quarter of them with every
-    answer read off the tree, a quarter with every one scanned, and the rest changing
-    over part way, at the budget and at half a block; half with `cfg.FOLLOW_NEAR` at
-    0. Traced at the return, as #302's guard is."""
+    """A guard test (#342). `follow` reads the join off the dominator tree: the first
+    child of the conditional, in reverse postorder, that both arms reach by forward
+    edges. This holds each answer to the scan run to the end of the function, on 4,000
+    random graphs of three kinds: code as a compiler lays it out, with returns part way
+    down an arm; checks in a row that jump to blocks after them all, so that the joins
+    are far below; and branches to anywhere, with ends that several share. Each with a
+    few edges moved, which makes loops with two ways in, and with second entries.
+    Traced at the return, as #302's guard is."""
     import random
     from jadart import cfg
     from jadart.cfg import Block, structure
-    seen = {"found": 0, "none": 0, "far": 0, "read": 0, "read found": 0, "scan": 0,
-            "both": 0}
+    seen = {"found": 0, "none": 0, "far": 0, "read": 0}
 
     def scanned(cur, blocks, rpo, dominates):
         succs = blocks[cur].succ
@@ -7256,9 +7250,6 @@ def test_a_follow_node_is_the_scan_s_where_it_is_read_off_the_dominator_tree():
             seen["found" if want is not None else "none"] += 1
             if want is not None:
                 seen["far"] += f["rpo"][want] - f["rpo"][cur] > 16
-                seen["read found"] += "near" not in frame.f_locals
-            seen["scan"] += "near" in frame.f_locals
-            how.add("near" in frame.f_locals)
         return returned
 
     def calls(frame, _event, _arg):
@@ -7324,12 +7315,9 @@ def test_a_follow_node_is_the_scan_s_where_it_is_read_off_the_dominator_tree():
             succs.append([rng.randrange(n + j + 1, n + m) if j + 1 < m else
                           rng.randrange(n) for _ in range(k)])
         return succs
-    near, swept = getattr(cfg, "FOLLOW_NEAR", None), getattr(cfg, "FOLLOW_SWEPT", None)
     sys.settrace(calls)
     try:
         for seed in range(4000):
-            cfg.FOLLOW_SWEPT = (-1, 1e18, swept, 0.5)[seed % 4]
-            cfg.FOLLOW_NEAR = near if seed // 4 % 2 else 0
             rng = random.Random(seed)
             succs = (written, laddered, tangled)[seed // 8 % 3](rng)
             for _ in range(rng.choice((0, 0, 1, 3))):        # and a few edges moved
@@ -7343,20 +7331,11 @@ def test_a_follow_node_is_the_scan_s_where_it_is_read_off_the_dominator_tree():
                                   "x0 != 0" if k == 2 else "")
             roots = tuple(0x100 * rng.randrange(len(succs))
                           for _ in range(rng.randrange(0, 3)))
-            how = set()
             structure(blocks, 0, orphans=True, entries=roots)
-            seen["both"] += len(how) == 2
     finally:
         sys.settrace(None)
-        cfg.FOLLOW_NEAR = near
-        if swept is None:
-            del cfg.FOLLOW_SWEPT
-        else:
-            cfg.FOLLOW_SWEPT = swept
     assert seen["found"] > 7000 and seen["none"] > 50000 and seen["far"] > 4000, seen
-    if swept is not None:
-        assert seen["read"] > 25000 and seen["read found"] > 3500, seen
-        assert seen["scan"] > 16000 and seen["both"] > 1400, seen
+    assert seen["read"] > 25000, seen
 
 
 def test_a_follow_node_costs_the_same_where_the_joins_are_far_below():
@@ -7365,7 +7344,8 @@ def test_a_follow_node_costs_the_same_where_the_joins_are_far_below():
     in its block, N or more blocks below it, and `follow` scanned all of those for each
     (#342). Counted, not timed: the lines run inside `follow`, per instruction, at 30
     checks and at 120. Scanned that was 548 and 2,171; with the join read off the
-    dominator tree once the scans have passed twice the function's blocks, 96 and 101."""
+    dominator tree once the scans had passed twice the function's blocks, 96 and 101;
+    with every join read off it, 15.2 and 15.2."""
     from jadart import cfg
     from jadart.expr import tier3_graph
     ran, inside = [0], [0]
@@ -20423,9 +20403,10 @@ def test_dominance_by_numbers_answers_what_the_walk_up_idom_did():
     from the lower, and is now a check of two numbers (cfg.dom_numbers). This holds the
     numbers to the walk: on each graph of _graphs_282, `_dominates` agrees with
     `_dominators` on every ordered pair of blocks, a block in no tree and an address
-    that is no block among them; and with the numbering turned off, which is the walk
-    as main had it, the loop bodies, trips, regions, join kills, structure and lifted
-    lines are the same. A numbering that is no forest is refused."""
+    that is no block among them; and with the lifter's numbering turned off, which is
+    the walk as main had it, the loop bodies, trips, regions, join kills, structure and
+    lifted lines are the same. A numbering that is no forest is refused. `structure`
+    keeps no walk: the forest it numbers is always one, so its numbering stays on."""
     from jadart import cfg, expr
     from jadart.cfg import build_cfg, entry_reach, structure
     from jadart.expr import Lifter, lift_function, tier3_graph
@@ -20437,9 +20418,9 @@ def test_dominance_by_numbers_answers_what_the_walk_up_idom_did():
 
     def built(name, rows, base, mono, tier3, numbered):
         ann = [(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
-        saved = expr.dom_numbers, cfg.dom_numbers
+        saved = expr.dom_numbers
         if not numbered:
-            expr.dom_numbers = cfg.dom_numbers = lambda idom: None
+            expr.dom_numbers = lambda idom: None
         try:
             if tier3:
                 g = tier3_graph(ann, mono=mono)
@@ -20459,7 +20440,7 @@ def test_dominance_by_numbers_answers_what_the_walk_up_idom_did():
             got["pairs"] = {(a, b): lf._dominates(a, b) for a in asked for b in asked}
             return lf, got
         finally:
-            expr.dom_numbers, cfg.dom_numbers = saved
+            expr.dom_numbers = saved
 
     for name, rows, base, mono, tier3 in _graphs_282():
         lf, got = built(name, rows, base, mono, tier3, True)

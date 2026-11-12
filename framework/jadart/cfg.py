@@ -876,19 +876,6 @@ def strong_components(nodes, succ) -> list:
     return out
 
 
-#: How far past a conditional in reverse postorder `structure`'s `follow` leaves a block
-#: to the scan alone, and asks neither whether the conditional dominates it nor whether
-#: it can be done with early (#311). The scan reaches a block that near in fewer steps
-#: than the bookkeeping costs: the clean fixture's 11,766 follow calls took 0.060 s of
-#: CPU on main, 0.068 s with that asked of every block, and 0.054 s with this.
-FOLLOW_NEAR = 16
-
-#: How many blocks `structure`'s `follow` may scan past in one function, as a multiple of
-#: its blocks, before it reads each join off the dominator tree instead (#342). Twice,
-#: as a loop nest is built once the loops walked come to twice the blocks (#332).
-FOLLOW_SWEPT = 2
-
-
 def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
               rest: bool = False):
     """Return a list of statements. Each is one of:
@@ -946,6 +933,9 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
     second = second_reach(blocks, reachable, entries) if orphans else frozenset()
     idom, order, trees = dominator_forest(blocks, entry, fsucc,
                                           entries if second else (), reachable)
+    # Never None: `_idoms` gives each block it numbers an idom it numbered before it, and
+    # each further tree of the forest is over blocks no earlier one took, so every walk up
+    # `idom` ends at a root and the forest is one (dom_numbers).
     num = dom_numbers(idom)
     rank = {n: i for i, n in enumerate(order)}
     rpo = _rpo(blocks, entry, fsucc)
@@ -963,12 +953,8 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
     def dominates(a, b):
         # `a` is `b` or above it in its tree: O(1) from the numbering, where the walk
         # up `idom` it replaces took 18 million steps for 300 nested loops (#282)
-        if num is not None:
-            pre, end = num[0], num[1]
-            return a == b or (a in pre and b in pre and pre[a] <= pre[b] < end[a])
-        while b in idom and b != a and b != idom[b]:
-            b = idom[b]
-        return b == a
+        pre, end = num[0], num[1]
+        return a == b or (a in pre and b in pre and pre[a] <= pre[b] < end[a])
     loop_header = {}
     for n in blocks:
         for s in blocks[n].succ:
@@ -1026,7 +1012,7 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
                     if p not in nodes and dominates(header, p):
                         stack.append(p)
             walked += len(nodes)
-            if num is None or walked <= 2 * len(blocks):
+            if walked <= 2 * len(blocks):
                 return nodes
             nest = LoopNest(preds, dominates, num)
             nest.prepare(loop_header, loop_nodes)
@@ -1055,32 +1041,21 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
     visited = set()
     loop_of = {}   # ctx -> node set, for the out-of-loop escape guard
 
-    by_rpo = sorted(rpo, key=rpo.get)
     follow_memo = {}
-    forward_in = {}
-
-    def edges_in(n):
-        """How many edges come into `n` from a block before it in reverse postorder."""
-        k = forward_in.get(n)
-        if k is None:
-            k = forward_in[n] = sum(p in rpo and rpo[p] < rpo[n] for p in preds[n])
-        return k
-
-    swept = 0
 
     def meet(cur, here, succs):
-        """`follow`'s answer read off the dominator tree, with no scan (#342).
+        """`follow`'s answer read off the dominator tree (#342).
 
-        The block the scan stops at is a child of `cur` in that tree. Say its immediate
-        dominator were another block d below `cur`: each arm's way to it goes through d,
-        forward all the way, so d carries both bits, `cur` dominates it, and it comes
-        first. And every block below one child carries that child's bits and no other:
-        a forward way from an arm to it passes the child, and the depth-first walk the
-        order comes from goes down from the child to it by forward edges alone. So the
-        tags of the children are enough. Each is the bit of the arm it is, and the tags
-        of the children its forward edges in come from below, found by where the
-        source's number falls among the children's. They are taken in reverse postorder,
-        as the scan takes them, and the first with both is the answer.
+        The block the two-colour search stops at is a child of `cur` in that tree. Say its
+        immediate dominator were another block d below `cur`: each arm's way to it goes
+        through d, forward all the way, so d carries both bits, `cur` dominates it, and it
+        comes first. And every block below one child carries that child's bits and no
+        other: a forward way from an arm to it passes the child, and the depth-first walk
+        the order comes from goes down from the child to it by forward edges alone. So the
+        tags of the children are enough. Each is the bit of the arm it is, and the tags of
+        the children its forward edges in come from below, found by where the source's
+        number falls among the children's. They are taken in reverse postorder, as the
+        search takes them, and the first with both is the answer.
 
         A child is asked once, by its one parent, and an edge once, so every call of a
         function together costs its blocks and edges, however far the joins are."""
@@ -1136,106 +1111,12 @@ def structure(blocks, entry, orphans: bool = False, cut=frozenset(), entries=(),
         succs = blocks[cur].succ
         if len(succs) != 2 or succs[0] == succs[1] or cur not in rpo:
             return None
-        # Only the blocks after this one in reverse postorder are visited, and a tag
-        # moves along forward edges only, so an arm whose block comes before it, a back
-        # edge's, passes its bit to none of them. `live[b]` counts the tagged blocks not
-        # yet done with that carry bit b. A block takes its tag only from blocks done
-        # with before it, so once either count is 0 no block can come to carry both, and
-        # the scan has nothing left to find (#302).
-        #
-        # Two things let a block be done with before the scan reaches it, and neither
-        # changes the answer (#311). A block `cur` does not dominate is never tagged: no
-        # forward edge goes back into an earlier tree of the forest, and within a tree a
-        # way round `cur` to that block is a way round it to every block it leads to, so
-        # none of those is a candidate either. And a block with one bit, all of whose
-        # edges in come from blocks done with, holds its last tag and is no candidate,
-        # so it passes its bit on then and there, off `ready`. Without either, an arm
-        # that ends in a block laid out after the rest of the function, a trap or a slow
-        # path past the `ret`, kept its bit to the end of the scan, as did one that ends
-        # in a block other branches share, and each such branch scanned the rest of the
-        # function. Both are asked only of a block more than FOLLOW_NEAR places on; a
-        # nearer one that `cur` does not dominate is tagged as before, which changes
-        # nothing either, as what it leads to is no candidate whatever its tag.
-        #
-        # One block is taken off `ready` per tagged block the scan visits, first in
-        # first out, so an arm that does run on is walked no faster than the scan, which
-        # stops no later than it did.
-        #
-        # The scan still passes every block between `cur` and a join far below it, so N
-        # conditionals whose joins are N blocks on cost N * N (#342). `swept` counts the
-        # blocks the scans of this function have passed, and past FOLLOW_SWEPT times its
-        # blocks the answer comes from `meet`, which passes none. Until then a call
-        # pays one addition for it.
-        nonlocal swept
-        here = rpo[cur]
-        if num is not None and swept > FOLLOW_SWEPT * len(by_rpo):
-            m = meet(cur, here, succs)
-            if m is not None:
-                follow_memo[cur] = m
-            return m
-        near = here + FOLLOW_NEAR
-        pre = num[0] if num is not None else None
-        lo, hi = (pre[cur], num[1][cur]) if pre is not None and cur in pre else (0, 0)
-        tag, seen, gone, ready = {}, {}, set(), []
-        live = [0, 0]
-        for bit, s in enumerate(succs):
-            if s in rpo and rpo[s] > here:
-                if rpo[s] > near:
-                    if not (lo <= pre.get(s, -1) < hi if pre is not None
-                            else dominates(cur, s)):
-                        continue
-                    seen[s] = 1
-                    if (forward_in.get(s) or edges_in(s)) == 1:
-                        ready.append(s)
-                tag[s] = 1 << bit
-                live[bit] = 1
-        i, r, scanned = here + 1, 0, True
-        while live[0] and live[1]:
-            n = None
-            while scanned and r < len(ready):
-                s = ready[r]
-                r += 1
-                if s not in gone and rpo[s] >= i:
-                    n, scanned = s, False
-                    gone.add(n)
-            if n is None:
-                scanned = True
-                while i < len(by_rpo):
-                    m = by_rpo[i]
-                    i += 1
-                    if m in tag and m not in gone:
-                        n = m
-                        break
-                else:
-                    swept += i - here
-                    return None
-                t = tag[n]
-                if t == 3 and dominates(cur, n):
-                    follow_memo[cur] = n
-                    swept += i - here
-                    return n
-            t, rn = tag[n], rpo[n]
-            live[0] -= t & 1
-            live[1] -= t >> 1
-            for s in blocks[n].succ:
-                rs = rpo.get(s, -1)
-                if rs <= rn:
-                    continue
-                if rs > near:
-                    if not (lo <= pre.get(s, -1) < hi if pre is not None
-                            else dominates(cur, s)):
-                        continue
-                    seen[s] = seen.get(s, 0) + 1
-                new = t & ~tag.get(s, 0)
-                if new:
-                    tag[s] = tag.get(s, 0) | new
-                    live[0] += new & 1
-                    live[1] += new >> 1
-                if rs > near and tag[s] < 3 and seen[s] == (forward_in.get(s)
-                                                             or edges_in(s)):
-                    ready.append(s)
-        swept += i - here
-        return None
+        # The search is not run block by block: `meet` reads its answer off the dominator
+        # tree, passing none of the blocks between `cur` and the join. A scan forward in
+        # reverse postorder passed every one, so N conditionals whose joins are N blocks
+        # on cost N * N (#342).
+        m = follow_memo[cur] = meet(cur, rpo[cur], succs)
+        return m
 
     def merge_point(cur, ctx):
         """Post-dominator merge for a conditional, with the follow node as the fallback.
