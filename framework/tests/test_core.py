@@ -5933,6 +5933,70 @@ def test_a_crafted_pool_lists_each_list_and_long_string_once():
         assert open(os.path.join(out, "constants.txt"), encoding="utf-8").read() == text
 
 
+def _crafted_constants(*argv):
+    """(exit code, stdout, stderr) of `constants` over a crafted pool: 0x10 holds a long
+    string, 0x18 shares 0x10's list, 0x20 names the long string twice."""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+    from unittest import mock
+    from jadart import cli, disasm
+
+    fr = SimpleNamespace(pool=[("ref", 1), ("ref", 1), ("ref", 2), ("ref", 3)],
+                         arrays={1: (10, 11), 2: (11, 12, 11), 3: (12,)},
+                         smi_values={10: 7}, strings={11: "L" * 300, 12: "short"},
+                         functions=[], names={})
+    loaded = (SimpleNamespace(arch=None), fr, None)
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.object(disasm, "load_instructions", lambda _p: loaded), \
+            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            rc = cli.main(list(argv))
+        except SystemExit as e:
+            rc = e.code
+    return rc, out.getvalue(), err.getvalue()
+
+
+def test_constants_prints_the_one_list_a_body_names():
+    """A body names one table, `const[47] @0xb9b0{...}`, and `constants` printed every
+    table in the binary to show it: 173,012 bytes on FluffyChat for one lookup (#357).
+    `constants <libapp.so> 0xb9b0`, or `@0xb9b0` as the body spells it, prints that one.
+
+    Listed alone, it is whole: a slot sharing another's list, or a long string listed
+    earlier in the full dump, is spelled out, never sent to a line this run left out."""
+    import json
+    long_ = "L" * 300
+    rc, out, _ = _crafted_constants("constants", CLEAN, "0x18")
+    assert (rc, out) == (0, f'0x18\t[2]\t0x7, "{long_}"\n'), (rc, out[:200])
+    rc, out, _ = _crafted_constants("constants", CLEAN, "@0x20")
+    assert (rc, out) == (0, f'0x20\t[3]\t"{long_}", "short", same as 0x20[0]\n'), \
+        (rc, out[:200])
+    rc, out, _ = _crafted_constants("constants", CLEAN, "@0x28", "-j")
+    assert rc == 0, out
+    assert json.loads(out) == {"ok": True, "count": 1, "constants": [
+        {"offset": 0x28, "length": 1, "elements": ["short"]}]}
+    # No offset is the whole listing, as before.
+    rc, out, _ = _crafted_constants("constants", CLEAN)
+    assert rc == 0 and out.count("\n") == 4 and "same as 0x10\n" in out, out[:200]
+
+
+def test_constants_at_an_offset_that_is_no_list_is_a_miss():
+    """An offset no const list sits at exits 1 and says so, and prints nothing on stdout:
+    not the list before it, not the one after (#357). `-j` says it as `"ok": false` with
+    the same exit, and an offset that is not a number is a usage error."""
+    import json
+    for off in ("0x11", "@0x1c", "0x30"):
+        rc, out, err = _crafted_constants("constants", CLEAN, off)
+        assert (rc, out) == (1, ""), (off, rc, out)
+        assert "no const list at pool offset" in err, (off, err)
+    rc, out, _ = _crafted_constants("constants", CLEAN, "0x11", "-j")
+    assert rc == 1
+    assert json.loads(out) == {"ok": False, "offset": 0x11, "count": 0, "constants": [],
+                               "error": "no const list at pool offset 0x11"}
+    rc, out, err = _crafted_constants("constants", CLEAN, "@b9b0")
+    assert (rc, out) == (2, "") and "invalid pool offset" in err, (rc, out, err)
+
+
 def _rodata_fill(blob: bytes, *offset_lists):
     """walk_fill over one RO data String cluster per offset list, and nothing else."""
     from types import SimpleNamespace

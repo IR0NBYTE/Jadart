@@ -52,7 +52,7 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | `sub_0x1234` | a call to an unnamed function at that address | "the validator" |
 | `dispatch(...)` | a virtual call whose target depends on runtime type | "calls `List.add`" |
 | a raw `ldur x0, [x1, #7]` line | an instruction the lifter does not model | anything about its meaning |
-| `const[47] @0xb9b0{...}` | a const list, shown truncated | guess the rest; run `constants` |
+| `const[47] @0xb9b0{...}` | a const list, shown truncated | guess the rest; run `constants <path> @0xb9b0` |
 | `goto L_0x1234` | an edge the structurer could not nest | "a loop" without checking |
 | `// reached by no edge ...` | code no branch shown leads to | "it runs after that" |
 | `// TRUNCATED: past the instruction cut` | the function goes on past the 4,000 instructions decoded | "it ends here" |
@@ -155,6 +155,7 @@ will bury the answer along with your context budget.
 | Show me the machine code | `jadart disasm <path> <symbol>` |
 | What text does it contain? | `jadart strings <path> -g <pattern>` |
 | What data tables are embedded? | `jadart constants <path>` |
+| What is in the table a body names as `@0xb9b0`? | `jadart constants <path> @0xb9b0` |
 | Who touches this string or function? | `jadart xrefs <path> <kind> <what>` |
 | What are the virtual calls really calling? | `jadart selectors <path>` |
 | What native code does it reach into? | `jadart ffi <path>` |

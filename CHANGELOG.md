@@ -9,6 +9,19 @@ package (`header`, `program`, `verify`, `export`, `decompile`, `strings`, `selec
 Everything under `jadart.*` submodules is implementation and may move in a minor release.
 A new Dart format epoch is a minor release, because it only ever adds binaries that parse.
 
+## Unreleased
+
+### Added
+
+- `constants <libapp.so> OFFSET` prints the one const list at that pool offset, the
+  `@0xb9b0` a body prints in `const[47] @0xb9b0{...}`, with or without the `@`, in text
+  and in `-j`. Following one label used to cost the whole listing: 173,012 bytes on
+  FluffyChat's libapp.so, where the one table is 108 bytes at the median of its 550
+  truncated lists and 26,526 at the largest. The list prints whole: a slot sharing
+  another's list, or a long string the full listing printed earlier, is spelled out
+  rather than sent to a line this run leaves out. An offset no list sits at exits 1 and
+  says so, and prints no neighbour. Without an offset the output is unchanged.
+
 ## 1.4.0 - 2026-11-12
 
 Upgrading from 1.3.0. The commands and their options are the same. A few things a script
