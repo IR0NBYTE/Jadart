@@ -421,6 +421,46 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A value that names `SP` or `FP` is right on every line it is printed on.** `SP` in
+  a text is SP at that line, and a value built off it kept its text when SP moved:
+  `add x0, x15, #0x238; sub x15, x15, #0x20; ret` printed `return SP + 0x238;` where the
+  machine returns SP as it then is plus 0x258, and `add x17, x15, #0x238; str x2, [x15,
+  #-8]!; str x1, [x17]` printed the store at `(SP + 0x238)`, eight bytes from where it
+  goes and beside reads spelled off the SP the push left (#340). Before a row that moves
+  a frame register the walk now sees to every register whose text names it
+  (`Lifter._role_stale`). A value that is the register plus a constant by its own
+  record, `V.at` (#329), takes the move into the constant where the row says how far:
+  an `add` or `sub` of x15, a push, a pop, a pair with write-back, and the rows
+  strip_boilerplate blanks, read back through `raw`. Any other value is declared under
+  a name on the line before the move, while its text is right, and read by the name
+  after: a sum with an index, a 32-bit sum, a read through the address, `FP - SP`, and
+  every value under `and x15, x15, #0xfffffffffffffff0` or `mov x15, x29`, which do not
+  say how far SP goes. One nothing reads again is dropped. A slot holds such a value by
+  name from the spill on, a loop that moves the register names it before the loop, and
+  at a join that a way in moved the register past it is forgotten and the register is
+  printed bare. `FP` is the frame in force at the line, so a value naming it is named
+  where a frame begins or ends, and inside an FFI call's frame `add x0, x29, #8` under
+  0x40 of locals is `FP - 64`, the coordinates `ldr x0, [x29, #8]` has been read in
+  since #165, where it printed `FP + 8`. x15 itself reads as `SP` after every row that
+  writes it: `and x15, x15, #0xfffffffffffffff0` left the walk holding
+  `SP & 0xfffffffffffffff0` for the register, the SP of the row before, and a join then
+  carried x15 as a variable, `var t15 = x15;` against `t3 = SP & 0xfffffffffffffff0;`.
+  A row printed raw that writes it, `mrs x15, nzcv`, still leaves the bare register,
+  and a value spelled `x15 + 8` after one is named before the next move as well.
+  Checked against the CPU: 9,000 generated functions that build an address off SP or
+  FP, move the register, then return the address or load or store through it, run
+  under unicorn. main printed another address on 6,403 of them and this on none: 8,943
+  agree and 57 fault in the emulator before the line. Over the nine binaries 1,666
+  functions hold a value naming SP when SP moves and 448 one naming FP where a frame
+  changes, 3,444 and 560 values named and 4 rebased; 48 of the names are read by a line
+  that prints, the rest being the SP an FFI call saves. 408 of 273,863 ranges print
+  differently: 287 lose the x15 variable, 7,257 lines, and 4 of those now declare a
+  name at the top that was declared in place, 48 gain a named value and 73 only
+  renumber. Three alternating dumps of the clean fixture took 24.03, 24.47 and 23.93 s
+  on main and 24.82, 24.40 and 24.15 s here, about 1% more.
+  The CPU check is a test that needs unicorn, which CI does not install, so CI's cap
+  on skipped tests goes from 33 to 34 and the README's count with it.
+
 - **A conditional whose arms meet far below it finds the join without scanning down to
   it.** `follow` pushes a tag per arm forward in reverse postorder until a block the
   conditional dominates carries both, so it passed every block between a branch and its

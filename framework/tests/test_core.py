@@ -22018,6 +22018,329 @@ def test_the_address_facts_cost_the_same_per_instruction_at_any_length():
         expr._addr_facts, expr._af_meet, expr._af_add = facts, meet, add
 
 
+_PRO_340 = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+            ("sub", "x15, x15, #0x40")]
+_EPI_340 = [("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10")]
+_FFI_IN_340 = [("str", "x29, [x15, #-8]!"), ("mov", "x29, x15")]
+_FFI_OUT_340 = [("mov", "x15, x29"), ("ldr", "x29, [x15], #8")]
+
+
+def _lift_340(rows):
+    return _lift_rows(rows + [("ret", "")])
+
+
+def test_an_address_off_sp_follows_sp_past_a_move():
+    # `add x0, x15, #0x238; sub x15, x15, #0x20; ret` printed `return SP + 0x238;` and
+    # the machine returns SP as it is at that line plus 0x258. `SP` is SP at the line it
+    # is printed on, so a value that is SP plus a constant by its own record takes the
+    # move into the constant, at every row that moves SP by an amount it states (#340).
+    hold = ("add", "x0, x15, #0x238")
+    for move, want in ((("sub", "x15, x15, #0x20"), "SP + 0x258"),
+                       (("add", "x15, x15, #0x20"), "SP + 0x218"),
+                       (("str", "x2, [x15, #-8]!"), "SP + 0x240"),
+                       (("str", "w2, [x15, #-8]!"), "SP + 0x240"),
+                       (("str", "x2, [x15], #-8"), "SP + 0x240"),
+                       (("ldr", "x2, [x15], #8"), "SP + 0x230"),
+                       (("ldr", "x2, [x15, #8]!"), "SP + 0x230"),
+                       (("ldrb", "w2, [x15], #1"), "SP + 0x237"),
+                       (("stp", "x2, x3, [x15, #-0x10]!"), "SP + 0x248"),
+                       (("stp", "w2, w3, [x15, #-0x10]!"), "SP + 0x248"),
+                       (("ldp", "x2, x3, [x15], #0x10"), "SP + 0x228"),
+                       (("ldp", "w2, w3, [x15], #0x10"), "SP + 0x228"),
+                       (("ldpsw", "x2, x3, [x15], #8"), "SP + 0x230")):
+        assert _lift_340([hold, move]) == [f"return {want};"], move
+    assert _lift_340([hold, ("push", "x1, x2")]) == ["push x1, x2", "return SP + 0x248;"]
+    # Moves that cancel leave the text it had, and the constant goes through zero.
+    assert _lift_340([hold, ("sub", "x15, x15, #0x20"), ("str", "x2, [x15, #-8]!"),
+                      ("ldr", "x3, [x15], #8"),
+                      ("add", "x15, x15, #0x20")]) == ["return SP + 0x238;"]
+    assert _lift_340([("add", "x0, x15, #0x20"),
+                      ("add", "x15, x15, #0x20")]) == ["return SP;"]
+    assert _lift_340([("add", "x0, x15, #8"),
+                      ("add", "x15, x15, #0x20")]) == ["return SP - 24;"]
+    assert _lift_340([("sub", "x0, x15, #0x18"),
+                      ("sub", "x15, x15, #0x20")]) == ["return SP + 8;"]
+    # SP itself is the sum with no constant, and a sum built on after the move is one.
+    assert _lift_340([("mov", "x0, x15"),
+                      ("sub", "x15, x15, #0x20")]) == ["return SP + 32;"]
+    assert _lift_340([("add", "x1, x15, #0x238"), ("sub", "x15, x15, #0x20"),
+                      ("add", "x0, x1, #8")]) == ["return SP + 0x260;"]
+    assert _lift_340([("add", "x1, x15, #0x238"), ("mov", "x0, x1"),
+                      ("sub", "x15, x15, #0x20"),
+                      ("sub", "x0, x0, x1")]) == ["return SP + 0x258 - (SP + 0x258);"]
+    # Every reader: a load and a store through it, a compare, a call's argument.
+    move = ("sub", "x15, x15, #0x20")
+    assert _lift_340([("add", "x1, x15, #0x238"), move,
+                      ("ldr", "x0, [x1]")]) == ["return (SP + 0x258).field_0x1;"]
+    assert _lift_340([("add", "x17, x15, #0x238"), ("str", "x2, [x15, #-8]!"),
+                      ("str", "x1, [x17]")]) == ["(SP + 0x240).field_0x1 = x1;",
+                                                 "return x0;"]
+    assert _lift_340([("add", "x1, x15, #0x238"), move, ("cmp", "x1, x3"),
+                      ("b.lt", "#0x18"), ("mov", "x0, #1"), ("ret", ""),
+                      ("mov", "x0, #2")])[0] == "if ((SP + 0x258) >= x3) {"
+    # Without a move nothing changes: the guard, which passes before the fix too.
+    assert _lift_340([hold]) == ["return SP + 0x238;"]
+    assert _lift_340([("add", "x1, x15, #0x238"),
+                      ("ldr", "x0, [x1]")]) == ["return (SP + 0x238).field_0x1;"]
+
+
+def test_a_value_naming_sp_is_named_before_a_move_it_cannot_follow():
+    # Where the value is not SP plus a constant, or the row does not say how far SP
+    # moves, no rewrite of the text is right after the move. It is given a name while
+    # the text still is, on the line before, and read by that name after (#340).
+    move = ("sub", "x15, x15, #0x20")
+
+    def named(text):
+        return [f"var t0 = {text};", "return t0;"]
+    # Not a constant off SP: an index, a 32-bit sum, a conditional, a read through it.
+    assert _lift_340([("add", "x1, x15, x2, lsl #3"), move,
+                      ("mov", "x0, x1")]) == named("SP + (x2 << 3)")
+    assert _lift_340([("add", "w0, w15, #0x238"),
+                      move]) == named("(SP + 0x238).toUnsigned(32)")
+    assert _lift_340([("add", "x1, x15, #0x238"), ("cmp", "x2, #0"),
+                      ("csel", "x0, x1, x3, eq"),
+                      move]) == named("x2 == 0 ? SP + 0x238 : x3")
+    assert _lift_340([("add", "x1, x15, x2, lsl #3"), move, ("ldr", "x0, [x1]")]) == [
+        "var t0 = SP + (x2 << 3);", "return t0.field_0x1;"]
+    assert _lift_340([("mov", "x2, x29"), ("sub", "x2, x2, x15"),
+                      ("str", "x3, [x15, #-8]!"), ("mov", "x0, x2")]) == named("FP - SP")
+    # SP moved by an amount the row does not state.
+    hold = ("add", "x0, x15, #0x238")
+    for lost in (("and", "x15, x15, #0xfffffffffffffff0"), ("sub", "x15, x15, x3"),
+                 ("mov", "x15, x3"), ("mov", "x15, x29")):
+        assert _lift_340([hold, lost]) == named("SP + 0x238"), lost
+    # The row that moves SP reads the value itself: a push of an address off SP, whose
+    # own line is neither before the move nor after it.
+    assert _lift_340([("add", "x1, x15, #0x10"), ("str", "x1, [x15, #-8]!"),
+                      ("ldr", "x0, [x15], #8")]) == named("SP + 16")
+    assert _lift_340([("add", "x1, x15, #0x10"), ("add", "x2, x15, #0x20"),
+                      ("stp", "x1, x2, [x15, #-0x10]!"), ("sub", "x0, x2, x1")]) == [
+        "var t0 = SP + 16;", "var t1 = SP + 32;", "return t1 - t0;"]
+    assert _lift_340([("add", "x1, x15, #0x238"), ("str", "x1, [x15, #-8]!"),
+                      ("bl", "#0x1000"), ("add", "x15, x15, #8")]) == [
+        "var t0 = SP + 0x238;", "return sub_0x1000(t0);"]
+    # A slot holds a name and never the text, so a reload past the move is the name.
+    assert _lift_340([("add", "x1, x15, #0x238"), ("stur", "x1, [x29, #-0x10]"), move,
+                      ("ldur", "x0, [x29, #-0x10]")]) == named("SP + 0x238")
+    # A read through the address is the bytes there when it was read.
+    assert _lift_340([("add", "x17, x15, #0x238"), ("ldr", "x5, [x17]"),
+                      ("str", "x2, [x15, #-8]!"), ("str", "x1, [x15, #0x240]"),
+                      ("mov", "x0, x5")]) == named("(SP + 0x238).field_0x1")
+    # The rows strip_boilerplate blanks move SP as much as the ones it leaves.
+    assert _lift_340(_PRO_340 + [("add", "x0, x15, #8"), move]
+                     + _EPI_340) == named("SP + 40")
+    assert _lift_340([("add", "x0, x15, #8")] + _PRO_340 + _EPI_340) == named("SP + 88")
+    # A row printed raw that writes x15 leaves the bare register, the lifter knowing
+    # nothing of what it holds. A value spelled with that is named before the next move
+    # the same way, in a register or in a slot.
+    lost = ("mrs", "x15, nzcv")
+    for rows in ([("add", "x0, x15, #8"), move],
+                 [("add", "x0, x15, #8"), ("str", "x2, [x15, #-8]!")],
+                 [("add", "x0, x15, #8"), ("and", "x15, x15, #0xfffffffffffffff0")],
+                 [("add", "x1, x15, #8"), ("stur", "x1, [x29, #-8]"), move,
+                  ("ldur", "x0, [x29, #-8]")]):
+        assert _lift_340([lost] + rows) == ["mrs x15, nzcv"] + named("x15 + 8"), rows
+    # ...and x15 stays the bare register after the row, as it was before #340.
+    assert _lift_340([lost, ("add", "x0, x15, #8")]) == ["mrs x15, nzcv",
+                                                         "return x15 + 8;"]
+    # A value nothing reads again is not named: the guard.
+    assert _lift_340([("add", "x1, x15, #8"), ("and", "x15, x15, #0xfffffffffffffff0"),
+                      ("mov", "x0, x3")]) == ["return x3;"]
+    assert _lift_340([("mov", "x2, x29"), ("sub", "x2, x2, x15"),
+                      ("mov", "x0, x2")]) == ["return FP - SP;"]
+
+
+def test_a_value_naming_sp_is_right_past_a_loop_and_a_join():
+    # A loop that moves SP is entered again with SP somewhere else, so a text naming SP
+    # from before it is named before it; and where one way into a join moved SP and
+    # another did not, each way writes the name its own text (#340).
+    hold = ("add", "x0, x15, #0x238")
+    assert _lift_340([hold, ("sub", "x15, x15, #0x20"), ("sub", "x2, x2, #1"),
+                      ("cbnz", "x2, #0x4")]) == [
+        "var t0 = SP + 0x238;", "var t1 = x2;", "while (true) {",
+        "if ((t1 - 1) == 0) {", "t1 -= 1;", "break;", "}", "t1 -= 1;", "}",
+        "return t0;"]
+    assert _lift_340([hold, ("cbz", "x2, #0xc"), ("sub", "x15, x15, #0x20")]) == [
+        "var t0 = SP + 0x238;", "if (x2 != 0) {", "t0 = SP + 0x258;", "}", "return t0;"]
+    assert _lift_340([hold, ("cbz", "x2, #0x10"), ("sub", "x15, x15, #0x20"),
+                      ("b", "#0x14"), ("sub", "x15, x15, #0x40"),
+                      ("add", "x0, x0, #0")]) == [
+        "var t0;", "if (x2 != 0) {", "t0 = SP + 0x258;", "} else {",
+        "t0 = SP + 0x278;", "}", "return t0;"]
+    # Two ways out of nested arms to one join, which the walk reaches by a goto.
+    assert _lift_340([hold, ("cbz", "x2, #0x14"), ("sub", "x15, x15, #0x20"),
+                      ("cbz", "x3, #0x14"), ("sub", "x15, x15, #0x20"),
+                      ("add", "x0, x0, #8")]) == [
+        "var t1 = SP + 0x238;", "if (x2 != 0) {", "var t0 = SP + 0x258;",
+        "if (x3 != 0) {", "t0 = SP + 0x278;", "}", "t1 = t0;", "}", "return t1 + 8;"]
+    # x15 itself is SP on every line, and is not carried through a join as a variable:
+    # this printed `var t0 = x15;` and `t0 = SP & 0xfffffffffffffff0;` in the arm.
+    assert _lift_340([("cbz", "x2, #0xc"), ("mov", "x19, x15"),
+                      ("and", "x15, x15, #0xfffffffffffffff0"),
+                      ("ldr", "x0, [x15, #8]")]) == ["var t0 = SP.field_0x9;",
+                                                     "return t0;"]
+
+
+def test_a_value_naming_fp_is_right_past_a_move_of_fp():
+    # `FP` is the frame pointer of the frame in force at the line: where x29 was when
+    # that frame began. Inside a frame a move of x29 by an amount the frame analysis
+    # follows, an FFI call's own frame, goes into the offset, as it does for an access.
+    # A move it does not follow begins another frame, and a value naming FP is named
+    # before it (#340).
+    def named(text):
+        return [f"var t0 = {text};", "return t0;"]
+    hold = ("add", "x0, x29, #8")
+    for move in (("mov", "x29, x15"), ("sub", "x29, x29, #0x20"),
+                 ("ldr", "x29, [x15], #8")):
+        assert _lift_340([hold, move]) == named("FP + 8"), move
+    assert _lift_340([("mov", "x0, x29"), ("mov", "x29, x15")]) == named("FP")
+    assert _lift_340([hold] + _PRO_340 + _EPI_340) == named("FP + 8")
+    assert _lift_340([("add", "x1, x29, #8"), ("mov", "x29, x15"), ("add", "x2, x29, #8"),
+                      ("sub", "x0, x2, x1")]) == ["var t0 = FP + 8;",
+                                                  "return FP + 8 - t0;"]
+    # Inside the frame the prologue began, an FFI call's frame is 72 bytes down: the
+    # push of x29 under the 0x40 of locals. `add x0, x29, #8` there is FP - 64, and a
+    # load through x29 there has printed `(FP - 64).field_0x1` since #165.
+    inner = _PRO_340 + _FFI_IN_340
+    assert _lift_340(inner + [("add", "x0, x29, #8")] + _FFI_OUT_340) == [
+        "return FP - 64;"]
+    assert _lift_340(inner + [("mov", "x0, x29")] + _FFI_OUT_340) == ["return FP - 72;"]
+    assert _lift_340(inner + [("ldr", "x0, [x29, #8]")] + _FFI_OUT_340) == [
+        "var t0 = (FP - 64).field_0x1;", "return t0;"]
+    assert _lift_340(_PRO_340 + [("add", "x0, x29, #8")] + _FFI_IN_340
+                     + _FFI_OUT_340) == ["return FP + 8;"]
+    assert _lift_340(_PRO_340 + [("add", "x1, x29, #8"), ("sub", "x29, x29, #0x20"),
+                                 ("add", "x0, x29, #8"), ("sub", "x0, x0, x1"),
+                                 ("add", "x29, x29, #0x20")]) == [
+        "return FP - 24 - (FP + 8);"]
+    # Two frames one after the other: FP in the second is not FP in the first.
+    assert _lift_340(_FFI_IN_340 + [("add", "x16, x29, x4, lsl #3")] + _FFI_OUT_340
+                     + [("mov", "x29, x15"), ("add", "x11, x29, x4, lsl #3"),
+                        ("sub", "x0, x11, x16")]) == [
+        "var t0 = FP + (x4 << 3);", "return FP + (x4 << 3) - t0;"]
+    # Spelled with the bare register, past a row printed raw that wrote x29.
+    for move in (("mov", "x29, x15"), ("sub", "x29, x29, #0x20"),
+                 ("ldr", "x29, [x15], #8")):
+        assert _lift_340([("mrs", "x29, nzcv"), hold, move]) == [
+            "mrs x29, nzcv"] + named("x29 + 8"), move
+    # No move: the guard.
+    assert _lift_340([hold]) == ["return FP + 8;"]
+
+
+def test_a_store_through_a_held_frame_address_agrees_with_the_reads_beside_it():
+    # The store's text and the read's are of one SP, the one at their own line, so a
+    # reader can tell whether they are the same bytes: `(SP + 0x238).field_0x1 = x1;`
+    # under a push, beside `var t0 = SP.field_0x241;`, said they were not (#340). And a
+    # read taken before the store, which the store may write, is still named before it,
+    # through the held address or through the slot, whichever of the two each one is.
+    push = ("str", "x2, [x15, #-8]!")
+    held = ("add", "x17, x15, #0x238")
+    assert _lift_340([held, push, ("str", "x3, [x15, #0x240]"), ("str", "x1, [x17]"),
+                      ("ldr", "x0, [x15, #0x240]")]) == [
+        "(SP + 0x240).field_0x1 = x1;", "var t0 = SP.field_0x241;", "return t0;"]
+    assert _lift_340([("ldr", "x5, [x15, #0x240]"), held, push, ("str", "x1, [x17]"),
+                      ("mov", "x0, x5")]) == [
+        "var t0 = SP.field_0x241;", "(SP + 0x240).field_0x1 = x1;", "return t0;"]
+    assert _lift_340([("add", "x16, x15, #0x238"), held, ("ldr", "x5, [x16]"), push,
+                      ("str", "x1, [x17]"), ("mov", "x0, x5")]) == [
+        "var t0 = (SP + 0x238).field_0x1;", "(SP + 0x240).field_0x1 = x1;",
+        "return t0;"]
+    assert _lift_340([held, push, ("str", "x1, [x15, #0x240]"),
+                      ("ldr", "x0, [x17]")]) == ["return (SP + 0x240).field_0x1;"]
+    # With no move between them both spellings were right already: the guard.
+    assert _lift_340([("ldr", "x5, [x15, #0x238]"), held, ("str", "x1, [x17]"),
+                      ("mov", "x0, x5")]) == [
+        "var t0 = SP.field_0x239;", "(SP + 0x238).field_0x1 = x1;", "return t0;"]
+    assert _lift_340([("ldur", "x5, [x29, #-0x10]"), ("sub", "x17, x29, #0x10"), push,
+                      ("str", "x1, [x17]"), ("mov", "x0, x5")]) == [
+        "var t0 = (FP - 16).field_0x1;", "(FP - 16).field_0x1 = x1;", "return t0;"]
+
+
+def test_an_address_off_a_frame_register_is_what_the_cpu_returns():
+    # Generated rows that build an address off SP or FP, move SP, add to the address or
+    # not, and return it, run on a CPU: the text's constant off the register as the
+    # return finds it is what x0 holds. 184 of these 300 printed another address (#340).
+    _needs_capstone()
+    if not _unicorn_available():
+        _skip("  SKIP test_an_address_off_a_frame_register_is_what_the_cpu_returns"
+              " (no unicorn)")
+    import random
+    from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+    from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, arm64_const as a64
+    from jadart.expr import lift_function
+    md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
+
+    def imm(op, d, n, k):                       # add or sub xD, xN, #k
+        return op | k << 10 | n << 5 | d
+    add, sub = 0x91000000, 0xD1000000
+    moves = (lambda r: imm(sub, 15, 15, 8 * r.randrange(1, 40)),
+             lambda r: imm(add, 15, 15, 8 * r.randrange(1, 40)),
+             lambda r: 0xF81F8DE2,              # str x2, [x15, #-8]!
+             lambda r: 0xF84085E2,              # ldr x2, [x15], #8
+             lambda r: 0xA9BF0DE2,              # stp x2, x3, [x15, #-0x10]!
+             lambda r: 0xA8C10DE2)              # ldp x2, x3, [x15], #0x10
+    rng, wrong = random.Random(340), []
+    for case in range(300):
+        base = rng.choice((15, 15, 29))
+        words = [imm(add, 0, base, 8 * rng.randrange(0, 100))]
+        for _ in range(rng.randrange(1, 6)):
+            words.append(rng.choice(moves)(rng))
+            if rng.random() < 0.3:
+                words.append(imm(rng.choice((add, sub)), 0, 0, 8 * rng.randrange(1, 9)))
+        words.append(0xD65F03C0)                # ret
+        code = b"".join(struct.pack("<I", w) for w in words)
+        rows = [(i.address, i.mnemonic, i.op_str, "") for i in md.disasm(code, 0)]
+        assert len(rows) == len(words), case
+        mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
+        mu.mem_map(0x10000, 0x1000)
+        mu.mem_map(0x40000, 0x10000)
+        mu.mem_write(0x10000, code)
+        mu.reg_write(a64.UC_ARM64_REG_X15, 0x48000)
+        mu.reg_write(a64.UC_ARM64_REG_X29, 0x4c000)
+        mu.emu_start(0x10000, 0x10000 + len(code) - 4)
+        cpu = {"SP": mu.reg_read(a64.UC_ARM64_REG_X15),
+               "FP": mu.reg_read(a64.UC_ARM64_REG_X29)}
+        got = [ln.strip() for ln in lift_function(rows)]
+        m = re.fullmatch(r"return (SP|FP)((?: [+-] (?:0x[0-9a-f]+|\d+))*);", got[-1])
+        assert m and len(got) == 1, (case, got)
+        k = sum(int(sign + num, 0) for sign, num in
+                re.findall(r" ([+-]) (0x[0-9a-f]+|\d+)", m.group(2)))
+        if cpu[m.group(1)] + k != mu.reg_read(a64.UC_ARM64_REG_X0):
+            wrong.append((case, got))
+    assert not wrong, (len(wrong), wrong[:3])
+
+
+def test_naming_at_a_frame_move_costs_the_same_per_row_at_any_length():
+    # A guard on the cost, counted and not timed: each row that moves a frame register
+    # looks at the registers, a fixed number, so four times the rows is four times the
+    # looks, with every register holding a text that names SP and half the moves ones
+    # the constant cannot follow. It has nothing to count before #340, where it fails
+    # for want of the function and not for the cost.
+    import jadart.expr as expr
+    real, calls = expr._names_role, [0]
+
+    def counted(v, role):
+        calls[0] += 1
+        return real(v, role)
+
+    def per_row(n):
+        rows = []
+        for i in range(n):
+            rows.append(("add", f"x{1 + i % 8}, x15, #{8 * (i % 100)}"))
+            rows.append(("sub", "x15, x15, #0x10") if i % 2 else
+                        ("and", "x15, x15, #0xfffffffffffffff0"))
+            rows.append(("eor", f"x0, x0, x{1 + (i + 3) % 8}"))
+        calls[0] = 0
+        _lift_rows(rows + [("ret", "")])
+        return calls[0] / len(rows)
+    expr._names_role = counted
+    try:
+        small, large = per_row(200), per_row(800)
+        assert 0 < large <= small * 1.25 + 1, (small, large)
+    finally:
+        expr._names_role = real
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
