@@ -5060,7 +5060,7 @@ def test_the_memory_oracle_catches_a_stale_field_expression():
 
     pin = expr.Lifter._pin_mem
     try:
-        expr.Lifter._pin_mem = lambda self, st, loc, also=(), anywhere=False: []
+        expr.Lifter._pin_mem = lambda self, st, loc, *a, **k: []
         assert irfuzz.run_mem(count=40, trials=20, seed=7, verbose=False) != 0, (
             "the memory oracle passed with the staleness defect put back")
     finally:
@@ -5107,7 +5107,7 @@ def test_the_control_flow_memory_oracle_catches_every_defect_it_found():
 
     pin, copy = expr.Lifter._pin_mem, expr.Lifter._parallel_copy
     try:
-        expr.Lifter._pin_mem = lambda self, st, loc, also=(), anywhere=False: []
+        expr.Lifter._pin_mem = lambda self, st, loc, *a, **k: []
         for count, seed in ((60, 1), (150, 2), (200, 46)):
             assert irfuzz.run_cfgmem(count, 25, seed, False) != 0, (
                 f"the oracle passed at seed {seed} with the stale field read put back")
@@ -7468,7 +7468,7 @@ def _cfgmem_drawn(irfuzz, expr, ablate: bool) -> tuple:
     import io, contextlib
     real = expr.Lifter._pin_mem
     if ablate:
-        expr.Lifter._pin_mem = lambda self, st, loc, also=(), anywhere=False: []
+        expr.Lifter._pin_mem = lambda self, st, loc, *a, **k: []
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -21945,6 +21945,42 @@ def test_a_store_names_a_live_read_made_at_a_computed_address():
                 ("mov", "x0, x3")) == ["x2[x6] = x4;", "return x1.field_0x18;"]
     assert lift(("ldur", "x3, [x1, #7]"), ("stur", "x4, [x2, #0xf]"),
                 ("mov", "x0, x3")) == ["x2.field_0x10 = x4;", "return x1.field_0x8;"]
+
+
+def test_an_element_store_names_an_element_read_through_another_base():
+    """A store names the live values that read what it writes. A field is matched by its
+    selector under any base, since two registers may hold one object, but an element was
+    matched by its base's text: `add x2, x3, x4, lsl #3; ldur x0, [x2, #0x17]; add x5,
+    x6, x7, lsl #3; stur x9, [x5, #0x17]` printed `x6[x7] = x9;` and then
+    `return x3[x4];`, the element after the store, where the machine returns it as it was
+    before (#343). The two are one element when x6 is x3 and x7 is x4. Now an element
+    store names every element read, whatever its base and index. A field against an
+    element is two things in the object model, as before."""
+    lift = _lift_329
+    ret = ("mov", "x0, x8")
+    for read, store, line in (
+            ((("add", "x2, x3, x4, lsl #3"), ("ldur", "x8, [x2, #0x17]")),
+             (("add", "x5, x6, x7, lsl #3"), ("stur", "x9, [x5, #0x17]")),
+             "x6[x7] = x9;"),
+            ((("ldr", "x8, [x3, x4, lsl #3]"),),
+             (("str", "x9, [x6, x7, lsl #3]"),), "x6[x7] = x9;"),
+            ((("ldr", "x8, [x3, x4, lsl #3]"),),
+             (("add", "x5, x6, x7, lsl #3"), ("stur", "x9, [x5, #0x17]")),
+             "x6[x7] = x9;"),
+            ((("add", "x2, x3, x4, lsl #3"), ("ldur", "x8, [x2, #0x17]")),
+             (("str", "x9, [x3, x7, lsl #3]"),), "x3[x7] = x9;")):
+        got = lift(*read, *store, ret)
+        assert got[0].startswith("var t0 = x3[x4]") and line in got and got[-1] == (
+            "return t0;"), (read, store, got)
+    # The same element through the same base was named before, and still is.
+    assert lift(("ldr", "x8, [x2, x4, lsl #3]"), ("str", "x9, [x2, x4, lsl #3]"),
+                ret) == ["var t0 = x2[x4];", "x2[x4] = x9;", "return t0;"]
+    # A field is not an element, either way round.
+    assert lift(("ldur", "x8, [x1, #7]"), ("add", "x5, x6, x7, lsl #3"),
+                ("stur", "x9, [x5, #0x17]"), ret) == ["x6[x7] = x9;",
+                                                      "return x1.field_0x8;"]
+    assert lift(("ldr", "x8, [x2, x4, lsl #3]"), ("stur", "x9, [x1, #7]"),
+                ret) == ["x1.field_0x8 = x9;", "return x2[x4];"]
 
 
 #: `Assembler::TryAllocateObject` and `TryAllocateArray` (assembler_arm64.cc, 3.12.2),

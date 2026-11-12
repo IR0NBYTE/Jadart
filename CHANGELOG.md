@@ -421,6 +421,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An element store names a live element read through another base.** A store names
+  the live values that read what it writes. A field is matched by its selector under
+  any base, since two registers may hold one object, but an element was matched by its
+  base's text: `add x2, x3, x4, lsl #3; ldur x0, [x2, #0x17]; add x5, x6, x7, lsl #3;
+  stur x9, [x5, #0x17]` printed `x6[x7] = x9;` and then `return x3[x4];`, the element
+  after the store, where the machine returns it as it was before (#343). The two are
+  one element when x6 is x3 and x7 is x4. Each element read is now recorded where it
+  is made, as a read at a computed address is (#341), and an element store names every
+  one still live, whatever its base and index. An element of the frame, and a field
+  against an element, are left as they were. Over the two fixtures and the seven
+  app-sweep libraries, 97 bodies change and 522 values gain a name: 245 element reads
+  (181 before an element store, 64 carried to a later field store), 37 field reads, 15
+  reads at a computed address, 6 frame words and 219 join and arithmetic values the new
+  names move. Every other changed line is the old one once the names are inlined and
+  temporaries renumbered. The unicorn oracle, now with a second element address that
+  may be the first, went from 10, 11 and 14 wrong runs on three seeds of 3,000 to none.
+  With #341, a tier 3 dump of the clean fixture takes 24.30, 23.97 and 24.26 s against
+  main's 23.86, 23.72 and 23.76 in three alternating pairs, 1.7% more in all.
 - **A read at a computed address is named before a store that may write it.** A store
   names the live values that read what it writes, matched by the field's spelling or
   selector. A read at an address the lifter computed, `(x1 + x5 - 1).field_0x1`, is
