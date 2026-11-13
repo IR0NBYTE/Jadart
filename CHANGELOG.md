@@ -107,6 +107,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`tier3_graph` on rows nested too deeply raises `TooDeep`, not a stray
+  `RecursionError`.** On a chain of 500 or more `cmp`/`b.eq` pairs it ran out of
+  Python's stack, and the `RecursionError` escaped from whichever frame it hit, while
+  `lift_function` on the same rows printed them flat (#405). It now raises
+  `jadart.expr.TooDeep`, which names the row count and is a `RecursionError`, so a
+  caller that caught one, as tools/cfgcheck.py and `lift_function` do, still does.
+  `lift_function` prints those rows flat as before. At 500, 1,000, 2,000 and 4,000
+  pairs `tier3_graph` gives up in 0.004, 0.007, 0.013 and 0.026 s, as before; 200 pairs
+  still make a graph. Neither fixture's output changes.
 - **A signed load of an element into an `x` register is extended.** `ldrsw x0, [x9, x7,
   lsl #2]` printed `return x9[x7];`, the word as read, where the register holds it
   sign-extended to 64 bits: 0xffffffff80000000 for an element of 0x80000000 (#403). The
