@@ -13245,10 +13245,29 @@ def _proven_entries(blocks, mono, placed) -> tuple:
     return mono, mono + _NORMAL_PAST_MONO
 
 
+class TooDeep(RecursionError):
+    """Rows nested too deeply for tier 3 to structure: `tier3_graph` raises it, and
+    `lift_function` prints such rows flat (cfg.flat), as tier 2 does (#81). Structuring
+    recurses once per level of nesting, so a chain of 500 conditionals, which only a
+    crafted binary holds, ran out of Python's stack, and the RecursionError escaped from
+    wherever it happened to (#405). A RecursionError still, so a caller that caught that
+    catches this."""
+
+
 def tier3_graph(ann, cut_end=None, mono=None):
     """The Tier3Graph of the annotated rows `ann`, or None where they make no block.
     `_lift_function` lifts it and tools/cfgcheck.py checks it, so both see one graph.
-    `mono` is the code's monomorphic entry, as lift_function takes it."""
+    `mono` is the code's monomorphic entry, as lift_function takes it. Rows nested too
+    deeply to structure raise TooDeep, where lift_function prints them flat (#405)."""
+    try:
+        return _tier3_graph(ann, cut_end, mono)
+    except RecursionError:
+        # Nothing it built outlives it: the graph is the call's own, and the caches
+        # hold parses only (see lift_function).
+        raise TooDeep(f"{len(ann)} rows nested too deeply to structure") from None
+
+
+def _tier3_graph(ann, cut_end, mono):
     slow = set()
     stripped = strip_boilerplate(ann, slow)
     # Tier 3 honours traps, the rule tier 2 took in #57: a block ends at a `brk`/`udf`

@@ -10807,6 +10807,35 @@ def test_a_section_too_deep_to_structure_prints_its_rows():
     assert len(body) == 108 and body[-1] == "return x0;", body[-3:]
 
 
+def test_tier3_graph_too_deep_raises_its_own_error_and_lift_prints_flat():
+    """`tier3_graph` on a chain of 500 or more `cmp`/`b.eq` pairs ran out of Python's
+    stack and the RecursionError escaped from whichever frame it hit, where
+    `lift_function` on the same rows prints them flat (#405). It now raises TooDeep, a
+    RecursionError, so a caller that caught one still does, and `lift_function` prints
+    the flat rows as before. 200 pairs still make a graph, also after a TooDeep."""
+    from jadart.cfg import TOO_DEEP
+    from jadart.expr import TooDeep, lift_function, tier3_graph
+
+    def chain(n):
+        end = 8 * n
+        rows = []
+        for i in range(n):
+            rows += [(8 * i, "cmp", f"x{i % 7}, #{i}", ""),
+                     (8 * i + 4, "b.eq", f"#{end + 8}", "")]
+        return rows + [(end, "mov", "x0, #1", ""), (end + 4, "ret", "", ""),
+                       (end + 8, "mov", "x0, #2", ""), (end + 12, "ret", "", "")]
+    assert issubclass(TooDeep, RecursionError)
+    for n in (500, 1000, 4000):
+        ann = chain(n)
+        with pytest.raises(TooDeep, match=f"{len(ann)} rows"):
+            _at_default_limit(lambda: tier3_graph(ann))
+        body = [ln.strip() for ln in _at_default_limit(lambda: lift_function(ann))]
+        assert body[0] == "// " + TOO_DEEP, body[:2]
+        at = [int(ln.split()[0], 16) for ln in body[1:]]
+        assert at == [a for a, *_ in ann], (n, at[:3], at[-3:])
+    assert _at_default_limit(lambda: tier3_graph(chain(200))) is not None
+
+
 def test_the_sections_after_one_too_deep_print_their_rows_under_their_notes():
     """`structure` stops placing at the section too deep for it, and the sections after
     it are printed as they are too, each under its own note, so that no row is left out
