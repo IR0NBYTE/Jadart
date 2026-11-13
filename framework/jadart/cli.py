@@ -691,7 +691,25 @@ def cmd_constants(args) -> int:
         lists = const_lists(fr, getattr(image, "arch", None))
     except JadartError as e:
         return _fail(e)
-    if getattr(args, "json", False):
+    as_json = getattr(args, "json", False)
+    wanted = getattr(args, "offset", None)
+    if wanted is not None:
+        # The one list a body names, by the `@0xb9b0` it printed. Listed on its own, so
+        # it is whole: a slot that shares another's list, or a long string listed before
+        # it, is spelled here rather than sent to an offset this run does not print.
+        try:
+            off = int(wanted[1:] if wanted.startswith("@") else wanted, 0)
+        except ValueError:
+            return _xrefs_usage(args, f"invalid pool offset: {wanted!r}")
+        if off not in lists:
+            message = f"no const list at pool offset {hex(off)}"
+            if as_json:
+                return emit({"ok": False, "offset": off, "count": 0, "constants": [],
+                             "error": message}, EXIT_MISS)
+            error(message)
+            return EXIT_MISS
+        lists = {off: lists[off]}
+    if as_json:
         return emit({"ok": True, "count": len(lists), "constants": const_entries(lists)})
     if not lists:
         print("no const list in the object pool resolves to elements this can name")
@@ -1520,6 +1538,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = _add(sub, common, "constants",
              "the const lists in the object pool, elements and all")
+    p.add_argument("offset", nargs="?", metavar="OFFSET",
+                   help="print only the list at this pool offset, as a body names it: "
+                        "`const[47] @0xb9b0{...}` is 0xb9b0 or @0xb9b0")
     p.set_defaults(func=cmd_constants)
 
     p = _add(sub, common, "strings", "the recovered identifier and string pool")
