@@ -148,12 +148,13 @@ _HEADING = re.compile(r"[ \t>]*(?:(?:[-+]|\d+[.)])[ \t]+(?:>[ \t]*)*)*"
 #: follows it or changes how a renderer reads the lines after it. Anything else in an
 #: HTML block is refused, which keeps out `<pre>`, `<script>`, `<style>`, `<textarea>`,
 #: `<select>`, `<details>` and the rest, the tags renderers disagree on (`<search>`,
-#: `<source>`), every custom element, and attributes such as `hidden` or `style` that
-#: hide what they hold.
+#: a `<source>` outside a `<picture>`), every custom element, and attributes such as
+#: `hidden` or `style` that hide what they hold.
 _ALLOWED = frozenset((
-    "a b br code div em h1 h2 h3 h4 h5 h6 hr i img kbd p span strong sub sup table "
-    "tbody td th thead tr").split())
-_ALLOWED_ATTRS = frozenset("align alt height href src title width".split())
+    "a b br code div em h1 h2 h3 h4 h5 h6 hr i img kbd p picture source span strong sub "
+    "sup table tbody td th thead tr").split())
+_ALLOWED_ATTRS = frozenset(
+    "align alt height href media src srcset title width".split())
 
 #: The allowed tags that must close on the line that opens them. Left open, one alone on
 #: its line (an HTML block) or a formatting tag such as `<b>` can wrap the rest of the
@@ -164,14 +165,21 @@ _ALLOWED_ATTRS = frozenset("align alt height href src title width".split())
 #: table and GitHub after a `div`, so that the container wraps everything after it. A
 #: `p` is held to the same rule to keep it one rule. `br`, `hr` and `img` are void.
 _CLOSE_ON_LINE = frozenset((
-    "a b code em h1 h2 h3 h4 h5 h6 i kbd span strong sub sup").split())
+    "a b code em h1 h2 h3 h4 h5 h6 i kbd picture span strong sub sup").split())
 _STAYS_OPEN = frozenset("div p table tbody td th thead tr".split())
 
 #: What may stand inside an open inline or heading element on its line. While a block tag
 #: there is open, a browser or GitHub can ignore the element's closer or reopen the
 #: element after the block, so it can wrap the rest of the page after all; any other tag
 #: is refused rather than tell when.
-_INLINE = frozenset("a b br code em i img kbd span strong sub sup".split())
+_INLINE = frozenset(
+    "a b br code em i img kbd picture source span strong sub sup".split())
+
+#: `<picture>` is how GitHub serves one image in light mode and another in dark: a
+#: `<source media="(prefers-color-scheme: dark)" srcset="...">` beside the `<img>` every
+#: renderer falls back to. It closes on its line like any inline element. A `<source>`
+#: is read only inside one: on its own it is the media tag renderers disagree about.
+_IN_PICTURE = frozenset(("source",))
 
 #: Markdown's inline syntax, which HTML in the docs does not hold anywhere on its lines,
 #: in a tag, a comment, the text between them or a `*` bullet or footnote label before
@@ -305,6 +313,8 @@ def _markup_problem(text: str, contained: bool = False):
         if "<" in text[i + 1:k]:
             return i, "<in"
         tag = name.group(0).lower()
+        if tag in _IN_PICTURE and not open_tags.get("picture"):
+            return i, f"<{tag}>"     # outside a <picture> it is no fallback's sibling
         if not closing and tag not in _INLINE and inline:
             return i, "block"        # the open element's closer might not end it
         if tag in tracked:

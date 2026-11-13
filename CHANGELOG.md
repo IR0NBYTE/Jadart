@@ -107,6 +107,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The README's logo passes the Markdown check again, and the check reads a
+  `<picture>`.** The new header serves one logo in light mode and another in dark with
+  a `<picture>` element, as GitHub documents it, and `tools/fencecheck.py` refused the
+  tag, the `<source>` inside it and a heading left open over six lines, so the step
+  "Markdown code fences close" failed on main and on every pull request (#411). The
+  header is one line now, and the check allows a `<picture>` that closes on the line
+  that opens it and a `<source>` inside one, with `media` and `srcset`. A `<source>`
+  on its own is still refused: only beside the `<img>` a renderer falls back to does
+  every renderer agree on what is shown.
 - **A shifted operand of a 32-bit instruction is shifted at 32 bits.** `add w0, w5, w6,
   asr #3` printed `(x5 + (x6 >> 3)).toUnsigned(32)`: the 64-bit shift brings the top
   half of x6 down into the result, and takes its sign from bit 63 (#373). A right shift
