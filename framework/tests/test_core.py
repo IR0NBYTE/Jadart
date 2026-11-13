@@ -22130,8 +22130,9 @@ def test_a_store_names_a_live_read_made_at_a_computed_address():
     #-1]; stur x4, [x1, #7]; mov x0, x3` returned `(x1 + x5 - 1).field_0x1` read AFTER
     the store, which writes it when x5 is 8 (#341). Each such read is recorded and every
     heap store names it, and the mirror: a store at a computed address may write any
-    field of any object, so it names every live read of the heap. The frame and a
-    proven element stay out, as two fields of the object model do."""
+    field of any object, so it names every live read of the heap. The frame stays out,
+    as two fields of the object model do, and so does an element at a data offset
+    against a field below it (#375 for one that reaches it)."""
     lift = _lift_329
     comp = ("add", "x0, x1, x5")
     for read, store, decl, line in (
@@ -22169,7 +22170,8 @@ def test_a_store_names_a_live_read_made_at_a_computed_address():
         assert got[0] == f"var t0 = {decl};" and line in got and got[-1] == (
             "return t0;"), (read, store, got)
     # A frame slot is not the heap, two plain fields at different offsets are two
-    # addresses, and a field is not an element: nothing is named for any of them.
+    # addresses, and a field below the data offset is no element: nothing is named
+    # for any of them.
     assert lift(comp, ("ldur", "x3, [x0, #-1]"), ("stur", "x4, [x29, #-8]"),
                 ("mov", "x0, x3")) == ["return (x1 + x5 - 1).field_0x1;"]
     assert lift(("sub", "x0, x29, #0x10"), ("ldur", "x3, [x0, #0xf]"),
@@ -22178,10 +22180,11 @@ def test_a_store_names_a_live_read_made_at_a_computed_address():
     assert lift(("add", "x0, x29, #8"), ("ldur", "x3, [x1, #0xf]"),
                 ("stur", "x4, [x0, #-1]"), ("mov", "x0, x3")) == [
         "FP.field_0x8 = x4;", "return x1.field_0x10;"]
-    assert lift(("ldr", "x3, [x2, x6, lsl #3]"), ("stur", "x4, [x1, #7]"),
+    elem = ("add", "x5, x2, x6, lsl #3")
+    assert lift(elem, ("ldur", "x3, [x5, #0x17]"), ("stur", "x4, [x1, #7]"),
                 ("mov", "x0, x3")) == ["x1.field_0x8 = x4;", "return x2[x6];"]
-    assert lift(("ldur", "x3, [x1, #0x17]"), ("str", "x4, [x2, x6, lsl #3]"),
-                ("mov", "x0, x3")) == ["x2[x6] = x4;", "return x1.field_0x18;"]
+    assert lift(("ldur", "x3, [x1, #0xf]"), elem, ("stur", "x4, [x5, #0x17]"),
+                ("mov", "x0, x3")) == ["x2[x6] = x4;", "return x1.field_0x10;"]
     assert lift(("ldur", "x3, [x1, #7]"), ("stur", "x4, [x2, #0xf]"),
                 ("mov", "x0, x3")) == ["x2.field_0x10 = x4;", "return x1.field_0x8;"]
 
@@ -22193,8 +22196,8 @@ def test_an_element_store_names_an_element_read_through_another_base():
     x6, x7, lsl #3; stur x9, [x5, #0x17]` printed `x6[x7] = x9;` and then
     `return x3[x4];`, the element after the store, where the machine returns it as it was
     before (#343). The two are one element when x6 is x3 and x7 is x4. Now an element
-    store names every element read, whatever its base and index. A field against an
-    element is two things in the object model, as before."""
+    store names every element read, whatever its base and index. A field below the
+    data offset against an element is two things in the object model, as before."""
     lift = _lift_329
     ret = ("mov", "x0, x8")
     for read, store, line in (
@@ -22214,12 +22217,13 @@ def test_an_element_store_names_an_element_read_through_another_base():
     # The same element through the same base was named before, and still is.
     assert lift(("ldr", "x8, [x2, x4, lsl #3]"), ("str", "x9, [x2, x4, lsl #3]"),
                 ret) == ["var t0 = x2[x4];", "x2[x4] = x9;", "return t0;"]
-    # A field is not an element, either way round.
+    # A field below the data offset is not an element, either way round.
     assert lift(("ldur", "x8, [x1, #7]"), ("add", "x5, x6, x7, lsl #3"),
                 ("stur", "x9, [x5, #0x17]"), ret) == ["x6[x7] = x9;",
                                                       "return x1.field_0x8;"]
-    assert lift(("ldr", "x8, [x2, x4, lsl #3]"), ("stur", "x9, [x1, #7]"),
-                ret) == ["x1.field_0x8 = x9;", "return x2[x4];"]
+    assert lift(("add", "x5, x2, x4, lsl #3"), ("ldur", "x8, [x5, #0x17]"),
+                ("stur", "x9, [x1, #7]"), ret) == ["x1.field_0x8 = x9;",
+                                                   "return x2[x4];"]
 
 
 def test_a_pair_store_reads_its_registers_and_address_before_either_store():
@@ -22303,6 +22307,264 @@ def test_a_pair_store_that_reads_neither_word_prints_as_it_did():
     assert lift(("ldp", "x13, x0, [x13, #8]")) == ["return x13.field_0x11;"]
     assert lift(("ldp", "x0, x13, [x13, #8]"), ("mov", "x1, x13")) == [
         "return x13.field_0x9;"]
+
+
+def test_a_field_read_and_an_element_that_may_be_one_word_are_named_before_the_store():
+    """The elements of an object are the words from its data offset up, and a read at
+    a fixed offset that reaches that far is one of them: `ldur x4, [x13, #0x17]; add
+    x16, x13, x8, lsl #3; stur x1, [x16, #0x17]; mov x0, x4` printed `x13[x8] = x1;`
+    and then `return x13.field_0x18;`, the word after the store, where the machine
+    returns it as it was before whenever x8 is 0 (#375). An element store now names
+    each live field read with a byte at the data offset or past it, a field store
+    names each live element read whose data offset its bytes end past, and both
+    through any base, since two registers may hold one object."""
+    lift = _lift_329
+    elem, ret = ("add", "x16, x13, x8, lsl #3"), ("mov", "x0, x4")
+    # The issue and its mirror, at the data offset and above it, through another base.
+    for base in ("x13", "x12"):
+        for off, sel in ((0x17, "0x18"), (0x27, "0x28")):
+            assert lift(("ldur", f"x4, [{base}, #{off:#x}]"), elem,
+                        ("stur", "x1, [x16, #0x17]"), ret) == [
+                f"var t0 = {base}.field_{sel};", "x13[x8] = x1;", "return t0;"]
+            assert lift(elem, ("ldur", "x4, [x16, #0x17]"),
+                        ("stur", f"x1, [{base}, #{off:#x}]"), ret) == [
+                "var t0 = x13[x8];", f"{base}.field_{sel} = x1;", "return t0;"]
+    # The width decides where a read ends: eight bytes at 0xc reach 0x10 and four do
+    # not, a byte inside the data is in it, and sixteen bytes from 0x8 reach it.
+    low = ("add", "x16, x13, x8, lsl #2")
+    assert lift(("ldur", "x4, [x13, #0xb]"), low, ("stur", "w1, [x16, #0xf]"), ret) == [
+        "var t0 = x13.field_0xc;", "x13[x8] = x1;", "return t0;"]
+    assert lift(("ldur", "w4, [x13, #0xb]"), low, ("stur", "w1, [x16, #0xf]"), ret) == [
+        "x13[x8] = x1;", "return x13.field_0xc;"]
+    assert lift(("ldurb", "w4, [x13, #0x1a]"), elem, ("stur", "x1, [x16, #0x17]"),
+                ret) == ["var t0 = x13.field1_0x1b;", "x13[x8] = x1;", "return t0;"]
+    assert lift(("ldur", "q0, [x13, #7]"), low, ("stur", "w1, [x16, #0xf]"),
+                ("stur", "q0, [x20, #7]"))[:2] == [
+        "var t0 = x13.field16_0x8;", "x13[x8] = x1;"]
+    assert lift(elem, ("ldur", "x4, [x16, #0x17]"), ("sturb", "w1, [x13, #0x1a]"),
+                ret) == ["var t0 = x13[x8];", "x13.field1_0x1b = x1;", "return t0;"]
+    # A field that ends below the data offset is the header, either way round.
+    assert lift(("ldur", "x4, [x13, #0xf]"), elem, ("stur", "x1, [x16, #0x17]"),
+                ret) == ["x13[x8] = x1;", "return x13.field_0x10;"]
+    assert lift(elem, ("ldur", "x4, [x16, #0x17]"), ("stur", "x1, [x13, #0xf]"),
+                ret) == ["x13.field_0x10 = x1;", "return x13[x8];"]
+    assert lift(("ldur", "x4, [x13, #-1]"), elem, ("stur", "x1, [x16, #0x17]"),
+                ret) == ["x13[x8] = x1;", "return x13.tags;"]
+    # An element with no data offset shown is the access at its address: it may be
+    # any field, the header too, and any field store may write it.
+    for off, sel in ((7, "field_0x8"), (0x17, "field_0x18"), (-1, "tags")):
+        assert lift(("ldur", f"x4, [x12, #{off:#x}]"), ("str", "x1, [x13, x8, lsl #3]"),
+                    ret) == [f"var t0 = x12.{sel};", "x13[x8] = x1;", "return t0;"]
+        assert lift(("ldr", "x4, [x13, x8, lsl #3]"), ("stur", f"x1, [x12, #{off:#x}]"),
+                    ret) == ["var t0 = x13[x8];", f"x12.{sel} = x1;", "return t0;"]
+    assert lift(("ldr", "x4, [x13, #0x10]"), elem, ("str", "x1, [x16]"), ret) == [
+        "var t0 = x13.field_0x11;", "x13[x8] = x1;", "return t0;"]
+    assert lift(elem, ("ldr", "x4, [x16]"), ("str", "x1, [x13, #0x10]"), ret) == [
+        "var t0 = x13[x8];", "x13.field_0x11 = x1;", "return t0;"]
+    # The frame is not the heap, and neither is the thread.
+    frame = ("sub", "x0, x29, #0x10")
+    assert lift(frame, ("ldur", "x4, [x0, #0x1f]"), elem, ("stur", "x1, [x16, #0x17]"),
+                ret) == ["x13[x8] = x1;", "return (FP - 16).field_0x20;"]
+    assert lift(frame, elem, ("ldur", "x4, [x16, #0x17]"), ("stur", "x1, [x0, #0x1f]"),
+                ret) == ["(FP - 16).field_0x20 = x1;", "return x13[x8];"]
+    assert lift(("ldr", "x4, [x26, #0x700]"), elem, ("stur", "x1, [x16, #0x17]"),
+                ret) == ["x13[x8] = x1;", "return THR.field_0x700;"]
+    assert lift(elem, ("ldur", "x4, [x16, #0x17]"), ("str", "x1, [x26, #0x700]"),
+                ret) == ["THR.field_0x700 = x1;", "return x13[x8];"]
+
+
+def test_a_store_through_a_pointer_read_out_of_the_thread_or_the_frame_names_elements():
+    """A store INTO the thread or the frame writes no word of the heap, so it names
+    no element read. A store through a pointer LOADED from one writes the object the
+    pointer holds, which may be any: `add x16, x13, x8, lsl #3; ldur x5, [x16, #0x17];
+    ldr x9, [x26, #0x40]; stur x1, [x9, #0x17]; mov x0, x5` printed
+    `THR.field_0x40.field_0x18 = x1;` and then `return x13[x8];`, the word the store
+    wrote wherever the thread's field holds x13 and x8 is 0. The base's spelling
+    starting at THR or at a frame address said the first and was taken for the
+    second (#375)."""
+    lift = _lift_329
+    read = (("add", "x16, x13, x8, lsl #3"), ("ldur", "x5, [x16, #0x17]"))
+    ret = ("mov", "x0, x5")
+    assert lift(*read, ("ldr", "x9, [x26, #0x40]"), ("stur", "x1, [x9, #0x17]"),
+                ret) == ["var t0 = x13[x8];", "THR.field_0x40.field_0x18 = x1;",
+                         "return t0;"]
+    assert lift(*read, ("ldr", "x9, [x26, #0x40]"), ("ldur", "x9, [x9, #7]"),
+                ("stur", "x1, [x9, #0x17]"), ret) == [
+        "var t0 = x13[x8];", "THR.field_0x40.field_0x8.field_0x18 = x1;", "return t0;"]
+    assert lift(*read, ("sub", "x10, x29, #0x20"), ("ldr", "x9, [x10]"),
+                ("stur", "x1, [x9, #0x17]"), ret) == [
+        "var t0 = x13[x8];", "(FP - 32).field_0x1.field_0x18 = x1;", "return t0;"]
+    # Into the thread, the frame and the object pool, which are no object's words.
+    assert lift(*read, ("str", "x1, [x26, #0x40]"), ret) == [
+        "THR.field_0x40 = x1;", "return x13[x8];"]
+    assert lift(*read, ("sub", "x10, x29, #0x20"), ("str", "x1, [x10, #0x18]"),
+                ret) == ["(FP - 32).field_0x19 = x1;", "return x13[x8];"]
+    assert lift(*read, ("str", "x1, [x27, #0x40]"), ret) == [
+        "PP.field_0x40 = x1;", "return x13[x8];"]
+
+
+#: An inline allocation as `_addr_facts` proves one: the top loaded from the thread,
+#: bumped, stored back and tagged, and the header store.
+_FRESH_375 = (("ldr", "x0, [x26, #0x50]"), ("add", "x1, x0, #0x30"),
+              ("str", "x1, [x26, #0x50]"), ("add", "x0, x0, #1"),
+              ("stur", "x2, [x0, #-1]"))
+_FRESH_375_LINES = ["var t0 = THR.field_0x50;", "THR.field_0x50 += 48;",
+                    "(t0 + 1).tags = x2;"]
+
+
+def test_an_element_read_after_an_allocation_is_named_by_a_store_into_it():
+    """A store into an object the rows before it allocated names the element reads
+    made since the allocation, as any field store does (#375): one through the new
+    pointer, and one through a field the pointer was stored to, are words of the new
+    object. `(t0 + 1).field_0x18 = x3;` was followed by `return (t0 + 1)[x8];`."""
+    lift = _lift_329
+    store, tail = ("stur", "x3, [x0, #0x17]"), (("mov", "x6, x0"), ("mov", "x0, x5"))
+    assert lift(*_FRESH_375, ("add", "x16, x0, x8, lsl #3"), ("ldur", "x5, [x16, #0x17]"),
+                store, *tail) == _FRESH_375_LINES + [
+        "var t1 = (t0 + 1)[x8];", "(t0 + 1).field_0x18 = x3;", "return t1;"]
+    assert lift(*_FRESH_375, ("stur", "x0, [x13, #7]"), ("ldur", "x9, [x13, #7]"),
+                ("add", "x16, x9, x8, lsl #3"), ("ldur", "x5, [x16, #0x17]"), store,
+                *tail) == _FRESH_375_LINES + [
+        "x13.field_0x8 = t0 + 1;", "var t1 = x13.field_0x8[x8];",
+        "(t0 + 1).field_0x18 = x3;", "return t1;"]
+    # Of two allocations, a read between them is after the first and before the
+    # second, and a store through any other base is no store into a new object.
+    read = (("add", "x16, x13, x8, lsl #3"), ("ldur", "x5, [x16, #0x17]"))
+    assert lift(*_FRESH_375, ("mov", "x10, x0"), *read, *_FRESH_375, store,
+                ("stur", "x3, [x10, #0x17]"), tail[1]) == _FRESH_375_LINES + [
+        "var t1 = THR.field_0x50;", "THR.field_0x50 += 48;", "(t1 + 1).tags = x2;",
+        "(t1 + 1).field_0x18 = x3;", "var t2 = x13[x8];", "(t0 + 1).field_0x18 = x3;",
+        "return t2;"]
+    assert lift(*read, *_FRESH_375, ("stur", "x3, [x12, #0x17]"), *tail) == (
+        _FRESH_375_LINES + ["var t1 = x13[x8];", "x12.field_0x18 = x3;", "return t1;"])
+
+
+def test_an_element_read_before_an_allocation_is_not_named_by_a_store_into_it():
+    """An element read before an object was allocated is a word of some other
+    object, and no store into the new one writes it, as no raw store into one
+    reaches a field read (#341). The element stores of #375 named them: in 12 of 40
+    ranges sampled from the nine binaries the new name was a typed data element in
+    front of the header store of an allocation, `var t1 = x13[x8]; (t0 + 1).tags =
+    x2;`. A guard against that: main, with no such rule, prints these as they are
+    here."""
+    lift = _lift_329
+    tail = (("mov", "x6, x0"), ("mov", "x0, x5"))
+    for read in ((("ldr", "x5, [x13, x8, lsl #3]"),),
+                 (("add", "x16, x13, x8, lsl #3"), ("ldur", "x5, [x16, #0x17]"))):
+        assert lift(*read, *_FRESH_375, *tail) == _FRESH_375_LINES + ["return x13[x8];"]
+        assert lift(*read, *_FRESH_375, ("stur", "x3, [x0, #0x17]"), *tail) == (
+            _FRESH_375_LINES + ["(t0 + 1).field_0x18 = x3;", "return x13[x8];"])
+
+
+def test_a_body_walked_again_tells_the_reads_before_an_allocation_from_those_after():
+    """A body is walked more than once (#204), and a walk tells what it read before
+    an allocation from what it read after by how many names it had made by then. The
+    counts are that walk's: kept with what the walks share, an earlier walk's were
+    searched along with this one's, and the read before the allocation was named with
+    the one after, `var t4 = x13[t2]; var t5 = x12[t2];`. The loop is the `pinned`
+    one of `_GOTO_SHAPES`, which takes three walks; only the read after is named, and
+    main, with no such rule, names neither."""
+    from jadart import expr
+    loop = [r[1:] for r in _GOTO_SHAPES["pinned"][0][:13]]
+    walks, init = [], expr.Lifter.__init__
+    try:
+        def counted(self, *a, **k):
+            walks.append(1)
+            init(self, *a, **k)
+        expr.Lifter.__init__ = counted
+        got = _lift_329(
+            *loop, ("ldr", "x5, [x13, x8, lsl #3]"), *_FRESH_375,
+            ("ldr", "x7, [x12, x8, lsl #3]"), ("stur", "x4, [x0, #0x17]"),
+            ("mov", "x6, x0"), ("add", "x0, x5, x7"))
+    finally:
+        expr.Lifter.__init__ = init
+    assert len(walks) == 3, walks
+    assert got[-6:] == [
+        "t3 = THR.field_0x50;", "THR.field_0x50 += 48;", "(t3 + 1).tags = x2;",
+        "var t4 = x12[t2];", "(t3 + 1).field_0x18 = t1;", "return x13[t2] + t4;"], got
+
+
+def test_an_element_index_is_taken_to_be_zero_or_more():
+    """What #375 names rests on an ASSUMPTION the lifter does not prove: an element's
+    index is never negative, so `B[I]` off data offset D is at D or above and the
+    header under it is no element. The compiler checks an index against the length
+    before it uses one, and nothing in the rows says it did. Where it did not, `asr
+    x8, x7, #63` making the index 0 or -1, the store below writes `x13.field_0x10`
+    when x7 is negative and the value returned is printed as read after it. This
+    keeps what is printed, wrong as it is there, so a change to the rule shows. A
+    guard: main prints the same."""
+    lift = _lift_329
+    sign, elem = ("asr", "x8, x7, #63"), ("add", "x16, x13, x8, lsl #3")
+    assert lift(sign, ("ldur", "x4, [x13, #0xf]"), elem, ("stur", "x1, [x16, #0x17]"),
+                ("mov", "x0, x4")) == ["x13[x7 >> 63] = x1;", "return x13.field_0x10;"]
+    assert lift(sign, elem, ("ldur", "x5, [x16, #0x17]"), ("stur", "x1, [x13, #0xf]"),
+                ("mov", "x0, x5")) == ["x13.field_0x10 = x1;", "return x13[x7 >> 63];"]
+
+
+def _slots_375(shape, n):
+    """About `n` rows that keep many reads in frame slots under many stores: "fields",
+    header reads and then element stores; "elems", element reads at two data offsets
+    and then field stores that end between them; "chains", reads four fields deep
+    and then element stores."""
+    rows = [("sub", "x15, x15, #0x8000")]
+    if shape == "fields":
+        for j in range(n // 5):
+            rows += [("ldur", f"x2, [x{9 + j % 4}, #{7 + 8 * (j % 2)}]"),
+                     ("str", f"x2, [x15, #{8 * (j % 4000)}]")]
+    elif shape == "elems":
+        for j in range(64):
+            rows += [("add", "x8, x8, #1"), ("add", "x17, x11, x8, lsl #3"),
+                     ("ldur", "x3, [x17, #0xf]")]
+        for j in range((n - 200) // 6):
+            rows += [("add", "x8, x8, #1"), ("add", "x16, x13, x8, lsl #3"),
+                     ("ldur", "x2, [x16, #0x17]"),
+                     ("str", f"x2, [x15, #{8 * (j % 4000)}]")]
+        return rows + [("stur", "x1, [x12, #0xf]")] * (n - len(rows)) + [("ret", "")]
+    else:
+        for j in range(n // 8):
+            rows += [("ldur", f"x2, [x{9 + j % 4}, #7]"), ("ldur", "x2, [x2, #7]"),
+                     ("ldur", "x2, [x2, #0xf]"), ("ldur", "x2, [x2, #7]"),
+                     ("str", f"x2, [x15, #{8 * (j % 4000)}]")]
+    while len(rows) < n:
+        rows += [("add", "x16, x13, x8, lsl #3"), ("stur", "x1, [x16, #0x17]")]
+    return rows + [("ret", "")]
+
+
+def test_reads_kept_in_slots_under_many_stores_cost_the_same_per_row():
+    """Every store asked every slot of the frame whether it reads what the store
+    writes, and #375 gave it two more things to ask: element reads kept in slots
+    under field stores took 7.7 s at 4,000 rows where they had taken 1.6 (0.11
+    now), and field reads under element stores 0.62 s where 0.23 (0.11 now). A
+    store past the first few (`_PIN_WALK`) now keeps the texts it does not write,
+    under everything the answer is made of, and the next store that asks the same
+    asks only about the texts it has not seen; an element is looked for among the
+    reads made since the text was last asked (`_elem_below`). Counted, not timed:
+    the Python calls to lift each shape, per row, at about 1,000 rows and at about
+    2,000. On main the larger takes 1.47, 1.54 and 1.27 times the calls per row of
+    the smaller, and here 1.00, 1.02 and 1.00."""
+    from jadart import expr
+    calls = [0]
+
+    def count(frame, event, arg):
+        if event == "call":
+            calls[0] += 1
+
+    def per_row(shape, n):
+        rows = [(i * 4, mn, op, "") for i, (mn, op) in
+                enumerate(_slots_375(shape, n))]
+        expr.lift_function(rows)                # the memos, filled
+        calls[0] = 0
+        was = sys.getprofile()
+        sys.setprofile(count)
+        try:
+            expr.lift_function(rows)
+        finally:
+            sys.setprofile(was)
+        return calls[0] / len(rows)
+
+    for shape in ("fields", "elems", "chains"):
+        small, large = per_row(shape, 1000), per_row(shape, 2000)
+        assert large <= small * 1.1, (shape, small, large)
 
 
 #: `Assembler::TryAllocateObject` and `TryAllocateArray` (assembler_arm64.cc, 3.12.2),
