@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import bisect
 import itertools
+import re
 from collections import Counter
 from operator import attrgetter
 from dataclasses import dataclass, field
@@ -132,6 +133,10 @@ def _balanced(text: str) -> bool:
     return depth == 0
 
 
+#: A floating-point register as cfg names a compare's operand.
+_FP_REG = re.compile(r"\b[dsh](?:3[01]|[12]\d|\d)\b")
+
+
 def negate_cond(cond: str) -> str:
     """Negate a condition (then-branch is the fallthrough = branch not taken).
 
@@ -156,6 +161,10 @@ def negate_cond(cond: str) -> str:
     parts, depth = cond.split(" "), 0
     for i, tok in enumerate(parts):
         if depth == 0 and tok in _NEG:
+            if tok not in ("==", "!=") and _FP_REG.search(cond):
+                # Two doubles are unordered when either is NaN, and then every ordering
+                # is false: `d0 >= d1` is not "not `d0 < d1`" (#402).
+                return f"!({cond})"
             parts[i] = _NEG[tok]
             return " ".join(parts)
         depth += tok.count("(") - tok.count(")")
@@ -188,6 +197,14 @@ def _int(t: str):
 _REL = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">=",
         "mi": "<", "pl": ">="}
 _CARRY = {"cc": "<", "lo": "<", "cs": ">=", "hs": ">=", "ls": "<=", "hi": ">"}
+#: After `fcmp`: each condition as an ordering of the two values, and whether it is
+#: that ordering's negation, the conditions that also hold when one is NaN (#402).
+_FP_REL = {"eq": ("==", False), "ne": ("!=", False),
+           "mi": ("<", False), "lo": ("<", False), "cc": ("<", False),
+           "pl": ("<", True), "hs": ("<", True), "cs": ("<", True),
+           "ls": ("<=", False), "hi": ("<=", True),
+           "ge": (">=", False), "lt": (">=", True),
+           "gt": (">", False), "le": (">", True)}
 _REL.update({cc: _unsigned(rel) for cc, rel in _CARRY.items()})
 
 #: Flag sources that set C and V to constants rather than computing them: the logical
@@ -277,9 +294,18 @@ def _cond_text(prev_cmp, mn, op) -> str:
                    f"isNaN({parts[0]}) || isNaN({parts[1]})")
             return nan if cc == "vs" else f"!({nan})"
         if pm in ("fcmp", "fcmpe") and len(parts) >= 2:
-            # Two doubles have no unsigned reading: the carry conditions after `fcmp`
-            # are orderings of the two values, and keep the plain operators.
-            lhs, rhs, rel = parts[0], parts[1], _CARRY.get(cc, rel)
+            # `fcmp` sets NZCV to 1000 for less, 0110 for equal, 0010 for greater and
+            # 0011 for unordered, a NaN on either side. Each condition holds for one,
+            # two or three of the four: the ones that hold on unordered are the
+            # negation of an ordering, which a NaN makes false. `d0 >= d1` for pl, hs
+            # and ge printed the same test three times where pl and hs also hold on NaN
+            # and ge does not; lt printed `d0 < d1`, false on NaN where the CPU takes
+            # the branch (#402).
+            if cc not in _FP_REL:
+                return "?"
+            op_, neg = _FP_REL[cc]
+            text = f"{parts[0]} {op_} {parts[1]}"
+            return f"!({text})" if neg else text
         elif pm == "cmp" and len(parts) >= 2:
             lhs = parts[0]
             rhs = parts[1] if len(parts) == 2 else _shifted(parts[1:])
