@@ -22,6 +22,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   rather than sent to a line this run leaves out. An offset no list sits at exits 1 and
   says so, and prints no neighbour. Without an offset the output is unchanged.
 
+### Changed
+
+- **`-j` is compact when stdout is not a terminal.** Every `-j` document was written with
+  two-space indentation, which an agent reading through a pipe paid for byte by byte.
+  Off a terminal it is now one line with no whitespace between tokens; a terminal still
+  gets it indented. The parsed value is unchanged: `json.loads` of the new output equals
+  1.4.0's for all 54 commands compared over both fixtures (27 each, successes, misses and
+  errors). Those 54 shrink from 7,378,962 to 4,870,369 bytes (34%); on the clean fixture
+  `disasm -j get:first` goes from 140,500 to 74,891 bytes, `lift -j get:first` from
+  14,634 to 9,845 and `classes -j` from 830,555 to 501,167.
+
 ## 1.4.0 - 2026-11-12
 
 Upgrading from 1.3.0. The commands and their options are the same. A few things a script

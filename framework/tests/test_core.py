@@ -3493,6 +3493,37 @@ def test_json_output_is_one_parseable_document():
     assert doc["ok"] is False and doc["exit"] == rc and doc["type"]
 
 
+def test_json_output_is_compact_off_a_terminal_and_indented_on_one():
+    # An agent reads -j through a pipe and pays for every byte. Two-space indentation was
+    # a quarter of `lift -j`, so a pipe gets the compact form; a person at a terminal still
+    # gets it indented. The value is the same either way.
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    for argv in (["info", CLEAN, "-j"],                       # success
+                 ["classes", CLEAN, "-f", "BenchAccount", "-j"],
+                 ["lift", CLEAN, "no_such_symbol_anywhere", "-j"],   # a miss
+                 ["info", __file__, "-j"]):                   # bad input, _json_error
+        pipe, tty = io.StringIO(), Tty()
+        with contextlib.redirect_stdout(pipe):
+            rc_pipe = cli.main(argv)
+        with contextlib.redirect_stdout(tty):
+            rc_tty = cli.main(argv)
+        assert rc_pipe == rc_tty, argv
+        text = pipe.getvalue()
+        assert text.endswith("\n") and text.count("\n") == 1, (argv, text[:200])
+        doc = json.loads(text)
+        assert text == json.dumps(doc, separators=(",", ":"), default=str) + "\n", argv
+        assert json.loads(tty.getvalue()) == doc, argv
+        assert "\n  \"" in tty.getvalue(), argv
+
+
 def test_every_public_entry_point_raises_only_jadart_errors():
     """The one promise the package docstring makes: `except jadart.JadartError` is enough.
 
@@ -12216,9 +12247,12 @@ def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
 #: roots: 1,126 lines of the clean sample and 1,198 of the obf one, each a `bl` to a stub
 #: that gained a `; -> _iso_stub_...Stub` note, half of them that note in `-j`. Checked
 #: line by line: both samples keep their line count and nothing else differs.
+#: Regenerated for compact `-j` off a terminal: the `-j` half of each sample is one line
+#: now. Re-indenting that half by two spaces gives back the previous sha for both
+#: samples, so the text listing and the parsed `-j` value did not move.
 _ARM64_DISASM_SAMPLE_SHA = {
-    "clean": "e7bec2a97810e4f12160b75652585e93b4b1df6d8527119303df105376628660",
-    "obf": "57ed088614707e44ca805bee9606ec9439f5b70c8a945c5aefa90439b23e0715",
+    "clean": "d1517c63d8195b5a079e4e9f4ebe49f71b1b68b0d94b237625c34ad319ee2e5f",
+    "obf": "6fe914c532c33e8316e65a8bc264ed1ddd074808398373fcc42b14ca293a0650",
 }
 
 

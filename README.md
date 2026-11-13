@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 576](https://img.shields.io/badge/tests-576-brightgreen.svg)](#tests)
+[![tests: 577](https://img.shields.io/badge/tests-577-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -179,6 +179,9 @@ It takes an APK, a directory or a bare `libapp.so`. You do not unzip anything fi
 iOS builds work the same way (see [platform support](#platform-and-version-support)).
 
 `-j` gives JSON on any command, errors included, so a caller never parses stderr.
+It is one document on one line when stdout is a pipe or a file, which is how a script or
+an agent reads it, and indented by two spaces only when stdout is a terminal. The value
+is the same either way.
 Exit code is `0` on success, `1` when nothing in the binary matched what you asked for
 or an acceptance gate failed, `2` when the input will not parse or the command line is
 wrong, and `3` when jadart itself has a bug, which is never your file's fault.
@@ -448,7 +451,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 576 tests
+cd framework && python3 -m pytest tests -q     # 577 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -456,7 +459,7 @@ cd framework && python3 -m pytest tests -q     # 576 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 542 of the 576 to run and the other 34 to
+clone with capstone installed, expect about 543 of the 577 to run and the other 34 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

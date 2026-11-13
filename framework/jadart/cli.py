@@ -60,18 +60,33 @@ def emit(obj, code: int = EXIT_OK) -> int:
     The exit code has to be passed in rather than assumed successful. `-j` used to report 0
     on every path that printed `"ok": false` (including a failed acceptance gate) so a
     script branching on `$?` saw success where the same command without `-j` said 1."""
-    import json
-    json.dump(obj, sys.stdout, indent=2, sort_keys=False, default=str)
-    sys.stdout.write("\n")
+    _write_json(obj)
     return code
+
+
+def _write_json(obj) -> None:
+    """One JSON document and a newline on stdout, indented only for a person.
+
+    A terminal gets two-space indentation. A pipe or a file, which is where a script or an
+    agent reads it, gets the compact form: the same value, with no whitespace between
+    tokens. Indentation was a quarter of the bytes of `lift -j` (93,263 B against
+    70,984 B over ten functions), and an agent pays for every byte it reads."""
+    import json
+    try:
+        tty = sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        tty = False
+    if tty:
+        json.dump(obj, sys.stdout, indent=2, sort_keys=False, default=str)
+    else:
+        json.dump(obj, sys.stdout, separators=(",", ":"), sort_keys=False, default=str)
+    sys.stdout.write("\n")
 
 
 def _json_error(exc, code: int) -> int:
     """The same failure a human would see, shaped so a script can branch on it."""
-    import json
-    json.dump({"ok": False, "error": str(exc), "type": type(exc).__name__,
-               "exit": code}, sys.stdout, indent=2, default=str)
-    sys.stdout.write("\n")
+    _write_json({"ok": False, "error": str(exc), "type": type(exc).__name__,
+                 "exit": code})
     return code
 
 
@@ -1754,11 +1769,8 @@ def main(argv=None) -> int:
         # `jadart: '_kDartIsolateSnapshotData'` and exited 2, while the issue template
         # asked the reporter for a traceback the tool had just swallowed.
         if _JSON[0]:
-            import json
-            json.dump({"ok": False, "error": str(e), "type": type(e).__name__,
-                       "internal": True, "exit": EXIT_INTERNAL},
-                      sys.stdout, indent=2, default=str)
-            sys.stdout.write("\n")
+            _write_json({"ok": False, "error": str(e), "type": type(e).__name__,
+                         "internal": True, "exit": EXIT_INTERNAL})
             return EXIT_INTERNAL
         if os.environ.get("JADART_DEBUG"):
             raise
