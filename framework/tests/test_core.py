@@ -24094,6 +24094,257 @@ def test_every_dispatch_offset_on_the_clean_build_is_the_one_in_the_word():
     assert not any(".sel_m0x1(" in ln for ln in body), body
 
 
+
+#: The rows that end a dispatch call once the row is in x30.
+_TABLE_CALL = [("ldr", "x30, [x21, x30, lsl #3]"), ("blr", "x30"), ("ret", "")]
+
+
+def test_a_dispatch_receiver_is_the_object_the_class_id_was_read_from():
+    """The class id is read before the arguments are moved into place. In
+    `_deactivateRecursively` it is read off x2, x2 goes to x1 and x2 is then loaded from
+    the pool, and the call printed `pool_0x2a00.sel_m0xfd8(...)`: the receiver was
+    whatever the register of the read held at the call (#377). It is the object as it
+    was at the read, which x1 holds here, and where no register is proven to hold it and
+    it was not pushed either, the call has no receiver."""
+    from jadart.expr import detect_dispatch
+
+    def site(rows):
+        got = detect_dispatch([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        assert len(got) == 1, got
+        return next(iter(got.values()))
+    read = [("ldur", "x2, [x1, #0xf]"), ("ldur", "x0, [x2, #-1]"),
+            ("ubfx", "x0, x0, #0xc, #0x14")]
+    call = [("sub", "x30, x0, #0xfd8"), *_TABLE_CALL]
+    pool = ("ldr", "x2, [x27, #0x2a00]")
+    moved = [*read, ("mov", "x1, x2"), pool, *call]
+    assert site(moved) == ("x1", -0xfd8)
+    assert _lift_rows(moved) == ["return x1.field_0x10.sel_m0xfd8(...);"]
+    # the register of the read, where nothing wrote it
+    assert _lift_rows([*read, *call]) == ["return x1.field_0x10.sel_m0xfd8(...);"]
+    none = ["var t0 = sel_m0xfd8(...);   // virtual dispatch", "return t0;"]
+    for lost in ([pool],                                # written, and copied nowhere
+                 [("mov", "w1, w2"), pool],             # half of it is not the object
+                 [("mov", "x1, x2"), ("ldp", "x3, x1, [x5, #0x10]"), pool],
+                 [("mov", "x1, x2"), ("mov", "x1, x3"), pool]):
+        rows = [*read, *lost, *call]
+        assert site(rows) == (None, -0xfd8), lost
+        assert _lift_rows(rows) == none, lost
+    # A call between the read and the dispatch takes every register it may write. The
+    # class id is kept in x20 here, which a call leaves, and the object is not kept.
+    kept = [("ldur", "x20, [x2, #-1]"), ("ubfx", "x20, x20, #0xc, #0x14"),
+            ("mov", "x1, x2"), ("bl", "#0x4000"), ("sub", "x30, x20, #0xfd8"),
+            *_TABLE_CALL]
+    assert site(kept) == (None, -0xfd8)
+
+
+def test_a_dispatch_receiver_is_what_every_way_to_the_call_leaves():
+    """The receiver was followed down the rows between the class id read and the call
+    as if they ran top to bottom. `cbz x5, L; mov x1, x2; L:` printed x1, which holds
+    the object on one of the two ways to the call, and so did a copy that a block
+    after the `ret` or a loop back edge writes over (#377). A row a branch names keeps
+    what every way into it carries. The Smi check, a `tbz` on the row before the read
+    that lands after the `ubfx`, carries the register of the read."""
+    from jadart.expr import detect_dispatch
+
+    def site(rows):
+        got = detect_dispatch([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        assert len(got) == 1, got
+        return next(iter(got.values()))
+    read = [("ldur", "x0, [x2, #-1]"), ("ubfx", "x0, x0, #0xc, #0x14")]
+    call = [("sub", "x30, x0, #8"), *_TABLE_CALL]
+    pool = ("ldr", "x2, [x27, #0x10]")
+    # The Smi check: the object is in x2 whether or not its class id was read off it.
+    smi = [("mov", "x3, #0x3b"), ("tbz", "w2, #0, #0x10"), ("ldur", "x3, [x2, #-1]"),
+           ("ubfx", "x3, x3, #0xc, #0x14")]
+    by_reg = [*smi, ("mov", "x1, x2"), pool, ("sub", "x30, x3, #8"), *_TABLE_CALL]
+    assert site(by_reg) == ("x1", -8)
+    assert _lift_rows(by_reg)[-1] == "return x2.sel_m0x8(...);"
+    by_slot = [*smi, ("ldur", "x16, [x1, #0x17]"), ("stp", "x16, x2, [x15]"),
+               ("mov", "x2, x3"), ("mov", "x30, x2"), *_TABLE_CALL]
+    assert site(by_slot) == (8, 0)
+    assert _lift_rows(by_slot)[-1] == "return x2.sel_0x0(x1.field_0x18);"
+    # A push the check jumps over is a push on one way only.
+    early = [("mov", "x3, #0x3b"), ("tbz", "w2, #0, #0x14"), ("ldur", "x3, [x2, #-1]"),
+             ("ubfx", "x3, x3, #0xc, #0x14"), ("str", "x2, [x15]"), ("mov", "x2, x3"),
+             ("mov", "x30, x2"), *_TABLE_CALL]
+    assert site(early) == (None, 0)
+    # Only that check may skip the read: another test, register or bit proves nothing
+    # about what x2 holds on the way that did not read it.
+    for skip in (("cbz", "x5, #0x10"), ("tbz", "w4, #0, #0x10"),
+                 ("tbz", "w2, #1, #0x10"), ("tbnz", "w2, #0, #0x10")):
+        rows = [smi[0], skip, *smi[2:], ("mov", "x1, x2"), ("sub", "x30, x3, #8"),
+                *_TABLE_CALL]
+        assert site(rows) == (None, -8), skip
+        assert not any(".sel_" in line for line in _lift_rows(rows)), skip
+    # A copy on one way only: x1 is not the object when x5 is zero, x2 is on both.
+    one = [*read, ("cbz", "x5, #0x10"), ("mov", "x1, x2"), *call]
+    assert site(one) == ("x2", -8)
+    assert _lift_rows(one) == ["return x2.sel_m0x8(...);"]
+    # ... and where x2 is then written, no register holds it on both.
+    lost = [*read, ("cbz", "x5, #0x10"), ("mov", "x1, x2"), pool, *call]
+    assert site(lost) == (None, -8)
+    # A block after the `ret` writes x1 and jumps back in.
+    far = [*read, ("mov", "x1, x2"), ("cbz", "x5, #0x20"), *call,
+           ("mov", "x1, x7"), ("b", "#0x10")]
+    assert site(far) == (None, -8)
+    assert _lift_rows(far)[:2] == ["var t0 = sel_m0x8(...);   // virtual dispatch",
+                                   "return t0;"]
+    # A loop back edge into the stretch, after x1 is written.
+    loop = [*read, ("mov", "x1, x2"), ("sub", "x30, x0, #8"), ("mov", "x1, x0"),
+            ("cbnz", "x0, #0xc"), *_TABLE_CALL]
+    assert site(loop) == (None, -8)
+    # A branch from above the row before the read carries nothing that was followed.
+    above = [("cbz", "x5, #0x14"), ("nop", ""), *read, ("mov", "x1, x2"), *call]
+    assert site(above) == (None, -8)
+    # A jump through a register may land on any row of the body.
+    assert site([*read, ("mov", "x1, x2"), *call[:-1], ("br", "x9")]) == (None, -8)
+    # Both ways agree: the copy is made before the branch and x2 is lost on one.
+    both = [*read, ("mov", "x1, x2"), ("cbz", "x5, #0x18"), pool, ("nop", ""), *call]
+    assert site(both) == ("x1", -8)
+    # A row after `b` that no branch names is not on any way to the call.
+    over = [*read, ("mov", "x1, x2"), ("b", "#0x18"), ("mov", "x1, x7"), ("nop", ""),
+            *call]
+    assert site(over) == ("x1", -8)
+    # A branch to the call itself, past a write of x1.
+    late = [*read, ("mov", "x1, x2"), ("sub", "x30, x0, #8"),
+            ("ldr", "x30, [x21, x30, lsl #3]"), ("cbz", "x5, #0x1c"), ("mov", "x1, x7"),
+            ("blr", "x30"), ("ret", "")]
+    assert site(late) == ("x2", -8)
+
+
+def test_a_dispatch_receiver_that_went_to_the_stack_is_read_from_its_slot():
+    """A call that takes its arguments on the stack pushes the receiver and then copies
+    the class id over it: `stp x16, x0, [x15]; mov x0, x8`. The call printed
+    `x0.sel_0x0(...)`, the register the class id is in, 426 times on the clean build
+    (#377). The receiver is the value pushed, where that slot is argument zero at the
+    call. `markNeedsBuild` pushes it below another value, and prints no receiver."""
+    from jadart.expr import detect_dispatch
+
+    def site(rows):
+        got = detect_dispatch([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        assert len(got) == 1, got
+        return next(iter(got.values()))
+    read = [("ldur", "x0, [x2, #0x27]"), ("ldur", "x8, [x0, #-1]"),
+            ("ubfx", "x8, x8, #0xc, #0x14")]
+    call = [("mov", "x0, x8"), ("mov", "x30, x0"), *_TABLE_CALL]
+    swap = [*read, ("ldur", "x16, [x1, #0x17]"), ("stp", "x16, x0, [x15]"), *call]
+    assert site(swap) == (8, 0)
+    assert _lift_rows(swap) == ["return x2.field_0x28.sel_0x0(x1.field_0x18);"]
+    one = [*read, ("str", "x0, [x15]"), *call]
+    assert site(one) == (0, 0)
+    assert _lift_rows(one) == ["return x2.field_0x28.sel_0x0();"]
+    # The slot is written again, or part of it is or may be, or SP moves under it.
+    for after in ([("str", "x3, [x15]")], [("str", "w3, [x15, #4]")],
+                  [("sturb", "w3, [x15, #7]")], [("sub", "x15, x15, #0x10")],
+                  [("stp", "x3, x5, [x15, #-8]")], [("str", "x3, [x15], #8")],
+                  [("str", "q0, [x15, #-8]")], [("stlr", "x3, [x15]")],
+                  [("mov", "x15, x3")], [("dc", "zva, x15")]):
+        rows = [*read, ("str", "x0, [x15]"), *after, *call]
+        assert site(rows) == (None, 0), after
+        assert not _lift_rows(rows)[0].startswith("return x"), after
+    # Dart 2.19 pushes: each store moves SP down first, and the slot is that much up.
+    tail = [("mov", "x17, #0x9a0e"), ("add", "x30, x0, x17"), *_TABLE_CALL]
+    load = [("ldur", "x2, [x1, #0xf]"), ("ldur", "x0, [x2, #-1]"),
+            ("ubfx", "x0, x0, #0xc, #0x14")]
+    push = [*load, ("ldur", "x16, [x1, #0x17]"), ("stp", "x16, x2, [x15, #-0x10]!"),
+            ("ldur", "x2, [x1, #0x1f]"), ("str", "x2, [x15, #-8]!"), *tail]
+    assert site(push) == (16, 0x9a0e)
+    assert _lift_rows(push) == [
+        "return x1.field_0x10.sel_0x9a0e(x1.field_0x18, x1.field_0x20);"]
+    for after in ([("add", "x15, x15, #8")], [("str", "x4, [x15, #8]!")],
+                  [("str", "w4, [x15, #-8]!")], [("str", "x4, [x15], #-8")]):
+        rows = [*load, ("str", "x2, [x15, #-8]!"), ("mov", "x2, x3"), *after, *tail]
+        assert site(rows) == (None, 0x9a0e), after
+        assert not _lift_rows(rows)[0].startswith("return x"), after
+    # markNeedsBuild: pushed below a value from the pool, then its register reloaded.
+    below = [("ldur", "x4, [x2, #0x27]"), ("ldur", "x0, [x4, #-1]"),
+             ("ubfx", "x0, x0, #0xc, #0x14"), ("ldr", "x16, [x27, #0x2ab8]"),
+             ("stp", "x4, x16, [x15]"), ("ldr", "x4, [x27, #0x818]"),
+             ("mov", "x17, #0x498d"), ("add", "x30, x0, x17"), *_TABLE_CALL]
+    assert site(below) == (0, 0x498d)
+    assert _lift_rows(below) == [
+        "var t0 = sel_0x498d(pool_0x2ab8, x2.field_0x28);   // virtual dispatch",
+        "return t0;"]
+
+
+def test_every_dispatch_receiver_on_the_clean_build_is_where_the_pass_says():
+    """Each dispatch site of the clean build with its offset, by where its receiver is at
+    the call: the first argument register, the register the class id was read off,
+    the stack. 440 of the calls printed another value: the register the class id is in
+    for those on the stack, and what was loaded over the receiver for 13 of those in a
+    register (#377). The six with none are in bodies that jump through a register. The
+    named bodies are the issue's."""
+    _needs_capstone()
+    import jadart
+    from jadart.disasm import disassemble_range, load_instructions
+    from jadart.expr import detect_dispatch
+    image, _fr, _ = load_instructions(CLEAN)
+    where = {"x1": 0, "other": 0, "stack": 0, "none": 0}
+    for cr in image.all_ranges:
+        dis = disassemble_range(image, cr)
+        at = {row[0]: i for i, row in enumerate(dis)}
+        for addr, (recv, off) in detect_dispatch(dis).items():
+            if off is None:
+                assert recv is None, hex(addr)
+                continue
+            if isinstance(recv, str):
+                # No row from the read to the call writes it but a copy of the object.
+                i = at[addr]
+                wrote = [j for j in range(i - 1, max(i - 24, -1), -1)
+                         if dis[j][2].split(",")[0] in (recv, "w" + recv[1:])
+                         and dis[j][1] not in ("str", "stur", "stp", "cmp", "tbz", "tbnz",
+                                               "cbz", "cbnz", "tst")]
+                tags = [j for j in range(i - 1, max(i - 24, -1), -1)
+                        if dis[j][1] == "ldur" and dis[j][2].endswith(", #-1]")]
+                assert tags and (not wrote or wrote[0] < tags[0]
+                                 or dis[wrote[0]][1] == "mov"), hex(addr)
+            where["x1" if recv == "x1" else "other" if isinstance(recv, str)
+                  else "none" if recv is None else "stack"] += 1
+    assert where == {"x1": 1761, "other": 368, "stack": 445, "none": 6}, where
+    for name, want, wrong in (
+            ("_deactivateRecursively", "a0.sel_m0xfd8(", "pool_0x2a00."),
+            ("markNeedsBuild", "sel_0x498d(pool_0x2ab8, ", "pool_0x818.")):
+        body = [ln for f in jadart.decompile(CLEAN, name) for ln in f["body"]]
+        assert any(want in ln for ln in body), body
+        assert not any(wrong in ln for ln in body), body
+
+
+def test_following_a_dispatch_receiver_costs_the_same_per_row_guard():
+    """A guard: the receiver is followed from the class id read to the call only over
+    `_RECV_WINDOW` rows, so many calls off one read, the shape that would make the walk
+    quadratic, cost the same per row at four times the length. Counted in rows whose
+    writes are asked for, not in time."""
+    from jadart import expr
+
+    def per_row(blocks):
+        rows = []
+        for _ in range(blocks):
+            rows.append(("ldur", "x0, [x2, #-1]"))
+            for _ in range(15):
+                rows += [("ubfx", "x3, x0, #0xc, #0x14"), ("sub", "x30, x3, #5"),
+                         ("ldr", "x30, [x21, x30, lsl #3]"), ("blr", "x30")]
+        for _ in range(blocks * 61):                # and the same again with no read
+            rows += [("ubfx", "x3, x0, #0xc, #0x14"), ("sub", "x30, x3, #5"),
+                     ("ldr", "x30, [x21, x30, lsl #3]"), ("blr", "x30")]
+        calls = [0]
+        real = expr._def_use
+
+        def counted(mn, op):
+            calls[0] += 1
+            return real(mn, op)
+        expr._def_use = counted
+        try:
+            got = expr.detect_dispatch(
+                [(i * 4, m, o, "") for i, (m, o) in enumerate(rows)])
+        finally:
+            expr._def_use = real
+        assert len(got) == blocks * 15 + blocks * 61
+        return calls[0] / len(rows)
+    small, large = per_row(8), per_row(32)
+    assert large <= small * 1.25 + 1, (small, large)
+    assert large <= getattr(expr, "_RECV_WINDOW", 64), large
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

@@ -107,6 +107,50 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A virtual call prints the object its class id was read from as its receiver.** The
+  class id of a dispatch table call is read off the receiver before the arguments are
+  put in place, and the call printed whatever the register of that read held by the
+  call. `ldur x0, [x2, #-1]`, then `mov x1, x2` and `ldr x2, [x27, #0x2a00]`, printed
+  `pool_0x2a00.sel_m0xfd8(...)`. A call that takes its arguments on the stack pushes
+  the receiver and copies the class id over it, `stp x16, x0, [x15]; mov x0, x8`, and
+  printed `x0.sel_0x0(...)`, the class id (#377). The object is followed from the read
+  to the call now. A whole register `mov` out of a register that holds it makes
+  another holder and any other write ends one. A holder stored off SP is in that slot
+  until a store reaches the slot or SP moves, other than by a Dart 2.19 push, which
+  moves the slot with it. What the call prints has to hold on every way to it, not
+  down the rows in address order: a row a branch names keeps what the ways into it
+  agree on, so `cbz x5, L; mov x1, x2; L:` leaves x2 and not x1. The Smi check,
+  `tbz w2, #0` on the row before the read and over it, carries the register it tests.
+  A branch into the stretch from anywhere else, a loop back edge included, leaves no
+  receiver, and so does a `br` anywhere in the body, which may land on any row. The
+  call prints a register that still holds the object, the first argument register
+  where it does; failing that the value pushed, where its slot is argument zero of the
+  call; failing that no receiver, and every pushed value is then an argument:
+  `sel_0x498d(pool_0x2ab8, ...)   // virtual dispatch`. The read may be 64 rows above
+  the call, and the furthest on the nine binaries is 19. The separate reading of the
+  words at every dispatch site disagreed with 457 of the clean fixture's 2,580
+  receivers and with 9,784 of the 53,680 on the seven app-sweep libraries, and with
+  none now: 2,129 in a register, 445 in a slot and 6 not given on the fixture, 44,063,
+  9,479 and 138 on the libraries. A second check walks each body's flow graph back
+  from the call to the read and keeps what all the ways down it agree on: the 58,690
+  receivers given on the nine binaries hold on every way, the Smi check at 4,969 calls
+  is the only way to a call that skips its read, and the 150 not given are the calls
+  in bodies with a `br`, where a getter prints as `get:iterator(...)`. As
+  printed, 2,573 of the fixture's 2,580 calls carry the value the lifter held at the
+  read and seven print no receiver. Each fixture changes in 231 bodies, 457 lines out
+  and 554 in, and the nine binaries in 5,455 bodies, 10,585 lines out and 14,232 in;
+  with the entry below, 7,430 bodies, 14,893 lines out and 18,568 in. Among the calls
+  printed by offset on the nine, a bare register as the receiver goes from 9,153 to
+  1,291, a pool entry from 97 to none, and 127 print no receiver. Three of the lines:
+  `pool_0x2a00.sel_m0xfd8(...);` is now `a0.sel_m0xfd8(...);`,
+  `var t34 = x0.sel_0x0(t26);` is now
+  `var t34 = this.field_0x8.field_0x28.sel_0x0(t26);`, and
+  `var t5 = pool_0x818.sel_0x498d(t3.field_0x10[t2]);` is now
+  `var t5 = sel_0x498d(pool_0x2ab8, t3.field_0x10[t2]);   // virtual dispatch`. The
+  selector of every call is as it was, and the 607 with a source name are the same
+  607. The pass takes 75 ms over the clean fixture's 457,622 rows, against 47 with the
+  entry below alone and 85 before it, in three alternating runs, and the nine binaries
+  lift in 619 s of CPU against 614 and 615, one run each on a loaded machine.
 - **A virtual call names the selector its shifted immediate adds up to.** A call through
   the dispatch table adds the selector offset to the class id and loads its target from
   the table at the sum. The pass that reads the offset took the immediate of that `add`
