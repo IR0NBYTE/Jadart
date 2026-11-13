@@ -107,6 +107,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **lt, ge, gt and le after an add compare the operand with minus the other.**
+  `cmn x5, #4; b.lt` printed `(x5 + 4) < 0`, the sign of the sum as it wrapped, where lt
+  reads N and V together, the sign of the sum taken without wrapping: for x5 =
+  0x7fffffffffffffff the CPU falls through and the printed test said it branches, 1 of
+  40 random entry states (#400). After `cmn` and `adds` with a constant they now print
+  `x5 < -4`, exact since minus a constant fits. With a register, minus it overflows at
+  the most negative value and the condition prints `?`. At 32 bits nothing changes. In
+  the unicorn oracle's 1,008 condition programs the 60 with a wrong run, all of them
+  signed conditions after an add on `x` registers, went to none, 12 of them now
+  declined. 110 lines in 76 ranges change on the nine binaries, 8 on each fixture, such
+  as `if ((t82 + 0x16) >= 0) {` to `if (t82 >= -22) {`.
 - **mi and pl after a compare read the sign of the difference.** `cmp x5, x6; b.mi`
   printed `x5 >= x6` on the fall through, the signed order of the operands, where N is
   the sign of `x5 - x6` as it wrapped: for x5 = 0x8000000000000000 and x6 = 1 the CPU

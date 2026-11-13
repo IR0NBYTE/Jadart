@@ -25170,7 +25170,8 @@ def test_the_unsigned_conditions_are_not_spelled_as_the_signed_ones():
     # The conditions that are not the carry read as they did, but for the sign of the
     # difference, which is not the order of the operands (#399).
     assert _cond_text((0, "cmp", "x5, x6", ""), "b.mi", "#0") == "(x5 - x6) < 0"
-    assert _cond_text((0, "cmn", "x5, #4", ""), "b.lt", "#0") == "(x5 + 4) < 0"
+    # A signed condition after an add compares a with -b (#400).
+    assert _cond_text((0, "cmn", "x5, #4", ""), "b.lt", "#0") == "x5 < -4"
 
 
 def test_a_floating_point_compare_keeps_the_plain_operators():
@@ -25222,6 +25223,51 @@ def test_a_sign_condition_after_a_compare_reads_the_difference():
         "return (x5 - x6).toSigned(32) >= 0 ? 1 : 0;"]
     assert _lift_rows([("cmp", "w5, #4"), ("cset", "x0, mi"), ("ret", "")]) == [
         "return (x5 - 4).toSigned(32) < 0 ? 1 : 0;"]
+
+
+_HOLDS_400 = {"lt": lambda n, z, c, v: n != v, "ge": lambda n, z, c, v: n == v,
+              "gt": lambda n, z, c, v: z == 0 and n == v,
+              "le": lambda n, z, c, v: z == 1 or n != v}
+
+
+def test_a_signed_condition_after_an_add_compares_the_operands():
+    """lt, ge, gt and le after `cmn a, b` or `adds` read N and V of the sum, which is
+    the order of `a` against `-b`. Printed as the sign of the wrapped sum, `cmn x5, #4;
+    b.lt` fell through to `return 2` where `x5 + 4` overflows and the CPU does not
+    branch (1 of 40 random entry states, #400). Against a constant `-b` is exact. Against
+    a register it overflows itself for b = 0x8000000000000000, and has no spelling here:
+    the condition is declined. At 32 bits the halves are added sign-extended (#370), as
+    before. The truth table: each printed condition and its negation against the flags."""
+    from jadart.cfg import _cond_text, negate_cond
+    m = (1 << 64) - 1
+    edge = [0, 1, 2, 7, (1 << 63) - 1, 1 << 63, (1 << 63) + 1, (1 << 64) - 2, m,
+            (1 << 63) - 4, (1 << 63) - 5, (1 << 64) - 4, (1 << 64) - 5, (1 << 63) - 0x10]
+    for setter, op, k in (("cmn", "x5, #4", 4), ("adds", "x1, x5, #4", 4),
+                          ("cmn", "x5, #0x10", 0x10), ("cmn", "x5, #0", 0)):
+        for cc, holds in _HOLDS_400.items():
+            cond = _cond_text((0, setter, op, ""), "b." + cc, "#0")
+            for a in edge:
+                want = holds(*_flags_371(setter, a, k))
+                assert _reads_371(cond, {"x5": a}) == want, (setter, op, cc, cond, hex(a))
+                assert _reads_371(negate_cond(cond), {"x5": a}) != want, (op, cc, cond)
+    assert _cond_text((0, "cmn", "x5, #4", ""), "b.lt", "#0") == "x5 < -4"
+    assert _cond_text((0, "cmn", "x5, #0", ""), "b.ge", "#0") == "x5 >= 0"
+    for setter, op in (("cmn", "x5, x6"), ("adds", "x1, x5, x6"),
+                       ("cmn", "x5, x6, lsl #2")):
+        for cc in _HOLDS_400:
+            assert "?" in _cond_text((0, setter, op, ""), "b." + cc, "#0"), (op, cc)
+    # The issue's program, and a select declined to its raw line.
+    assert _lift_rows([("cmn", "x5, #4"), ("b.lt", "#0x10"), ("mov", "x0, #1"),
+                       ("ret", ""), ("mov", "x0, #2"), ("ret", "")]) == [
+        "if (x5 >= -4) {", "return 1;", "} else {", "return 2;", "}"]
+    assert _lift_rows([("adds", "x1, x5, #1"), ("cset", "x0, gt"), ("ret", "")]) == [
+        "return x5 > -1 ? 1 : 0;"]
+    assert _lift_rows([("cmn", "x5, x6"), ("csel", "x0, x2, x3, lt"), ("ret", "")]) == [
+        "csel x0, x2, x3, lt", "return x0;"]
+    # Neither a sign test nor a 32-bit sum changes.
+    assert _cond_text((0, "cmn", "x5, #4", ""), "b.mi", "#0") == "(x5 + 4) < 0"
+    assert _lift_rows([("cmn", "w5, w6"), ("cset", "x0, lt"), ("ret", "")]) == [
+        "return (x5.toSigned(32) + x6.toSigned(32)) < 0 ? 1 : 0;"]
 
 
 def _sx(v, n):
