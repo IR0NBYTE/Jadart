@@ -174,6 +174,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   change, 59 lines out and 59 in, none with an error: 35 lines gain the extension and 24
   lose the doubled one.
 
+- **An element whose index is built from an object is the access at a computed
+  address.** `ldur x2, [x13, #7]; sub x9, x13, #0x20; add x16, x8, x9; stur x1, [x16,
+  #0x17]; mov x0, x2` printed `x8[x13 - 32] = x1;` and then `return x13.field_0x8;`. An
+  add with no shift has no base and no index, either register may hold the object, and
+  where x8 is 16 the store writes the word just read (#435). Where the second register
+  of such an add is a register and a constant, or a register a live value reads a field
+  of, the element keeps its spelling and is the access at a computed address, as an
+  element off a computed base is (#387): this prints `var t0 = x13.field_0x8;` and
+  returns `t0`, and a read of such an element is named before a store to the heap. A
+  plain index, `x8[x9]`, is as it was. The unicorn oracle at 40 entry states went from
+  11 wrong runs to none on the case, and agrees on 40 of 40 for the load, the 32-bit
+  index sign- and zero-extended, the operands the other way round, and the object
+  itself as the index. On the two fixtures 4 of 16,382 ranges change, 12 lines out and
+  20 in, each a field read named before an element store whose index is a counter and
+  a constant: `if ((a1 + 1 + 1) u< (a0.field_0x14.toSigned(32) >> 1)) {` is now `var
+  t0 = a0.field_0x14.toSigned(32) >> 1;` and `if ((a1 + 1 + 1) u< t0) {`, and
+  `this.field_0x10[t1 + 1 + 1] = ...` is now `t2[t1 + 1 + 1] = ...` under `var t2 =
+  this.field_0x10;`.
 - **vs and vc after integer flags are declined.** V after a compare or an add is its
   signed overflow, which no Dart operator spells, and `cmp x5, x6; b.vs` printed
   `if (!(x5 vs x6))`, an operator that does not exist (#401). The branch now prints `?`,

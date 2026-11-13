@@ -7394,6 +7394,31 @@ class Lifter:
         return self._row_computed(self._here) or (
             v.at is not None and self._row_computed(v.at[3]))
 
+    @staticmethod
+    def _object_index(v: V, st: State) -> bool:
+        """Whether `v`, the second register of an add of two with no shift, is built
+        from a register that may hold an object, so that the add is not an element of
+        the first (#435): a register plus or minus a constant (`V.at`), or a register
+        whose fields a live value of the walk reads, `x13.field_0x8` or `(x13 -
+        16).field_0x18`. A bare number, and a register no live value reads through,
+        is the index it has always been: `x8[x9]` of a byte array."""
+        if v.at is not None:
+            return True
+        text = v.text
+        if v.smi or v.prec != P_ATOM or not text.isidentifier():
+            return False
+        near = (text + ".", "(" + text + " ")
+        pat = None
+        for x in (*st.reg.values(), *st.slot.values()):
+            t = x.text
+            if near[0] in t or near[1] in t:
+                if pat is None:
+                    pat = re.compile(r"(?<![\w$@])" + re.escape(text)
+                                     + r"(?:\.| [-+] [^.()\[\]]+\)\.)")
+                if pat.search(t):
+                    return True
+        return False
+
     def _loose(self, rows) -> bool:
         """Whether the base of an element address may hold an address the lifter
         computed and not an object pointer (#387), where the value the walk has for
@@ -8738,6 +8763,15 @@ class Lifter:
             # shifted as the machine shifts it, `x4 >> 1`, and says no more than that.
             sh = (ops[3].strip().split()[0].lower()
                   if len(ops) >= 4 and ops[3].strip() else "")
+            # An add with no shift has no base and no index: either register may hold
+            # the object, and the body takes the first. `sub x9, x13, #0x20; add x16,
+            # x8, x9; stur x1, [x16, #0x17]` printed `x8[x13 - 32] = x1` and left a live
+            # `x13.field_0x8` standing, which the store writes where x8 is 16 (#435). An
+            # index built from a register is one that may be the object (`_object_index`)
+            # and the access is then at a computed address, as an element off a computed
+            # base is (#387): the spelling stays, and what it may reach is any field.
+            whose = (not swap and not scale and sh not in ("asr", "lsr")
+                     and self._object_index(idx_v, st))
             if sh in _EXTENDS:
                 # The index is what the extend reads of the register (#369).
                 idx_v = _extend(idx_v, sh, ops[0].strip()[:1] == "w")
@@ -8761,6 +8795,8 @@ class Lifter:
             # have lost it: `_addr_facts` has every load plain, and is not asked.
             if untagged:
                 loose = False
+            elif whose:
+                loose = True
             elif base_v.smi:
                 loose = base_v.smi == _SMI_TAG
             elif base_v.calc:
