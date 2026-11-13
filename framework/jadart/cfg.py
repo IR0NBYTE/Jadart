@@ -216,7 +216,7 @@ _LOGICAL_FLAGS = ("tst", "ands", "bics")
 _Z_N_ONLY = frozenset({"eq", "ne", "mi", "pl"})
 
 
-def _cond_for(ctx, mn, op) -> str:
+def _cond_for(ctx, mn, op, tier2=False) -> str:
     """The condition of a branch, given the instructions before it on its one path.
 
     _cond_text reads the instruction right before the branch. On arm32 the compare is
@@ -250,10 +250,10 @@ def _cond_for(ctx, mn, op) -> str:
                 return f"({bit}) {'==' if cc in ('cc', 'lo') else '!='} 0"
             if cc in _REL and cc in ("eq", "ne", "mi", "pl"):
                 return f"({src} >> {n}) {_REL[cc]} 0"
-    return _cond_text(last, mn, op)
+    return _cond_text(last, mn, op, tier2)
 
 
-def _cond_text(prev_cmp, mn, op) -> str:
+def _cond_text(prev_cmp, mn, op, tier2=False) -> str:
     """Best-effort condition for a conditional terminator, from the preceding flag-setting
     instruction and the branch. Approximate (registers, not source names).
 
@@ -262,6 +262,11 @@ def _cond_text(prev_cmp, mn, op) -> str:
     ands, `cmn` adds. Treating them all as `cmp` turned `tst x1, x2; b.eq` into `x1 != x2`
     when it means `(x1 & x2) == 0`: not a near miss but the wrong predicate over the wrong
     values.
+
+    `tier2` is set where the text is printed as it is. Tier 3 reads a 32-bit signed
+    condition after an add from the sum it spells (`expr._cond32`); tier 2 prints that
+    sum, which reads as the sign of the wrapped sum, and so spells it as at 64 bits
+    (`_sum_order`).
     """
     cc = cond_of(mn)
     if mn in ("cbz", "cbnz"):
@@ -332,7 +337,7 @@ def _cond_text(prev_cmp, mn, op) -> str:
             b = parts[1] if len(parts) == 2 else _shifted(parts[1:])
             if b is None:
                 return "?"
-            lhs, rhs = _sum_order(cc, parts[0], b)
+            lhs, rhs = _sum_order(cc, parts[0], b, tier2)
             if lhs == "?":
                 return f"? {rel} ?"
             if cc in _CARRY:
@@ -345,7 +350,7 @@ def _cond_text(prev_cmp, mn, op) -> str:
             b = parts[2] if len(parts) == 3 else _shifted(parts[2:])
             if b is None:
                 return "?"
-            lhs, rhs = _sum_order(cc, parts[1], b)
+            lhs, rhs = _sum_order(cc, parts[1], b, tier2)
             if lhs == "?":
                 return f"? {rel} ?"
             if cc in _CARRY:
@@ -379,7 +384,7 @@ def _difference_sign(cc, a, b):
     return a, b
 
 
-def _sum_order(cc, a, b):
+def _sum_order(cc, a, b, tier2=False):
     """`(lhs, rhs)` for condition `cc` after the flags of `a + b`, `?` when unspelled.
 
     lt, ge, gt and le read N and V together: the sign of the sum taken without wrapping,
@@ -387,10 +392,11 @@ def _sum_order(cc, a, b):
     the wrapped sum, false for x5 = 0x7fffffffffffffff and x6 = 1 where the CPU takes lt's
     fall through (60 of 72 such programs against a CPU, #400). With a constant k the test
     is `a < -k`, exact since -k fits. With a register, -b overflows at the most negative
-    value and no short spelling is exact, so it is declined. At 32 bits the sum is printed
-    as before: the 32-bit renderer reads it as the sign of a sum of sign-extended halves,
-    which cannot overflow."""
-    if cc not in ("lt", "ge", "gt", "le") or a.startswith("w"):
+    value and no short spelling is exact, so it is declined. At 32 bits tier 3 reads the
+    sum as the sign of a sum of sign-extended halves, which cannot overflow, and keeps it.
+    Tier 2 printed the same `(w5 + w6) < 0` for lt and for mi, which differ where the
+    32-bit add overflows (#438), and spells it as at 64 bits: -k fits in 32 bits too."""
+    if cc not in ("lt", "ge", "gt", "le") or (a.startswith("w") and not tier2):
         return f"({a} + {b})", "0"
     k = _int(b)
     if k is None:
@@ -442,7 +448,7 @@ def _shifted(parts):
 
 
 def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None,
-              ends=frozenset()) -> tuple[dict, int]:
+              ends=frozenset(), tier2=False) -> tuple[dict, int]:
     """Return ({addr: Block}, entry_addr) for a function's disasm
     (list of (addr, mn, op, note)).
 
@@ -464,7 +470,9 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None,
     `cut_end` is where the range ends when the instruction cut stopped `dis` short of it
     (disasm.cut_end), else None. A target from the end of `dis` up to it is inside this
     function, in code not decoded, and so is the fallthrough of the last instruction
-    (Block.past_cut, Block.cut_next)."""
+    (Block.past_cut, Block.cut_next).
+
+    `tier2` spells the conditions to be printed as they are (`_cond_text`)."""
     if not dis:
         return {}, 0
     exits = exits or {}
@@ -499,7 +507,7 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None,
                 if cc:
                     # Leaves only when the condition holds, so it also falls through.
                     blk.cexit = True
-                    blk.cond = _cond_for(insns[:-1], "b" + cc, op)
+                    blk.cond = _cond_for(insns[:-1], "b" + cc, op, tier2)
                     blk.succ = [end] if end < hi else []
                 else:
                     blk.succ = []
@@ -529,7 +537,7 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None,
             elif _is_cond(mn):
                 t = _target(op)
                 ft = end if end < hi else None
-                blk.cond = _cond_for(insns[:-1], mn, op)
+                blk.cond = _cond_for(insns[:-1], mn, op, tier2)
                 blk.succ = []
                 if t is not None and lo <= t < hi:
                     blk.succ.append(t)      # taken
@@ -553,11 +561,11 @@ def build_cfg(dis, exits=None, traps=TRAPS, cut_end=None,
                         mn in ("b", "ret", "br", "bx") or mn in TRAPS or blk.exit)):
                 blk.cut_next = hi
         blocks[la] = blk
-    _conditions_from_the_block_before(blocks)
+    _conditions_from_the_block_before(blocks, tier2=tier2)
     return blocks, lo
 
 
-def _conditions_from_the_block_before(blocks, stop=frozenset()) -> None:
+def _conditions_from_the_block_before(blocks, stop=frozenset(), tier2=False) -> None:
     """A branch alone in its block reads the flags its one predecessor left.
 
     `cmp r0, r1; blt X; bgt Y` is two branches on one compare, and the second starts a
@@ -592,7 +600,7 @@ def _conditions_from_the_block_before(blocks, stop=frozenset()) -> None:
             at = p[0]
         if ctx:
             _a, mn, op, _n = blk.insns[-1]
-            cond = _cond_for(ctx, mn, op)
+            cond = _cond_for(ctx, mn, op, tier2)
             if "?" not in cond:
                 blk.cond = cond
 
@@ -1554,7 +1562,7 @@ def render_function(rows, *, exits=None, cut_end=None, indent="  ", depth=1,
     of Python's stack: 500 raised RecursionError, and `export -t 2` and `decompile -t 2`
     exited 3, a bug in jadart (#81). Such a function prints its rows instead (`flat`),
     and the rest of the output goes on."""
-    blocks, entry = build_cfg(rows, exits=exits, cut_end=cut_end)
+    blocks, entry = build_cfg(rows, exits=exits, cut_end=cut_end, tier2=True)
     try:
         return render(blocks, structure(blocks, entry, orphans=True), indent, depth,
                       show=show)
