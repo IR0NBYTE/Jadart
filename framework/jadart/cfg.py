@@ -106,7 +106,21 @@ class Block:
     ends_path: bool = False
 
 
+#: How an unsigned comparison is spelled: the signed operator with this in front of it,
+#: `x1 u< x2`, as Binary Ninja's HLIL writes it. Dart has no unsigned comparison, so
+#: there is no Dart spelling to borrow as `>>>` was for the unsigned shift, and the
+#: signed operator is a different predicate whenever exactly one side has its top bit
+#: set: `x1 < x2` passes the negative index that a bounds check, `cmp x1, x2; b.hs`,
+#: rejects. Every unsigned operator printed is built here and nowhere else.
+_UNSIGNED = "u"
+
+
+def _unsigned(rel: str) -> str:
+    return _UNSIGNED + rel
+
+
 _NEG = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", "<=": ">", ">": "<="}
+_NEG.update({_unsigned(a): _unsigned(b) for a, b in list(_NEG.items()) if a[0] in "<>"})
 
 
 def _balanced(text: str) -> bool:
@@ -167,11 +181,14 @@ def _int(t: str):
         return None
 
 
-#: Relational spelling for each condition code. `rel` is only meaningful for a flag source
-#: that actually sets all four flags; see _Z_N_ONLY below.
+#: Relational spelling for each condition code after an integer compare. hs, lo, hi and
+#: ls read the carry: they compare the operands as unsigned, and printed with the signed
+#: operators they were a different test (24 of 40 random entry states of `cmp x5, x6;
+#: cset x0, lo` against a CPU, #371).
 _REL = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">=",
-        "cc": "<", "lo": "<", "cs": ">=", "hs": ">=", "ls": "<=", "hi": ">",
         "mi": "<", "pl": ">="}
+_CARRY = {"cc": "<", "lo": "<", "cs": ">=", "hs": ">=", "ls": "<=", "hi": ">"}
+_REL.update({cc: _unsigned(rel) for cc, rel in _CARRY.items()})
 
 #: Flag sources that set C and V to constants rather than computing them: the logical
 #: operations. After one of them only Z (eq/ne) and N (mi/pl) carry information, and a
@@ -258,7 +275,11 @@ def _cond_text(prev_cmp, mn, op) -> str:
             nan = (f"isNaN({parts[0]})" if parts[1] in ("0", "0.0", parts[0]) else
                    f"isNaN({parts[0]}) || isNaN({parts[1]})")
             return nan if cc == "vs" else f"!({nan})"
-        if pm in ("cmp", "fcmp", "fcmpe") and len(parts) >= 2:
+        if pm in ("fcmp", "fcmpe") and len(parts) >= 2:
+            # Two doubles have no unsigned reading: the carry conditions after `fcmp`
+            # are orderings of the two values, and keep the plain operators.
+            lhs, rhs, rel = parts[0], parts[1], _CARRY.get(cc, rel)
+        elif pm == "cmp" and len(parts) >= 2:
             lhs = parts[0]
             rhs = parts[1] if len(parts) == 2 else _shifted(parts[1:])
             if rhs is None:
@@ -274,16 +295,37 @@ def _cond_text(prev_cmp, mn, op) -> str:
             lhs, rhs = parts[1], rhs2
         elif pm == "cmn" and len(parts) >= 2:
             lhs, rhs = f"({parts[0]} + {parts[1]})", "0"
+            if cc in _CARRY:
+                if len(parts) > 2 or cc in ("hi", "ls"):
+                    return f"? {rel} ?"
+                rel, rhs = _carry_out(cc, parts[0], parts[1])
         elif pm == "adds" and len(parts) >= 3:
             b = parts[2] if len(parts) == 3 else _shifted(parts[2:])
             if b is None:
                 return "?"
             lhs, rhs = f"({parts[1]} + {b})", "0"
+            if cc in _CARRY:
+                if cc in ("hi", "ls"):
+                    return f"? {rel} ?"
+                rel, rhs = _carry_out(cc, parts[1], b)
         elif pm in _LOGICAL_FLAGS and cc in _Z_N_ONLY:
             a, b = (parts[0], parts[1]) if pm == "tst" else (
                 (parts[1], parts[2]) if len(parts) >= 3 else (parts[0], parts[-1]))
             lhs, rhs = f"({a} & {'~' if pm == 'bics' else ''}{b})", "0"
     return f"{lhs} {rel} {rhs}"
+
+
+def _carry_out(cc, a, b):
+    """`(rel, rhs)` for the carry condition `cc` after `a + b`, the sum on the left.
+
+    After an add the carry is the carry out of it, and the sum wrapped exactly when it
+    is below either operand, read unsigned: hs is that, lo its negation. `(x5 + x6) >=
+    0` for hs was the sign of the sum, another flag (15 of 40 entry states against a
+    CPU, #371). The operand named is the constant where there is one and the first
+    otherwise, which in an allocation's `adds x1, x0, x2` is the top it loaded and not
+    the size it computed. hi and ls also read Z, two tests of the sum in one condition,
+    and the callers leave them unspelled."""
+    return _unsigned(_NEG[_CARRY[cc]]), b if _int(b) is not None else a
 
 
 #: `cmp x0, x1, lsl #3` compares x0 against x1<<3, and dropping the third operand made

@@ -107,6 +107,42 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An unsigned condition is printed as one.** `hs`, `lo`, `hi` and `ls` read the
+  carry: after `cmp` and `subs` they compare the two operands as unsigned numbers, and
+  they printed with Dart's operators, which are signed. `cmp x5, x6; cset x0, lo`
+  printed `x5 < x6 ? 1 : 0` and `cmp x5, x6; b.hi` printed `if (x5 <= x6)`, a different
+  test whenever exactly one side has its top bit set: 24 of 40 random entry states
+  against a CPU, and a bounds check, one unsigned compare of the index against the
+  length, read as letting a negative index through (#371). Dart has no unsigned
+  comparison to borrow, so the spelling is the signed operator with a `u` in front of
+  it, `x5 u< x6`, which nobody takes for the signed one. It is made in one place,
+  `cfg._unsigned`, and its negation is unsigned too, `u<` to `u>=`. After `adds` and
+  `cmn` the carry is the carry out of the sum, and it printed as the sum's sign:
+  `adds x1, x5, x6; cset x0, hs` was `(x5 + x6) >= 0 ? 1 : 0` and is
+  `(x5 + x6) u< x5 ? 1 : 0`, true where the sum wrapped. `hi` and `ls` after an add
+  test the carry and Z at once and print `?`, as the carry conditions after `tst` did
+  already, so a select on one stays the raw instruction. After `fcmp` the four order
+  two doubles and keep the plain operators. Over the two fixtures and the seven
+  app-sweep libraries 29,247 of 273,863 ranges change and 72,631 lines, each one a
+  comparison respelled in place, none added or dropped: 72,465 gain the `u` and
+  nothing else, and 166 are the carry out of an add, the overflow test of an inline
+  allocation. 72,523 of them are `if` lines, and 26,640 of those are the bounds check
+  shape, the test over `throw RangeError();`. On the clean fixture that is 1,251 of
+  8,194 ranges and 3,249 lines, 1,296 of them bounds checks. Three of them, as they
+  were and as they are. A class id range test, which the signed reading passes for
+  every id below 0x438:
+  `if ((((x0.tags >> 12) & 0xfffff) - 0x438) > 0x5a) {` is now
+  `if ((((x0.tags >> 12) & 0xfffff) - 0x438) u> 0x5a) {`. Index 0 against a length:
+  `if (0 < (this.field_0x8.field_0x14.toSigned(32) >> 1)) {` is now
+  `if (0 u< (this.field_0x8.field_0x14.toSigned(32) >> 1)) {`. An allocation's top
+  plus its size, where the sign of the sum said nothing about the wrap:
+  `if ((THR.field_0x60 + ((t0 << 32 >> 32) + 31 & 0xfffffffffffffff0)) < 0) {` is now
+  `if ((THR.field_0x60 + ((t0 << 32 >> 32) + 31 & 0xfffffffffffffff0)) u>=
+  THR.field_0x60) {`. Against the unicorn oracle, of 422 programs that set, branch or
+  select on one of the four between x registers, 40 entry states each, 166 printed a
+  wrong test and none does now. aotopsy and flutterdec print these conditions with
+  the signed operators; blutter and unflutter print no condition. `mi` and `pl`, the
+  signed conditions after an add, and a compare of w registers print as they did.
 - **A field read and an element that may be one word are named before the store.** The
   elements of an object are the words from its data offset up, and a read at a fixed
   offset that reaches that far is one of them. The lifter kept the two apart: `ldur x4,

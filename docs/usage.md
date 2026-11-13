@@ -163,6 +163,19 @@ whose place in the frame the analysis could not fix: it is declared on the line 
 load, where `SP` is SP at that line, and two such reads of different addresses can print
 the same text. The name is what carries the value; the text says where it came from.
 
+**Reading a comparison.** `<`, `<=`, `>` and `>=` between two integers are Dart's, and
+Dart's are signed. `u<`, `u<=`, `u>` and `u>=` compare the same two 64 bit words as
+unsigned numbers. Dart has no operator for that, so the spelling is the signed operator
+with a `u` in front of it. The two differ whenever exactly one side has its top bit set,
+and the bounds check is where that matters: `cmp x1, x2; b.hs` ahead of a range error
+prints `if (x1 u>= x2) {` over `throw RangeError();`, which throws for an index of -1
+where `x1 >= x2` would let it through. The conditions `hs`, `lo`, `hi` and `ls` print
+these after `cmp` and `subs`. After `adds` and `cmn`, `hs` and `lo` read the carry of the
+sum, so `adds x1, x5, x6; cset x0, hs` is `(x5 + x6) u< x5 ? 1 : 0`, true where the sum
+wrapped. A condition that is not one comparison of what the rows show, `hi` after `cmn`
+or `lo` after `tst`, prints `?` on a branch, `if (? u<= ?) {`, and leaves a select as
+the raw instruction. Between doubles the operators are the plain ones.
+
 Two things sit outside the tier ladder and matter a lot in practice.
 
 **Full-image disassembly coverage.** Fixing the instruction-table walk to size a
