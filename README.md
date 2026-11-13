@@ -1,4 +1,9 @@
-<h1 align="center"><img src="docs/logo/jadart-logo.png" alt="Jadart" width="600"></h1>
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/jadart-logo-dark.png">
+    <img src="docs/logo/jadart-logo.png" alt="Jadart" width="600">
+  </picture>
+</h1>
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
