@@ -107,6 +107,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **hi and ls after an add compare against minus the constant.** hi after `cmn` or
+  `adds` is the carry out of the sum with the sum not zero, and it printed `? u<= ?`
+  (#419). With a constant k that is not zero, hi holds exactly when the operand is above
+  -k at its width, so `cmn w1, #5; b.hi` is `w1 u> -5` and ls is `w1 u<= -5`. With k
+  zero nothing carries and hi never holds, `x1 u> -1`. Against a register the zero sum
+  needs a test of its own, and those stay `?`. Checked on the CPU for x and w, `cmn` and
+  `adds`, k of 0, 1, 5 and 0xfff: 44 of 48 forms per width agree on 60 of 60 inputs,
+  where 32 did, and the other 4 are the register forms. Tier 3 dumps of the two
+  fixtures: 0 lines change.
 - **Tier 2 tells lt from mi after a 32-bit add.** `cmn w5, w6` followed by `b.lt` and by
   `b.mi` both printed `(w5 + w6) < 0`, where mi is the sign of the 32-bit sum as it
   wrapped and lt that sign taken without wrapping: for w5 = 0x7fffffff and w6 = 1 the
