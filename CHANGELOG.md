@@ -33,6 +33,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `disasm -j get:first` goes from 140,500 to 74,891 bytes, `lift -j get:first` from
   14,634 to 9,845 and `classes -j` from 830,555 to 501,167.
 
+### Fixed
+
+- **The agent skill gave the wrong exit codes.** It said `0` on success and `2` on
+  failure, but a name that is not in the binary exits `1`, a bug in jadart exits `3` and
+  an interrupt `130`, so an agent branching on `2` read a miss as success. The skill,
+  the README and the `--help` epilog now carry the same sentence, naming `0`, `1`, `2`,
+  `3` and `130`; what the command line returns is unchanged.
+
 ## 1.4.0 - 2026-11-12
 
 Upgrading from 1.3.0. The commands and their options are the same. A few things a script

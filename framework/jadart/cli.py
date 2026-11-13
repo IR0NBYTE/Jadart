@@ -9,6 +9,8 @@ Exit codes are part of the interface:
   0  the command produced its output
   1  the thing asked for isn't in this binary, or the acceptance gates failed
   2  bad usage, or the file could not be parsed as a snapshot
+  3  a bug in jadart, not a problem with the input
+  130  interrupted (Ctrl-C)
 """
 from __future__ import annotations
 
@@ -44,6 +46,11 @@ examples:
   jadart verify libapp.so                  byte-exact acceptance gates
   jadart symbols libapp.so --format r2     radare2 script naming every function (also ida, ghidra)
   jadart hook app.apk Foo.bar > hook.js    Frida script logging one function's calls
+
+Exit code is `0` on success, `1` when nothing in the binary matched what you asked for
+or an acceptance gate failed, `2` when the input will not parse or the command line is
+wrong, `3` when jadart itself has a bug, which is never your file's fault, and `130`
+when interrupted.
 
 `jadart <command> --help` documents one command.
 `python3 -m jadart` and `python3 -m jadart.cli` are the same entry point.

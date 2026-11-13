@@ -196,8 +196,12 @@ built at runtime can still reach it.
 `jadart` takes an APK, an IPA, a directory or a bare `libapp.so` / `App.framework/App`.
 You do not need to unzip anything first.
 
-Add `-j` to any command for JSON. Exit code is `0` on success and `2` on failure, and with
-`-j` the error is JSON too, so you never have to parse stderr. Read through a pipe, as
+Add `-j` to any command for JSON. Exit code is `0` on success, `1` when nothing in the
+binary matched what you asked for or an acceptance gate failed, `2` when the input will
+not parse or the command line is wrong, `3` when jadart itself has a bug, which is never
+your file's fault, and `130` when interrupted. A miss is `1`, not `2`: the file was fine
+and the name is not in it. With `-j` the error is JSON too, so you never have to parse
+stderr. Read through a pipe, as
 you do, `-j` is one compact line with no indentation; only a terminal gets it indented.
 
 ---
