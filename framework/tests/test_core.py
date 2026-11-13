@@ -25167,8 +25167,9 @@ def test_the_unsigned_conditions_are_not_spelled_as_the_signed_ones():
     assert _lift_rows([("cmn", "x5, x6"), ("cset", "x0, hi"), ("ret", "")]) == [
         "cset x0, hi", "return x0;"]
     assert "?" in _cond_text((0, "adds", "x1, x5, x6", ""), "b.ls", "#0")
-    # The conditions that are not the carry read as they did.
-    assert _cond_text((0, "cmp", "x5, x6", ""), "b.mi", "#0") == "x5 < x6"
+    # The conditions that are not the carry read as they did, but for the sign of the
+    # difference, which is not the order of the operands (#399).
+    assert _cond_text((0, "cmp", "x5, x6", ""), "b.mi", "#0") == "(x5 - x6) < 0"
     assert _cond_text((0, "cmn", "x5, #4", ""), "b.lt", "#0") == "(x5 + 4) < 0"
 
 
@@ -25180,6 +25181,49 @@ def test_a_floating_point_compare_keeps_the_plain_operators():
                     ("pl", ">="), ("lt", "<"), ("ge", ">=")):
         assert _cond_text((0, "fcmp", "d0, d1", ""), "b." + cc, "#0") == f"d0 {rel} d1"
     assert _cond_text((0, "fcmp", "d0, d0", ""), "b.vs", "#0") == "isNaN(d0)"
+_HOLDS_399 = {"mi": lambda n, z, c, v: n == 1, "pl": lambda n, z, c, v: n == 0}
+
+
+def test_a_sign_condition_after_a_compare_reads_the_difference():
+    """mi and pl after `cmp` or `subs` read N, the sign of the difference as it wrapped
+    at 64 bits, which is the order of the two operands only where the subtraction does
+    not overflow. Printed as `x5 >= x6`, `cmp x5, x6; b.mi` fell through for x5 =
+    0x8000000000000000 and x6 = 1 where the CPU leaves N clear, and 3 of 40 random entry
+    states disagreed with a CPU (#399). The truth table: each printed condition and its
+    negation against the flags, over the values where the readings part."""
+    from jadart.cfg import _cond_text, negate_cond
+    m = (1 << 64) - 1
+    edge = [0, 1, 2, 7, (1 << 63) - 1, 1 << 63, (1 << 63) + 1, (1 << 64) - 2, m]
+    forms = [("cmp", "x5, x6", lambda b: b), ("subs", "x1, x5, x6", lambda b: b),
+             ("cmp", "x5, x6, lsl #2", lambda b: b << 2 & m),
+             ("cmp", "x5, #7", lambda b: 7), ("subs", "x1, x5, #7", lambda b: 7),
+             ("cmp", "x5, #0", lambda b: 0), ("cmp", "x5, xzr", lambda b: 0)]
+    for setter, op, rhs in forms:
+        for cc, holds in _HOLDS_399.items():
+            cond = _cond_text((0, setter, op, ""), "b." + cc, "#0")
+            for a in edge:
+                for b in edge:
+                    env, want = {"x5": a, "x6": b}, holds(*_flags_371(setter, a, rhs(b)))
+                    assert _reads_371(cond, env) == want, (setter, op, cc, cond, a, b)
+                    assert _reads_371(negate_cond(cond), env) != want, (op, cc, cond)
+    # Against zero the difference is the operand, and reads as it did.
+    assert _cond_text((0, "cmp", "x5, #0", ""), "b.mi", "#0") == "x5 < 0"
+    assert _cond_text((0, "cmp", "x5, x6", ""), "b.pl", "#0") == "(x5 - x6) >= 0"
+    # The issue's program, a conditional set and a select.
+    assert _lift_rows([("cmp", "x5, x6"), ("b.mi", "#0x10"), ("mov", "x0, #1"),
+                       ("ret", ""), ("mov", "x0, #2"), ("ret", "")]) == [
+        "if ((x5 - x6) >= 0) {", "return 1;", "} else {", "return 2;", "}"]
+    assert _lift_rows([("subs", "x1, x5, #4"), ("cset", "x0, mi"), ("ret", "")]) == [
+        "return (x5 - 4) < 0 ? 1 : 0;"]
+    assert _lift_rows([("cmp", "x5, x6, lsl #2"), ("csel", "x0, x2, x3, pl"),
+                       ("ret", "")]) == ["return (x5 - (x6 << 2)) >= 0 ? x2 : x3;"]
+    # At 32 bits the sign is bit 31 of the difference, as it was (#370).
+    assert _lift_rows([("cmp", "w5, w6"), ("cset", "x0, pl"), ("ret", "")]) == [
+        "return (x5 - x6).toSigned(32) >= 0 ? 1 : 0;"]
+    assert _lift_rows([("cmp", "w5, #4"), ("cset", "x0, mi"), ("ret", "")]) == [
+        "return (x5 - 4).toSigned(32) < 0 ? 1 : 0;"]
+
+
 def _sx(v, n):
     """The low `n` bits of `v`, sign-extended."""
     v &= (1 << n) - 1

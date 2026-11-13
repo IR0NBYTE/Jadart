@@ -263,7 +263,8 @@ def _cond_text(prev_cmp, mn, op) -> str:
         lhs = f"{reg} & 1" if bit == 0 else f"({reg} >> {bit}) & 1"
         return f"{lhs} == 0" if mn == "tbz" else f"{lhs} != 0"
     # mi/pl are "result negative"/"not negative"; against a zero right-hand side that is
-    # exactly < and >=, which is also what they mean after a cmp.
+    # exactly < and >=. After a compare the difference is that left side
+    # (`_difference_sign`).
     rel = _REL.get(cc, cc)
     lhs = rhs = "?"
     if prev_cmp:
@@ -284,6 +285,7 @@ def _cond_text(prev_cmp, mn, op) -> str:
             rhs = parts[1] if len(parts) == 2 else _shifted(parts[1:])
             if rhs is None:
                 return "?"
+            lhs, rhs = _difference_sign(cc, lhs, rhs)
         elif pm in ("subs", "negs") and len(parts) >= 3:
             # `subs xD, xA, xB` sets exactly the flags `cmp xA, xB` sets; xD is the
             # destination, and reading it as the left operand compared the wrong register
@@ -292,7 +294,7 @@ def _cond_text(prev_cmp, mn, op) -> str:
             rhs2 = parts[2] if len(parts) == 3 else _shifted(parts[2:])
             if rhs2 is None:
                 return "?"
-            lhs, rhs = parts[1], rhs2
+            lhs, rhs = _difference_sign(cc, parts[1], rhs2)
         elif pm == "cmn" and len(parts) >= 2:
             # The third operand shifts or extends the second, as it does for `cmp`:
             # `cmn x5, w6, sxtw` printed `(x5 + x6)`, the register whole (#369).
@@ -327,6 +329,19 @@ def _cond_text(prev_cmp, mn, op) -> str:
                     return "?"
             lhs, rhs = f"({a} & {'~' if pm == 'bics' else ''}{b})", "0"
     return f"{lhs} {rel} {rhs}"
+
+
+def _difference_sign(cc, a, b):
+    """`(lhs, rhs)` for condition `cc` after `a - b`, the compared operands otherwise.
+
+    mi and pl read N, the sign of the difference as it wrapped at 64 bits, which is not
+    the order of the two operands when the subtraction overflows: `cmp x5, x6; b.mi`
+    printed `x5 < x6`, false for x5 = 0x8000000000000000 and x6 = 1 where N is clear
+    (3 of 40 entry states against a CPU, #399). Dart's ints wrap at 64 bits as the
+    machine does, so `(x5 - x6) < 0` is the flag. Against zero nothing overflows."""
+    if cc in ("mi", "pl") and _int(b) != 0:
+        return f"({a} - {b})", "0"
+    return a, b
 
 
 def _carry_out(cc, a, b):

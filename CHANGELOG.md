@@ -107,6 +107,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **mi and pl after a compare read the sign of the difference.** `cmp x5, x6; b.mi`
+  printed `x5 >= x6` on the fall through, the signed order of the operands, where N is
+  the sign of `x5 - x6` as it wrapped: for x5 = 0x8000000000000000 and x6 = 1 the CPU
+  falls through and the printed test is false, 3 of 40 random entry states (#399). After
+  `cmp` and `subs` they now print `(x5 - x6) < 0` and `(x5 - x6) >= 0`, which Dart's
+  64-bit ints wrap exactly as the machine does; against zero they print `x5 < 0` as
+  before, and at 32 bits bit 31 of the difference as before. The unicorn oracle, over
+  1,008 programs (12 flag setters, 14 conditions, a branch, a `cset` and a `csel`, `x`
+  and `w`) at 60 entry states, went from 90 programs with a wrong run to 60, all 60 a
+  signed condition after an add (#400); 144 mi and pl programs all agree, against 114.
+  One line changes on each of the nine binaries, on the fixtures `if (t3 >= 1) {` to
+  `if ((t3 - 1) >= 0) {`.
 - **An element off a base that may hold a computed address is the access at that
   address.** `ldur x4, [x13, #7]; sub x9, x13, #0x20; add x16, x9, x8, lsl #3; stur x1,
   [x16, #0x17]; mov x0, x4` printed `(x13 - 32)[x8] = x1;` and then `return
