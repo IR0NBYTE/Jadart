@@ -318,6 +318,13 @@ def _cond_text(prev_cmp, mn, op) -> str:
         elif pm in _LOGICAL_FLAGS and cc in _Z_N_ONLY:
             a, b = (parts[0], parts[1]) if pm == "tst" else (
                 (parts[1], parts[2]) if len(parts) >= 3 else (parts[0], parts[-1]))
+            # `tst x5, x6, lsl #3` tests x5 against x6 << 3, as `cmp` compares against
+            # it: the shift was dropped, and `(x5 & x6) == 0` is another test (#373).
+            tail = parts[2:] if pm == "tst" else parts[3:]
+            if tail:
+                b = _shifted([b] + tail)
+                if b is None:
+                    return "?"
             lhs, rhs = f"({a} & {'~' if pm == 'bics' else ''}{b})", "0"
     return f"{lhs} {rel} {rhs}"
 
