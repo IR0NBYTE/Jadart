@@ -508,7 +508,8 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
     Three things a user actually types, in order of how exactly they mean it:
 
     An address (`0x1eebac`, the virtual address Jadart prints, or the older
-    `.text+0xb812c` spelling) names a range that has no symbol at all.
+    `.text+0xb812c` spelling) names a range that has no symbol at all, and one that has,
+    by the name `functions` lists for it.
     AOT emits closures anonymously, so the lambda passed to `map` cannot be reached by name
     from anywhere, and it is regularly the function that holds the answer.
 
@@ -530,8 +531,14 @@ def named_ranges(image: InstrImage, fr, name: str) -> list:
         if cr is None:                     # inside a range rather than at its start
             cr = next((c for c in image.all_ranges
                        if c.pc_offset <= addr < c.pc_offset + (c.size or 1)), None)
-        # the spelling every surface uses for a range with no name
-        return [(sub_label(image, cr.pc_offset), cr)] if cr else []
+        if cr is None:
+            return []
+        # The name `functions` and `xrefs` print for the range (callgraph.range_names),
+        # so asked for by its address a function is called what it is asked for by name
+        # (#406), and `sub_0x...`, the spelling every surface uses, where it has none.
+        from .callgraph import range_names
+        nm = range_names(image, fr).get(cr.pc_offset, ("",))[0]
+        return [(nm or sub_label(image, cr.pc_offset), cr)]
 
     # Matched as printed: a name holding a control character is escaped everywhere it
     # appears (#74), and a long one is cut (#94), so that spelling is the one that reads

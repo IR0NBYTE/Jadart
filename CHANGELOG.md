@@ -107,6 +107,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **`lift` and `disasm` asked for a range by its address print the name `functions`
+  lists.** `lift FILE 0x1e9c18` printed `// sub_0x1e9c18(a1)` and its `-j` name was
+  `sub_0x1e9c18`, where `functions` lists the range as `build` (#406). The address form
+  now takes the name from the same table `functions` and `xrefs` use, in the text header
+  and in the `-j` name, and keeps `sub_0x...` for a range with none; `xrefs` by address
+  and `jadart.decompile` follow. Of 50 random ranges on the clean fixture, 32 of them
+  named, the header and `-j` name of both commands matched `functions` for 18 before and
+  all 50 now. Asked by name the output is unchanged: 144 runs of both commands, text and
+  `-j`, over 18 names on each fixture are byte for byte as before. The pinned `disasm`
+  sample of every 32nd range, which asks by address, is regenerated: 181 headers and 181
+  `-j` names on the clean fixture and 8 and 8 on the obf one move from `sub_0x...` to
+  the name, and nothing else. A name a `--sigs` match infers is not used by the address
+  form; not measured.
 - **`tier3_graph` on rows nested too deeply raises `TooDeep`, not a stray
   `RecursionError`.** On a chain of 500 or more `cmp`/`b.eq` pairs it ran out of
   Python's stack, and the `RecursionError` escaped from whichever frame it hit, while
