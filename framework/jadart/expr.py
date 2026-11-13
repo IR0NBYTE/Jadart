@@ -5736,7 +5736,14 @@ class Lifter:
         if amt is None:
             return None
         if kind in _SHIFT_SYM:
-            return _bin(v, _SHIFT_SYM[kind], _num(amt), P_SHIFT) if amt else v
+            if not amt:
+                return v
+            if ops[i].strip()[:1] == "w":
+                # A 32-bit operand is shifted at 32 bits: `add w0, w5, w6, asr #3` shifts
+                # the low half of x6, signed, and `x6 >> 3` brings its top half down into
+                # the result (#373). `_leaf` read it untruncated.
+                return _shift32(v, _SHIFT_SYM[kind], amt)
+            return _bin(v, _SHIFT_SYM[kind], _num(amt), P_SHIFT)
         if kind in _EXTENDS:
             # The extend reads part of the register, and the amount after it is a left
             # shift of what it read (#369).

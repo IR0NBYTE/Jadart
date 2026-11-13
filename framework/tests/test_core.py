@@ -25456,6 +25456,7 @@ def test_arithmetic_on_a_smi_tagged_register_reads_the_word_it_holds():
         "lsr w0, w1, #1": lambda w, y: (w & m32) >> 1,
         "asr w0, w1, #3": lambda w, y: (s32(w) >> 3) & m32,
         "and w0, w1, w4": lambda w, y: w & y & m32,
+        "orr w0, w4, w1, lsr #3": lambda w, y: (y | (w & m32) >> 3) & m32,
         "mul w0, w1, w4": lambda w, y: w * y & m32,
         "cmp x1, #8; cset x0, lt": lambda w, y: s64(w) < 8,
         "cmp x1, x4; cset x0, eq": lambda w, y: w == y,
@@ -25535,6 +25536,63 @@ def test_a_32_bit_equality_reads_whole_only_what_every_path_proves_a_reference()
         "return x13.field_0x8.toUnsigned(32) < x2.toUnsigned(32) ? 1 : 0;")
     assert joined("w1, [x13, #7]", "w1, [x13, #7]") == (
         "return x13.field_0x8 < x2.toUnsigned(32) ? 1 : 0;")
+
+
+def test_a_shifted_operand_of_a_32_bit_instruction_is_shifted_at_32_bits():
+    """`add w0, w5, w6, asr #3` shifts the low half of x6, sign-extended. Tier 3 printed
+    `(x5 + (x6 >> 3)).toUnsigned(32)`, a shift of all 64 bits that brings three bits of
+    the top half down into the result, and so for `lsr` (#373). A left shift only moves
+    bits up and out, and stays as it was. Every shift on the 32-bit forms of `add`,
+    `sub`, `and`, `orr`, `eor` and `bic` is checked against arm64 on random inputs.
+    `tst` dropped the shift of its operand at either width, `(x5 & x6) == 0` for
+    `tst x5, x6, lsl #3`."""
+    import random
+    one = lambda mn, op: _untag_text([(mn, op)])
+    assert one("add", "w0, w5, w6, asr #3") == (
+        "(x5 + (x6.toSigned(32) >> 3)).toUnsigned(32)")
+    assert one("add", "w0, w5, w6, lsr #3") == (
+        "(x5 + (x6.toUnsigned(32) >>> 3)).toUnsigned(32)")
+    assert one("add", "w0, w5, w6, lsl #3") == "(x5 + (x6 << 3)).toUnsigned(32)"
+    assert one("eor", "w0, w5, w5, asr #31") == (
+        "(x5 ^ x5.toSigned(32) >> 31).toUnsigned(32)")
+    # The 64-bit forms shift the register whole, as they did.
+    assert one("add", "x0, x5, x6, asr #3") == "x5 + (x6 >> 3)"
+    assert one("add", "x0, x5, x6, lsr #3") == "x5 + (x6 >>> 3)"
+    # No spelling for a rotate: the instruction stays raw.
+    raw = _lift_rows([("eor", "w0, w5, w6, ror #3"), ("ret", "")])
+    assert raw[0] == "eor w0, w5, w6, ror #3", raw
+
+    rng = random.Random(373)
+    m32 = 0xffffffff
+    shift = {"lsl": lambda v, n: v << n, "lsr": lambda v, n: (v & m32) >> n,
+             "asr": lambda v, n: _sx(v, 32) >> n}
+    insn = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b,
+            "and": lambda a, b: a & b, "orr": lambda a, b: a | b,
+            "eor": lambda a, b: a ^ b, "bic": lambda a, b: a & ~b}
+    for mn, fn in insn.items():
+        for sh, shifted in shift.items():
+            for n in (1, 3, 17, 31):
+                text = one(mn, f"w0, w5, w6, {sh} #{n}").replace(">>>", ">>")
+                for _ in range(40):
+                    env = _w_env(rng)
+                    want = fn(env["x5"], shifted(env["x6"], n)) & m32
+                    assert _dart_int(text, env) == want, (mn, sh, n, text, env)
+
+    cset = lambda rows, cc: _untag_text(list(rows) + [("cset", f"x0, {cc}")])
+    assert cset([("tst", "x5, x6, lsl #3")], "eq") == "(x5 & (x6 << 3)) == 0 ? 1 : 0"
+    assert cset([("tst", "w5, w6, lsr #3")], "ne") == (
+        "(x5 & (x6.toUnsigned(32) >>> 3)) != 0 ? 1 : 0")
+    for sh, shifted in shift.items():
+        for cc, holds in _HOLDS.items():
+            if cc not in ("eq", "ne", "mi", "pl"):
+                continue
+            text = cset([("tst", f"w5, w6, {sh} #3")], cc)
+            assert text.endswith(" ? 1 : 0"), text
+            cond = text[:-len(" ? 1 : 0")].replace(">>>", ">>")
+            for _ in range(60):
+                env = _w_env(rng)
+                want = bool(holds(*_flags32("tst", env["x5"], shifted(env["x6"], 3))))
+                assert bool(_dart_int(cond, env)) == want, (sh, cc, text, env)
 
 
 if __name__ == "__main__":

@@ -107,6 +107,26 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A shifted operand of a 32-bit instruction is shifted at 32 bits.** `add w0, w5, w6,
+  asr #3` printed `(x5 + (x6 >> 3)).toUnsigned(32)`: the 64-bit shift brings the top
+  half of x6 down into the result, and takes its sign from bit 63 (#373). A right shift
+  of a `w` operand now shifts the low half alone, signed for `asr`,
+  `(x5 + (x6.toSigned(32) >> 3)).toUnsigned(32)`, and unsigned for `lsr`,
+  `(x5 + (x6.toUnsigned(32) >>> 3)).toUnsigned(32)`, on `add`, `sub`, `and`, `orr`,
+  `eor`, `bic` and their flag-setting forms. `lsl` was right in the low half and is
+  unchanged, and `ror` stays the raw instruction. `tst x5, x6, lsl #3` and `ands` and
+  `bics` with a shifted operand lost the shift at either width, `(x5 & x6) == 0`, and
+  keep it now. After #370, 5 ranges change on each fixture, 6 lines. A string hash's
+  `t1 = (t1 + (t0 + 15)[t2] + (t1 + (t0 + 15)[t2] << 10) ^ t1 + (t0 + 15)[t2] + (t1 +
+  (t0 + 15)[t2] << 10) >>> 6).toUnsigned(32);` is now `t1 = (t1 + (t0 + 15)[t2] + (t1 +
+  (t0 + 15)[t2] << 10) ^ (t1 + (t0 + 15)[t2] + (t1 + (t0 + 15)[t2] << 10))
+  .toUnsigned(32) >>> 6).toUnsigned(32);`, its last step
+  `t1 + (t1 << 3) ^ t1 + (t1 << 3) >>> 11` is
+  `t1 + (t1 << 3) ^ (t1 + (t1 << 3)).toUnsigned(32) >>> 11`, and the write barrier's
+  `if (((t6.field1_0x0 & t2.field1_0x0 >>> 2) & HEAP) != 0) {` is
+  `if (((t6.field1_0x0 & t2.field1_0x0 >>> 2) & (HEAP >>> 32)) != 0) {`. The unicorn
+  oracle, over the 1,291 programs the assembler accepts of every shift kind on those
+  instructions at 40 entry states, went from 422 programs with a wrong run to none.
 - **A 32-bit comparison reads the low half of its operands.** `ldur w1, [x13, #7];
   cmp w1, #0; cset x0, lt` printed `x13.field_0x8 < 0 ? 1 : 0`, which a zero-extended
   load never is, and `cbz w5` printed `if (x5 != 0)`, true of an x5 of 0x100000000 that
