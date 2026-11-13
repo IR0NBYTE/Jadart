@@ -25892,6 +25892,70 @@ def test_a_comparison_still_to_be_read_is_named_before_a_store_that_may_write_it
                                         "return x13.field_0x18 == x2 ? 1 : 0;"]
 
 
+def test_an_element_off_a_computed_base_is_the_access_at_a_computed_address():
+    """`ldur x4, [x13, #7]; sub x9, x13, #0x20; add x16, x9, x8, lsl #3; stur x1, [x16,
+    #0x17]; mov x0, x4` printed `(x13 - 32)[x8] = x1;` and then `return
+    x13.field_0x8;`: the store is to `x13.field_0x8` where x8 is 2, and it was taken
+    for an element of an object at `x13 - 32`, whose elements start at its data
+    offset and so reach no field below it (#387). An element off a base the rows
+    computed keeps its spelling and is the access at a computed address (#341): a
+    store names every live read of the heap, and a read is named before any store to
+    the heap. A base that is an object pointer is as it was."""
+    lift = _lift_329
+    ld, el = ("ldur", "x4, [x13, #7]"), ("add", "x16, x9, x8, lsl #3")
+    st, ret = ("stur", "x1, [x16, #0x17]"), ("mov", "x0, x4")
+    assert lift(ld, ("sub", "x9, x13, #0x20"), el, st, ret) == [
+        "var t0 = x13.field_0x8;", "(x13 - 32)[x8] = x1;", "return t0;"]
+    # A constant added, two taken off, a copy, an unshifted index, and the header of
+    # an object read through another register.
+    for made, text in (((("add", "x9, x13, #8"),), "(x13 + 8)[x8]"),
+                       ((("sub", "x9, x13, #0x10"), ("sub", "x9, x9, #0x10")),
+                        "(x13 - 16 - 16)[x8]"),
+                       ((("sub", "x10, x13, #0x20"), ("mov", "x9, x10")),
+                        "(x13 - 32)[x8]")):
+        assert lift(ld, *made, el, st, ret) == [
+            "var t0 = x13.field_0x8;", text + " = x1;", "return t0;"], made
+    assert lift(ld, ("sub", "x9, x13, #0x20"), ("add", "x16, x9, x8"), st, ret) == [
+        "var t0 = x13.field_0x8;", "(x13 - 32)[x8] = x1;", "return t0;"]
+    assert lift(("ldur", "x4, [x12, #-1]"), ("sub", "x9, x13, #0x20"), el, st, ret) == [
+        "var t0 = x12.tags;", "(x13 - 32)[x8] = x1;", "return t0;"]
+    # Computed on one way in only: the walk has lost the value, and the rows say.
+    assert lift(ld, ("mov", "x9, x13"), ("cbz", "x5, #0x10"), ("sub", "x9, x9, #0x20"),
+                el, st, ret) == [
+        "var t0 = x13;", "if (x5 != 0) {", "t0 = x13 - 32;", "}",
+        "var t1 = x13.field_0x8;", "t0[x8] = x1;", "return t1;"]
+    # Read through such a base, the element is named before a store to any field,
+    # and not before a store into the thread.
+    rd = (("sub", "x9, x13, #0x20"), el, ("ldur", "x4, [x16, #0x17]"))
+    assert lift(*rd, ("stur", "x1, [x13, #7]"), ret) == [
+        "var t0 = (x13 - 32)[x8];", "x13.field_0x8 = x1;", "return t0;"]
+    assert lift(*rd, ("stur", "x1, [x26, #0x40]"), ret) == [
+        "THR.field_0x40 = x1;", "return (x13 - 32)[x8];"]
+    # An object pointer: the register itself, a copy, and a constant added and taken
+    # off again. The element is at the data offset or past it, and the field below
+    # stays inline, both ways round.
+    for made in ((("mov", "x9, x13"),), (("add", "x9, x13, #8"), ("sub", "x9, x9, #8"))):
+        assert lift(ld, *made, el, st, ret) == [
+            "x13[x8] = x1;", "return x13.field_0x8;"], made
+        assert lift(*made, el, ("ldur", "x4, [x16, #0x17]"), ("stur", "x1, [x13, #7]"),
+                    ret) == ["x13.field_0x8 = x1;", "return x13[x8];"], made
+    # ...and a base loaded from a field is one without the rows being asked.
+    from jadart import expr
+    made, facts = [0], expr._addr_facts
+
+    def counted(*args, **kw):
+        made[0] += 1
+        return facts(*args, **kw)
+
+    expr._addr_facts = counted
+    try:
+        assert lift(ld, ("ldur", "x9, [x13, #0xf]"), el, st, ret) == [
+            "x13.field_0x10[x8] = x1;", "return x13.field_0x8;"]
+        assert made[0] == 0, made[0]
+    finally:
+        expr._addr_facts = facts
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
