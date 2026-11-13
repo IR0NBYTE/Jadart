@@ -3,6 +3,7 @@
 Ground truth is our FluBench Dart 3.12.2 build. Run: python3 -m pytest, or
 python3 tests/test_core.py.
 """
+import math
 import os
 import random
 import re
@@ -25175,13 +25176,90 @@ def test_the_unsigned_conditions_are_not_spelled_as_the_signed_ones():
 
 
 def test_a_floating_point_compare_keeps_the_plain_operators():
-    """Guard. The carry conditions after `fcmp` order two doubles, which have no
-    unsigned reading: `fcmp d0, d1; b.lo` is `d0 < d1`."""
+    """The carry conditions after `fcmp` order two doubles, which have no unsigned
+    reading: `fcmp d0, d1; b.lo` is `d0 < d1`. Those that also hold when a side is NaN
+    are the negation of an ordering, never the reversed operator (#402)."""
     from jadart.cfg import _cond_text
-    for cc, rel in (("lo", "<"), ("hs", ">="), ("hi", ">"), ("ls", "<="), ("mi", "<"),
-                    ("pl", ">="), ("lt", "<"), ("ge", ">=")):
-        assert _cond_text((0, "fcmp", "d0, d1", ""), "b." + cc, "#0") == f"d0 {rel} d1"
+    for cc, want in (("lo", "d0 < d1"), ("hs", "!(d0 < d1)"), ("hi", "!(d0 <= d1)"),
+                     ("ls", "d0 <= d1"), ("mi", "d0 < d1"), ("pl", "!(d0 < d1)"),
+                     ("lt", "!(d0 >= d1)"), ("ge", "d0 >= d1")):
+        assert _cond_text((0, "fcmp", "d0, d1", ""), "b." + cc, "#0") == want
     assert _cond_text((0, "fcmp", "d0, d0", ""), "b.vs", "#0") == "isNaN(d0)"
+
+
+#: Whether condition code `cc` holds for the flags NZCV, from the Arm ARM.
+_HOLDS_402 = {
+    "eq": lambda n, z, c, v: z == 1, "ne": lambda n, z, c, v: z == 0,
+    "hs": lambda n, z, c, v: c == 1, "cs": lambda n, z, c, v: c == 1,
+    "lo": lambda n, z, c, v: c == 0, "cc": lambda n, z, c, v: c == 0,
+    "mi": lambda n, z, c, v: n == 1, "pl": lambda n, z, c, v: n == 0,
+    "vs": lambda n, z, c, v: v == 1, "vc": lambda n, z, c, v: v == 0,
+    "hi": lambda n, z, c, v: c == 1 and z == 0, "ls": lambda n, z, c, v: c == 0 or z == 1,
+    "ge": lambda n, z, c, v: n == v, "lt": lambda n, z, c, v: n != v,
+    "gt": lambda n, z, c, v: z == 0 and n == v, "le": lambda n, z, c, v: z == 1 or n != v}
+
+
+def _fcmp_flags(a, b):
+    """NZCV after `fcmp` of two Python floats: less, equal, greater or unordered."""
+    if math.isnan(a) or math.isnan(b):
+        return 0, 0, 1, 1
+    return (1, 0, 0, 0) if a < b else (0, 1, 1, 0) if a == b else (0, 0, 1, 0)
+
+
+def _reads_402(cond, env):
+    """What a printed condition over doubles says for `env`, read as Dart reads it: an
+    ordering with a NaN side is false, `!=` true."""
+    py = cond.replace("isNaN(", "math.isnan(").replace("!(", "not (")
+    py = py.replace(" || ", " or ").replace(" && ", " and ")
+    return bool(eval(py, {"math": math}, env))
+
+
+def test_a_condition_after_a_floating_point_compare_holds_on_nan():
+    """`fcmp` sets NZCV to 0011 when either side is NaN, and every condition that holds
+    there (ne, hs, pl, hi, lt, le, vs) is true for NaN where an ordering is false. `fcmp
+    d0, d1; b.lt` printed `d0 < d1`, and the branch the CPU takes on NaN read as not
+    taken; hs, pl and ge all printed `d0 >= d1`, three conditions as one (#402). The
+    truth table: each condition over NaN, the infinities, both zeros and two finite
+    values, printed after `fcmp` and `fcmpe`, against a register and against zero, and
+    its negation; then the branch, `cset` and `csel` as tier 3 prints them, each
+    either exact or left raw."""
+    from jadart.cfg import _cond_text, negate_cond
+    vals = [math.nan, -math.inf, -1.5, -0.0, 0.0, 1.5, math.inf]
+    for setter, op in (("fcmp", "d0, d1"), ("fcmpe", "d0, d1"), ("fcmp", "d0, #0.0")):
+        for cc, holds in _HOLDS_402.items():
+            cond = _cond_text((0, setter, op, ""), "b." + cc, "#0")
+            for a in vals:
+                for b in (vals if "#" not in op else [0.0]):
+                    want = holds(*_fcmp_flags(a, b))
+                    env = {"d0": a, "d1": b}
+                    assert _reads_402(cond, env) == want, (setter, op, cc, cond, a, b)
+                    assert _reads_402(negate_cond(cond), env) != want, (op, cc, a, b)
+    for cc, holds in _HOLDS_402.items():
+        fall = _lift_rows([("fcmp", "d0, d1"), ("b." + cc, "#0x10"), ("mov", "x0, #1"),
+                           ("ret", ""), ("mov", "x0, #2"), ("ret", "")])
+        assert fall[1:] == ["return 1;", "} else {", "return 2;", "}"], (cc, fall)
+        cond = fall[0][len("if ("):-len(") {")]
+        sel = {}
+        for mn, ops, arms in (("cset", f"x0, {cc}", " ? 1 : 0;"),
+                              ("csel", f"x0, x2, x3, {cc}", " ? x2 : x3;")):
+            out = _lift_rows([("fcmp", "d0, d1"), (mn, ops), ("ret", "")])
+            if out[0].endswith(arms):
+                sel[mn] = out[0][len("return "):-len(arms)]
+            else:
+                assert out == [f"{mn} {ops}", "return x0;"], (cc, out)
+        for a in vals:
+            for b in vals:
+                env, want = {"d0": a, "d1": b}, holds(*_fcmp_flags(a, b))
+                assert _reads_402(cond, env) != want, (cc, cond, a, b)
+                for mn, text in sel.items():
+                    assert _reads_402(text, env) == want, (mn, cc, text, a, b)
+    # Negated once the operand is a field: `x1.field_0x9 < 0.0` names no double, and
+    # flipping its operator was the bug again.
+    assert _lift_rows([("ldr", "d0, [x1, #8]"), ("fcmp", "d0, #0.0"), ("b.lt", "#0x10"),
+                       ("b", "#0x14"), ("bl", "#0x100"), ("ret", "")])[0] == (
+        "if (!(x1.field_0x9 >= 0.0)) {")
+
+
 _HOLDS_399 = {"mi": lambda n, z, c, v: n == 1, "pl": lambda n, z, c, v: n == 0}
 
 

@@ -40,6 +40,7 @@ from typing import NamedTuple
 
 from .keep import kept
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
+                  _FP_REG,
                   _UNSIGNED, cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
                   entry_reach, UNREACHED, cut_off, dominator_forest, dom_numbers,
                   second_reach, strong_components, past_trap, _cond_for, checks_into,
@@ -10451,7 +10452,13 @@ class Lifter:
             elif kind == "if":
                 _, cond, then, els = s
                 head = self._last_block if self._last_block is not None else self.entry
-                cond_txt = self._cond(cond, st, self._branch_cc(head, cond))
+                cc = self._branch_cc(head, cond)
+                cond_txt = self._cond(cond, st, cc)
+                # The negation of an ordering of doubles is not the reversed operator,
+                # and once the registers are substituted cfg no longer sees that they
+                # were doubles: negated here, from the registers (#402).
+                neg_txt = (self._cond(negate_cond(cond), st, cc)
+                           if _FP_REG.search(cond) else None)
                 a, b = st.copy(), st.copy()
                 tlines, tfalls = self.walk(then, a, indent, depth + 1, joins[i])
                 elines, efalls = self.walk(els, b, indent, depth + 1, joins[i])
@@ -10470,7 +10477,8 @@ class Lifter:
                     entered = self._entered(tlines + elines)
                     at = joins[i] if entered and joins[i] is not None else head
                     self._anchor.update(dict.fromkeys(range(first, st.tmpc[0]), at))
-                out.extend(self._render_if(cond_txt, tlines, elines, pad, indent))
+                out.extend(self._render_if(cond_txt, tlines, elines, pad, indent,
+                                           neg_txt))
                 if tfalls and efalls:
                     _merge(st, a, b)
                     if self._low32:
@@ -10596,16 +10604,19 @@ class Lifter:
             _drop_empty_note(out, note[0])
         return out, falls
 
-    def _render_if(self, cond, tlines, elines, pad, indent):
+    def _render_if(self, cond, tlines, elines, pad, indent, neg=None):
+        """`neg`, where given, is the negation of `cond` (the walk's, #402)."""
         if not tlines and not elines:
             return []                                          # both arms lifted to nothing
+        if neg is None:
+            neg = negate_cond(cond)
         # `if (c) {} else { break; }`  ->  `if (!c) break;`
         if not tlines and elines == [pad + indent + "break;"]:
-            return [f"{pad}if ({negate_cond(cond)}) break;"]
+            return [f"{pad}if ({neg}) break;"]
         if not tlines and elines == [pad + indent + "continue;"]:
-            return [f"{pad}if ({negate_cond(cond)}) continue;"]
+            return [f"{pad}if ({neg}) continue;"]
         if not tlines:                                         # empty then: flip to the else
-            cond, tlines, elines = negate_cond(cond), elines, []
+            cond, tlines, elines = neg, elines, []
         out = [f"{pad}if ({cond}) {{"]
         out.extend(tlines)
         if elines:

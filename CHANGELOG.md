@@ -107,6 +107,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Conditions after a float compare hold when a side is NaN.** `fcmp` leaves NZCV at
+  0011 when either side is NaN, and every ordering is then false. `fcmp d0, d1; b.lt`
+  printed `d0 < d1`, so the branch the CPU takes on NaN read as not taken; pl, hs and ge
+  all printed `d0 >= d1`; and a fall through printed the reversed operator, `t0 <= 1.0`
+  for the CPU's "not `t0 > 1.0`" (#402). Each condition is now an ordering or the
+  negation of one: lt is `!(d0 >= d1)`, hs and pl `!(d0 < d1)`, hi `!(d0 <= d1)`, le
+  `!(d0 > d1)`, and a negation is always `!(...)`, also once a load has replaced the
+  register. A truth table over NaN, both infinities, both zeros and two finite values
+  checks each condition and its negation, the branch, `cset` and `csel`; the unicorn
+  oracle does not run doubles. 2,913 lines in 1,388 ranges change on the nine binaries,
+  75 on each fixture, such as `if (t0 <= 1.0) {` to `if (!(t0 > 1.0)) {`.
 - **lt, ge, gt and le after an add compare the operand with minus the other.**
   `cmn x5, #4; b.lt` printed `(x5 + 4) < 0`, the sign of the sum as it wrapped, where lt
   reads N and V together, the sign of the sum taken without wrapping: for x5 =
