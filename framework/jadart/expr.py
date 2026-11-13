@@ -7185,9 +7185,6 @@ class Lifter:
                     and not index):
                 self._last_mem = None
                 return self._bump(st, base, delta)
-            # Both targets are built BEFORE anything is pinned, because pinning rewrites
-            # the register map the base is read through and the second half of an `stp`
-            # would then be addressed off a temporary that names the base's old value.
             # An element access carries no width: the index is already scaled by the
             # element size, so a 16-byte element is `t3[t4]` either way (#209). One
             # `_elem_access` declines is the store to the address it computes (#308).
@@ -7196,39 +7193,56 @@ class Lifter:
             # `ops[1]` and not `pair[0]` for the second, which `canon` has folded: s1 is
             # d1 there and would read as eight bytes where the store writes four. The
             # offset step has the same reason.
+            #
+            # The machine reads both registers of an `stp`, and its address, before it
+            # writes either word, and the two lines print one after the other. So the
+            # second line is built from the map as the first store's names left it,
+            # with the registers it reads live for that store whatever comes after:
+            # `ldur x1, [x13, #8]; stp x2, x1, [x13, #8]` printed `x13.field_0x11 =
+            # x13.field_0x9` under the line that had just changed that field, which
+            # stores x2 twice, and a base or an index that reads the first word was
+            # read again the same way (#372).
             words = [(disp, ops[0], val)] + ([(pair[1], ops[1], pair[2])] if pair else [])
-            on_elem = index is not None or base in st.elem
-            tgts, cast = [], self.cast_at.get((at, base))
-            for d, reg, v in words:
-                elem = self._elem_access(base, index, scale, st, d) if on_elem else None
+            out, cast = list(basedecl), self.cast_at.get((at, base))
+            for k, (d, reg, v) in enumerate(words):
+                if k:
+                    v = g(pair[0])
+                elem = (self._elem_access(base, index, scale, st, d)
+                        if index is not None or base in st.elem else None)
                 if elem is not None:                          # element store
                     # Every element read is named, through any base (#343).
-                    tgts.append((elem, v, (), False,
-                                 not _FRAME_ROOT.match(elem.text.split("[", 1)[0])))
-                    continue
-                w = _access_width(mn, reg)
-                # `_rebase` and not `_byte_off`: a displacement below the base goes into
-                # the base expression, so the offset is a field offset, never negative.
-                held = g(base)
-                bv, off, hdr = self._rebase(base, held, d)
-                cast = cast if off == d + 1 and bv is held else None
-                also = self._covers(bv, off, w, cast, hdr)
-                if self._byte_off(base, held, d) == 0 and not (bv is held and hdr):
-                    # Offset 0 spelled as the access at its address. It may write any
-                    # header word a live value read, as the `.tags` it was spelled as
-                    # did: pinned as that spelling pins (#329).
-                    also += self._header_selectors(w)
-                # A store at a computed address, at any offset, may be to any field of
-                # any object, so every live read of the heap is named first (#341).
-                tgts.append((self._field(bv, off, w, cast, hdr), v, also,
-                             not _fresh_v(held) and self._at_computed(base, held, bv),
-                             False))
-            out = list(basedecl)
-            for tgt, v, also, anywhere, elems in tgts:
+                    tgt, also, anywhere = elem, (), False
+                    elems = not _FRAME_ROOT.match(elem.text.split("[", 1)[0])
+                else:
+                    w = _access_width(mn, reg)
+                    # `_rebase` and not `_byte_off`: a displacement below the base goes
+                    # into the base expression, so the offset is a field offset, never
+                    # negative.
+                    held = g(base)
+                    bv, off, hdr = self._rebase(base, held, d)
+                    cast = cast if off == d + 1 and bv is held else None
+                    also = self._covers(bv, off, w, cast, hdr)
+                    if self._byte_off(base, held, d) == 0 and not (bv is held and hdr):
+                        # Offset 0 spelled as the access at its address. It may write
+                        # any header word a live value read, as the `.tags` it was
+                        # spelled as did: pinned as that spelling pins (#329).
+                        also += self._header_selectors(w)
+                    # A store at a computed address, at any offset, may be to any field
+                    # of any object, so every live read of the heap is named first
+                    # (#341).
+                    tgt = self._field(bv, off, w, cast, hdr)
+                    anywhere = not _fresh_v(held) and self._at_computed(base, held, bv)
+                    elems = False
                 # The value being stored was read off the map before this, so `+=` still
                 # renders: the rhs keeps the field's own spelling even when a register
                 # holding it is pinned on the way past.
-                out.extend(self._pin_mem(st, tgt.text, also, anywhere, elems))
+                live = self._live_after
+                if pair and not k:
+                    self._live_after = live | _reg_mask((pair[0], base))
+                try:
+                    out.extend(self._pin_mem(st, tgt.text, also, anywhere, elems))
+                finally:
+                    self._live_after = live
                 out.append(self._assign(tgt, v))
             self._last_mem = ("store", base, disp, src0)
             return out + self._bump(st, base, delta)
