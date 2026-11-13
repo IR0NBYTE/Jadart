@@ -26399,6 +26399,35 @@ def test_an_element_whose_index_is_built_from_an_object_is_at_a_computed_address
     assert lift(ld, ("add", "x16, x8, x13, lsl #3"), st, ret) == [
         "x8[x13] = x1;", "return x13.field_0x8;"]
 
+
+def test_an_element_at_a_constant_index_below_zero_is_at_a_computed_address():
+    """`ldur x2, [x13, #7]; mov x9, #-0x10; add x16, x13, x9; stur x1, [x16, #0x17];
+    mov x0, x2` printed `x13[-16] = x1;` and then `return x13.field_0x8;`: the store
+    writes x13 + 7, the word just read (#436). An element is taken to have an index of
+    zero or more, and here the lifter can see it is not. The access keeps its spelling
+    and is at a computed address, so a store names the live read of the word first and
+    a load is named before a store to the heap. The sum itself is as it was."""
+    lift = _lift_329
+    ld, ret = ("ldur", "x2, [x13, #7]"), ("mov", "x0, x2")
+    st = ("stur", "x1, [x16, #0x17]")
+    for made, at in (((("mov", "x9, #-0x10"), ("add", "x16, x13, x9")), "x13[-16]"),
+                     ((("mov", "x9, #-0x10"), ("add", "x16, x9, x13")), "x13[-16]"),
+                     ((("mov", "w9, #-0x10"), ("add", "x16, x13, w9, sxtw")), "x13[-16]"),
+                     ((("mov", "x9, #-0x2"), ("add", "x16, x13, x9, lsl #3")), "x13[-2]"),
+                     ((("mov", "w9, #-0x2"), ("add", "x16, x13, w9, sxtw #3")),
+                      "x13[-2]")):
+        assert lift(ld, *made, st, ret) == [
+            "var t0 = x13.field_0x8;", f"{at} = x1;", "return t0;"], made
+    # A load through it, before a store to the word it read.
+    assert lift(("mov", "x9, #-0x10"), ("add", "x16, x13, x9"),
+                ("ldur", "x2, [x16, #0x17]"), ("stur", "x1, [x13, #7]"), ret) == [
+        "var t0 = x13[-16];", "x13.field_0x8 = x1;", "return t0;"]
+    # Zero or more is an element as it was, and so is a 32-bit word zero-extended.
+    assert lift(ld, ("mov", "x9, #0x10"), ("add", "x16, x13, x9"), st, ret) == [
+        "x13[16] = x1;", "return x13.field_0x8;"]
+    assert lift(ld, ("mov", "w9, #-0x10"), ("add", "x16, x13, w9, uxtw"), st, ret) == [
+        "x13[0xfffffff0] = x1;", "return x13.field_0x8;"]
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

@@ -192,6 +192,18 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   t0 = a0.field_0x14.toSigned(32) >> 1;` and `if ((a1 + 1 + 1) u< t0) {`, and
   `this.field_0x10[t1 + 1 + 1] = ...` is now `t2[t1 + 1 + 1] = ...` under `var t2 =
   this.field_0x10;`.
+
+- **An element at a constant index below zero is the access at a computed address.**
+  `ldur x2, [x13, #7]; mov x9, #-0x10; add x16, x13, x9; stur x1, [x16, #0x17]; mov
+  x0, x2` printed `x13[-16] = x1;` and then `return x13.field_0x8;`, but the store
+  writes x13 + 7, the word just read (#436). An element is taken to have an index of
+  zero or more, and here the lifter can see it is not. The access keeps its spelling
+  and is at a computed address, as #435's is: the store now prints after `var t0 =
+  x13.field_0x8;` and returns `t0`, and a load through it is named before a store to
+  the heap. The add itself prints as it did. The unicorn oracle at 40 entry states
+  went from all 40 runs wrong to 40 of 40 agreeing on the store, the load, both
+  operand orders, a 32-bit index sign-extended, `movn` for the constant, and a scaled
+  index (`lsl #3`, `sxtw #3`). No range changes on the two fixtures or the seven apps.
 - **vs and vc after integer flags are declined.** V after a compare or an add is its
   signed overflow, which no Dart operator spells, and `cmp x5, x6; b.vs` printed
   `if (!(x5 vs x6))`, an operator that does not exist (#401). The branch now prints `?`,

@@ -1204,6 +1204,16 @@ def _bin(a: V, op: str, b: V, prec: int) -> V:
              sext=sext, calc=True)
 
 
+def _neg_index(idx: V, scale: int):
+    """The byte offset an element address at index `idx`, shifted left by `scale`, adds
+    to its base where `idx` is a constant and the offset is below zero as the machine's
+    64-bit sum reads it, else None (#436)."""
+    if not _INT_LITERAL.match(idx.text):
+        return None
+    n = (int(idx.text, 0) << scale) & 0xffffffffffffffff
+    return n - (1 << 64) if n >> 63 else None
+
+
 def _num(n: int) -> V:
     return V(str(n) if -256 < n < 256 else hex(n), P_ATOM,
              bits=n.bit_length() if n >= 0 else 64, calc=True)
@@ -8796,6 +8806,15 @@ class Lifter:
             if untagged:
                 loose = False
             elif whose:
+                loose = True
+            elif sh not in ("asr", "lsr") and _neg_index(idx_v, scale) is not None:
+                # A constant index below zero is no element: an element's index is zero
+                # or more, which is what keeps it apart from the fields under the data.
+                # `mov x9, #-0x10; add x16, x13, x9; stur x1, [x16, #0x17]` printed
+                # `x13[-16] = x1` and left a live `x13.field_0x8` standing, the word it
+                # writes (#436). The access is at a computed address, as #435's is: the
+                # spelling stays, and what it may reach is any field. The sum is left as
+                # it was; only an access through it changes.
                 loose = True
             elif base_v.smi:
                 loose = base_v.smi == _SMI_TAG
