@@ -462,22 +462,25 @@ def cmd_functions(args) -> int:
     """Every code range in the image, the way `afl` and IDA's Functions window list them."""
     from .disasm import load_instructions, addr_label, va_of
     from .callgraph import function_table, ORIGINS
+
+    # The filters that need no call graph pick the rows first, and the graph is built for
+    # those rows alone: one name is a read of the image, not the whole graph (#353).
+    def wanted(f):
+        return ((not args.filter or args.filter.lower() in f.label.lower())
+                and (not args.library
+                     or args.library.lower() in (f.library or "").lower())
+                and (not args.named or f.origin != "anonymous")
+                and (not args.anonymous or f.origin == "anonymous"))
+    narrowed = args.filter or args.library or args.named or args.anonymous
     try:
         image, fr, hdr = load_instructions(args.libapp)
         table, graph_error, notes = function_table(image, fr, hdr,
-                                            sigs=getattr(args, "sigs", None))
+                                            sigs=getattr(args, "sigs", None),
+                                            only=wanted if narrowed else None)
     except JadartError as e:
         return _fail(e)
 
-    rows = table
-    if args.filter:
-        rows = [f for f in rows if args.filter.lower() in f.label.lower()]
-    if args.library:
-        rows = [f for f in rows if args.library.lower() in (f.library or "").lower()]
-    if args.named:
-        rows = [f for f in rows if f.origin != "anonymous"]
-    if args.anonymous:
-        rows = [f for f in rows if f.origin == "anonymous"]
+    rows = [f for f in table if wanted(f)] if narrowed else table
     if args.called:
         rows = [f for f in rows if f.callers]
     if args.virtual:

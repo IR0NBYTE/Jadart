@@ -24,6 +24,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **`functions -f NAME` and `xrefs function NAME` build the call graph for that name
+  only.** Both decoded every range in the image and then kept one row. A filter on name,
+  library, `--named` or `--anonymous` now picks the rows first, and the graph keeps only
+  the edges that touch them. On FluffyChat (88,618 ranges), best of 3: `functions -f
+  get:avatarUrl` 6.94 s to 3.26 s, `xrefs function get:avatarUrl` 6.44 s to 2.86 s,
+  against 1.21 s for `symbols -f`. What is left is the dispatch-table decode that `vin`,
+  `overloads` and virtual call sites need from every call site in the image; the counts
+  printed are the whole graph's. Output is byte-identical to 1.4.0 on 81 queries over the
+  two fixtures and FluffyChat.
+
 - **`-j` is compact when stdout is not a terminal.** Every `-j` document was written with
   two-space indentation, which an agent reading through a pipe paid for byte by byte.
   Off a terminal it is now one line with no whitespace between tokens; a terminal still

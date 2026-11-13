@@ -8455,6 +8455,70 @@ def test_virtual_edges_stay_separate_from_direct_ones():
     assert idx.opaque_sites >= 0
 
 
+def test_one_name_builds_only_its_part_of_the_call_graph():
+    """`functions -f NAME` and `xrefs function NAME` built the call graph of the whole
+    image and kept one row of it: 5.80 and 5.41 s on an app of 88,618 ranges, where
+    `symbols -f` answers the same name in 1.01 s. Counted rather than timed. The index a
+    one-name query builds holds the edges that touch that name and no others, it decodes
+    fewer ranges than the whole graph, and the counts it prints are the whole graph's."""
+    _needs_capstone()
+    import io
+    import json
+    import contextlib
+    from jadart import cli, callgraph
+    from jadart.disasm import load_instructions, function_name_by_pc
+
+    image, fr, hdr = load_instructions(CLEAN)
+    pc = next(p for p, nm in function_name_by_pc(image, fr).items()
+              if nm == "benchWithdraw")
+    whole = {f.pc_offset: f for f in callgraph.function_table(image, fr, hdr)[0]}[pc]
+
+    built, decoded = [], [0]
+    real_build, real_dis = callgraph.build_index, callgraph.disassemble_range
+
+    def build(*a, **k):
+        built.append(real_build(*a, **k))
+        return built[-1]
+
+    def dis(*a, **k):
+        decoded[0] += 1
+        return real_dis(*a, **k)
+
+    def run(*argv):
+        built.clear()
+        decoded[0] = 0
+        out = io.StringIO()
+        callgraph.build_index, callgraph.disassemble_range = build, dis
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = cli.main([*argv, "-j"])
+        finally:
+            callgraph.build_index, callgraph.disassemble_range = real_build, real_dis
+        assert rc == 0 and len(built) == 1, (rc, len(built))
+        return json.loads(out.getvalue()), built[0], decoded[0]
+
+    _doc, _idx, all_decodes = run("functions", CLEAN, "-n", "1")
+    for argv in (("functions", CLEAN, "-f", "benchWithdraw"),
+                 ("xrefs", CLEAN, "function", "benchWithdraw")):
+        doc, idx, decodes = run(*argv)
+        edges = ([(s, t) for t, ss in idx.callers.items() for s in ss]
+                 + [(s, t) for s, ts in idx.callees.items() for t in ts]
+                 + [(s, t) for t, ss in idx.may_be_called_by.items() for s in ss])
+        assert edges and all(pc in e for e in edges), (
+            f"{argv[0]}: {sum(pc not in e for e in edges)} of {len(edges)} edges in the "
+            f"index do not touch benchWithdraw")
+        assert decodes < all_decodes, (argv[0], decodes, all_decodes)
+        if argv[0] == "functions":
+            (row,) = doc["functions"]
+            assert (row["callers"], row["callees"], row["indirect"],
+                    row["virtual_callers"], row["overloads"]) == (
+                whole.callers, whole.callees, whole.indirect, whole.virtual_callers,
+                whole.overloads), row
+        else:
+            (fn,) = doc["functions"]
+            assert len(fn["called_by"]) == whole.callers, fn
+
+
 def test_unresolved_call_targets_are_counted_not_dropped():
     """A bl into a runtime stub outside the instructions table has no range to attach to.
     Counting those keeps the edge totals honest; dropping them silently would make the
