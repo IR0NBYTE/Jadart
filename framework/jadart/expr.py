@@ -4729,6 +4729,10 @@ class Lifter:
         #: fields past it, and per kind of store, the slot texts it does not write.
         self._past_at: dict = {}
         self._unread: dict = {}
+        #: and per offset and width of a field store, the selectors of the fields read
+        #: at another offset that share a byte with it (`_overlapping`, #385).
+        self._over_at: dict = {}
+        self._alias_at: dict = {}
         self._defs: dict = {}
         #: per block, whether it stores where `_writes_stack`, `_writes_heap` and
         #: `_writes_outgoing` ask, calls (`_CALLS`, or `bl`/`blr`), or what `_exit_slots`
@@ -6474,7 +6478,7 @@ class Lifter:
         return out
 
     def _pin_mem(self, st: State, loc: str, also=(), anywhere=False, elems=False,
-                 edge=None, keep=None, since=None) -> list:
+                 edge=None, keep=None, since=None, only=()) -> list:
         """Give a name to every LIVE tracked value that reads `loc`, before `loc` changes.
 
         Two more ways a store reaches a read, both because an access at a COMPUTED
@@ -6525,7 +6529,9 @@ class Lifter:
         the bytes a live `x2.field_0x8` and `x2.field_0x10` read, and neither text
         contains the other, so matching one text would miss them (#209). A text that
         is a bare selector, `.tags`, is one the write may land on under ANY base
-        (`_header_selectors`).
+        (`_header_selectors`). `only` is spellings the write lands on under their own
+        base and no other: a field of the thread read at another offset, which is no
+        object's field at that offset (`_overlapping`, #385).
 
         `_pin` is the same argument about a register: the map holds expressions, not
         results, and `x4.field_0x1` only means what it meant while x4 still points where it
@@ -6560,7 +6566,8 @@ class Lifter:
         # Looked for as text (`_spelled`), where a pattern was compiled at every
         # store: nearly every store has its own, so the 512 that `re` keeps were no
         # help, and compiling them was 4% of the time tier 3 takes (#346).
-        texts = tuple(dict.fromkeys(x for x in (loc, *also) if x[:1] != ".")) or ("",)
+        texts = tuple(dict.fromkeys(
+            x for x in (loc, *also, *only) if x[:1] != ".")) or ("",)
         alias = None
         sel = _FIELD_LHS.search(loc)
         if sel:
@@ -6577,11 +6584,17 @@ class Lifter:
             # Not off THR or PP: the same offset is the same slot only where the two bases
             # may be one object, and the thread and the object pool are not Dart objects
             # at all, so no store through a base the lifter tracks can write them.
-            sels = dict.fromkeys((sel.group(0), *(
-                m.group(0) for m in map(_FIELD_LHS.search, also) if m)))
-            alias = re.compile(r"(?<!\bTHR)(?<!\bPP)(?:"
-                               + "|".join(re.escape(x) for x in sels)
-                               + r")(?![0-9a-fA-F])")
+            # Made once for each store's selector and spellings: the stores of a body
+            # write the same few fields, and with the fields a store overlaps (#385)
+            # there are more selectors to put together for each.
+            made = (sel.group(0), also)
+            alias = self._alias_at.get(made)
+            if alias is None:
+                sels = dict.fromkeys((made[0], *(
+                    m.group(0) for m in map(_FIELD_LHS.search, also) if m)))
+                alias = self._alias_at[made] = re.compile(
+                    r"(?<!\bTHR)(?<!\bPP)(?:" + "|".join(re.escape(x) for x in sels)
+                    + r")(?![0-9a-fA-F])")
         elif "[" in loc:
             # An element store off a base whose index is not a literal reaches any element
             # of that base, so every read through the same base goes.
@@ -7276,6 +7289,58 @@ class Lifter:
         for off in (byte_off, byte_off + 8) if width == 16 else (byte_off,):
             out += [f"{base}.{n}" for n in sorted(self._named_at.get(off, ()))]
         return tuple(out)
+
+    def _overlapping(self, off: int, width: int) -> tuple:
+        """The selector of every field this body read at ANOTHER offset that has a
+        byte of the `width` bytes at `off` (#385). `_covers` spells the bytes a write
+        lands on at its own offset, and a read that starts elsewhere shares none of
+        those texts: `ldur x1, [x13, #7]` reads eight bytes at 8 and `stur w2, [x13,
+        #11]` writes four of them at 0xc, so `return x13.field_0x8;` under the store
+        returned a word the machine had read before it.
+
+        Two accesses share a byte where each starts below the other's end, whatever
+        the two widths and offsets are, so every offset a read can start at and still
+        reach the write is asked: up to 15 below it, for sixteen bytes, to its last
+        byte. A read's width is the one its spelling states, `.field1_`, `.field2_`,
+        `.field16_`; a word and a recovered name state none and are taken for eight
+        bytes at an offset this body read eight at (`wide`) and for four anywhere
+        else, as an element store takes them (`_fields_in`). Offset 0 is spelled both
+        ways, `.tags` and `.field_0x0`.
+
+        Bare selectors, which `_pin_mem` matches under any base, as it matches the
+        write's own: two registers may hold one object. Only the reads the body
+        made are looked for (`span`, kept where each is made), so a body of aligned
+        Dart fields, four bytes each or eight at multiples of eight, asks for
+        nothing more than it did. Made again when a read or a name is added and not
+        at every store."""
+        box = self._elem_box
+        span = box.get("span")
+        if span is None:
+            return ()
+        wide, named = box.get("wide", ()), self._named_at
+        now = (span[None], len(wide), self._named_n)
+        got = self._over_at.get((off, width))
+        if got is not None and got[0] == now:
+            return got[1]
+        out = []
+        for o in range(max(off - 15, 0), off + width):
+            codes = span.get(o)
+            if not codes or o == off:
+                continue
+            gap = off - o                   # a read from below reaches past this far
+            word = codes & 4 and (8 if o in wide else 4)
+            if word > gap:
+                out.append(f".field_0x{o:x}")
+                if not o:
+                    out.append(".tags")
+            for n in (1, 2, 16):
+                if codes & n and n > gap:
+                    out.append(f".field{n}_0x{o:x}")
+            # A name is printed for a read of eight bytes or fewer at its offset.
+            if (word or (2 if codes & 2 else codes & 1)) > gap:
+                out += ["." + n for n in sorted(named.get(o, ()))]
+        got = self._over_at[off, width] = (now, tuple(out))
+        return got[1]
 
     def _field(self, base_v: V, byte_off: int, width: int = 8, cast=None,
                header: bool = True) -> V:
@@ -8035,7 +8100,7 @@ class Lifter:
                     elems = not _FRAME_ROOT.match(elem.text.split("[", 1)[0])
                     edge = (self._elem_lo or None) if elems else None
                     tgt, also, anywhere = elem, (), elems and edge is None
-                    since = None
+                    since, only = None, ()
                 else:
                     w = _access_width(mn, reg)
                     # `_rebase` and not `_byte_off`: a displacement below the base goes
@@ -8053,6 +8118,21 @@ class Lifter:
                     # A store at a computed address, at any offset, may be to any field
                     # of any object, so every live read of the heap is named first
                     # (#341).
+                    # And the fields read at another offset that have a byte of this
+                    # write, under any base an object can be read through: `stur w2,
+                    # [x13, #11]` writes the upper half of what `ldur x1, [x13, #7]`
+                    # read (#385). Into the thread, the pool, the frame or an untagged
+                    # role's own address, DISPATCH or HEAP, which no object's field is
+                    # in (`_at_computed`), the ones read off that base: a store through
+                    # a pointer read out of one of them is into whatever object that
+                    # is, and names them all.
+                    only = self._overlapping(off, w)
+                    if only:
+                        if (bv.text in _NO_OBJECT or _role_address(bv)
+                                or _FRAME_ROOT.match(bv.text)):
+                            only = tuple(bv.text + x for x in only)
+                        else:
+                            also, only = also + only, ()
                     tgt = self._field(bv, off, w, cast, hdr)
                     fresh = _fresh_v(held)
                     anywhere = not fresh and self._at_computed(base, held, bv)
@@ -8081,7 +8161,7 @@ class Lifter:
                         (pair[0],) if keep else (pair[0], base))
                 try:
                     out.extend(self._pin_mem(st, tgt.text, also, anywhere, elems, edge,
-                                             keep, since))
+                                             keep, since, only))
                 finally:
                     self._live_after = live
                 out.append(self._assign(tgt, v))
@@ -8327,6 +8407,16 @@ class Lifter:
                         if wide is None:
                             wide = self._elem_box["wide"] = set()
                         wide.add(off)
+                    # Where each field was read and at which widths, for the store
+                    # that writes some of its bytes from another offset
+                    # (`_overlapping`, #385).
+                    span = self._elem_box.get("span")
+                    if span is None:
+                        span = self._elem_box["span"] = {}
+                    had, code = span.get(off, 0), wk if wk in (1, 2, 16) else 4
+                    if not had & code:
+                        span[off] = had | code
+                        span[None] = span.get(None, 0) + 1     # how many were added
                     v = self._field(bv, off, wk,
                                     cast if off == d + 1 and bv is at_base else None, hdr)
                     # A read at its address, at any offset: a store through any base

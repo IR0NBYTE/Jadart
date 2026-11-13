@@ -25732,6 +25732,98 @@ def test_joins_past_raw_writes_cost_the_same_per_row_at_any_length():
         expr.Lifter._lift_block = real
 
 
+def test_a_store_names_a_live_read_it_writes_part_of_from_another_offset():
+    """`ldur x1, [x13, #7]; stur w2, [x13, #11]; mov x0, x1` printed `x13.field_0xc =
+    x2;` and then `return x13.field_0x8;`: the read took eight bytes at offset 8, the
+    store wrote four of them at 0xc, and only a read at the store's own offset was
+    named before it (#385). A store now names each live field read that has a byte
+    of what it writes, whatever the two offsets and widths, through any base, and a
+    read with no byte of it stays inline."""
+    lift = _lift_329
+    assert lift(("ldur", "x1, [x13, #7]"), ("stur", "w2, [x13, #11]"),
+                ("mov", "x0, x1")) == ["var t0 = x13.field_0x8;", "x13.field_0xc = x2;",
+                                       "return t0;"]
+    load = {1: ("ldurb", "w1"), 2: ("ldurh", "w1"), 4: ("ldur", "w1"), 8: ("ldur", "x1")}
+    store = {1: ("sturb", "w2"), 2: ("sturh", "w2"), 4: ("stur", "w2"),
+             8: ("stur", "x2")}
+    seen = set()
+    for rw, (ld, r) in load.items():
+        for sw, (st, v) in store.items():
+            for so in range(0x10 - 8, 0x10 + 9):
+                for base in ("x13", "x12"):
+                    got = lift((ld, f"{r}, [x13, #0xf]"), (st, f"{v}, [{base}, #{so - 1}]"),
+                               ("mov", "x0, x1"))
+                    shared = so < 0x10 + rw and 0x10 < so + sw
+                    assert (got[0].startswith("var t0 = x13.field") and len(got) == 3
+                            and got[2] == "return t0;") if shared else (
+                        len(got) == 2 and got[1].startswith("return x13.field")), (
+                        rw, sw, so, base, got)
+                    seen.add(shared)
+    assert seen == {True, False}
+    # A chain, a value computed from the read, and the word under a pair's second.
+    assert lift(("ldur", "x9, [x13, #7]"), ("ldur", "x1, [x9, #0xf]"),
+                ("ldur", "x10, [x12, #7]"), ("sturb", "w2, [x10, #0x16]"),
+                ("mov", "x0, x1")) == ["var t0 = x13.field_0x8.field_0x10;",
+                                       "x12.field_0x8.field1_0x17 = x2;", "return t0;"]
+    assert lift(("ldur", "x1, [x13, #0xf]"), ("add", "x3, x1, x5"),
+                ("stur", "w2, [x13, #0x13]"), ("mov", "x0, x3"))[0] == (
+        "var t0 = x13.field_0x10 + x5;")
+    assert lift(("ldur", "x1, [x13, #0x1c]"), ("stp", "x2, x5, [x13, #0x10]"),
+                ("mov", "x0, x1")) == ["x13.field_0x11 = x2;", "var t0 = x13.field_0x1d;",
+                                       "x13.field_0x19 = x5;", "return t0;"]
+    # Sixteen bytes written over a word in their top half, and read under a byte.
+    assert lift(("ldur", "w1, [x13, #0x13]"), ("stur", "q0, [x13, #7]"),
+                ("mov", "x0, x1"))[0] == "var t0 = x13.field_0x14;"
+    assert lift(("ldur", "q1, [x13, #7]"), ("sturb", "w2, [x13, #0x16]"),
+                ("stur", "q1, [x12, #7]"))[0] == "var t0 = x13.field16_0x8;"
+    # The thread is no object: its own fields by their offsets, and no object's.
+    assert lift(("ldr", "x1, [x26, #0x40]"), ("str", "w2, [x26, #0x44]"),
+                ("mov", "x0, x1")) == ["var t0 = THR.field_0x40;",
+                                       "THR.field_0x44 = x2;", "return t0;"]
+    assert lift(("ldur", "x1, [x13, #0x3f]"), ("str", "w2, [x26, #0x44]"),
+                ("mov", "x0, x1")) == ["THR.field_0x44 = x2;", "return x13.field_0x40;"]
+    # Nor is the pool, the frame, or an untagged role's own address, DISPATCH or HEAP,
+    # in a register of its own or copied: a store into one names what was read off
+    # it and no object's field.
+    read = ("ldur", "x1, [x13, #0xf]")
+    for into in ([("stur", "w2, [x21, #0x13]")], [("stur", "w2, [x28, #0x13]")],
+                 [("stur", "w2, [x27, #0x13]")],
+                 [("mov", "x9, x21"), ("stur", "w2, [x9, #0x13]")],
+                 [("mov", "x9, x29"), ("stur", "w2, [x9, #0x13]")],
+                 [("sub", "x9, x29, #0x40"), ("stur", "w2, [x9, #0x13]")]):
+        got = lift(read, *into, ("mov", "x0, x1"))
+        assert len(got) == 2 and got[1] == "return x13.field_0x10;", (into, got)
+    assert lift(("ldur", "x1, [x21, #0x10]"), ("stur", "w2, [x21, #0x14]"),
+                ("mov", "x0, x1")) == ["var t0 = DISPATCH.field_0x10;",
+                                       "DISPATCH.field_0x14 = x2;", "return t0;"]
+    # A pointer READ OUT of one of them is to whatever object that is, and a store
+    # through it names the read, as does one through an address made from a role.
+    for ptr, tgt in ((("ldr", "x9, [x21, #0x20]"), "DISPATCH.field_0x20"),
+                     (("ldr", "x9, [x28, #0x20]"), "HEAP.field_0x20"),
+                     (("ldr", "x9, [x26, #0x20]"), "THR.field_0x20"),
+                     (("ldr", "x9, [x27, #0x20]"), "pool_0x20"),
+                     (("add", "x9, x21, #8"), "(DISPATCH + 8)")):
+        assert lift(ptr, read, ("stur", "w2, [x9, #0x13]"), ("mov", "x0, x1")) == [
+            "var t0 = x13.field_0x10;", tgt + ".field_0x14 = x2;", "return t0;"], ptr
+    assert lift(("ldr", "x9, [x29, #0x20]"), read, ("stur", "w2, [x9, #0x13]"),
+                ("mov", "x0, x1")) == ["var t0 = FP.field_0x21;",
+                                       "var t1 = x13.field_0x10;",
+                                       "t0.field_0x14 = x2;", "return t1;"]
+    # A recovered name is the word at its offset: eight bytes where the body read
+    # eight there, and four where it read four.
+    from jadart.expr import lift_function
+
+    def named(*rows):
+        ann = [(i * 4, mn, op, "") for i, (mn, op) in enumerate([*rows, ("ret", "")])]
+        return [ln.strip() for ln in lift_function(ann, receiver={"x1": "this"},
+                                                   fields={8: "balance"})]
+    assert named(("ldur", "x3, [x1, #7]"), ("stur", "w2, [x4, #11]"),
+                 ("mov", "x0, x3")) == ["var t0 = this.balance;", "x4.field_0xc = x2;",
+                                        "return t0;"]
+    assert named(("ldur", "w3, [x1, #7]"), ("stur", "w2, [x4, #11]"),
+                 ("mov", "x0, x3")) == ["x4.field_0xc = x2;", "return this.balance;"]
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

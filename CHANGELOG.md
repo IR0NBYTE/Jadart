@@ -107,6 +107,32 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A store names every live read it writes part of, wherever that read began.** `ldur
+  x1, [x13, #7]; stur w2, [x13, #11]; mov x0, x1` printed `x13.field_0xc = x2;` and then
+  `return x13.field_0x8;`: the read took eight bytes at offset 8, the store wrote four
+  of them at 0xc, and only a read spelled at the store's own offset was named before it
+  (#385). A field store now names each live field read that shares a byte with what it
+  writes, at any two offsets and widths and through any base an object can be read
+  through, so this prints `var t0 = x13.field_0x8;` first and returns `t0`. A read with
+  no byte of the write stays inline. A store into the thread, the pool, the frame or an
+  untagged role's own address, DISPATCH or HEAP, is into memory no Dart object lives in
+  and names only what was read off that base; a store through a pointer read out of one
+  of them names every read it may write. The spelling of a word does not say four bytes
+  or eight, so it is taken for eight at an offset the body read eight at and for four
+  elsewhere, as an element store takes it: a four-byte read at an offset the body also
+  read eight at is named before a store that begins where it ends, which it need not be.
+  The unicorn oracle, over 4,887 programs (reads and stores of 1, 2, 4 and 8 bytes at
+  every pair of offsets that can overlap, off a field, an element, a frame slot, the
+  thread, a pair, a header, a chain and sixteen bytes) at 40 entry states, went from 874
+  programs with a wrong run to none; 717 it cannot decide, against 655 before. On the
+  two fixtures 16 of 16,382 ranges change, 172 lines out and 238 in, 224 of those 410
+  only renumbering a temporary, with 52 more declarations and no error. After
+  `this.field_0xc = x2.field_0x8;`, `this.field_0x14 = x2.field_0x10;` is now
+  `this.field_0x14 = t0;` with `var t0 = x2.field_0x10;` above the first store; after
+  `t0.field_0x18.field_0x10.field_0xc = 0;`, `handleNext(t0.field_0x18.field_0x10, ...)`
+  is `handleNext(t1, ...)` with `var t1 = t0.field_0x18.field_0x10;` above the store;
+  and `t3 = this.field_0x8.field16_0x1;` under `(t0 - 31).tags = 0x4129c;` is `var t1 =
+  this.field_0x8.field16_0x1;` above it.
 - **A branch after an instruction printed raw keeps the value each arm left.** After
   `umulh x3, x5, x6`, a `cbz x1` over `mov x3, #7` and a `ret` of `x3` printed
   `return x3;`, the bare register reading as the last printed write, which was the raw
