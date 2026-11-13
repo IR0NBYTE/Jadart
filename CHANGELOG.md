@@ -107,6 +107,26 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An extended register operand reads the part it extends.** `add x0, x5, w6, sxtw`
+  adds the low 32 bits of x6, sign-extended, and tier 3 printed `return x5 + x6;`, the
+  register whole: the extend was dropped and only the shift after it kept (#369). Each
+  of `uxtb`, `uxth`, `uxtw`, `sxtb`, `sxth` and `sxtw` now prints what it reads, with
+  its shift, on `add`, `sub` and their flag-setting forms: `x5 + x6.toSigned(32)`,
+  `x5 - (x6.toUnsigned(32) << 3)`, `x5 + (x6 & 0xff)`. A value that already is the
+  extension gets no second one, and the index of an element address is the extended
+  value too. `cmn` with an extended operand declines as `cmp` did, where it printed
+  `(x5 + x6) < 0`, and `cmn x5, x6, lsl #3` keeps its shift. The 64-bit carry after
+  it, which was declined while the sum left the shift out, is the carry out of that
+  sum, `(x5 + (x6 << 3)) u< x5`. On the two fixtures 107 ranges of 8,194 and 107 of
+  8,188 change, 410 and 411 lines, nearly all of them the index of an element read off
+  `add xD, xB, wI, sxtw #n`:
+  `FP[x4.field_0x14 - 4 + 6]` is now `FP[(x4.field_0x14 - 4).toSigned(32) + 6]`,
+  `x4[(x2 << 1 << 1) + 8]` is `x4[((x2 << 1 << 1) + 8).toSigned(32)]` and
+  `t0[t1] = t2.field16_0x8;` is `t0[t1.toSigned(32)] = t2.field16_0x8;`. The unicorn
+  oracle, over 3,160 programs of every extend on `add`, `sub`, `cmp`, `cmn`, `adds`
+  and `subs` at 40 entry states each, went from 795 programs with a wrong run to
+  48, all 48 a Smi-tagged operand added whole, which the 64-bit
+  `add x0, x5, x6` prints the same way on main.
 - **A call lists every argument it passes, or prints `(...)`.** `removeViewInsets`
   printed `copyWith(NULL, NULL, NULL)` twice and `copyWith(t5, t6)` for three calls
   that each pass two more arguments in x1 and x2 and an arguments descriptor in x4

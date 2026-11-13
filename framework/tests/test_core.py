@@ -25150,6 +25150,95 @@ def test_a_floating_point_compare_keeps_the_plain_operators():
                     ("pl", ">="), ("lt", "<"), ("ge", ">=")):
         assert _cond_text((0, "fcmp", "d0, d1", ""), "b." + cc, "#0") == f"d0 {rel} d1"
     assert _cond_text((0, "fcmp", "d0, d0", ""), "b.vs", "#0") == "isNaN(d0)"
+def _sx(v, n):
+    """The low `n` bits of `v`, sign-extended."""
+    v &= (1 << n) - 1
+    return v - (1 << n) if v >> (n - 1) else v
+
+
+#: Entry values that tell a 32-bit read from a 64-bit one: each half at its edges.
+_W_EDGE = (0, 1, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff, 0x7fffffff, 0x80000000,
+           0xffffffff, 0x100000000, 0x17fffffff, 0x180000000, 0xffffffff00000000,
+           0xffffffff7fffffff, 0xffffffff80000000, (1 << 63) - 1, 1 << 63, (1 << 64) - 1)
+
+
+def _w_env(rng, regs=("x5", "x6")):
+    """Random 64-bit register values, weighted to `_W_EDGE` and to two registers that
+    agree in their low half and differ above it."""
+    env = {r: rng.choice((rng.getrandbits(64), rng.getrandbits(32), rng.choice(_W_EDGE)))
+           for r in regs}
+    if len(regs) > 1 and rng.random() < 0.2:
+        env[regs[1]] = env[regs[0]] & 0xffffffff | rng.choice(_W_EDGE) >> 32 << 32
+    return env
+
+
+def test_an_extended_register_operand_reads_the_part_it_extends():
+    """`add x0, x5, w6, sxtw` adds the low 32 bits of x6, sign-extended. Tier 3 printed
+    `x5 + x6`, the register whole, and so for every extend, with a shift or without, on
+    `add` and `sub` (#369). Each of the eight extends is checked against the arm64
+    definition on random inputs, in the 64-bit form and the 32-bit one, where the result
+    keeps its low half. An element address reads its index the same way, and a `cmn`
+    with an extended operand, which `cmp` already declined, declines."""
+    import random
+    mask = (1 << 64) - 1
+    one = lambda op: _untag_text([("add", f"x0, x5, {op}")])
+    assert one("w6, sxtw") == "x5 + x6.toSigned(32)"
+    assert one("w6, uxtw") == "x5 + x6.toUnsigned(32)"
+    assert one("w6, uxtb") == "x5 + (x6 & 0xff)"
+    assert one("w6, sxth #2") == "x5 + (x6.toSigned(16) << 2)"
+    assert one("x6, sxtx #1") == "x5 + (x6 << 1)"
+    assert _untag_text([("sub", "x0, x5, w6, uxtw #3")]) == (
+        "x5 - (x6.toUnsigned(32) << 3)")
+    # A value that already is the extension gets no second one, and a literal is folded.
+    untag = [("sbfx", "x6, x6, #1, #0x1f"), ("add", "x0, x5, w6, sxtw")]
+    assert _untag_text(untag) == "x5 + (x6.toSigned(32) >> 1)"
+    assert _untag_text([("sxtw", "x6, w6"), ("add", "x0, x5, w6, sxtw")]) == (
+        "x5 + (x6 << 32 >> 32)")
+    assert _untag_text([("mov", "w6, #-5"), ("add", "x0, x5, w6, uxtw")]) == (
+        "x5 + 0xfffffffb")
+    # A 32-bit result truncated on the way is read before the truncation.
+    assert _untag_text([("add", "w6, w6, w5"), ("add", "x0, x5, w6, sxtw")]) == (
+        "x5 + (x6 + x5).toSigned(32)")
+    rng = random.Random(369)
+    extends = {"uxtb": 8, "uxth": 16, "uxtw": 32, "uxtx": 64,
+               "sxtb": 8, "sxth": 16, "sxtw": 32, "sxtx": 64}
+    for mn in ("add", "sub"):
+        for kind, bits in extends.items():
+            for sh in (0, 1, 3):
+                tail = f"{kind} #{sh}" if sh else kind
+                reg = "x6" if bits == 64 else "w6"
+                wide = _untag_text([(mn, f"x0, x5, {reg}, {tail}")])
+                low = _untag_text([(mn, f"w0, w5, w6, {tail}")])
+                for _ in range(60):
+                    env = _w_env(rng)
+                    a, b = env["x5"], env["x6"]
+                    part = _sx(b, bits) if kind[0] == "s" else b & ((1 << bits) - 1)
+                    want = a + (part << sh) if mn == "add" else a - (part << sh)
+                    assert _dart_int(wide, env) == want & mask, (wide, env)
+                    part = _sx(b, min(bits, 32)) if kind[0] == "s" else (
+                        b & ((1 << min(bits, 32)) - 1))
+                    want = a + (part << sh) if mn == "add" else a - (part << sh)
+                    assert _dart_int(low, env) == want & 0xffffffff, (low, env)
+    # The index of an element address is the extended value, as the address is.
+    elem = _lift_rows([("add", "x1, x13, w6, sxtw #2"), ("ldur", "w0, [x1, #0xf]"),
+                       ("ret", "")])
+    assert elem == ["return x13[x6.toSigned(32)];"], elem
+    # A shifted `cmn` keeps its shift, and the carry out of the sum reads it as the
+    # carry of `adds` does: it printed `?` while the sum was spelled without it.
+    from jadart.cfg import _cond_text
+    cmn = lambda cc: _cond_text((0, "cmn", "x5, x6, lsl #3", ""), "b." + cc, "#0")
+    assert cmn("eq") == "(x5 + (x6 << 3)) == 0"
+    assert cmn("hs") == "(x5 + (x6 << 3)) u< x5" and cmn("hi") == "? u> ?"
+    assert _cond_text((0, "cmn", "w5, w6, lsl #3", ""), "b.hs", "#0") == "? u>= ?"
+    for cc in ("hs", "lo"):
+        for _ in range(60):
+            env = _w_env(rng)
+            assert _reads_371(cmn(cc), env) == _HOLDS_371[cc](
+                *_flags_371("cmn", env["x5"], env["x6"] << 3 & mask)), (cc, env)
+    # `cmn x5, w6, sxtw` printed `(x5 + x6) < 0`. No spelling for it here: raw.
+    for flags in ("cmn", "cmp"):
+        body = _lift_rows([(flags, "x5, w6, sxtw"), ("cset", "x0, lt"), ("ret", "")])
+        assert body == ["cset x0, lt", "return x0;"], body
 
 
 if __name__ == "__main__":
