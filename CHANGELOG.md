@@ -107,6 +107,64 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A field read and an element that may be one word are named before the store.** The
+  elements of an object are the words from its data offset up, and a read at a fixed
+  offset that reaches that far is one of them. The lifter kept the two apart: `ldur x4,
+  [x13, #0x17]; add x16, x13, x8, lsl #3; stur x1, [x16, #0x17]; mov x0, x4` printed
+  `x13[x8] = x1;` and then `return x13.field_0x18;`, the word after the store, where the
+  machine returns it as it was before whenever x8 is 0 (#375). An element read and then a
+  field store went wrong the same way. The rule is now what the layout allows. An element
+  printed `B[I]` off a data offset D is at D or above for an index of zero or more, so an
+  element store names each live field read with a byte at D or past it, and a field store
+  names each live element read whose D its bytes end past, both through any base, since
+  two registers may hold one object. A constant below the index, `B[I - 1]`, lowers D by
+  that many strides. A field that ends below D is the header and no element, so
+  `x13.field_0x10` stays inline across `x13[x8] = x1;` at a data offset of 0x18. That an
+  index is never negative is an assumption and not something the lifter proves: the
+  compiler checks an index against the length before it uses one, and nothing in the rows
+  says it did. Where it did not, `asr x8, x7, #63` making the index 0 or -1, `x13[x8]` can
+  be `x13.field_0x10` and the two are printed apart, as they are on main, and a test keeps
+  that case as it prints. The width decides where a field ends: sixteen bytes, two and one
+  are in the spelling, and a word counts eight where this body read eight at that offset
+  and four anywhere else. An element with no data offset shown, `[x13, x8, lsl #3]` or a
+  displacement of 0, is the access at its address, so its store names every live heap read
+  and every field store names its read, as a raw address does (#341). A store into the
+  frame, THR or PP is into no Dart object and names no element. A store through a pointer
+  read out of one of them is into whatever object that is, and names them as any field
+  store does: `ldr x9, [x26, #0x40]; stur x1, [x9, #0x17]` prints
+  `THR.field_0x40.field_0x18 = x1;` with the element read before it named. A store into an
+  object the rows before it allocated names only the elements read since the allocation,
+  because nothing read before the object was made is a word of it, as a raw store into one
+  names no earlier read (#341). Without that, 363 more values took a name over the nine
+  binaries below, 355 of them an element right in front of the header store of a new
+  object. Two tests said a field read stays inline across a register-offset element store,
+  which is the case above with no displacement, and now say it across a proven element
+  whose data starts past the field. In each fixture 57 bodies change, 34 of them only in
+  the numbers of their temporaries, where a name was made and nothing read it, and 24
+  values gain a name: 2 element reads, 10 field reads and 12 join and arithmetic values
+  the new names move. Three of the changes: `t1[t3].field_0x44 = NULL;` after
+  `t1[t3].field_0x40 = a1;` is now `t4.field_0x44 = NULL;` with `var t4 = t1[t3];` before
+  the first store; a list add, `t0.field_0x10[t1] = pool_0x9650;` and then a read of
+  `t0.field_0x10.field_0xc`, takes `var t2 = t0.field_0x10;` before the store and reads
+  `t2.field_0xc`; and `this.field_0x14 = t6.field_0x8[t3] & ...` after `this.field_0xc =
+  48;` reads `t10`, which is set to `t6.field_0x8[t3]` before that store. Over the two
+  fixtures and the seven app-sweep libraries, with the pair store fix under it, 1,231 of
+  273,863 bodies change, 306 of them only in the numbers of their temporaries, and 1,890
+  values gain a name: 877 field reads, 709 reads at a computed address, 69 element reads
+  and 235 join and arithmetic values; 71,212 lines go and 73,258 come, most of them
+  temporaries renumbered, and no body fails to lift. A frame of thousands of slots under
+  thousands of stores costs less than it did. Every store asked every slot whether it
+  reads what the store writes; past sixteen slots walked for each row of the body, a store
+  keeps the slot texts it does not write and the next store that asks the same asks only
+  about the texts it has not seen. 8,000 rows of element reads kept in slots under field
+  stores lift in 0.27 s where they took 6.2, and of field reads under element stores in
+  0.27 s where 0.77, and the Python calls per row are the same at 1,000 rows and at 2,000,
+  where the larger took 1.3 to 1.5 times the smaller. The unicorn oracle, with a new area
+  of field and element accesses through bases that may be one object and indexes from 0 to
+  3, found a wrong run in 35, 42, 45 and 36 of 3,000 programs on four seeds and finds none
+  it can judge: the one left is a 16-byte copy, which it reads as zero, and prints as it
+  does on main. The count of Python calls to lift forty ordinary bodies is 57,976, under
+  the 58,032 recorded.
 - **A pair store reads both registers and its address before it stores either word.**
   `stp` printed as two stores in a row, and the second took its value and its address
   as they are spelled after the first: `ldur x1, [x13, #8]; stp x2, x1, [x13, #8]`

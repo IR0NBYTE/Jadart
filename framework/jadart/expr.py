@@ -998,6 +998,56 @@ _FRAME_READ = re.compile(r"\((?:FP|SP)(?: [-+] (?:0x[0-9a-fA-F]+|\d+))?\)\.field
                          r"[0-9a-fA-F]+|\b(?:FP|SP)\.field\d*_0x[0-9a-fA-F]+|\b(?:FP|SP)\[")
 
 
+#: The most spellings a store looks for one by one to say whether a field and an
+#: element may be one word (`Lifter._pin_mem`, #375). Past it the store names every
+#: live read of the kind, which is more names and the same cost per row.
+_EDGE_CAP = 64
+#: `Lifter._elems_under`: every element read, where there are more than `_EDGE_CAP`.
+_EVERY = object()
+#: `Lifter._pin_mem`: the element reads a field store may write, not asked for yet.
+_LATER = object()
+#: How many slots `Lifter._pin_mem` walks, per row of the function, before it keeps
+#: the texts a store was found not to write. Ordinary code stays far under it: a store
+#: walks the slots the frame holds, and the walks of a whole body come to a few times
+#: its rows. A body made to hold thousands of slots across thousands of stores passes
+#: it at once, and from there a store like the one before it asks about a slot's text
+#: once and not once a store.
+_PIN_WALK = 16
+#: How many kinds of store `_pin_mem` keeps those texts for, the oldest dropped first.
+_PIN_KEPT = 8
+
+#: A field read spelled by its offset, with the width its spelling states.
+_FIELD_AT = re.compile(r"(?<!\bTHR)(?<!\bPP)\.field(\d*)_0x([0-9a-fA-F]+)")
+#: The same off any base, to count the `.` of a text that are one.
+_FIELD_ANY = re.compile(r"\.field\d*_0x[0-9a-fA-F]+")
+#: The bases a store goes INTO that hold no Dart object, so no element of one: the
+#: thread and the object pool. A store through a pointer read out of one is a store
+#: into whatever object that pointer is (`Lifter._pin_mem`, #375).
+_NO_OBJECT = frozenset((_THR, "PP"))
+
+
+def _fields_in(text: str) -> tuple:
+    """Where the fields `text` reads off a heap object end, which an element store
+    asks of every live value (`Lifter._pin_mem`, #375), so it is made once a text.
+    The furthest byte a spelling states, with a word taken for four bytes; the
+    offsets of the words that end past that if they are eight; and whether a `.` in
+    it is anything but a field spelled by its offset, which is where a named field
+    would be. Not a read off the frame, which no heap store reaches, nor off THR or
+    PP, which are no Dart objects."""
+    named = text.count(".") != len(_FIELD_ANY.findall(text))
+    if "P" in text:
+        text = _FRAME_READ.sub("", text)
+    end, words = 0, set()
+    for m in _FIELD_AT.finditer(text):
+        off, w = int(m.group(2), 16), m.group(1)
+        if w:
+            end = max(end, off + int(w))
+        else:
+            end = max(end, off + 4)
+            words.add(off)
+    return end, tuple(o for o in words if o + 8 > end), named
+
+
 def _fresh_v(v) -> bool:
     """Whether `v` is the pointer an inline allocation made (`Lifter._offset`, #329): a
     store off it cannot reach memory older than the object (#341)."""
@@ -4144,6 +4194,8 @@ class Lifter:
         #: first asked.
         self.data_offsets = _data_offsets(None)
         self._elem_box = {}
+        #: The lowest field offset the element `_elem_access` last named can be at.
+        self._elem_lo = 0
         #: Prints an operand kept as is, and names a range with no name; see
         #: lift_function.
         self.show = None
@@ -4198,6 +4250,9 @@ class Lifter:
         #: can be spelled one by name and one by offset, and the may-alias rule compares
         #: spellings.
         self._named_at: dict = {}
+        #: How many names it holds, so what was made of them is made again when one
+        #: is added and not at every store (`_pin_mem`).
+        self._named_n = 0
         #: The CastClass a cast proves the base of an access an instance of, on every
         #: path to that access, keyed by (instruction address, base register)
         #: (fields.cast_accesses). The THIRD base whose class is read rather than
@@ -4305,6 +4360,15 @@ class Lifter:
         #: whichever site minted it. Before, only `_phi`'s and `_name_blind`'s were
         #: hoistable, and a name any other site minted was not (#204).
         self.minted: set = set()
+        #: How many names `_mint` had made before each, for a store into an object
+        #: this body allocated to tell the reads made since (`_pin_mem`, #375).
+        self._mint_at: dict = {}
+        self._mints = 0
+        #: Each element this walk read, as (text, lowest offset), and beside it how
+        #: many names had been made by then (`_elem_read`). This walk's and not the
+        #: body's (`_elem_box`): the count starts again with each walk.
+        self._elem_reads: list = []
+        self._elem_when: list = []
         #: The registers each spelled record named, so `_lift_function` can tell whether
         #: the prior above would change an answer and pay for the extra walk only then.
         self.spelled_regs: set = set()
@@ -4414,6 +4478,13 @@ class Lifter:
         #: over the dominator tree once; see _kill_fold.
         self._kfold = None
         self._kwalked = 0
+        #: the slots `_pin_mem` has walked, and how many it walks before it keeps what
+        #: a store did not write (`_PIN_WALK`), made at the first store with a slot.
+        self._pin_walked, self._pin_budget = 0, None
+        #: what `_pin_mem` keeps of this walk: per edge, the selectors of the named
+        #: fields past it, and per kind of store, the slot texts it does not write.
+        self._past_at: dict = {}
+        self._unread: dict = {}
         self._defs: dict = {}
         #: per block, whether it stores where `_writes_stack`, `_writes_heap` and
         #: `_writes_outgoing` ask, calls (`_CALLS`, or `bl`/`blr`), or what `_exit_slots`
@@ -5834,6 +5905,8 @@ class Lifter:
         name = f"t{st.tmpc[0]}"
         st.tmpc[0] += 1
         self.minted.add(name)
+        self._mint_at[name] = self._mints
+        self._mints += 1
         if name in self.hoist:
             self.hoisted.add(name)
             # Already declared at the top, so an initialiser-less one needs no line at all.
@@ -5943,7 +6016,8 @@ class Lifter:
             st.poolbase.pop(key, None)
         return out
 
-    def _pin_mem(self, st: State, loc: str, also=(), anywhere=False, elems=False) -> list:
+    def _pin_mem(self, st: State, loc: str, also=(), anywhere=False, elems=False,
+                 edge=None, keep=None, since=None) -> list:
         """Give a name to every LIVE tracked value that reads `loc`, before `loc` changes.
 
         Two more ways a store reaches a read, both because an access at a COMPUTED
@@ -5958,6 +6032,36 @@ class Lifter:
         (`_at_reads("elem")`), whatever its base and index: `x6[x7]` is `x3[x4]` when x6
         holds x3 and x7 holds x4, as two registers may hold one object for a field
         (#343).
+
+        And `edge`, a field against an element (#375). The elements of an object are
+        the words from its data offset up, and a field read at a fixed offset that
+        reaches that far is one of them: `ldur x4, [x13, #0x17]` is element 0 of the
+        array `add x16, x13, x8, lsl #3; stur x1, [x16, #0x17]` stores into, whenever
+        x8 is 0, and through any two bases that hold one object. So an element store
+        names each live field read with a byte at `edge`, the lowest offset the
+        element can be at, or past it (`_field_past`), and a field store names each
+        live element read that can be below `edge`, the end of the bytes it writes
+        (`_elems_under`). A field that ends below the data offset is the header and no
+        element. An element with no data offset shown is spelled by its address and
+        nothing else, and both ways it is the access at a computed address above.
+        Past `_EDGE_CAP` spellings to look for, a store names every live heap read, or
+        every live element read: more names, and the work stays linear in the rows.
+        The caller gives no `edge` for a store into the thread, the pool or the frame,
+        which hold no Dart object. `since` is for a store into an object this body
+        allocated: the order of the name its address was given, so that only the
+        elements read after it are named, as nothing read before the object was made
+        is a word of it (#341).
+
+        That an element is at its data offset or above is an ASSUMPTION about the
+        compiler and not something the rows prove: compiled Dart checks every index
+        against the length before it is used, so an index is never negative, and the
+        lifter does not look for the check. Rows that index with a negative number,
+        `asr x8, x7, #63` for one, reach below the data offset, and a header field
+        read stays inline across that store (`_elem_access`).
+
+        `keep` is the element address the second word of an `stp` is still to be
+        stored through. Its base and index take names where every other record that
+        reads the write is dropped, so the second word prints as the element it is.
 
         `also` is the OTHER spellings of bytes this write covers, which a 16-byte access
         needs because the spelling says the width: a write of `x2.field16_0x8` lands on
@@ -6031,15 +6135,53 @@ class Lifter:
         at = self._at_reads() if "at" in box else None
         maybe = self._at_reads("maybe_sel") if "maybe_sel" in box else None
         el = self._at_reads("elem") if elems and "elem" in box else None
+        past = under = None
+        wide, risky = (), False
+        if edge is not None:
+            if elems:
+                # The named fields that reach the elements, by their selectors: made
+                # again when a name or a wide word is added, not at every store.
+                wide = box.get("wide", ())
+                if self._named_at:
+                    made = self._past_at
+                    got, now = made.get(edge), (self._named_n, len(wide))
+                    if got is None or got[0] != now:
+                        past = tuple("." + n for off, ns in self._named_at.items()
+                                     if off + (8 if off in wide else 4) > edge
+                                     for n in ns)
+                        # A name that starts as `.field_0x10` does is found inside
+                        # one, so a text is asked whatever its `.` are.
+                        got = made[edge] = (now, past,
+                                            any(n.startswith(".f") for n in past))
+                    past, risky = got[1], got[2]
+                else:
+                    past = ()
+                if len(past) > _EDGE_CAP:
+                    past, anywhere = None, True
+                else:
+                    fields = box.get("fields")
+                    if fields is None:
+                        fields = box["fields"] = {}
+            elif "elem_at" in box:
+                under = _LATER                # made where a live value has an element
+        # A field's spellings each have a `.` in them (`_covers`) and an element's a
+        # `[`, so a text with neither is not asked for them. Over thousands of slots
+        # that is most of what a store asks.
+        dotted, indexed = sel is not None, sel is None and "[" in loc and not also
 
         def reads(text):
-            # The two tests that need `_addr_facts` (`_at_computed`) come last and ask
-            # only once a text depends on them, so a body pays for the analysis only
-            # where a live value could be named by it.
-            nonlocal at, maybe, anywhere
-            if (_spelled(texts, text) or (alias is not None and alias.search(text))
+            # The two tests that need `_addr_facts` (`_at_computed`) ask only once a
+            # text depends on them, so a body pays for the analysis only where a live
+            # value could be named by it. The one put off comes before the tests of
+            # #375, which would name most of what it asks about and leave every later
+            # access to read the rows back for itself (`_row_plain`).
+            nonlocal at, maybe, anywhere, under
+            dot, bracket = "." in text, "[" in text
+            if ((dot if dotted else bracket or not indexed)
+                    and (_spelled(texts, text)
+                         or (alias is not None and alias.search(text)))
                     or (at is not None and _spelled(at, text))
-                    or (el is not None and _spelled(el, text, True))):
+                    or (el is not None and bracket and _spelled(el, text, True))):
                 return True
             if (maybe is not None and _spelled(maybe, text)
                     and any(x in text for x in self._elem_box["maybe"])):
@@ -6047,7 +6189,21 @@ class Lifter:
                 at, maybe = self._at_reads(), None
                 if at is not None and _spelled(at, text):
                     return True
-            if not anywhere or "." not in text and "[" not in text:
+            if past is not None and dot:
+                got = fields.get(text)
+                if got is None:
+                    got = fields[text] = _fields_in(text)
+                if (got[0] > edge
+                        or got[1] and any(o + 8 > edge and o in wide for o in got[1])
+                        or past and (got[2] or risky) and _spelled(past, text)):
+                    return True
+            if under is not None and bracket:
+                if under is _LATER:
+                    under = self._elems_under(edge, since)
+                if under and (under is _EVERY
+                              or self._elem_below(text, since, under)):
+                    return True
+            if not anywhere or not (dot or bracket):
                 return False                  # every read of the heap has one of them
             if self._reads_mem(_FRAME_READ.sub("", text)):
                 if anywhere is not True:
@@ -6074,11 +6230,57 @@ class Lifter:
         # at all, so a slot that reads the written location is dropped rather than named.
         # Dropping is honest (the reload renders as the bare destination register) and does
         # not spend a declaration on a spill nothing reloads.
-        for key in [k for k, v in st.slot.items() if reads(v.text)]:
-            st.forget_slot(key)
+        slots = st.slot
+        if slots:
+            self._pin_walked += len(slots)
+            budget = self._pin_budget
+            if budget is None:
+                budget = self._pin_budget = _PIN_WALK * sum(
+                    len(b.insns) for b in self.blocks.values())
+            if self._pin_walked <= budget or maybe is not None or anywhere:
+                for key in [k for k, v in slots.items() if reads(v.text)]:
+                    st.forget_slot(key)
+            else:
+                # Past `_PIN_WALK` the walks have cost more than the body is long, which
+                # is a frame of thousands of slots under thousands of stores. A slot's
+                # text that this store does not write is kept, under everything the
+                # answer is made of, and a store that asks the same thing again asks
+                # only about the texts it has not seen. Not where the analysis of the
+                # body may still be asked (`maybe`, `anywhere`), which is no text's
+                # alone to answer.
+                kept = self._unread
+                what = (texts, alias and alias.pattern, at and len(at), el and len(el),
+                        edge, past, len(wide))
+                if under is not None:
+                    what += (since, len(box["elem_at"][1]),
+                             since is not None and len(self._elem_when))
+                unread = kept.get(what)
+                if unread is None:
+                    if len(kept) >= _PIN_KEPT:
+                        del kept[next(iter(kept))]
+                    unread = kept[what] = set()
+                for key, text in [(k, v.text) for k, v in slots.items()
+                                  if v.text not in unread]:
+                    if reads(text):
+                        st.forget_slot(key)
+                    else:
+                        unread.add(text)
         for key, (b, i, _s, _f) in list(st.elem.items()):
-            if reads(b.text) or reads(i.text):
+            rb, ri = reads(b.text), reads(i.text)
+            if not (rb or ri):
+                continue
+            if key != keep:
                 del st.elem[key]
+                continue
+            got = []
+            for v, hit in ((b, rb), (i, ri)):
+                if hit:
+                    tmp, decl = self._mint(st, v.text)
+                    out.append(decl)
+                    self.raw_names.add(tmp)
+                    v = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                got.append(v)
+            st.elem[key] = (got[0], got[1], _s, _f)
         return out
 
     def _at_reads(self, kind="at"):
@@ -6098,6 +6300,65 @@ class Lifter:
         if made is None or made[0] != len(got):
             made = box[kind + "_re"] = (len(got), tuple(got))
         return made[1]
+
+    def _elems_under(self, edge: int, since):
+        """The element reads this body made that can be at a field offset below
+        `edge`, the end of the bytes a field store writes (#375): `x3[x4]`, read at a
+        data offset of 0x18, for a store to `.field_0x18` or past it of any base, and
+        for none to `.field_0x10`. As the data offsets under `edge` that an element
+        was read at, for `_elem_below`, or `_EVERY` where more than `_EDGE_CAP` texts
+        were read at them, counted from the lowest offset up and no further, so a
+        store's share of the work does not grow with the body.
+
+        With `since`, for a store into an object this body allocated (`_pin_mem`):
+        the texts of the ones read after the name of that order was made, which is
+        after the allocation, and `_EVERY` past `_EDGE_CAP` reads since."""
+        by_lo, _pairs, los = self._elem_box["elem_at"]
+        if since is not None:
+            read = self._elem_reads
+            i = bisect.bisect_right(self._elem_when, since)
+            if len(read) - i > _EDGE_CAP:
+                return _EVERY
+            return tuple(dict.fromkeys(r[0] for r in read[i:] if r[1] < edge))
+        n = 0
+        for k, lo in enumerate(los):
+            if lo >= edge:
+                return los[:k]
+            n += len(by_lo[lo])
+            if n > _EDGE_CAP:
+                return _EVERY
+        return tuple(los)
+
+    def _elem_below(self, text: str, since, under) -> bool:
+        """Whether `text` has in it, as a whole name (`_spelled`), an element read
+        that `_elems_under` gave `under` for. Asked of every live value at every
+        field store, so what a text has in it is kept by data offset: each element
+        read is looked for in a text once, and a text asked again is asked only
+        about the reads made since. The few read since an allocation are looked for
+        as they are."""
+        if since is not None:
+            return _spelled(under, text, True)
+        box = self._elem_box
+        seen = box.get("elem_in")
+        if seen is None:
+            seen = box["elem_in"] = {}
+        got = seen.get(text)
+        if got is None:
+            got = seen[text] = {}
+        by_lo = box["elem_at"][0]
+        for lo in under:
+            had = got.get(lo)
+            if had is True:
+                return True
+            texts = by_lo[lo]
+            n = len(texts)
+            if had != n:
+                for x in texts[had or 0:]:
+                    if x in text and _spelled((x,), text, True):
+                        got[lo] = True
+                        return True
+                got[lo] = n
+        return False
 
     def _at_read(self, text: str, got) -> None:
         """Record `text`, a read `_at_computed` gave `got` for: one at a computed
@@ -6129,7 +6390,26 @@ class Lifter:
         """`v`, an element this body read, recorded for the element stores after it to
         name (#343). An element of the frame, `FP[x4]`, is no heap store's to write."""
         if not _FRAME_ROOT.match(v.text.split("[", 1)[0]):
-            self._elem_box.setdefault("elem", {})[v.text] = None
+            box = self._elem_box
+            box.setdefault("elem", {})[v.text] = None
+            # And by the lowest offset it can be at, for the field stores (#375): each
+            # text at each offset once, in the order they were first read, and every
+            # read of this walk with how many names had been made by then
+            # (`_elems_under`).
+            made = box.get("elem_at")
+            if made is None:
+                made = box["elem_at"] = ({}, set(), [])
+            by_lo, pairs, los = made
+            r = (v.text, self._elem_lo)
+            if r not in pairs:
+                pairs.add(r)
+                texts = by_lo.get(r[1])
+                if texts is None:
+                    texts = by_lo[r[1]] = []
+                    bisect.insort(los, r[1])
+                texts.append(r[0])
+            self._elem_when.append(self._mints)
+            self._elem_reads.append(r)
         return v
 
     def _at_computed(self, base_reg: str, base_v: V, spelled: V):
@@ -6600,7 +6880,13 @@ class Lifter:
                     self._cast_re = None
         if name:
             tag = "." + name
-            self._named_at.setdefault(byte_off, set()).add(name)
+            names = self._named_at.get(byte_off)
+            if names is None:
+                self._named_at[byte_off] = {name}
+                self._named_n += 1
+            elif name not in names:
+                names.add(name)
+                self._named_n += 1
         elif width not in (4, 8):
             tag = f".field{width}_0x{byte_off:x}"
         else:
@@ -7204,15 +7490,22 @@ class Lifter:
             # read again the same way (#372).
             words = [(disp, ops[0], val)] + ([(pair[1], ops[1], pair[2])] if pair else [])
             out, cast = list(basedecl), self.cast_at.get((at, base))
+            second_elem = (pair is not None and base in st.elem and self._elem_access(
+                base, index, scale, st, pair[1]) is not None)
             for k, (d, reg, v) in enumerate(words):
                 if k:
                     v = g(pair[0])
                 elem = (self._elem_access(base, index, scale, st, d)
                         if index is not None or base in st.elem else None)
                 if elem is not None:                          # element store
-                    # Every element read is named, through any base (#343).
-                    tgt, also, anywhere = elem, (), False
+                    # Every element read is named, through any base (#343), and every
+                    # field read that reaches the elements (#375). An element with no
+                    # header shown is the store at its address, which may be to any
+                    # field of any object (#341).
                     elems = not _FRAME_ROOT.match(elem.text.split("[", 1)[0])
+                    edge = (self._elem_lo or None) if elems else None
+                    tgt, also, anywhere = elem, (), elems and edge is None
+                    since = None
                 else:
                     w = _access_width(mn, reg)
                     # `_rebase` and not `_byte_off`: a displacement below the base goes
@@ -7231,16 +7524,34 @@ class Lifter:
                     # of any object, so every live read of the heap is named first
                     # (#341).
                     tgt = self._field(bv, off, w, cast, hdr)
-                    anywhere = not _fresh_v(held) and self._at_computed(base, held, bv)
+                    fresh = _fresh_v(held)
+                    anywhere = not fresh and self._at_computed(base, held, bv)
+                    # The bytes end here: an element read that can be below it is
+                    # named (#375). Not for a store into the thread, the pool or the
+                    # frame, which hold no Dart object: a store through a pointer
+                    # read out of one of them is to whatever object that is. And for
+                    # a store into an object these rows allocated, only an element
+                    # read since the allocation, which is since its address was named
+                    # at the store back to the thread: nothing read before the object
+                    # was made is a word of it (#341).
                     elems = False
+                    edge = (None if bv.text in _NO_OBJECT or _FRAME_ROOT.match(bv.text)
+                            else off + w)
+                    since = self._mint_at.get(held.at[0].text) if fresh else None
                 # The value being stored was read off the map before this, so `+=` still
                 # renders: the rhs keeps the field's own spelling even when a register
                 # holding it is pinned on the way past.
-                live = self._live_after
+                live, keep = self._live_after, None
                 if pair and not k:
-                    self._live_after = live | _reg_mask((pair[0], base))
+                    # Where the second word is an element, the address keeps its
+                    # record, with names (`_pin_mem`); anywhere else the word is
+                    # addressed off the base register.
+                    keep = base if second_elem else None
+                    self._live_after = live | _reg_mask(
+                        (pair[0],) if keep else (pair[0], base))
                 try:
-                    out.extend(self._pin_mem(st, tgt.text, also, anywhere, elems))
+                    out.extend(self._pin_mem(st, tgt.text, also, anywhere, elems, edge,
+                                             keep, since))
                 finally:
                     self._live_after = live
                 out.append(self._assign(tgt, v))
@@ -7473,6 +7784,13 @@ class Lifter:
                 else:
                     wk = _access_width(mn, ops[k])
                     bv, off, hdr = self._rebase(base, at_base, d)
+                    if wk == 8:
+                        # The spelling of a word does not say four bytes or eight,
+                        # and an element store asks which (`_field_past`).
+                        wide = self._elem_box.get("wide")
+                        if wide is None:
+                            wide = self._elem_box["wide"] = set()
+                        wide.add(off)
                     v = self._field(bv, off, wk,
                                     cast if off == d + 1 and bv is at_base else None, hdr)
                     # A read at its address, at any offset: a store through any base
@@ -7824,6 +8142,7 @@ class Lifter:
             if index_reg is not None:
                 # `[xD, xJ]` off an element address: the address plus a second index,
                 # which the entry's own index does not say.
+                self._elem_lo = 0
                 return V(f"{_wrap(self._leaf(base_reg, st), P_POST)}"
                          f"[{self._leaf(index_reg, st).text}]", P_POST)
             base_v, idx_v, s, offs = st.elem[base_reg]
@@ -7841,7 +8160,16 @@ class Lifter:
                 return None
             idx = (idx_v.text if k == 0 else _bin(idx_v, "+", _num(k), P_ADD).text
                    if k > 0 else _bin(idx_v, "-", _num(-k), P_ADD).text)
+            # The lowest field offset the access reaches with an index of zero or more:
+            # the data offset with the tag bias, less the strides below the index. 0
+            # where no header was shown, which says nothing about where it is.
+            # That the index is zero or more is assumed, not proven: compiled Dart
+            # checks an index against the length before it uses it, and the rows are
+            # not searched for the check. `asr x8, x7, #63` as the index is -1 or 0,
+            # and its element is the word below the data offset (`_pin_mem`, #375).
+            self._elem_lo = max(at + 1 + (k << s if k < 0 else 0), 0) if at else 0
             return V(f"{_wrap(base_v, P_POST)}[{idx}]", P_POST)
+        self._elem_lo = 0
         base_v = self._leaf(base_reg, st)
         idx_v = self._leaf(index_reg, st) if index_reg else V("0", P_ATOM)
         return V(f"{_wrap(base_v, P_POST)}[{idx_v.text}]", P_POST)
