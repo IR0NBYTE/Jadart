@@ -18781,7 +18781,8 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     # the other register file reads none: it is `fmov`'s reinterpretation.
     for st, ld, want in (("stur w0", "ldursw x3", "x0 << 32 >> 32"),
                          ("sturh w0", "ldursh x3", "x0 << 48 >> 48"),
-                         ("sturb w0", "ldursb w3", "x0 << 56 >> 56"),
+                         # Into a w register the extension stops at 32 bits (#374).
+                         ("sturb w0", "ldursb w3", "(x0 << 56 >> 56).toUnsigned(32)"),
                          ("sturh w0", "ldurh w3", "x0 & 0xffff"),
                          ("sturb w0", "ldurb w3", "x0 & 0xff"),
                          ("stur w0", "ldur w3", "x0")):        # as `mov w3, w0`: guard
@@ -25622,6 +25623,41 @@ def test_a_shifted_operand_of_a_32_bit_instruction_is_shifted_at_32_bits():
                 env = _w_env(rng)
                 want = bool(holds(*_flags32("tst", env["x5"], shifted(env["x6"], 3))))
                 assert bool(_dart_int(cond, env)) == want, (sh, cc, text, env)
+
+
+def test_a_signed_load_into_a_w_register_is_extended_to_32_bits():
+    """`ldursh w0, [x13, #7]` sign-extends two bytes to 32 bits and clears the top half
+    of x0. Tier 3 printed `x13.field2_0x8 << 48 >> 48`, the extension to 64 bits, which
+    is negative where the register holds a positive value (#374). The same load into an
+    x register is extended to 64, as it was. A frame slot and an element read the same
+    way, and a 32-bit consumer reads the value before the truncation."""
+    ret = lambda rows: _lift_rows(list(rows) + [("ret", "")])[-1]
+    assert ret([("ldursh", "w0, [x13, #7]")]) == (
+        "return (x13.field2_0x8 << 48 >> 48).toUnsigned(32);")
+    assert ret([("ldursb", "w0, [x13, #7]")]) == (
+        "return (x13.field1_0x8 << 56 >> 56).toUnsigned(32);")
+    assert ret([("ldrsb", "w0, [x13, #8]")]) == (
+        "return (x13.field1_0x9 << 56 >> 56).toUnsigned(32);")
+    assert ret([("ldursh", "x0, [x13, #7]")]) == "return x13.field2_0x8 << 48 >> 48;"
+    assert ret([("ldursw", "x0, [x13, #7]")]) == "return x13.field_0x8 << 32 >> 32;"
+    slot = [("sturh", "w5, [x29, #-8]"), ("ldursh", "w0, [x29, #-8]")]
+    assert ret(slot) == "return (x5 << 48 >> 48).toUnsigned(32);"
+    assert ret([("ldrsh", "w0, [x9, x7]")]) == (
+        "return (x9[x7] << 48 >> 48).toUnsigned(32);")
+    # What the w register holds, read by a 64-bit add, a 32-bit one and a compare.
+    load = [("ldursh", "w1, [x13, #7]")]
+    assert ret(load + [("add", "x0, x1, x5")]) == (
+        "return (x13.field2_0x8 << 48 >> 48).toUnsigned(32) + x5;")
+    assert ret(load + [("add", "w0, w1, w5")]) == (
+        "return ((x13.field2_0x8 << 48 >> 48) + x5).toUnsigned(32);")
+    assert ret(load + [("cmp", "w1, #0"), ("cset", "x0, lt")]) == (
+        "return (x13.field2_0x8 << 48 >> 48) < 0 ? 1 : 0;")
+    # The value printed is the one the register holds. `<< 48 >> 48` on Dart's 64-bit
+    # ints is `.toSigned(16)`, which `_dart_int` has and a wrapping shift it has not.
+    text = ret([("ldursh", "w0, [x13, #7]")])[len("return "):-1]
+    text = text.replace("x13.field2_0x8 << 48 >> 48", "f.toSigned(16)")
+    for half in (0, 1, 0x7fff, 0x8000, 0xffff, 0x1234, 0xfedc):
+        assert _dart_int(text, {"f": half}) == _sx(half, 16) & 0xffffffff, (text, half)
 
 
 if __name__ == "__main__":
