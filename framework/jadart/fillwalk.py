@@ -107,6 +107,10 @@ class FillResult:
     code_first_ref: int = -1   # the Code cluster's first ref id; the serialized dispatch
                                # table repeats it, which anchors the table exactly (see
                                # dispatch.py / Serializer::WriteDispatchTable)
+    #: The first ref this snapshot's own clusters allocate. Every ref below it is a base
+    #: object, one the VM snapshot holds and this one only names (Serializer::
+    #: AddBaseObject), so nothing here says what it is. 0 where that is not known.
+    first_ref: int = 0
     # Redundantly-encoded values kept for the acceptance gates (verify.py). Each is read by
     # the fill pass anyway and is cross-checkable against a value the ALLOC pass read, which
     # ties the two passes together without needing an external oracle.
@@ -383,6 +387,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     return FillResult(strings=strings, functions=functions, fields=fields,
                       classes=classes, types=types, codes=codes, pool=pool, end_pos=st.pos,
                       code_first_ref=code_first, func_code_index=func_code_index,
+                      first_ref=min((cl.start_ref for cl in clusters), default=0),
                       class_sizes=class_sizes, class_unboxed=class_unboxed,
                       class_state=class_state, class_interfaces=class_interfaces,
                       code_stub_refs=code_stub_refs,

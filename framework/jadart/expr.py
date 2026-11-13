@@ -4188,6 +4188,8 @@ class Lifter:
                  selectors=None, entry=None, fields=None, allocs=None, casts=None):
         self.blocks = blocks
         self.pool_map = pool_map or {}
+        #: Pool byte offset -> the arguments descriptor there (disasm.PoolMap.descs).
+        self.pool_descs = getattr(pool_map, "descs", None) or {}
         #: The displacements an element access is read at, `Target.data_offsets`'s pair
         #: for compressed pointers unless `lift_function` is told otherwise, and per
         #: element address the ones its accesses reach (`_elem_offsets`), made when
@@ -4323,6 +4325,8 @@ class Lifter:
         self._live_after = 0
         #: (call reads, live in, live out) per block; see _printed_liveness.
         self._printed = None
+        #: {call address: _call_plan's answer}, filled a block at a time by _call_reads.
+        self._plans: dict = {}
         #: The block being lifted and the index of the instruction in it; see _reads_next.
         self._insns, self._at = (), 0
         #: Temporaries minted for a call result. Only these may be folded back into their
@@ -4331,6 +4335,9 @@ class Lifter:
         self.results: set = set()
         #: Names _verbatim gave, which _drop_unread leaves out where nothing reads them.
         self.raw_names: set = set()
+        #: The names `_mint` gave a value the lifter does not know: declared and never
+        #: assigned. An argument list that reads one is not printed (`_exact`).
+        self.unknown: set = set()
         #: Registers the printed body has assigned SO FAR in this walk.
         self._printed_regs: set = set()
         #: Registers the printed body assigns ANYWHERE in the function, handed in by the
@@ -4656,35 +4663,182 @@ class Lifter:
         """{index: the registers the call there prints, as a mask} for one block.
 
         `_def_use` says a direct call reads no register, which is what the machine needs
-        and not what the printed body does: `_call_args` spells the callee's register
-        arguments when its arity is known, and a throw prints x0. A value reloaded from a
-        slot only to be passed to a call is read by the reader, and `_slot_crossings` has
-        to count it (#64): `handleMessage` reloads a spilled field to pass it on, and the
-        argument printed as a fresh read of the field after the calls in between. The
-        tests `_call_args` makes that the block shows: a stub, an arity it cannot read, a
-        StackArity short of six registers, handed a double or whose reach is not known.
-        The other ones, an argument register the walk holds no value for and fewer values
-        pushed than a StackArity reads, are decided by the walk, and a call that prints
-        `...` for them counts its reads all the same; the cost is a name nothing reads. An
-        indirect call needs nothing here: liveness already sees it read its target, and a
-        dispatch call's receiver is read by the class id load in front of it."""
-        out = {}
-        for i, (_a, mn, op, note) in enumerate(insns):
-            if mn != "bl":
+        and not what the printed body does: `_call_args` spells the register arguments
+        where they are known, and a throw prints x0. A value reloaded from a slot only
+        to be passed to a call is read by the reader, and `_slot_crossings` has to count
+        it (#64): `handleMessage` reloads a spilled field to pass it on, and the
+        argument printed as a fresh read of the field after the calls in between.
+
+        Which registers is `_call_plan`'s to say, from the rows alone, and its answer is
+        kept for the walk to print from, so the two cannot disagree. What only the walk
+        can decide, an argument register it holds no value for or a pushed list of the
+        wrong length, prints `...` and counts its reads all the same; the cost is a name
+        nothing reads. An indirect call reads its target and a dispatch call's receiver
+        is read by the class id load in front of it, which liveness already sees; the
+        other registers one prints are counted here as a direct call's are."""
+        out, sites = {}, None
+        for i, (a, mn, op, note) in enumerate(insns):
+            if mn not in _CALLS:
                 continue
             name = note.split("-> ", 1)[1].strip() if "-> " in note else None
-            ops = _split_ops(op)
-            target = _imm(ops[0]) if ops and ops[0].startswith("#") else None
-            if name and "_iso_stub_" in name:
+            if mn == "bl" and name and "_iso_stub_" in name:
                 if _classify_stub(name)[0] == "throw":
                     out[i] = _reg_mask((_T.ret_int,))
-            elif not (name and "stub" in name) and self.arity is not None and (
-                    target is not None):
-                k = self.arity(target)
-                if k and not (isinstance(k, StackArity) and (  # `...`; _call_args
-                        k < len(ARG_REGS) or k.fpu or k.need is None)):
-                    out[i] = _reg_mask(ARG_REGS[:k])
+                continue
+            if sites is None:
+                sites = _call_sites(insns)
+            target = None
+            if mn == "bl":
+                ops = _split_ops(op)
+                target = _imm(ops[0]) if ops and ops[0].startswith("#") else None
+            plan = self._plans[a] = self._call_plan(mn, a, name, target, sites[i])
+            if plan is not None and plan[0]:
+                out[i] = _reg_mask(ARG_REGS[:plan[0]])
         return out
+
+    def _call_plan(self, mn, addr, name, target, site):
+        """How the call at `addr` lists its arguments, as far as the rows say: (how many
+        of ARG_REGS, the arguments descriptor or None, how the rest is read), or None
+        where it prints `...`.
+
+        `site` is `_call_sites`'s (descriptor, cpu, fpu, words) for it. The last word is
+
+          desc   the descriptor counts them: `count - size` in registers and `size`
+                 words pushed, a type-argument vector above those (`_plan_desc`);
+          regs   registers only, and nothing pushed;
+          six    all six registers and then what was pushed (a StackArity);
+          stack  what was pushed, and no register;
+          cached the same under a descriptor the VM made, where what was pushed is the
+                 words the call's own block stored (the middle of the plan);
+          all    the same, before 3.4, for a callee that reads no argument: what was
+                 pushed is every argument there, and an empty list where nothing was;
+          pushed what was pushed, with nothing asked of it: the first word pushed is
+                 taken for the receiver of a dispatch call that has one in a register.
+
+        A list is every argument or it is `...`, so each of the others declines
+        where the rows show an argument it would leave out. A callee that reads x4 with
+        no descriptor loaded for it takes a list this cannot count. An argument register
+        the caller wrote and nothing read is one more argument, or an input of a stub
+        whose registers are its own: past the ones the callee reads it is a parameter
+        the callee leaves to the code it jumps on to, `containsKey(a)` over a key in x2,
+        and beside a pushed list it means the registers carry some. How many is not
+        said either way. A V register so written, where the callee is not read, is a
+        double passed beside the x registers in no order said (#155), and so is one
+        where the callee reads no V register: the list would leave the double out. None
+        of that is asked before 3.4, where a register carries no argument at all."""
+        desc, cpu, fpu, words = site
+        ar = self.arity
+        if ar is None:
+            # No resolver: nothing is known of any callee or of the release, and the
+            # list is what was pushed, as it was. Only a caller that asks for no
+            # argument reconstruction lifts this way, and no command does.
+            return 0, None, "pushed"
+        conv = getattr(ar, "convention", None)
+        if conv == "stack":
+            cpu, fpu = -1, False
+        if mn != "bl":
+            if desc is not None:
+                return self._plan_desc(desc, cpu, fpu, words, conv, (),
+                                       addr in self.dispatch)
+            # With none, only a dispatch call is a Dart call: the rest go through a
+            # Code's entry point to a stub, whose registers are its own (#280).
+            if addr in self.dispatch and (cpu >= 0 or fpu):
+                return None
+            return 0, None, "stack"
+        if name and "stub" in name:
+            return 0, None, "stack"
+        known = target is not None
+        ent = getattr(ar, "entry", None)
+        ent = ent(target) if ent is not None and known else None
+        if desc is not None:
+            return self._plan_desc(desc, cpu, fpu, words, conv,
+                                   ent[0] if ent is not None else ())
+        k = ar(target) if known else None
+        if k is None:
+            if cpu >= 0 or fpu or (ent is not None and (ent[1] or ent[2])):
+                return None
+            return 0, None, "stack"
+        # One whose register count falls short of six leaves a register argument it does
+        # not read, or passes some in the V registers, and which is not said; and one
+        # handed a double in a V register passes it beside the six, in no order said.
+        # And where its loads do not say how far up it reads, nor how many were pushed.
+        if isinstance(k, StackArity):
+            if k < len(ARG_REGS) or k.fpu or k.need is None or fpu:
+                return None
+            return int(k), None, "six"
+        # The registers run to the highest one the callee reads, not to the first it
+        # does not: `classify(int score)` on an instance reads x2 and never x1, and
+        # printed `classify()` (entry_args, #255).
+        hi = k - 1 if ent is None else max(map(ARG_REGS.index, ent[0]), default=-1)
+        if hi < 0 and conv == "stack":
+            return 0, None, "all"
+        return None if cpu > hi or fpu else (hi + 1, None, "regs")
+
+    def _plan_desc(self, desc, cpu, fpu, words, conv, callee, dispatch=False):
+        """`_call_plan` for a call handed the arguments descriptor in pool slot `desc`
+        (-1: x4 was written, and not from the pool).
+
+        `ArgumentsDescriptor::New(type_args_len, ArgumentCountWithoutTypeArgs,
+        ArgumentsSizeWithoutTypeArgs, names)` is what every call instruction builds
+        (il.h, GetArgumentsDescriptor), and the size is the words on the stack
+        (FlowGraph::ComputeArgumentsSizeInWords), so `count - size` arguments are in
+        registers. From 3.4 to 3.13 those are the first ones, each in the next register
+        of its own class (dart_calling_conventions.cc, ComputeCallingConvention), and
+        only fixed parameters of a function that is not generic
+        (Function::MaxNumberOfParametersInRegisters). The descriptor does not say the
+        class. They are x1 up, all of them, exactly where the last of those registers
+        is seen to carry an argument: the callee reads it on entry, or the caller wrote
+        it and nothing read it (`cpu`, `callee`), or it is x1 and the call a `dispatch`
+        one, whose first argument is the receiver and no double. A double among them
+        would leave that register unused. One seen past it contradicts the count, and
+        the list is not known, and so does a V register written for the call: a double
+        the count of x registers leaves no room for. From 2.19 to 3.3 everything is on
+        the stack and size is count. Any other release is not read: the convention was
+        not checked there.
+
+        A descriptor that is a base object is one the VM made before any snapshot,
+        ArgumentsDescriptor::Init's cached ones, each `NewNonCached(type_args_len, n,
+        n)`: no name and nothing in a register, in every release, and handed out for
+        no other call (dart_entry.cc, `num_arguments == size_arguments`). So what was
+        pushed is the list, the type-argument vector first where there is one. How many
+        that is the snapshot does not say, so the list is printed only where it is the
+        words this block stored off SP, `words`: a run the walk reads after a join is
+        what the ways in agree on, and one of them may have pushed more."""
+        d = self.pool_descs.get(desc)
+        if d is None or conv is None:
+            return None
+        tlen, count, size, _names = d
+        top = max(max(map(ARG_REGS.index, callee), default=-1), cpu)
+        if conv == "reg" and fpu:
+            return None
+        if count is None:
+            return None if conv == "reg" and top >= 0 else (0, words, "cached")
+        r = count - size
+        if conv == "stack":
+            return None if r else (0, d, "desc")
+        if r > len(ARG_REGS) or (r and tlen):
+            return None
+        if max(top, 0 if dispatch and r else -1) != r - 1:
+            return None
+        return r, d, "desc"
+
+    def _desc_args(self, plan, st: State, pushed):
+        """(the values, their names, how many lead the list that are no argument) for a
+        call `_plan_desc` read, or None where the walk does not hold exactly them.
+
+        The words pushed are the descriptor's size, and one more above them for the
+        type-argument vector where it counts one: a generic call's hidden first
+        argument, which heads the list as it does where nothing is named. A
+        type_args_len the snapshot does not state is taken as none only where the
+        count pushed says so."""
+        n, (tlen, count, size, names), _how = plan
+        regs = [st.reg.get(r) for r in ARG_REGS[:n]]
+        if None in regs or (tlen is None and not count):
+            return None
+        got, lead = list(pushed or ()), 1 if tlen else 0
+        if len(got) != size + lead:
+            return None
+        return regs + got, (None,) * lead + names, lead
 
     def _slot_crossings(self) -> frozenset:
         """(address, slot) for each frame store whose slot is read back after a call.
@@ -5905,6 +6059,8 @@ class Lifter:
         name = f"t{st.tmpc[0]}"
         st.tmpc[0] += 1
         self.minted.add(name)
+        if text is None:
+            self.unknown.add(name)
         self._mint_at[name] = self._mints
         self._mints += 1
         if name in self.hoist:
@@ -6957,12 +7113,12 @@ class Lifter:
             return None
         return site.fields.get(byte_off)
 
-    def _call_args(self, name, target, st: State, pushed=None) -> str:
+    def _call_args(self, target, st: State, pushed, plan) -> str:
         """Reconstruct a direct call's argument list, or `...` when it cannot be done
-        safely. Register-convention calls pass args in x1..xk (k = callee arity); the
-        stack convention (ArgumentsDescriptor set) and runtime stubs fall back to `...`.
-        Every argument rendered is a real incoming arg of the callee (from its live-in
-        set); the receiver of an instance call appears as the first argument.
+        safely. `plan` is `_call_plan`'s answer for the call. Register-convention calls
+        pass args in x1..xk; one handed an ArgumentsDescriptor passes what it counts,
+        the named ones printed `name: value` (`_plan_desc`); runtime stubs fall back to
+        `...`. The receiver of an instance call appears as the first argument.
 
         `pushed` is what the caller left in the outgoing area (_stack_args), the list a
         callee that reads only stack arguments takes. One that takes registers too, a
@@ -6978,30 +7134,112 @@ class Lifter:
         # population (generated closures, and everything in an --obfuscate build) where
         # the argument list is the only thing left to read. Where the target is not a
         # function this can measure, entry_arity still declines and the `...` stands.
-        listed = ", ".join(v.text for v in pushed) if pushed else "..."
-        if (name and "stub" in name) or self.arity is None or target is None:
-            return listed
-        k = self.arity(target)
-        if k is None:
-            return listed
-        # One whose register count falls short of six leaves a register argument it does
-        # not read, or passes some in the V registers, and which is not said; and one
-        # handed a double in a V register passes it beside the six, in no order said.
-        # And where its loads do not say how far up it reads, nor how many were pushed.
-        stack = isinstance(k, StackArity)
-        if stack and (k < len(ARG_REGS) or k.fpu or not pushed or k.need is None
-                      or len(pushed) < k.need):
+        got = self._listed(plan, st, pushed, target)
+        if got is None or not (plan[2] == "pushed" or self._exact(st, got[0])):
             return "..."
-        if k == 0:
-            return ""
-        parts = []
+        return self._list_text(got[0], got[1])
+
+    @staticmethod
+    def _list_text(vals, names) -> str:
+        return ", ".join(f"{nm}: {v.text}" if nm else v.text
+                         for v, nm in zip(vals, names or (None,) * len(vals)))
+
+    def _listed(self, plan, st: State, pushed, target=None):
+        """(the values of a call's whole argument list, their names or None, how many
+        lead it that are no argument) as `plan` reads it (`_call_plan`), or None where
+        the walk does not hold exactly that list."""
+        if plan is None:
+            return None
+        n, d, how = plan
+        if how == "desc":
+            return self._desc_args(plan, st, pushed)
+        got = list(pushed or ())
+        if how in ("stack", "pushed"):
+            return (got, None, 0) if got else None
+        if how == "cached":
+            return (got, None, 0) if got and len(got) == d else None
+        if how == "all":
+            if got:
+                return got, None, 0
+            # nothing read off the outgoing area: nothing in it, or a run with a hole
+            sp = _sp_reg()
+            held = any(k == _LOST or (k.startswith(sp) and (_imm(k[len(sp):]) or 0) >= 0)
+                       for k in st.slot)
+            return None if held else ([], None, 0)
+        if how == "six":
+            if not got or len(got) < self.arity(target).need:
+                return None
+        elif got:                      # stack arguments its callee is not seen to read
+            return None
         # ARG_REGS, not x1..xk: the fourth register argument is in X5, and X4 is
         # ARGS_DESC_REG. Walking x1..xk rendered the arguments descriptor as an argument.
-        for r in ARG_REGS[:k]:
-            if r not in st.reg:        # the caller did not establish this arg locally
-                return "..."           # not safe to attribute, so fall back
-            parts.append(st.reg[r].text)
-        return ", ".join(parts + ([listed] if stack else []))
+        regs = [st.reg.get(r) for r in ARG_REGS[:n]]
+        if None in regs:               # the caller did not establish this arg locally
+            return None                # not safe to attribute, so fall back
+        return regs + (got if how == "six" else []), None, 0
+
+    def _exact(self, st: State, vals) -> bool:
+        """Whether each of `vals` prints as the value the machine passes. A register a
+        join lost prints as its bare name, which in the output means the value the
+        function came in with (`_merge`), and so does one a loop left behind
+        (State.opaque); a name `_mint` gave a value nobody knows is declared and never
+        assigned, what a call leaves in a register it destroyed. `checkValidRange(x2,
+        x2, ...)` passed the incoming x2 and then another value under the same name,
+        and `var t0; g(...); f(t0)` read a temporary nothing assigns. An argument list
+        with one such value in it is not the call's list."""
+        bad = st.lost | st.opaque if st.lost or st.opaque else self.unknown
+        if not bad:
+            return True
+        if bad is not self.unknown:
+            bad = bad | self.unknown
+        for v in vals:
+            t = v.text
+            if '"' in t:
+                t = _QUOTED_RE.sub("", t)
+            if not bad.isdisjoint(_WORD_RE.findall(t)):
+                return False
+        return True
+
+    def _indirect_args(self, st: State, pushed, plan, recv):
+        """(the receiver an indirect call prints as its base or None, its argument list
+        or None where that is not known). `recv` is where `detect_dispatch` proves a
+        dispatch call's receiver to be at the call: a register, or the offset of the
+        outgoing slot it was pushed to where no register holds it (`_receiver_at`).
+
+        The receiver is argument zero and leaves the list it is the base of, but only
+        where argument zero is seen to be it: the first word pushed was dropped unseen,
+        so a call with its receiver in x1 and one named argument pushed printed no
+        argument at all. Under a descriptor the VM made, the type-argument vector may
+        sit above a receiver in a register, and the receiver so proved says whether one
+        does. A receiver in a slot that is not the first word pushed is the base of
+        nothing and leaves no list, as it was (#377)."""
+        got = self._listed(plan, st, pushed)
+        vals, names, lead = got if got is not None else (None, None, 0)
+        asked = plan is None or plan[2] != "pushed"
+        base = at = None
+        if isinstance(recv, int):
+            if pushed and (len(pushed) - 1) * 8 == recv:
+                base, at = pushed[0], 0
+                if vals is not None and (lead or vals[0] is not base
+                                         or (names and names[0])):
+                    vals = None
+        elif recv:
+            base = self._leaf(recv, st)
+            if not asked:
+                at = 0 if vals is not None else None
+            else:
+                leads = (0, 1) if plan is not None and plan[2] == "cached" else (lead,)
+                at = next((i for i in leads if vals is not None and len(vals) > i
+                           and not (names and names[i])
+                           and (vals[i] is base or vals[i].text == base.text)), None)
+                if at is None:
+                    vals = None
+        if vals is not None and at is not None:
+            vals = vals[:at] + vals[at + 1:]
+            names = names and names[:at] + names[at + 1:]
+        if vals is None or (asked and not self._exact(st, vals)):
+            return base, None
+        return base, self._list_text(vals, names)
 
     def _stack_args(self, st: State, drop_receiver: bool, whole: bool = False,
                     values: bool = False):
@@ -7298,7 +7536,8 @@ class Lifter:
             # same thing in the spelling the object-store allocation stubs already use.
             site = self.allocs.get(target) if target is not None else None
             call = name or self._sub(target or 0)
-            args = "" if site is not None else self._call_args(name, target, st, pushed)
+            args = "" if site is not None else self._call_args(
+                target, st, pushed, self._plans.get(addr))
             # after the arguments are read, not before: they live in the very registers the
             # call is about to destroy, and reading them afterwards would print the bare
             # register for every argument of every call. `_pin_call` goes here for the same
@@ -7320,21 +7559,12 @@ class Lifter:
         if mn in ("blr", "blx"):
             tgt = canon(ops[0]) if ops else None
             tgt_val = st.reg.get(tgt) if tgt else None
-            st.set(_T.ret_int, V(_T.ret_int, P_ATOM))
             disp = self.dispatch.get(addr)
             recv, off = disp if disp is not None else (None, None)
-            pushed = None
-            if isinstance(recv, int):
-                # The receiver is in no register by now, only in the slot it was pushed
-                # to (_receiver_at). It is the call's base where that slot is argument
-                # zero of the list read off the stack, and the call has none otherwise.
-                vals = (None if addr in self.save_wrapped
-                        else self._stack_args(st, False, values=True))
-                if vals and (len(vals) - 1) * 8 == recv:
-                    pushed = vals[0]
-                recv = None
-            stack_args = (None if addr in self.save_wrapped else self._stack_args(
-                st, drop_receiver=recv is not None or pushed is not None))
+            pushed = (None if addr in self.save_wrapped
+                      else self._stack_args(st, drop_receiver=False, values=True))
+            held, stack_args = self._indirect_args(st, pushed, self._plans.get(addr),
+                                                   recv)
             _drop_outgoing(st)          # consumed by this call; must not reach the next
             if disp is not None:                         # X21 dispatch-table (virtual) call
                 named = self.selectors.get(off) if off is not None else None
@@ -7344,8 +7574,7 @@ class Lifter:
                     # x0: two selectors share the offset, and this is the other one. The
                     # clean build's `._widget.textScaleFactor` was a bool getter (#128).
                     named = None
-                base = (_wrap(pushed, P_POST) if pushed is not None
-                        else _wrap(self._leaf(recv, st), P_POST) if recv else None)
+                base = _wrap(held, P_POST) if held is not None else None
                 pins = self._pin_call(st)   # after the receiver is read, and before it dies
                 # after the receiver is read; it is x0 as often as not
                 pins += self._clobber_call(st)
@@ -10875,6 +11104,89 @@ ARG_REGS = ("x1", "x2", "x3", "x5", "x6", "x7")
 FPU_ARG_REGS = ("d0", "d1", "d2", "d3", "d4", "d5")
 
 
+def _call_sites(insns) -> dict:
+    """{row index: (descriptor, cpu, fpu, words)} for each call of one block: what the
+    rows in front of it leave in the registers a call is handed arguments in.
+
+    `descriptor` is the pool byte offset x4 was loaded from, -1 where x4 holds something
+    else the block wrote and nothing read, None where the block left it alone. The
+    compiler loads ARGS_DESC_REG straight before the call instruction, from the pool
+    (flow_graph_compiler_arm64.cc, `LoadObject(ARGS_DESC_REG, arguments_descriptor)`),
+    so a call with one has it in its own block; a far slot is `add x4, x27, #hi` and
+    then `ldr x4, [x4, #lo]`.
+
+    `cpu` is the index of the highest of ARG_REGS the block wrote and nothing has read
+    since, -1 for none, and `fpu` whether one of FPU_ARG_REGS is so. A call destroys
+    every register, so a value written and left unread up to one is written for it. A
+    register the call instruction itself reads is its target, `blr x2`, and not that.
+    `words` is how many words the block stored off SP. Each call starts the counts
+    again."""
+    out = {}
+    x4, cpus, fpus, wanted = _SITE_MASKS
+    unread, desc, far, words = 0, None, None, 0
+    off_sp = "[" + _sp_reg()
+    for i, (_a, mn, op, _n) in enumerate(insns):
+        # `_def_use_masks`, from its memos: this runs once for every row of a block
+        # that calls, and a Python call for each is what #346 counts.
+        hit = _DEFUSE_CACHE.get(mn)
+        hit = hit.get(op) if hit is not None else None
+        hit = _DEFUSE_MASKS.get(hit) if hit is not None else None
+        de, us = hit or _def_use_masks(mn, op)
+        unread &= ~us
+        if mn in _CALLS:
+            hi = len(cpus) - 1
+            while hi >= 0 and not unread & cpus[hi]:
+                hi -= 1
+            out[i] = (desc, hi, bool(unread & fpus), words)
+            unread, desc, far, words = 0, None, None, 0
+            continue
+        if mn in _STORES and off_sp in op:
+            words += 2 if mn == "stp" else 1
+        if us & x4 and desc == -1:
+            desc = None
+        if de & x4:
+            desc, base, far = -1, far, None
+            parts = _split_ops(op)
+            if parts and parts[0].strip() == "x4":
+                m = _mem(parts[-1]) if mn == "ldr" and len(parts) == 2 else None
+                if m and m[2] is None and not m[4]:
+                    if _T.roles.get(m[0]) == "PP":
+                        desc = m[1]
+                    elif m[0] == "x4" and base is not None:
+                        desc = base + m[1]
+                elif mn == "add" and len(parts) >= 3 and (
+                        _T.roles.get(canon(parts[1])) == "PP"):
+                    imm = _imm(parts[2]) if parts[2].strip().startswith("#") else None
+                    if imm is not None and len(parts) >= 4 and "lsl" in parts[3]:
+                        imm <<= (_imm(parts[3].split("lsl")[-1]) or 0)
+                    far = imm
+        unread |= de & wanted
+    return out
+
+
+#: `_call_sites`'s masks: x4, each of ARG_REGS, the V argument registers, and all of
+#: the argument registers together.
+_SITE_MASKS = (_reg_mask(("x4",)), [_reg_mask((r,)) for r in ARG_REGS],
+               _reg_mask(FPU_ARG_REGS), _reg_mask(ARG_REGS + FPU_ARG_REGS))
+
+
+def _args_convention(dart: str):
+    """`reg`, `stack` or None: where a call's arguments are, for the release `dart`.
+
+    `stack` is 2.19 to 3.3, where runtime/vm/compiler/backend/dart_calling_conventions.cc
+    does not exist and every argument is pushed. `reg` is 3.4 to 3.13, where that file
+    is byte for byte the same in 3.4.4, 3.5.4, 3.6.2, 3.7.2, 3.8.1, 3.9.2, 3.10.9,
+    3.11.5, 3.12.2 and 3.13.0, and Function::MaxNumberOfParametersInRegisters differs
+    only in a list of architectures. None is every other release: nobody read it."""
+    m = re.match(r"(\d+)\.(\d+)", dart or "")
+    if not m:
+        return None
+    v = (int(m.group(1)), int(m.group(2)))
+    if (2, 19) <= v <= (3, 3):
+        return "stack"
+    return "reg" if (3, 4) <= v <= (3, 13) else None
+
+
 class StackArity(int):
     """entry_arity's register count for a function that takes the rest of its arguments
     on the stack, the last one at the lowest slot: `need` is how many slots of them its
@@ -10989,13 +11301,18 @@ def entry_args(ann: list, cut: bool = False) -> tuple:
     return _entry_read(ann, cut)[1]
 
 
-def _entry_read(ann: list, cut: bool) -> tuple:
-    """(entry_arity's answer, entry_args's), from one pass over the function."""
+def _entry_read(ann: list, cut: bool, wide: bool = False) -> tuple:
+    """(entry_arity's answer, entry_args's, what a call site asks), from one pass over
+    the function. The last is (the ARG_REGS read before they are written, whether x4
+    is, whether a V argument register is): `entry_args` where that answers, and the
+    same registers where it declines for the descriptor, which a call handed one still
+    needs (Lifter._plan_desc). The V registers of a function that reads only stack
+    arguments are looked at where `wide` asks, and are None otherwise."""
     stripped = strip_boilerplate(ann)
     # honours traps and calls that cannot return, like the lift
     blocks, entry = build_cfg(stripped, traps=TRAPS, ends=_path_ends(stripped))
     if not blocks or entry not in blocks:
-        return 0, ()
+        return 0, (), ((), False, False)
     # A function that never moves SP reads its incoming stack arguments off SP itself,
     # `ldr x0, [x15]`, and one that indexes them computes the address from FP, `add x1,
     # x29, w0, sxtw #2; ldr x1, [x1, #0x28]`. Where it reads no register as well, it was
@@ -11027,12 +11344,12 @@ def _entry_read(ann: list, cut: bool) -> tuple:
             elif indexed:
                 indexed -= _def_use(mn, op)[0]        # it holds something else now
     live = _live_in_header(blocks, set(blocks), entry, None)
+    args = tuple(r for r in ARG_REGS if r in live)
     if "x4" in live:                  # ARGS_DESC_REG: the stack convention, not arity
-        return None, ()
+        return None, (), (args, True, None)
     k = 0
     while k < len(ARG_REGS) and ARG_REGS[k] in live:
         k += 1
-    args = tuple(r for r in ARG_REGS if r in live)
     if not off_stack:
         # A function handed a double in a V register (`_fpu_args_live`) passes it beside
         # the x registers, in an order the registers alone do not give: `f(Object a,
@@ -11041,11 +11358,12 @@ def _entry_read(ann: list, cut: bool) -> tuple:
         # known, the same decline a mixed register-and-stack callee handed a double
         # already makes (#148, #155). A `ret` that hands d0 back is not counted here: a
         # function reading only x registers and returning its object in x0 has one too.
-        return (None, ()) if _fpu_args_live(blocks, entry, with_ret=False) else (k, args)
+        fpu = _fpu_args_live(blocks, entry, with_ret=False)
+        return ((None, ()) if fpu else (k, args)) + ((args, False, fpu),)
     if not args:
-        return None, ()
-    return StackArity(k, need if reach and not cut else None,
-                      _fpu_args_live(blocks, entry)), args
+        return None, (), ((), False, _fpu_args_live(blocks, entry) if wide else None)
+    k = StackArity(k, need if reach and not cut else None, _fpu_args_live(blocks, entry))
+    return k, args, (args, False, k.fpu)
 
 
 @kept
@@ -11055,25 +11373,31 @@ def make_arity_resolver(image):
     to render the callee's real arguments. Returns a callable; results are memoised.
 
     Its `args(pc)` is `entry_args` for the same function, from the same pass and the
-    same cache: the registers a body reads its arguments from (program.EntryNames)."""
+    same cache: the registers a body reads its arguments from (program.EntryNames).
+    `entry(pc)` is what a call site asks of its callee (`_entry_read`), None where no
+    range covers `pc`, and `convention` where this release passes arguments at all
+    (`_args_convention`)."""
     from .disasm import disassemble_range, truncated_by
     import bisect
     ranges = sorted(image.all_ranges, key=lambda cr: cr.pc_offset)
     starts = [cr.pc_offset for cr in ranges]
     cache: dict = {}
+    epoch = getattr(image, "epoch", None)
+    conv = _args_convention(getattr(epoch, "dart", None))
 
     def read(pc):
         if pc in cache:
             return cache[pc]
         i = bisect.bisect_right(starts, pc) - 1     # covering range (unchecked entries)
-        val = (None, ())
+        val = (None, (), None)
         if 0 <= i < len(ranges):
             cr = ranges[i]
             if cr.pc_offset <= pc < cr.pc_offset + cr.size:
                 dis = disassemble_range(image, cr)
                 if dis:
                     val = _entry_read([(a, m, o, "") for (a, m, o) in dis],
-                                      cut=bool(truncated_by(cr, dis)))
+                                      cut=bool(truncated_by(cr, dis)),
+                                      wide=conv != "stack")
         cache[pc] = val
         return val
 
@@ -11081,6 +11405,8 @@ def make_arity_resolver(image):
         return read(pc)[0]
 
     of.args = lambda pc: read(pc)[1]
+    of.entry = lambda pc: read(pc)[2]
+    of.convention = conv
     return of
 
 

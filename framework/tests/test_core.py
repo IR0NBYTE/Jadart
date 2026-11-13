@@ -15264,7 +15264,10 @@ def test_a_value_read_only_as_a_call_argument_is_live_up_to_the_call():
                  ("add", "x2, x1, #1"), ("b", "#0x24"), ("mov", "x2, x7"),
                  ("bl", "#0x200")], 2) == [
         "var t0;", "if (x3 != 0) {", "t0 = x2;", "} else {", "t0 = x7;", "}",
-        "return sub_0x200(x1, t0);"]
+        "return sub_0x200(...);"]
+    # ...and the list is not printed: its first argument is the x1 the inner `if` lost,
+    # and a bare `x1` there would say the value the function came in with (#358). It
+    # printed `sub_0x200(x1, t0)`.
 
 
 def test_a_dispatch_offset_other_selectors_share_is_not_named():
@@ -15458,6 +15461,346 @@ def test_registers_saved_round_a_call_are_not_its_arguments():
     assert dropped == ["return sub_0x100(x0);"], dropped
 
 
+def _pool_358(*descs):
+    """A pool map over a crafted fill result: slot i names descriptor i, given as
+    (type_args_len, count, size, ((name, position), ...)), a base object for None, or
+    the Array whose refs are listed. Smi v is ref 100 + v, except 0, which the VM
+    snapshot holds: base ref 5. Refs below 10 are base objects and 1 is null."""
+    import types
+    from jadart.disasm import build_pool_map
+    strings, arrays, pool = {}, {}, []
+    smi = lambda v: 5 if v == 0 else 100 + v
+    for i, d in enumerate(descs):
+        if d is None:
+            pool.append(("ref", 6))
+            continue
+        if isinstance(d, list):
+            arrays[200 + i] = tuple(d)
+        else:
+            tlen, count, size, named = d
+            elems = [smi(tlen), smi(count), smi(size), smi(count - len(named))]
+            for name, pos in sorted(named):
+                strings[300 + len(strings)] = name
+                elems += [299 + len(strings), smi(pos)]
+            arrays[200 + i] = tuple(elems + [1])
+        pool.append(("ref", 200 + i))
+    fr = types.SimpleNamespace(functions=[], names={}, strings=strings, pool=pool,
+                               arrays=arrays, first_ref=10,
+                               smi_values={100 + v: v for v in range(1, 300)})
+    return build_pool_map(fr)
+
+
+def _callee_358(k, regs=(), desc=False, fpu=False, convention="reg"):
+    """A resolver that answers for one callee as make_arity_resolver does: `k` its
+    arity, and what a call site asks, the argument registers it reads, whether it
+    reads x4 and whether a V register, under `convention`."""
+    ar = lambda pc: k
+    ar.args = lambda pc: () if k is None else regs
+    ar.entry = lambda pc: (regs, desc, fpu)
+    ar.convention = convention
+    return ar
+
+
+def _lift_358(rows, pool=None, ar=None):
+    from jadart.expr import lift_function
+    return [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])],
+        pool, arity=ar)]
+
+
+#: Pool slots 0x10 up: three named after two positional, a base object, a generic
+#: call's, one named after the receiver, an Array that is no descriptor, one all on
+#: the stack, three positional with one pushed, and one all in registers, whose size
+#: is the base Smi and so says that Smi is 0.
+_POOL_358 = [(0, 5, 3, (("left", 2), ("top", 3), ("right", 4))), None,
+             (1, 2, 2, (("onError", 1),)), (0, 2, 1, (("colorSpace", 1),)),
+             [105, 5, 5], (0, 2, 2, (("n", 1),)), (0, 3, 1, ()), (0, 2, 0, ())]
+_REGS_358 = [("mov", "x1, #7"), ("mov", "x2, #9")]
+_PUSH3_358 = [("stp", "x22, x22, [x15, #8]"), ("str", "x22, [x15]")]
+#: A dispatch-table call on the receiver in x1.
+_DISPATCH_358 = [("ldur", "x9, [x1, #-1]"), ("ubfx", "x9, x9, #0xc, #0x14"),
+                 ("add", "x30, x9, #0x40"), ("ldr", "x30, [x21, x30, lsl #3]"),
+                 ("blr", "x30")]
+
+
+def test_a_call_handed_an_arguments_descriptor_lists_register_and_named_arguments():
+    """#358: `removeViewInsets` printed `copyWith(NULL, NULL, NULL)` for a call that
+    passes two arguments in x1 and x2, three more on the stack and a descriptor in x4
+    naming those three. The callee reads x4, so its arity was not known, and what was
+    pushed printed as the whole list. The descriptor counts them: `count - size` in
+    registers, `size` words pushed, and the names with their positions."""
+    pool = _pool_358(*_POOL_358)
+    load = lambda off: [("ldr", f"x4, [x27, #{off:#x}]")]
+    two = _callee_358(None, ("x1", "x2"), desc=True)
+    none = _callee_358(None, (), desc=True)
+    call = [("bl", "#0x100")]
+    # the issue's shape
+    assert _lift_358(_REGS_358 + _PUSH3_358 + load(0x10) + call, pool, two) == [
+        "return sub_0x100(7, 9, left: NULL, top: NULL, right: NULL);"]
+    # a callee that never reads its last register parameter: the caller wrote it
+    assert _lift_358(_REGS_358 + _PUSH3_358 + load(0x10) + call, pool,
+                     _callee_358(None, ("x1",), desc=True)) == [
+        "return sub_0x100(7, 9, left: NULL, top: NULL, right: NULL);"]
+    # everything in registers, nothing pushed
+    assert _lift_358(_REGS_358 + load(0x48) + call, pool, two) == [
+        "return sub_0x100(7, 9);"]
+    # a generic call: nothing in a register, the type-argument vector pushed first
+    assert _lift_358([("mov", "x0, #3"), ("stp", "x0, x1, [x15, #8]"),
+                      ("str", "x22, [x15]")] + load(0x20) + call, pool, none) == [
+        "return sub_0x100(x1, 3, onError: NULL);"]
+    # before 3.4 everything is pushed, and a register written says nothing
+    old = _callee_358(None, (), desc=True, convention="stack")
+    assert _lift_358(_REGS_358 + [("stp", "x22, x1, [x15]")] + load(0x38) + call,
+                     pool, old) == ["return sub_0x100(7, n: NULL);"]
+    # a dispatch call: the receiver is argument zero and prints as the base. It
+    # printed `x0.sel_0x40()`, the one argument dropped as the receiver.
+    recv = [("mov", "x1, x0")]
+    assert _lift_358(recv + [("str", "x22, [x15]")] + load(0x28) + _DISPATCH_358,
+                     pool, two) == ["return x0.sel_0x40(colorSpace: NULL);"]
+    assert _lift_358(recv + [("mov", "x2, #9"), ("str", "x22, [x15]")] + load(0x40)
+                     + _DISPATCH_358, pool, two) == ["return x0.sel_0x40(9, NULL);"]
+
+
+def test_a_call_whose_descriptor_is_not_read_or_not_met_prints_no_list():
+    """#358: a descriptor's list is all of it or `...`. Each of these printed what was
+    pushed as the whole list."""
+    pool = _pool_358(*_POOL_358)
+    load = lambda off: [("ldr", f"x4, [x27, #{off:#x}]")]
+    two = _callee_358(None, ("x1", "x2"), desc=True)
+    none = _callee_358(None, (), desc=True)
+    call, no = [("bl", "#0x100")], ["return sub_0x100(...);"]
+    # fewer words pushed than its size
+    assert _lift_358(_REGS_358 + _PUSH3_358[1:] + load(0x10) + call, pool, two) == no
+    # nothing shows the second register carries an argument: it could be a double
+    assert _lift_358(_REGS_358[:1] + _PUSH3_358 + load(0x10) + call, pool,
+                     _callee_358(None, ("x1",), desc=True)) == no
+    # a register past the count carries one
+    assert _lift_358(_REGS_358 + [("mov", "x3, #1")] + _PUSH3_358 + load(0x10) + call,
+                     pool, two) == no
+    assert _lift_358(_REGS_358 + _PUSH3_358 + load(0x10) + call, pool,
+                     _callee_358(None, ("x1", "x2", "x3"), desc=True)) == no
+    # an Array that is no descriptor, and x4 written from somewhere else
+    assert _lift_358(_PUSH3_358 + load(0x30) + call, pool, none) == no
+    assert _lift_358(_PUSH3_358 + [("mov", "x4, x0")] + call, pool, none) == no
+    # a release whose convention nobody read
+    assert _lift_358([("stp", "x22, x1, [x15]")] + load(0x38) + call, pool,
+                     _callee_358(None, (), desc=True, convention=None)) == no
+    # a callee that reads x4, and no descriptor loaded for it
+    assert _lift_358([("stp", "x22, x1, [x15]")] + call, pool, none) == no
+    # one of the VM's own descriptors, a base object: nothing is in a register, so a
+    # register written for the call contradicts it
+    assert _lift_358(_REGS_358 + _PUSH3_358 + load(0x18) + call, pool, none) == no
+    # ...and with none written what was pushed is the list. (Passes on main: a guard.)
+    assert _lift_358(_PUSH3_358 + load(0x18) + call, pool, none) == [
+        "return sub_0x100(NULL, NULL, NULL);"]
+    # a dispatch call whose first argument is not the receiver it prints as its base
+    assert _lift_358([("mov", "x1, x0"), ("mov", "x9, #3"), ("stp", "x22, x9, [x15]")]
+                     + load(0x38) + _DISPATCH_358, pool, two) == [
+        "return x0.sel_0x40(...);"]
+
+
+def test_a_call_with_no_descriptor_lists_every_register_it_is_handed_or_none():
+    """#358, the same rule without a descriptor. A callee that reads x2 and not x1
+    printed `f()`; one handed more registers than it reads printed the ones it reads;
+    a dispatch call with its receiver in x1 printed the words pushed, less the first
+    as the receiver, whatever it was."""
+    call = [("bl", "#0x100")]
+    # the registers run to the highest one read
+    assert _lift_358(_REGS_358 + call, None, _callee_358(0, ("x2",))) == [
+        "return sub_0x100(7, 9);"]
+    # x2 is written for the call and the callee is not seen to read it
+    assert _lift_358(_REGS_358 + call, None, _callee_358(1, ("x1",))) == [
+        "return sub_0x100(...);"]
+    # a word pushed for a callee that reads only registers
+    assert _lift_358(_REGS_358 + [("str", "x22, [x15]")] + call, None,
+                     _callee_358(2, ("x1", "x2"))) == ["return sub_0x100(...);"]
+    # registers written for a callee that reads only the stack
+    assert _lift_358(_REGS_358 + [("str", "x22, [x15]")] + call, None,
+                     _callee_358(None)) == ["return sub_0x100(...);"]
+    # a dispatch call: a register argument beside what is pushed
+    recv = [("mov", "x1, x0")]
+    assert _lift_358(recv + [("mov", "x2, #9"), ("str", "x22, [x15]")]
+                     + _DISPATCH_358, None, _callee_358(None)) == [
+        "return x0.sel_0x40(...);"]
+    # ...and a first word pushed that is not the receiver
+    assert _lift_358([("mov", "x9, #3"), ("stp", "x22, x9, [x15]")] + _DISPATCH_358,
+                     None, _callee_358(None)) == ["return x1.sel_0x40(...);"]
+    # before 3.4 a callee that reads no argument is still handed what was pushed, and
+    # that is every argument: it printed `sub_0x100()`. Nothing pushed is no argument,
+    # which passes on main.
+    old = _callee_358(0, convention="stack")
+    assert _lift_358(_REGS_358 + [("str", "x22, [x15]")] + call, None, old) == [
+        "return sub_0x100(NULL);"]
+    assert _lift_358(_REGS_358 + call, None, old) == ["return sub_0x100();"]
+    # Guards, which pass on main. The receiver pushed first is left out of the list;
+    # before 3.4 a register written is no argument; a call through a Code's entry
+    # point is a stub's, with registers of its own (#280); and with no resolver the
+    # list is what was pushed.
+    assert _lift_358(recv + [("stp", "x22, x1, [x15]")] + _DISPATCH_358, None,
+                     _callee_358(None)) == ["return x0.sel_0x40(NULL);"]
+    assert _lift_358(_REGS_358 + [("str", "x22, [x15]")] + call, None,
+                     _callee_358(None, convention="stack")) == [
+        "return sub_0x100(NULL);"]
+    assert _lift_358([("stp", "x22, x1, [x15]"), ("mov", "x1, #1"),
+                      ("ldr", "x30, [x27, #0x80]"), ("ldur", "x30, [x30, #7]"),
+                      ("blr", "x30")], None, _callee_358(None)) == [
+        "return pool_0x80.field_0x8(x1, NULL);"]
+    assert _lift_358(_REGS_358 + [("str", "x22, [x15]")] + call) == [
+        "return sub_0x100(NULL);"]
+
+
+def test_a_call_prints_no_list_with_an_argument_it_cannot_write():
+    """#358, the review: a list is the call's only where each value in it is. `getOffset`
+    printed `getOffsetY(this, a1)` for a call that also passes 0.0 in d0, to a callee
+    that reads no V register on entry; `substring` printed `checkValidRange(x2, x2,
+    ...)`, the incoming x2 and then what a join left in x2 under the same name; and a
+    descriptor the VM made printed the one word both ways in agree on as the list."""
+    pool = _pool_358(*_POOL_358)
+    load = lambda off: [("ldr", f"x4, [x27, #{off:#x}]")]
+    call = [("bl", "#0x100")]
+    two = _callee_358(2, ("x1", "x2"))
+    # a V register written for the call, the callee not seen to read one
+    assert _lift_358(_REGS_358 + [("fmov", "d0, #1.0")] + call, None, two) == [
+        "return sub_0x100(...);"]
+    assert _lift_358(_REGS_358 + [("eor", "v0.16b, v0.16b, v0.16b")] + call, None,
+                     two) == ["return sub_0x100(...);"]
+    # ...and beside a descriptor that counts two in registers
+    assert _lift_358(_REGS_358 + [("fmov", "d0, #1.0")] + load(0x48) + call, pool,
+                     _callee_358(None, ("x1", "x2"), desc=True)) == [
+        "return sub_0x100(...);"]
+    # x1 is the incoming x2 and x2 what one way in loaded: one name, two values
+    lost = [("mov", "x1, x2"), ("cbz", "x0, #0xc"), ("ldur", "x2, [x9, #7]")]
+    assert _lift_358(lost + call, None, two)[-1] == "return sub_0x100(...);"
+    # ...and a word pushed out of the register the join lost
+    assert _lift_358(lost + [("str", "x2, [x15]")] + load(0x18) + call, pool,
+                     _callee_358(None, (), desc=True))[-1] == "return sub_0x100(...);"
+    # a descriptor the VM made does not count: two more words pushed one way in only
+    some = [("str", "x22, [x15]"), ("cbz", "x0, #0xc"), ("stp", "x22, x22, [x15, #8]")]
+    assert _lift_358(some + load(0x18) + call, pool,
+                     _callee_358(None, (), desc=True))[-1] == "return sub_0x100(...);"
+    # what an earlier call left in x1 is no argument: it printed `var t0; sub_0x200(7);
+    # return sub_0x100(t0);`, a read of a name nothing assigns
+    assert _lift_358([("mov", "x1, #7"), ("bl", "#0x200")] + call, None,
+                     _callee_358(1, ("x1",))) == [
+        "sub_0x200(7);", "return sub_0x100(...);"]
+    # Guards, which pass on main. The VM's descriptor over words this block pushed
+    # lists them. A receiver pushed first and its register used again is the base,
+    # off its slot, and the rest is the list (#377).
+    assert _lift_358([("stp", "x22, x22, [x15]")] + load(0x18) + call, pool,
+                     _callee_358(None, (), desc=True)) == [
+        "return sub_0x100(NULL, NULL);"]
+    assert _lift_358([("ldur", "x0, [x2, #-1]"), ("ubfx", "x0, x0, #0xc, #0x14"),
+                      ("str", "x2, [x15, #8]"), ("ldr", "x2, [x27, #0x80]"),
+                      ("str", "x2, [x15]"), ("add", "x30, x0, #0x40"),
+                      ("ldr", "x30, [x21, x30, lsl #3]"), ("blr", "x30")], pool,
+                     _callee_358(None))[-1] == "return x2.sel_0x40(pool_0x80);"
+
+
+def test_an_arguments_descriptor_is_read_from_its_array_in_full_or_not_at_all():
+    """#358: what `build_pool_map` keeps of a descriptor, and what it refuses. A number
+    the VM snapshot holds is a base ref, and its value is the one the rest leaves."""
+    from jadart import disasm
+    descs = _pool_358(*_POOL_358).descs
+    assert descs[0x10] == (0, 5, 3, (None, None, "left", "top", "right"))
+    assert descs[0x20] == (1, 2, 2, (None, "onError"))
+    assert descs[0x48] == (0, 2, 0, (None, None))
+    assert descs[0x18] == disasm.CACHED_DESC and 0x30 not in descs
+    # Not read: a name that is no identifier or longer than one, a position twice, a
+    # count past the cap, a size past the count, and no null at the end.
+    for bad in ((0, 2, 1, (("a b", 1),)), (0, 2, 1, (("a" * 65, 1),)),
+                (0, 3, 1, (("a", 2), ("b", 2))), (0, 256, 256, ()),
+                [105, 102, 103, 102, 1], [105, 102, 102, 102, 105]):
+        assert not _pool_358(bad).descs, bad
+    # Without a second descriptor to say what the base Smi is, a type_args_len that
+    # names it is not known; and a base ref is no value this snapshot has a Smi for.
+    assert _pool_358((0, 2, 1, (("n", 1),))).descs[0x10][0] is None
+    assert list(_pool_358((0, 2, 0, ()), [101, 102, 102, 5, 1]).descs) == [0x10]
+    # Each Array once, however many slots name it (#91).
+    calls, was = [0], disasm._args_desc
+
+    def counted(*a):
+        calls[0] += 1
+        return was(*a)
+    disasm._args_desc = counted
+    try:
+        many = _pool_358(*[_POOL_358[0]] * 2).descs
+        again = disasm.build_pool_map(__import__("types").SimpleNamespace(
+            functions=[], names={}, strings={}, first_ref=10, smi_values={101: 1, 102: 2},
+            pool=[("ref", 200)] * 4000, arrays={200: (5, 102, 5, 102, 1)}))
+    finally:
+        disasm._args_desc = was
+    assert len(many) == 2 and len(again.descs) == 4000 and calls[0] <= 6, calls
+
+
+def test_the_rows_before_a_call_say_what_its_argument_registers_hold():
+    """#358: `_call_sites`, the descriptor a call is handed and the argument
+    registers written for it, and `_args_convention`, the releases that is read in."""
+    from jadart.expr import _call_sites, _args_convention
+
+    def sites(rows):
+        return list(_call_sites([(i * 4, mn, op, "") for i, (mn, op)
+                                 in enumerate(rows)]).values())
+    assert sites([("mov", "x1, x0"), ("ldr", "x4, [x27, #0x58]"), ("bl", "#0x100"),
+                  ("bl", "#0x100")]) == [(0x58, 0, False, 0), (None, -1, False, 0)]
+    # a far slot, and a descriptor outlives a read of x4
+    assert sites([("add", "x4, x27, #0x8, lsl #12"), ("ldr", "x4, [x4, #0x10]"),
+                  ("mov", "x9, x4"), ("bl", "#0x100")]) == [(0x8010, -1, False, 0)]
+    # anything else in x4 is not one, unless it was read: then it was a temporary
+    assert sites([("mov", "w4, #1"), ("bl", "#0x100")]) == [(-1, -1, False, 0)]
+    assert sites([("ldr", "x4, [x4, #0x10]"), ("bl", "#0x100")]) == [(-1, -1, False, 0)]
+    assert sites([("mov", "x4, x0"), ("add", "x5, x4, #1"), ("bl", "#0x100")]) == [
+        (None, 3, False, 0)]
+    # a register read since it was written is not written for the call, nor is the
+    # one the call goes through; a V register is its own class
+    assert sites([("mov", "x2, x0"), ("ldur", "x3, [x2, #7]"), ("fmov", "d1, x0"),
+                  ("blr", "x3")]) == [(None, -1, True, 0)]
+    # the words the block stored off SP, a pair as two, counted again after a call
+    assert sites([("stp", "x0, x1, [x15, #8]"), ("str", "x2, [x15]"),
+                  ("stur", "x2, [x29, #-8]"), ("bl", "#0x100"),
+                  ("str", "x0, [x15, #-8]!"), ("bl", "#0x100")]) == [
+        (None, -1, False, 3), (None, -1, False, 1)]
+    assert [_args_convention(v) for v in ("2.18.6", "2.19.6", "3.3.4", "3.4.0",
+                                          "3.13.0", "3.14.0", "", None)] == [
+        None, "stack", "stack", "reg", "reg", None, None, None]
+
+
+def test_the_resolver_keeps_the_registers_a_callee_handed_a_descriptor_reads():
+    """#358: `entry_arity` declines for a function that reads x4, and a call handed
+    a descriptor still has to know which argument registers that function reads."""
+    from jadart.expr import _entry_read, StackArity
+    rows = lambda rs: [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rs)]
+    got = _entry_read(rows([("ldur", "w0, [x4, #0xf]"), ("ldur", "x9, [x1, #7]"),
+                            ("ldur", "x9, [x3, #7]"), ("ret", "")]), False)
+    assert got == (None, (), (("x1", "x3"), True, None))
+    assert _entry_read(rows([("ldur", "x9, [x2, #7]"), ("ret", "")]), False) == (
+        0, ("x2",), (("x2",), False, False))
+    # only stack arguments: the V registers are looked at where asked
+    stack = rows([("ldr", "x9, [x15]"), ("fadd", "d2, d0, d0"), ("ret", "")])
+    assert _entry_read(stack, False) == (None, (), ((), False, None))
+    assert _entry_read(stack, False, True) == (None, (), ((), False, True))
+    six = _entry_read(rows([("ldur", f"x9, [{r}, #7]") for r in
+                            ("x1", "x2", "x3", "x5", "x6", "x7")]
+                           + [("ldr", "x9, [x15]"), ("ret", "")]), False)
+    assert isinstance(six[0], StackArity) and six[2] == (six[1], False, six[0].fpu)
+
+
+def test_remove_view_insets_on_the_clean_fixture_prints_every_argument():
+    """#358 as reported, through the library API: each `copyWith` in
+    `removeViewInsets` on the clean fixture passes x1, or x1 and x2, beside what it
+    pushes, and names what it pushes."""
+    _needs_capstone()
+    lists = [m for fn in jadart.decompile(CLEAN, "removeViewInsets")
+             for ln in fn["body"] for m in re.findall(r"copyWith\(([^()]*)\)", ln)]
+    assert len(lists) == 3, lists
+    for got in lists[:2]:
+        args = got.split(", ")
+        assert len(args) == 5 and args[2:] == ["left: NULL", "top: NULL",
+                                               "right: NULL"], lists
+    last = lists[2].split(", ")
+    assert len(last) == 3 and last[1].startswith("viewPadding: ") and (
+        last[2].startswith("viewInsets: ")), lists
+
+
 def test_a_call_to_a_function_that_takes_a_double_does_not_list_its_other_arguments():
     # Dart passes doubles in V0 to V5, apart from the x registers (kFpuRegistersForArgs).
     # entry_arity counted only the x registers, so a call to `f(Object a, double b)`,
@@ -15492,9 +15835,10 @@ def test_a_call_to_a_function_that_takes_a_double_does_not_list_its_other_argume
         rows = [("mov", "x1, #5"), ("fmov", "d0, #1.0"), ("bl", "#0x100"), ("ret", "")]
         return [ln.strip() for ln in lift_function(
             [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)], arity=lambda pc: k)]
-    # a callee that takes a double declines; a register-only one still lists (as before)
+    # a callee that takes a double declines, and so does one that reads no V register
+    # where the caller wrote one for the call: `sub_0x100(5)` left the double out (#358)
     assert call(None) == ["return sub_0x100(...);"]
-    assert call(1) == ["return sub_0x100(5);"]
+    assert call(1) == ["return sub_0x100(...);"]
 
 
 def test_an_insert_into_an_upper_lane_keeps_the_double_in_the_low_lane():

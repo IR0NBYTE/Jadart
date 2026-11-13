@@ -107,6 +107,63 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A call lists every argument it passes, or prints `(...)`.** `removeViewInsets`
+  printed `copyWith(NULL, NULL, NULL)` twice and `copyWith(t5, t6)` for three calls
+  that each pass two more arguments in x1 and x2 and an arguments descriptor in x4
+  (#358). The callee reads x4, so its arity was not known and the words pushed printed
+  as the whole list. They now print `copyWith(t6, t7, left: NULL, top: NULL, right:
+  NULL)`, the same over `t0, pool_0x5140`, and `copyWith(this, viewPadding: t8,
+  viewInsets: t9)`. The descriptor is the Array `[type_args_len, count, size,
+  positional_count, (name, position)..., null]` (`dart_entry.h`, the same from 2.19.6
+  to 3.13.0), and `size` is the words on the stack
+  (`FlowGraph::ComputeArgumentsSizeInWords`), so `count - size` arguments are in
+  registers: the first ones in x1, x2, x3, x5, x6, x7 from Dart 3.4 to 3.13
+  (`dart_calling_conventions.cc`, `ComputeCallingConvention`), and none from 2.19 to
+  3.3, where that file does not exist. A named argument prints `name: value` at its
+  position, and a generic call's type-argument vector heads the list.
+
+  The rule is all or nothing, with a descriptor and without. A descriptor call prints
+  `(...)` where x4 was not loaded from the pool, where the Array is not read in full,
+  and where the registers seen to carry an argument are not `count - size` of them. A
+  number in the Array that the VM snapshot already holds is a base object whose value
+  this snapshot does not state: one such is solved from the rest of the descriptor,
+  more than one is not read, and before 3.11 that is most descriptors (6,067 calls on
+  the 3.5.4 app, 28 on the clean fixture). A descriptor that is itself a base object
+  is one of the VM's cached ones, `(type_args_len, n, n)` with no names, and counts
+  nothing here: the words pushed are its list where the call's own block stored that
+  many off SP, and words that only one way in pushed are no list. With no descriptor,
+  a call prints `(...)` where the caller wrote an argument register past the last one
+  its callee reads, where it wrote one for a callee of no known arity, and where a
+  dispatch call was handed one beside its receiver: each printed the part of the list
+  the callee was seen to read, or the part pushed. The registers of a callee run to
+  the highest one it reads, so `f(a, b)` over a callee that reads x2 and never x1 no
+  longer prints `f()`. Before 3.4 a callee that reads no argument is handed what was
+  pushed, and printed `f()` over it.
+
+  A list is the call's only where each value in it is. From 3.4 a call that a V
+  register was written for prints `(...)`: `getOffsetY()` on the clean fixture is
+  handed `this`, `a1` and 0.0 in d0. A register a join or a loop left prints as its
+  bare name, which reads as the value the function came in with, so a list that names
+  one prints `(...)`, as does one that names what an earlier call left in a register,
+  a temporary nothing assigns. A dispatch call's receiver is the one proved at the
+  call (#390), in a register or in the slot it was pushed to, and it leaves the list
+  only where argument zero is seen to be it.
+
+  Over both fixtures and the seven app-sweep libraries 48,011 of 273,863 functions
+  change, 298,881 lines for 299,335. 34,462 calls gain a full list: 12,736 printed
+  `(...)`, 19,674 printed fewer arguments and 2,052 printed theirs unnamed. 61,218
+  calls that printed a list print `(...)`, and 673 keep their length with a value
+  spelled through another temporary or a nested call that changed. 15,077 dispatch
+  calls keep a list through the receiver proved at the call, 14,936 of them with the
+  receiver in its slot, where the register the class id was read off no longer holds
+  it. On the clean fixture that is 1,788 of 8,194 functions, 1,325 calls gained and
+  1,800 fallen, and `(...)` goes from 5,290 to 6,661. Every other changed line is a
+  name: a value a call now reads gets a temporary, one it no longer reads loses it,
+  and a branch that held only such a line is laid out the other way. Each changed
+  function makes the same calls, stores, returns, throws, jumps and allocations as
+  before, counted on all 48,011; in three, `var t0 = a1.field_0x38; a1.field_0x38 =
+  t0 + 1;` became `a1.field_0x38 += 1;`. A lift made with no arity resolver, which no
+  command does, prints as it did.
 - **An unsigned condition is printed as one.** `hs`, `lo`, `hi` and `ls` read the
   carry: after `cmp` and `subs` they compare the two operands as unsigned numbers, and
   they printed with Dart's operators, which are signed. `cmp x5, x6; cset x0, lo`
