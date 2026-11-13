@@ -25489,6 +25489,42 @@ def test_tier_2_spells_a_32_bit_signed_condition_after_an_add():
         "return (x5.toSigned(32) + x6.toSigned(32)) < 0 ? 1 : 0;"]
 
 
+def test_hi_and_ls_after_an_add_compare_the_operand_with_minus_the_constant():
+    """hi and ls after `cmn` or `adds` read the carry out of the sum and whether it is
+    zero, and printed `? u<= ?` (#419). The carry of a + k is set when a is above ~k,
+    and with the sum not zero hi holds exactly when a is above -k, unsigned at the
+    operand's width: `cmn w1, #5; b.hi` is `w1 u> -5`. With k = 0 there is no carry,
+    hi never holds, and `a u> -1` says so. Against a register the zero sum needs a
+    guard of its own, and the condition stays declined. The truth table runs each
+    printed condition and its negation over the flags at 32 and at 64 bits."""
+    from jadart.cfg import _cond_text, negate_cond
+    assert _cond_text((0, "cmn", "w1, #5", ""), "b.hi", "#0") == "w1 u> -5"
+    assert _cond_text((0, "adds", "x3, x1, #5", ""), "b.ls", "#0") == "x1 u<= -5"
+    assert _cond_text((0, "cmn", "x1, #0", ""), "b.hi", "#0") == "x1 u> -1"
+    for n, r in ((64, "x"), (32, "w")):
+        m = (1 << n) - 1
+        edge = [0, 1, 2, 3, 4, 5, 0x10, 0xfff, 1 << (n - 1), (1 << (n - 1)) - 1,
+                m - 0xfff, m - 0x10, m - 5, m - 4, m - 3, m - 1, m]
+
+        def reads(cond, a):
+            lhs, rel, rhs = re.fullmatch(r"(.+) u([<>]=?) (.+)", cond).groups()
+            x, y = (eval(side, {}, {r + "5": a}) & m for side in (lhs, rhs))
+            return {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[rel]
+        for k in (0, 1, 4, 5, 0x10, 0xfff):
+            for setter, op in (("cmn", f"{r}5, #{k}"), ("adds", f"{r}1, {r}5, #{k}")):
+                for cc in ("hi", "ls"):
+                    cond = _cond_text((0, setter, op, ""), "b." + cc, "#0")
+                    for a in edge:
+                        total = a + k
+                        c, z = total >> n, int(total & m == 0)
+                        want = _HOLDS_371[cc](0, z, c, 0)
+                        assert reads(cond, a) == want, (op, cc, cond, hex(a))
+                        assert reads(negate_cond(cond), a) != want, (op, cc, cond)
+    for setter, op in (("cmn", "x1, x2"), ("adds", "w3, w1, w2")):
+        for cc in ("hi", "ls"):
+            assert "?" in _cond_text((0, setter, op, ""), "b." + cc, "#0"), (op, cc)
+
+
 def _sx(v, n):
     """The low `n` bits of `v`, sign-extended."""
     v &= (1 << n) - 1
@@ -25674,9 +25710,11 @@ def test_a_32_bit_comparison_reads_the_low_half_of_its_operands():
             text = cset([(kind, op)], cc)
             if text == "x0":
                 # Declined, the `cset` left raw: only where the flags have no spelling,
-                # which after an add is hi and ls, the carry and the zero flag at once.
+                # which after an add of a register is hi and ls, the carry and the zero
+                # flag at once (against a constant they are spelled since #419).
                 assert (kind == "tst" and cc not in ("eq", "ne", "mi", "pl")
-                        or kind == "cmn" and cc in ("hi", "ls")), (op, cc)
+                        or kind == "cmn" and right is None
+                        and cc in ("hi", "ls")), (op, cc)
                 continue
             told += 1
             assert text.endswith(" ? 1 : 0"), text
@@ -25687,7 +25725,7 @@ def test_a_32_bit_comparison_reads_the_low_half_of_its_operands():
                      else shift[right[0]](env["x6"], right[1]))
                 want = bool(holds(*_flags32(kind, env["x5"], b)))
                 assert bool(_dart_int(cond, env)) == want, (kind, op, cc, text, env)
-    assert told == len(forms) * 12 - 2 * 8 - 2 * 2, told
+    assert told == len(forms) * 12 - 2 * 8 - 2, told
 
 
 
