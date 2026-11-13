@@ -4574,6 +4574,12 @@ class Lifter:
         #: `_render_loop` RENAMES a carried register rather than writing it, so the
         #: growing set never sees that at all (#199).
         self.printed_prior: frozenset = frozenset()
+        #: Registers `_phi` left bare at a join of two plain values, and the ones among
+        #: them the printed body assigns somewhere, handed in by the walk before this
+        #: one: after a printed write a bare register is that line's value and not a
+        #: gap, so their joins are named (#368).
+        self.phi_skipped: set = set()
+        self.phi_shown: frozenset = frozenset()
         #: Phi names whose declaration this walk lifts to the top of the body, because the
         #: walk before it found them read outside the scope `_phi` declared them in (#198).
         self.hoist: frozenset = frozenset()
@@ -9893,11 +9899,20 @@ class Lifter:
             # the phi would carry the entry value down an arm that never kept it (#114).
             lit = ((_FLIT_RE.fullmatch(va.text) and vb.text != r)
                    or (_FLIT_RE.fullmatch(vb.text) and va.text != r))
+            # And so is a register a printed line has written, a raw instruction's
+            # destination. Left bare past the join it reads as that line's value on
+            # both ways in: `umulh x3, x5, x6; cbz x1, 1f; mov x3, #7; 1: mov x0, x3`
+            # printed the `umulh` and `return x3;`, the branch gone with the arm that
+            # printed nothing, where the CPU returns 7 whenever x1 is not zero (#368).
+            # The lines printed so far say it for a write above the join; one further
+            # down that a loop brings back round is in `phi_shown`, from the walk before.
             if (va.prec >= P_POST and vb.prec >= P_POST
                     and not _MINTED_RE.fullmatch(va.text)
                     and not _MINTED_RE.fullmatch(vb.text)
                     and not lit):
-                continue
+                if r not in self._printed_regs and r not in self.phi_shown:
+                    self.phi_skipped.add(r)
+                    continue
             # The value on entry to the `if`. `a` and `b` are copies of `st` taken before
             # either arm walked, so anything they both still agree with is what `st` had;
             # this reads `st` itself so the declaration cannot depend on which arm ran.
@@ -13125,7 +13140,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
 
     data, elem_box = _data_offsets(compressed), {}
 
-    def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None):
+    def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None,
+             phi_shown=None):
         lifter = Lifter(blocks, pool_map=pool_map, receiver=receiver, arity=arity,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields, allocs=allocs, casts=cast_at)
@@ -13158,6 +13174,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.carry_more = carry or {}
         lifter.join_phi = join_phi or {}
         lifter.printed_prior = printed_prior or frozenset()
+        lifter.phi_shown = phi_shown or frozenset()
         lifter.hoist = hoist or frozenset()
         st = State()
         # `State.set` mints a name for a value too long to inline, and it is the one such
@@ -13189,6 +13206,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     # enough: both walks print the same raw lines and the same write-backs, since those
     # come from the instructions, and every statement a later walk adds assigns a `tN`.
     printed_prior = frozenset(lifter.spelled_regs & printed) or None
+    # ...and whether a join `_phi` left bare is of a register the printed body assigns
+    # somewhere it could not have seen yet, round a loop (#368).
+    phi_shown = frozenset(lifter.phi_skipped & printed) or None
     # ...and which phi names are read outside the scope `_phi` declared them in, which
     # only the printed body can say (#198). Their declaration moves to the top, where it
     # dominates every read, and the initialiser stays where the value was.
@@ -13225,9 +13245,9 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     carried_regs = frozenset().union(*carry.values()) if carry else frozenset()
     join_phi = {j: frozenset(rs & carried_regs)
                 for j, rs in lifter._join_phi_set.items() if rs & carried_regs}
-    if keep is not None or carry or join_phi or printed_prior or hoist:
+    if keep is not None or carry or join_phi or printed_prior or hoist or phi_shown:
         lifter = lines = None               # not held while the second walk runs
-        lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
+        lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist, phi_shown)
         # A name the code after the loop does not print, its only reader a call that
         # prints `(...)`, says nothing, and the walk goes back to the bare register.
         unread = {h: frozenset(names[n] for n in _never_read(lines, names))
@@ -13236,7 +13256,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
             carry = {h: r - unread.get(h, frozenset()) for h, r in carry.items()}
             carry = {h: r for h, r in carry.items() if r}
             lifter = lines = None
-            lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
+            lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist, phi_shown)
         # A goto-join phi nothing reads says nothing, and minting its name shifted every
         # later temp for a line then dropped. The walk runs once more without the joins
         # whose names went unread, so those numbers go back and only a join a reader
@@ -13249,7 +13269,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                             for j, rs in join_phi.items()}
                 join_phi = {j: rs for j, rs in join_phi.items() if rs}
                 lifter = lines = None
-                lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
+                lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist,
+                                     phi_shown)
     # A goto-join phi is declared once, above the body, since no single edge into the
     # join dominates it; `_drop_dead_phis` drops the ones nothing read.
     # Hoisting changes the lines, so a name that was in scope may now not be. Measured on
@@ -13262,7 +13283,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
             break
         hoist = frozenset((hoist or frozenset()) | more)
         lifter = lines = None
-        lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist)
+        lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist, phi_shown)
     top = set(lifter._join_name.values()) | lifter.hoisted
     if top:
         pad = indent * depth
