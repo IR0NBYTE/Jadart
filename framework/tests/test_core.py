@@ -26366,6 +26366,39 @@ def test_an_element_off_a_computed_base_is_the_access_at_a_computed_address():
         expr._addr_facts = facts
 
 
+
+def test_an_element_whose_index_is_built_from_an_object_is_at_a_computed_address():
+    """`ldur x2, [x13, #7]; sub x9, x13, #0x20; add x16, x8, x9; stur x1, [x16,
+    #0x17]; mov x0, x2` printed `x8[x13 - 32] = x1;` and then `return
+    x13.field_0x8;`. An add with no shift has no base and no index, and where x8 is 16
+    the store writes the word just read (#435). An index that is a register and a
+    constant, or a register a live value reads a field of, may be the object: the
+    spelling stays, and the access is at a computed address, as an element off a
+    computed base is (#387). A plain index is as it was."""
+    lift = _lift_329
+    ld, ret = ("ldur", "x2, [x13, #7]"), ("mov", "x0, x2")
+    st = ("stur", "x1, [x16, #0x17]")
+    for el, text in ((("add", "x16, x8, x9"), "x8[x13 - 32]"),
+                     (("add", "x16, x8, w9, sxtw"), "x8[(x13 - 32).toSigned(32)]"),
+                     (("add", "x16, x8, w9, uxtw"), "x8[(x13 - 32).toUnsigned(32)]")):
+        assert lift(ld, ("sub", "x9, x13, #0x20"), el, st, ret) == [
+            "var t0 = x13.field_0x8;", text + " = x1;", "return t0;"], el
+    # A read of such an element is named before a store to the object's field.
+    assert lift(("sub", "x9, x13, #0x20"), ("add", "x16, x8, x9"),
+                ("ldur", "x2, [x16, #0x17]"), ("stur", "x1, [x13, #7]"), ret) == [
+        "var t0 = x8[x13 - 32];", "x13.field_0x8 = x1;", "return t0;"]
+    # The object itself as the index, where a live value reads a field of it.
+    assert lift(ld, ("add", "x16, x8, x13"), st, ret) == [
+        "var t0 = x13.field_0x8;", "x8[x13] = x1;", "return t0;"]
+    # A plain index, and a register no live value reads through, are as they were.
+    assert lift(ld, ("add", "x16, x8, x9"), st, ret) == [
+        "x8[x9] = x1;", "return x13.field_0x8;"]
+    assert lift(("ldur", "x2, [x12, #7]"), ("add", "x16, x8, x13"), st, ret) == [
+        "x8[x13] = x1;", "return x12.field_0x8;"]
+    # A shifted index is an index: the base is the first register.
+    assert lift(ld, ("add", "x16, x8, x13, lsl #3"), st, ret) == [
+        "x8[x13] = x1;", "return x13.field_0x8;"]
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
