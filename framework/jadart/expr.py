@@ -7036,11 +7036,21 @@ class Lifter:
             tgt_val = st.reg.get(tgt) if tgt else None
             st.set(_T.ret_int, V(_T.ret_int, P_ATOM))
             disp = self.dispatch.get(addr)
-            stack_args = (None if addr in self.save_wrapped
-                          else self._stack_args(st, drop_receiver=bool(disp and disp[0])))
+            recv, off = disp if disp is not None else (None, None)
+            pushed = None
+            if isinstance(recv, int):
+                # The receiver is in no register by now, only in the slot it was pushed
+                # to (_receiver_at). It is the call's base where that slot is argument
+                # zero of the list read off the stack, and the call has none otherwise.
+                vals = (None if addr in self.save_wrapped
+                        else self._stack_args(st, False, values=True))
+                if vals and (len(vals) - 1) * 8 == recv:
+                    pushed = vals[0]
+                recv = None
+            stack_args = (None if addr in self.save_wrapped else self._stack_args(
+                st, drop_receiver=recv is not None or pushed is not None))
             _drop_outgoing(st)          # consumed by this call; must not reach the next
             if disp is not None:                         # X21 dispatch-table (virtual) call
-                recv, off = disp
                 named = self.selectors.get(off) if off is not None else None
                 if named and off in getattr(self.selectors, "doubles", ()) and (
                         self._reads_next(_T.ret_int)):
@@ -7048,7 +7058,8 @@ class Lifter:
                     # x0: two selectors share the offset, and this is the other one. The
                     # clean build's `._widget.textScaleFactor` was a bool getter (#128).
                     named = None
-                base = _wrap(self._leaf(recv, st), P_POST) if recv else None
+                base = (_wrap(pushed, P_POST) if pushed is not None
+                        else _wrap(self._leaf(recv, st), P_POST) if recv else None)
                 pins = self._pin_call(st)   # after the receiver is read, and before it dies
                 # after the receiver is read; it is x0 as often as not
                 pins += self._clobber_call(st)
@@ -10902,16 +10913,159 @@ def make_return_resolver(image):
 _F_TAGS, _F_CID, _F_IMM, _F_DISP, _F_DTARGET = 0, 1, 2, 3, 4
 
 
+#: How many rows back from a dispatch call its class id read may be for the receiver to
+#: be followed from one to the other. The clean build's furthest is 11; past the bound
+#: the call prints no receiver, and a call costs no more than the bound to answer.
+_RECV_WINDOW = 64
+
+
+def _branch_map(dis):
+    """(into, out, indirect) for the rows of one body: the rows that branch to each row a
+    direct branch names, the row each direct branch names (None where it leaves the
+    body), and whether any row jumps through a register."""
+    row = {t[0]: i for i, t in enumerate(dis)}
+    into, out, indirect = {}, {}, False
+    for i, t in enumerate(dis):
+        mn = t[1]
+        if mn[:1] != "b" and mn not in _CONDB:
+            continue
+        if mn == "br" or mn == "bx":
+            indirect = True
+        elif mn == "b" or mn in _CONDB or cond_of(mn):
+            out[i] = j = row.get(_target(t[2]))
+            if j is not None:
+                into.setdefault(j, []).append(i)
+    return into, out, indirect
+
+
+def _receiver_at(dis, read, call, flow):
+    """Where the object whose tags word row `read[1]` loaded off register `read[0]` is at
+    the `blr` in row `call`: a register that holds it, or the offset of the outgoing
+    slot it was pushed to (an int) where no register does, or None. `flow` is the
+    body's `_branch_map`.
+
+    The class id is read before the arguments are moved into place, so the register it
+    was read from is as often as not something else by the call: `mov x1, x2` and then
+    `ldr x2, [x27, #0x2a00]` printed the pool entry as the receiver, and a class id
+    copied over its own object, which had gone to the stack, printed the register the
+    class id is in (#377). A whole-register `mov` out of a holder makes another holder
+    and any other write of one ends it; a whole holder stored off SP is in that slot
+    until a store reaches the slot or SP moves, other than by a push, which moves the
+    slot up by as much.
+
+    The answer is what every way from the read to the call leaves, not what the rows
+    between them leave when read top to bottom. A row a branch names is reached with
+    what each of its ways in carries, and keeps what they agree on: the row before it
+    unless that row cannot fall through, and each branch to it. A branch inside the
+    stretch carries what was known at it. The Smi check, `tbz w0, #0` on the row before
+    the read and over it to the row after the `ubfx`, carries the register of the read
+    and nothing else: it tests the low bit of that register, so the object is in it on
+    the way that skips the read as well. A branch from anywhere else, any other branch
+    on the row before the read and a loop back into the stretch included, carries
+    nothing this has followed, and the call has no receiver; so has a call in a body
+    that jumps through a register, since that may land on any row. A row after `b`,
+    `ret` or a trap that no branch names is not reached at all.
+
+    The first argument register is preferred where it holds the object, since that is
+    the receiver the callee is handed, then the register the read was off."""
+    reg, at = read
+    into, out, indirect = flow
+    if call - at > _RECV_WINDOW or indirect:
+        return None
+    sp = _sp_reg()
+    held, slot, live = {reg}, None, True
+    ahead = {}                                  # row -> what branches before it carry
+    for k in range(at, call + 1):
+        if k > at and (not live or k in into):
+            ways = ahead.pop(k, [])
+            if live:
+                ways.append((held, slot))
+            for src in into.get(k, ()):
+                if src == at - 1:
+                    ops = _split_ops(dis[src][2])
+                    if dis[src][1] != "tbz" or canon(ops[0]) != reg or ops[1] != "#0":
+                        return None             # not the Smi check on that register
+                    ways.append(({reg}, None))
+                elif not at <= src < k:
+                    return None                 # from outside the stretch, or a loop
+            if not ways:
+                if k == call:
+                    return None
+                continue                        # a row nothing reaches
+            held = set(ways[0][0]).intersection(*(w[0] for w in ways[1:]))
+            slot = ways[0][1] if all(w[1] == ways[0][1] for w in ways) else None
+            live = True
+        if k == call:
+            break
+        mn, op = dis[k][1], dis[k][2]
+        pushed = False
+        if mn == "mov":
+            ops = _split_ops(op)
+            # whole registers only: `mov w1, w2` keeps half of it
+            if len(ops) == 2 and ops[1] in held and canon(ops[0]) == ops[0]:
+                held.add(ops[0])
+                if ops[0] == sp:
+                    slot = None
+                continue
+        elif mn in _STORES:
+            ops = _split_ops(op)
+            m = _mem(ops[-1])
+            if m is None or m[0] != sp or m[2] is not None:
+                if m is None or m[0] == sp:
+                    slot = None             # a store off SP this cannot place
+            elif mn == "str" or mn == "stur" or mn == "stp":
+                low = m[1] or 0
+                if m[4]:
+                    # a push, as Dart 2.19 writes one: SP moves by the displacement and
+                    # the store is at the new SP, so a slot already held is that much up
+                    if slot is not None:
+                        slot = slot - low if slot >= low else None
+                    low, pushed = 0, True
+                for n, src in enumerate(ops[:-1]):
+                    at_off = low + 8 * n
+                    if src in held:
+                        slot = at_off
+                    elif src[:1] != "x" or (slot is not None and abs(at_off - slot) < 8):
+                        slot = None         # the slot, or a width this does not place
+            else:
+                slot = None
+        elif slot is not None and (mn == "dc" or "[" in op and mn not in _LOADS):
+            slot = None                     # any other instruction that may write memory
+        elif k in out:
+            j = out[k]
+            if j is not None and k < j <= call:
+                ahead.setdefault(j, []).append((frozenset(held), slot))
+            live = mn != "b"
+        elif mn == "ret" or mn in TRAPS:
+            live = False
+        defs = _def_use(mn, op)[0]
+        if defs:
+            held -= defs
+            if sp in defs and not pushed:
+                slot = None
+        if not held and slot is None and not ahead:
+            return None
+    first = _T.arg_regs[0] if _T.arg_regs else None
+    if not held:
+        return slot
+    return first if first in held else reg if reg in held else min(held)
+
+
+def _sp_reg() -> str:
+    """The register Dart keeps its stack pointer in."""
+    return next((r for r, v in _T.roles.items() if v == "SP"), "x15")
+
+
 def detect_dispatch(dis) -> dict:
-    """Map each X21 dispatch-table `blr` address -> (receiver_reg | None, selector_offset | None).
+    """Map each X21 dispatch-table `blr` address -> (receiver | None, offset | None).
 
     Dart AOT dispatch-table calls resolve a virtual/interface method by class id:
       ldur tags,[recv,#-1]; ubfx cid,tags,#0xc,#0x14; add idx,cid,#off; ldr t,[x21,idx,lsl#3]; blr t
     The offset added to the class id selects the row for one selector. It's stable across
     the whole program (same selector, same offset), so it identifies the selector even
     though the source name lives only in the serialized dispatch table, which this pass
-    doesn't read. Recovers the receiver register and that offset; the offset renders
-    as `sel_0x<off>`."""
+    doesn't read. Recovers that offset, which renders as `sel_0x<off>`, and where the
+    receiver is AT THE CALL: a register, or an outgoing slot's offset (_receiver_at)."""
     # ONE fact per register, not five parallel maps. The five kinds are mutually
     # exclusive by construction: every branch below invalidates its destination and then
     # records at most one thing about it, so a register can never be two of them at once.
@@ -10924,7 +11078,8 @@ def detect_dispatch(dis) -> dict:
     # anything was known, 2.2M of them on one `functions` run.
     fact = {}
     out = {}
-    for t in dis:
+    flow = None                                 # the body's branches, once a call asks
+    for i, t in enumerate(dis):
         mn = t[1]
         # While nothing is known, there is nothing to propagate and nothing to
         # invalidate, and only a load can put the first fact on the board: the tags word
@@ -10938,7 +11093,10 @@ def detect_dispatch(dis) -> dict:
             for r in [r for r in fact if r in _CALL_CLOBBERS]:
                 del fact[r]
             if f is not None and f[0] == _F_DTARGET:
-                out[t[0]] = f[1]
+                read, off = f[1]
+                if read and flow is None:
+                    flow = _branch_map(dis)
+                out[t[0]] = (_receiver_at(dis, read, i, flow) if read else None, off)
             continue
         if not ops:
             continue
@@ -10950,7 +11108,7 @@ def detect_dispatch(dis) -> dict:
                 for r in _def_use(mn, t[2])[0]:
                     fact.pop(r, None)
             elif m[2] is None and m[1] == -1 and m[0] not in _UNTAGGED:
-                fact[dst] = (_F_TAGS, m[0])                     # tags word of a tagged object
+                fact[dst] = (_F_TAGS, (m[0], i))            # tags word of a tagged object
             elif (_T.roles.get(m[0]) == "DISPATCH"
                   and m[2] is not None):                       # dispatch-table indexed load
                 f = fact.get(canon(m[2]))                       # read first: dst may BE the index
