@@ -293,6 +293,11 @@ def _cond_text(prev_cmp, mn, op) -> str:
             nan = (f"isNaN({parts[0]})" if parts[1] in ("0", "0.0", parts[0]) else
                    f"isNaN({parts[0]}) || isNaN({parts[1]})")
             return nan if cc == "vs" else f"!({nan})"
+        if cc in ("vs", "vc"):
+            # After an integer compare or add V is the signed overflow of it, which no
+            # operator spells: `cmp x5, x6; b.vs` printed `x5 vs x6`, a test that reads
+            # as an order and holds on none of its values (#401). Declined.
+            return "?"
         if pm in ("fcmp", "fcmpe") and len(parts) >= 2:
             # `fcmp` sets NZCV to 1000 for less, 0110 for equal, 0010 for greater and
             # 0011 for unordered, a NaN on either side. Each condition holds for one,

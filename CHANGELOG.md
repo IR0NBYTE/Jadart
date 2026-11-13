@@ -107,6 +107,12 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **vs and vc after integer flags are declined.** V after a compare or an add is its
+  signed overflow, which no Dart operator spells, and `cmp x5, x6; b.vs` printed
+  `if (!(x5 vs x6))`, an operator that does not exist (#401). The branch now prints `?`,
+  the decline the lifter already uses, and `cset` and `csel` stay raw as before. After
+  `fcmp` V is "unordered" and keeps its `isNaN` spelling. 69 lines change on the nine
+  binaries, 6 on each fixture, such as `if (!(t0 vs t1)) {` to `if (!(?)) {`.
 - **Conditions after a float compare hold when a side is NaN.** `fcmp` leaves NZCV at
   0011 when either side is NaN, and every ordering is then false. `fcmp d0, d1; b.lt`
   printed `d0 < d1`, so the branch the CPU takes on NaN read as not taken; pl, hs and ge

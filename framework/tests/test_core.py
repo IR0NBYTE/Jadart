@@ -25348,6 +25348,29 @@ def test_a_signed_condition_after_an_add_compares_the_operands():
         "return (x5.toSigned(32) + x6.toSigned(32)) < 0 ? 1 : 0;"]
 
 
+def test_an_overflow_condition_after_integer_flags_is_declined():
+    """V after an integer compare or add is the signed overflow of it, and no operator
+    spells that: `cmp x5, x6; b.vs` printed `if (!(x5 vs x6))`, an operator Dart does
+    not have, which a reader can only take for some order of the two (#401). The branch
+    goes for x5 = 0x8000000000000000, x6 = 1, where x5 - x6 leaves the signed range, and
+    not for x5 = 2, x6 = 1. Declined: the branch to `?`, which nothing takes for a
+    claim, and a select to its raw line. After `fcmp` V is unordered, and keeps its
+    `isNaN` spelling."""
+    from jadart.cfg import _cond_text
+    assert _flags_371("cmp", 1 << 63, 1)[3] == 1 and _flags_371("cmp", 2, 1)[3] == 0
+    for setter, op in (("cmp", "x5, x6"), ("cmp", "w5, #4"), ("subs", "x1, x5, x6"),
+                       ("cmn", "x5, x6"), ("adds", "x1, x5, #4"),
+                       ("cmp", "x5, x6, lsl #2")):
+        for cc in ("vs", "vc"):
+            assert _cond_text((0, setter, op, ""), "b." + cc, "#0") == "?", (setter, cc)
+    assert _lift_rows([("cmp", "x5, x6"), ("b.vs", "#0x10"), ("mov", "x0, #1"),
+                       ("ret", ""), ("mov", "x0, #2"), ("ret", "")])[0] == "if (!(?)) {"
+    for mn, ops in (("cset", "x0, vs"), ("csel", "x0, x2, x3, vc")):
+        assert _lift_rows([("cmp", "x5, x6"), (mn, ops), ("ret", "")]) == [
+            f"{mn} {ops}", "return x0;"]
+    assert _cond_text((0, "fcmp", "d0, d1", ""), "b.vs", "#0") == "isNaN(d0) || isNaN(d1)"
+
+
 def _sx(v, n):
     """The low `n` bits of `v`, sign-extended."""
     v &= (1 << n) - 1
