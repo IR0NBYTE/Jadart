@@ -3524,6 +3524,62 @@ def test_json_output_is_compact_off_a_terminal_and_indented_on_one():
         assert "\n  \"" in tty.getvalue(), argv
 
 
+def test_documented_exit_codes_are_the_ones_the_cli_returns():
+    # The skill told agents a failure exits 2, but a miss exits 1, so an agent branching
+    # on 2 read a miss as success. The skill, the README and `--help` carry one sentence,
+    # and what it names for success, a miss, bad input and a bug must be what main()
+    # returns.
+    import contextlib
+    import io
+    import re
+    import jadart.snapshot as snapshot
+    from jadart import cli
+
+    def sentence(text):
+        flat = " ".join(text.split())
+        m = re.search(r"Exit code is `0` on success.*?when interrupted\.", flat)
+        assert m, "no exit-code sentence"
+        return m.group(0)
+
+    root = os.path.join(os.path.dirname(__file__), "..", "..")
+    docs = {name: open(os.path.join(root, name), encoding="utf-8").read()
+            for name in ("README.md", "skills/flutter-reverse-engineering/SKILL.md")}
+    docs["--help"] = cli._EXAMPLES
+    said = {name: sentence(text) for name, text in docs.items()}
+    assert len(set(said.values())) == 1, said
+    text = said["README.md"]
+    codes = {int(c): text.find(f"`{c}`") for c in re.findall(r"`(\d+)`", text)}
+    assert sorted(codes) == [0, 1, 2, 3, 130], text
+
+    def meaning(code):
+        nxt = [p for p in codes.values() if p > codes[code]]
+        return text[codes[code]:min(nxt) if nxt else len(text)]
+
+    assert "success" in meaning(cli.EXIT_OK)
+    assert "nothing in the binary matched" in meaning(cli.EXIT_MISS)
+    assert "will not parse" in meaning(cli.EXIT_USAGE)
+    assert "bug" in meaning(cli.EXIT_INTERNAL)
+    assert "interrupted" in meaning(130)
+
+    def run(argv):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return cli.main(argv)
+
+    assert run(["info", CLEAN]) == 0
+    assert run(["lift", CLEAN, "no_such_symbol_anywhere"]) == 1
+    assert run(["info", __file__]) == 2               # a .py file is not a snapshot
+    real = snapshot.parse_libapp_with_anchor
+
+    def broken(*a, **k):
+        raise RuntimeError("planted")
+    snapshot.parse_libapp_with_anchor = broken
+    try:
+        assert run(["info", CLEAN]) == 3
+    finally:
+        snapshot.parse_libapp_with_anchor = real
+
+
 def test_every_public_entry_point_raises_only_jadart_errors():
     """The one promise the package docstring makes: `except jadart.JadartError` is enough.
 
