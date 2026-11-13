@@ -107,6 +107,28 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **An element off a base that may hold a computed address is the access at that
+  address.** `ldur x4, [x13, #7]; sub x9, x13, #0x20; add x16, x9, x8, lsl #3; stur x1,
+  [x16, #0x17]; mov x0, x4` printed `(x13 - 32)[x8] = x1;` and then `return
+  x13.field_0x8;`: the store was taken for an element of an object of its own, which
+  reaches no field of another, where its base is x13 less a constant and an index of 2
+  writes the word just read (#387). An element whose base may hold an address the lifter
+  computed, by the whole-body facts a field at a computed address already asks (#341),
+  keeps its spelling and is a store to a raw address: every live read of the heap is
+  named first, so this prints `var t0 = x13.field_0x8;` and returns `t0`. A read of such
+  an element is named before any store to the heap. A base read from a field is an
+  element of an object as before and asks for no facts; any other base costs its body
+  the one pass that makes them. The unicorn oracle, over 3,137 programs (a base made
+  sixteen ways, x13 and a constant among them, five forms of the address, element stores
+  against eleven reads and element reads against ten stores, in both orders and under a
+  comparison) at 40 entry states, went from 625 programs with a wrong run to none; 212
+  it cannot decide, before and after. Two forms print as elements as they did and are
+  wrong as they were: the address in the second register of an unshifted `add x16, x8,
+  x9`, and an index that is a constant in a register, `mov x9, #-0x10; add x16, x13,
+  x9`. No line of either fixture changes. With the two fixes under this one, on the two
+  fixtures and the seven app-sweep libraries 240 of 273,863 ranges change, 8,417 lines
+  out and 8,905 in, 15,678 of those 17,322 only renumbering a temporary, with 413 more
+  declarations and no error.
 - **The operands of a comparison still to be read are named before a store that may
   write them.** `ldur x4, [x13, #0x17]; add x16, x13, x8, lsl #3; cmp x4, x2; stur x1,
   [x16, #0x17]; cset x0, eq` printed `x13[x8] = x1;` and then `return x13.field_0x18 ==
