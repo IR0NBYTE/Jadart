@@ -25751,8 +25751,8 @@ def test_a_store_names_a_live_read_it_writes_part_of_from_another_offset():
         for sw, (st, v) in store.items():
             for so in range(0x10 - 8, 0x10 + 9):
                 for base in ("x13", "x12"):
-                    got = lift((ld, f"{r}, [x13, #0xf]"), (st, f"{v}, [{base}, #{so - 1}]"),
-                               ("mov", "x0, x1"))
+                    got = lift((ld, f"{r}, [x13, #0xf]"),
+                               (st, f"{v}, [{base}, #{so - 1}]"), ("mov", "x0, x1"))
                     shared = so < 0x10 + rw and 0x10 < so + sw
                     assert (got[0].startswith("var t0 = x13.field") and len(got) == 3
                             and got[2] == "return t0;") if shared else (
@@ -25822,6 +25822,74 @@ def test_a_store_names_a_live_read_it_writes_part_of_from_another_offset():
                                         "return t0;"]
     assert named(("ldur", "w3, [x1, #7]"), ("stur", "w2, [x4, #11]"),
                  ("mov", "x0, x3")) == ["x4.field_0xc = x2;", "return this.balance;"]
+
+
+def test_a_comparison_still_to_be_read_is_named_before_a_store_that_may_write_it():
+    """`ldur x4, [x13, #0x17]; add x16, x13, x8, lsl #3; cmp x4, x2; stur x1, [x16,
+    #0x17]; cset x0, eq` printed `x13[x8] = x1;` and then `return x13.field_0x18 == x2
+    ? 1 : 0;`: x4 is dead after the `cmp`, so the store named nothing, and the
+    comparison was printed under it from the text of its operand, which reads the word
+    the store wrote where x8 is 0 (#386). The operands of a comparison something still
+    reads are asked what a live register is asked, by every store."""
+    lift = _lift_329
+    ld, el = ("ldur", "x4, [x13, #0x17]"), ("add", "x16, x13, x8, lsl #3")
+    assert lift(ld, el, ("cmp", "x4, x2"), ("stur", "x1, [x16, #0x17]"),
+                ("cset", "x0, eq")) == ["var t0 = x13.field_0x18;", "x13[x8] = x1;",
+                                        "return t0 == x2 ? 1 : 0;"]
+    # Each instruction that leaves a comparison, each kind of store, each reader.
+    sets = {"cmp x4, x2": "t0 {} x2", "cmp x2, x4": "x2 {} t0",
+            "cmn x4, x2": "(t0 + x2) {} 0", "tst x4, #0xff": "(t0 & 0xff) {} 0",
+            "subs x3, x4, x2": "t0 {} x2", "adds x3, x4, x2": "(t0 + x2) {} 0",
+            "ands x3, x4, x2": "(t0 & x2) {} 0"}
+    stores = {"stur x1, [x13, #0x17]": "x13.field_0x18 = x1;",
+              "stur x1, [x12, #0x17]": "x12.field_0x18 = x1;",
+              "sturb w1, [x12, #0x1a]": "x12.field1_0x1b = x1;",
+              "stur w1, [x12, #0x1b]": "x12.field_0x1c = x1;",
+              "stlr x1, [x20]": "stlr x1, [x20]"}
+    reads = {"cset x0, eq": "return {} ? 1 : 0;",
+             "csel x0, x7, x5, eq": "return {} ? x7 : x5;",
+             "csinc x0, x7, x5, eq": "return {} ? x7 : x5 + 1;"}
+    for flags, cond in sets.items():
+        for store, line in stores.items():
+            for read, ret in reads.items():
+                got = lift(ld, *(tuple(x.split(" ", 1)) for x in (flags, store, read)))
+                assert got == ["var t0 = x13.field_0x18;", line,
+                               ret.format(cond.format("=="))], (flags, store, got)
+    # Two operands that read memory are two names, in the order of the registers.
+    assert lift(ld, ("ldur", "x6, [x13, #0x1f]"), ("cmp", "x6, x4"), el,
+                ("stur", "x1, [x16, #0x17]"), ("cset", "x0, lt")) == [
+        "var t0 = x13.field_0x18;", "var t1 = x13.field_0x20;", "x13[x8] = x1;",
+        "return t1 < t0 ? 1 : 0;"]
+    # A register that is live as well has the one name, and a 32-bit view keeps it.
+    assert lift(ld, ("cmp", "x4, x2"), ("stur", "x1, [x12, #0x17]"), ("cset", "x3, eq"),
+                ("add", "x0, x3, x4")) == [
+        "var t0 = x13.field_0x18;", "x12.field_0x18 = x1;",
+        "return (t0 == x2 ? 1 : 0) + t0;"]
+    # Read in the block the comparison is handed to, with the store on either side
+    # of the edge.
+    assert _lift_rows([ld, ("cmp", "x4, x2"), ("stur", "x1, [x12, #0x17]"),
+                       ("b", "#0x10"), ("cset", "x0, eq"), ("ret", "")]) == [
+        "var t0 = x13.field_0x18;", "x12.field_0x18 = x1;", "return t0 == x2 ? 1 : 0;"]
+    assert _lift_rows([ld, ("cmp", "x4, x2"), ("b.lt", "#0x14"), ("mov", "x0, #9"),
+                       ("ret", ""), ("stur", "x1, [x12, #0x17]"), ("cset", "x0, eq"),
+                       ("ret", "")]) == [
+        "if (x13.field_0x18 >= x2) {", "return 9;", "} else {",
+        "var t0 = x13.field_0x18;", "x12.field_0x18 = x1;", "return t0 == x2 ? 1 : 0;",
+        "}"]
+    # Nothing is named where nothing reads the comparison after the store, where the
+    # flags are set again before they are read, or where the store has no byte of
+    # what was compared.
+    assert lift(ld, ("cmp", "x4, x2"), ("stur", "x1, [x12, #0x17]"),
+                ("mov", "x0, x5")) == ["x12.field_0x18 = x1;", "return x5;"]
+    assert lift(ld, ("cmp", "x4, x2"), ("stur", "x1, [x12, #0x17]"), ("cmp", "x5, x6"),
+                ("cset", "x0, eq")) == ["x12.field_0x18 = x1;",
+                                        "return x5 == x6 ? 1 : 0;"]
+    assert lift(ld, ("cmp", "x4, x2"), ("stur", "x1, [x12, #0x27]"),
+                ("cset", "x0, eq")) == ["x12.field_0x28 = x1;",
+                                        "return x13.field_0x18 == x2 ? 1 : 0;"]
+    assert lift(ld, ("cmp", "x4, x2"), ("stur", "w1, [x12, #0x1f]"),
+                ("cset", "x0, eq")) == ["x12.field_0x20 = x1;",
+                                        "return x13.field_0x18 == x2 ? 1 : 0;"]
 
 
 if __name__ == "__main__":

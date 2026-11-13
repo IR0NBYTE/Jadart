@@ -107,6 +107,27 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The operands of a comparison still to be read are named before a store that may
+  write them.** `ldur x4, [x13, #0x17]; add x16, x13, x8, lsl #3; cmp x4, x2; stur x1,
+  [x16, #0x17]; cset x0, eq` printed `x13[x8] = x1;` and then `return x13.field_0x18 ==
+  x2 ? 1 : 0;`: the machine compared the field before the store and the line compares it
+  after (#386). The flags are kept as the operands that set them, and a store named the
+  live registers and frame slots that read what it writes but not those operands. It now
+  names them as well, where a conditional select, a branch or the block the flags are
+  handed to may still read them, so this prints `var t0 = x13.field_0x18;` first and
+  `return t0 == x2 ? 1 : 0;`. A comparison that was printed as a raw line because a
+  store had come between prints as an expression: `ldr x0, [x5]; adds x0, x0, x1; str
+  x0, [x5], #8; cset x2, lo` gives `(t0 + x1) u>= t0 ? 1 : 0` where it gave `cset x2,
+  lo`. The unicorn oracle, over 5,993 programs (a field, a 32-bit field, an element and
+  a sum compared thirteen ways at `x` and `w`, seven kinds of store, seven conditions,
+  read by `cset`, `csel`, `csinc`, a branch, the next block and a `ccmp` chain) at 40
+  entry states, went from 1,729 programs with a wrong run to 143. Those 143 are wrong
+  with the store taken out as well, as 85 of 85 such programs are before this change:
+  `cmp x4, x2; cset x0, mi` prints `<`, which is not the sign of the difference where
+  the subtraction overflows, and `cmn` and `adds` read by `lt` and `ge` likewise. On the
+  two fixtures one range in each changes, ten lines that only renumber a temporary: the
+  name taken for an operand whose branch prints `?` has no reader, so its declaration is
+  not printed.
 - **A store names every live read it writes part of, wherever that read began.** `ldur
   x1, [x13, #7]; stur w2, [x13, #11]; mov x0, x1` printed `x13.field_0xc = x2;` and then
   `return x13.field_0x8;`: the read took eight bytes at offset 8, the store wrote four
