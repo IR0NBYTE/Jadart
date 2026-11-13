@@ -197,7 +197,8 @@ built at runtime can still reach it.
 You do not need to unzip anything first.
 
 Add `-j` to any command for JSON. Exit code is `0` on success and `2` on failure, and with
-`-j` the error is JSON too, so you never have to parse stderr.
+`-j` the error is JSON too, so you never have to parse stderr. Read through a pipe, as
+you do, `-j` is one compact line with no indentation; only a terminal gets it indented.
 
 ---
 
