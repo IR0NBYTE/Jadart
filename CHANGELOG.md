@@ -107,6 +107,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Tier 2 tells lt from mi after a 32-bit add.** `cmn w5, w6` followed by `b.lt` and by
+  `b.mi` both printed `(w5 + w6) < 0`, where mi is the sign of the 32-bit sum as it
+  wrapped and lt that sign taken without wrapping: for w5 = 0x7fffffff and w6 = 1 the
+  sum wraps negative, mi holds and lt does not (#438). lt, ge, gt and le after a 32-bit
+  `cmn` or `adds` now print as the 64-bit forms do since #400, `w5 < -4` against a
+  constant and `?` against a register, and mi and pl keep the sum. Tier 3 already
+  printed these exactly and reads the sum itself, so it does not change: 0 lines on the
+  two fixtures. Tier 2 does not change there either: `export -t 2` of both fixtures
+  before and after, compared with `diff -r`, is 0 lines in 638 files, and the tier 2
+  output before has no 32-bit sum compared with 0 to change.
+
 - **`lift` and `disasm` asked for a range by its address print the name `functions`
   lists.** `lift FILE 0x1e9c18` printed `// sub_0x1e9c18(a1)` and its `-j` name was
   `sub_0x1e9c18`, where `functions` lists the range as `build` (#406). The address form
