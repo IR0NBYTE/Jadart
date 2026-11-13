@@ -22225,8 +22225,10 @@ def test_an_ldp_off_an_element_address_or_the_pool_loads_both_registers():
         "return x3[x4] + x3[x4 + 1];"]
     assert _lift_rows([add, ("ldp", "w0, w1, [x2]")] + tail) == [
         "return x3[x4] + (x3 + (x4 << 3)).field_0x5;"]
+    # Each word of an `ldpsw` extended, as the machine has it (#403).
     assert _lift_rows([("add", "x2, x3, x4, lsl #2"), ("ldpsw", "x0, x1, [x2]")]
-                      + tail) == ["return x3[x4] + x3[x4 + 1];"]
+                      + tail) == [
+        "return (x3[x4] << 32 >> 32) + (x3[x4 + 1] << 32 >> 32);"]
     # Into the element address itself: both words off the address it held.
     assert _lift_rows([add, ("ldp", "x2, x1, [x2]"), ("add", "x0, x2, x1"),
                        ("ret", "")]) == ["return x3[x4] + x3[x4 + 1];"]
@@ -25849,6 +25851,45 @@ def test_a_signed_load_into_a_w_register_is_extended_to_32_bits():
     text = text.replace("x13.field2_0x8 << 48 >> 48", "f.toSigned(16)")
     for half in (0, 1, 0x7fff, 0x8000, 0xffff, 0x1234, 0xfedc):
         assert _dart_int(text, {"f": half}) == _sx(half, 16) & 0xffffffff, (text, half)
+
+
+def test_a_signed_load_of_an_element_into_an_x_register_is_extended():
+    """`ldrsw x0, [x9, x7]` copies the top bit of the word it reads up to 64 bits. Tier 3
+    printed `x9[x7]`, the element as read, which is 0x91780000 where the register holds
+    0xffffffff91780000: 12 of 40 entry states disagreed with the CPU (#403). At a
+    register offset, shifted or extended, off an element address an `add` made, and
+    each word of an `ldpsw`, the element now reads extended as a field does. Into a w
+    register it stops at 32 bits (#374), and an unsigned load reads it as it is."""
+    ret = lambda rows: _lift_rows(list(rows) + [("ret", "")])[-1]
+    for ld in ("x0, [x9, x7]", "x0, [x9, x7, lsl #2]", "x0, [x9, w7, sxtw #2]"):
+        assert ret([("ldrsw", ld)]) == "return x9[x7] << 32 >> 32;", ld
+    assert ret([("ldrsh", "x0, [x9, x7, lsl #1]")]) == "return x9[x7] << 48 >> 48;"
+    assert ret([("ldrsb", "x0, [x9, x7]")]) == "return x9[x7] << 56 >> 56;"
+    elem = [("add", "x11, x9, x7, lsl #2")]
+    assert ret(elem + [("ldrsw", "x0, [x11]")]) == "return x9[x7] << 32 >> 32;"
+    assert ret(elem + [("ldpsw", "x0, x1, [x11]"), ("add", "x0, x0, x1")]) == (
+        "return (x9[x7] << 32 >> 32) + (x9[x7 + 1] << 32 >> 32);")
+    # An `sxtw` of what is already extended is the identity, off a field as off an
+    # element, and one narrower than the load still extends.
+    for ld in ("x3, [x9, x7, lsl #2]", "x3, [x9, #8]"):
+        got = ret([("ldrsw", ld), ("sxtw", "x0, w3")])
+        assert got.count("<< 32 >> 32") == 1, (ld, got)
+    assert ret([("ldrsw", "x3, [x9, x7, lsl #2]"), ("sxth", "x0, w3")]) == (
+        "return x9[x7] << 32 >> 32 << 48 >> 48;")
+    # As they were: into a w register, and the loads that do not extend.
+    assert ret([("ldrsb", "w0, [x9, x7]")]) == (
+        "return (x9[x7] << 56 >> 56).toUnsigned(32);")
+    assert ret(elem + [("ldp", "w0, w1, [x11]"), ("add", "x0, x0, x1")]) == (
+        "return x9[x7] + x9[x7 + 1];")
+    for mn, ld in (("ldr", "w0, [x9, x7, lsl #2]"), ("ldrb", "w0, [x9, x7]"),
+                   ("ldr", "x0, [x9, x7, lsl #3]")):
+        assert ret([(mn, ld)]) == "return x9[x7];", ld
+    # The printed value is the one the register holds: `<< 32 >> 32` on Dart's 64-bit
+    # ints is `.toSigned(32)`.
+    text = ret([("ldrsw", "x0, [x9, x7]")])[len("return "):-1]
+    text = text.replace("x9[x7] << 32 >> 32", "e.toSigned(32)")
+    for word in (0, 1, 0x7fffffff, 0x80000000, 0x91780000, 0xffffffff):
+        assert _dart_int(text, {"e": word}) == _sx(word, 32) & (1 << 64) - 1, (text, word)
 
 
 def test_a_join_past_a_raw_write_names_what_each_way_in_left():

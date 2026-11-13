@@ -107,6 +107,20 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A signed load of an element into an `x` register is extended.** `ldrsw x0, [x9, x7,
+  lsl #2]` printed `return x9[x7];`, the word as read, where the register holds it
+  sign-extended to 64 bits: 0xffffffff80000000 for an element of 0x80000000 (#403). The
+  same held for `ldrsb` and `ldrsh`, at a register offset with or without a shift, at an
+  extended one, off an element address an `add` built, and for both words of `ldpsw`.
+  These now print `x9[x7] << 32 >> 32`, as a field load at a constant offset did. An
+  `sxtw` of a value `ldrsw` already extended now adds nothing, where it printed the
+  extension twice (`<< 32 >> 32 << 32 >> 32`); field loads printed that too. The unicorn
+  oracle, over 618 programs (signed and unsigned loads, seven address forms and `ldp`
+  pairs, ten readers) at 40 entry states, went from 75 programs with a wrong run and 543
+  agreeing to none wrong and all 618 agreeing. On each fixture 25 of about 8,190 ranges
+  change, 59 lines out and 59 in, none with an error: 35 lines gain the extension and 24
+  lose the doubled one.
+
 - **vs and vc after integer flags are declined.** V after a compare or an add is its
   signed overflow, which no Dart operator spells, and `cmp x5, x6; b.vs` printed
   `if (!(x5 vs x6))`, an operator that does not exist (#401). The branch now prints `?`,

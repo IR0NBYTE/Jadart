@@ -8520,12 +8520,7 @@ class Lifter:
             if index is not None or (base in st.elem and not second):   # element load
                 elem = self._elem_access(base, index, scale, st, disp)
                 if elem is not None:
-                    elem = self._elem_read(elem)
-                    if mn in _SIGNED_LOADS and ops[0].strip()[:1] == "w":
-                        # The element, sign-extended to the 32 bits a w register
-                        # holds (#374). Into an x register it prints unextended still.
-                        width = _access_width(mn, ops[0])
-                        elem = _narrow(_extended(elem, 8 * width, True))
+                    elem = _signed_load(self._elem_read(elem), mn, ops[0])
                     st.set(dst, elem)
                     return self._bump(st, base, delta)
                 # Not one the lifter can show is an element: the load from the address
@@ -8566,7 +8561,7 @@ class Lifter:
                 v = (self._elem_access(base, None, scale, st, d) if base in st.elem
                      else None)
                 if v is not None:
-                    self._elem_read(v)
+                    v = _signed_load(self._elem_read(v), mn, ops[k])
                 else:
                     wk = _access_width(mn, ops[k])
                     bv, off, hdr = self._rebase(base, at_base, d)
@@ -8959,6 +8954,12 @@ class Lifter:
                     return []
                 src = _word(src)
             width = {"b": 8, "h": 16, "w": 32}[mn[3]]
+            if mn.startswith("s") and src.sext <= width:
+                # Already sign-extended from bit `width` - 1 or below, as `ldrsw` leaves
+                # what it read: the extension is the identity, and a second shift pair
+                # said nothing more (#403).
+                st.set(dst, src)
+                return []
             if mn.startswith("u"):
                 st.set(dst, _bin(src, "&", V(hex((1 << width) - 1), P_ATOM, bits=width), P_AND))
             else:
@@ -12725,6 +12726,17 @@ def _extended(v: V, bits: int, signed: bool) -> V:
         return replace(_bin(_bin(v, "<<", _num(pad), P_SHIFT), ">>", _num(pad), P_SHIFT),
                        sext=bits)
     return _bin(v, "&", V(hex((1 << bits) - 1), P_ATOM, bits=bits), P_AND)
+
+
+def _signed_load(v: V, mn: str, reg: str) -> V:
+    """`v`, an element a load of `mn` into `reg` read, as the register holds it: a signed
+    load copies the top bit of what it read up to 64 bits into an x register and to 32
+    into a w one (#374), at a register offset or off an element address as at a constant
+    one (#403). Any other load leaves it as read."""
+    if mn not in _SIGNED_LOADS:
+        return v
+    v = _extended(v, 8 * _access_width(mn, reg), True)
+    return _narrow(v) if reg.strip()[:1] == "w" else v
 
 
 def _access_width(mn: str, reg: str) -> int:
