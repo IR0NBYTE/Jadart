@@ -301,7 +301,9 @@ def _cond_text(prev_cmp, mn, op) -> str:
             b = parts[1] if len(parts) == 2 else _shifted(parts[1:])
             if b is None:
                 return "?"
-            lhs, rhs = f"({parts[0]} + {b})", "0"
+            lhs, rhs = _sum_order(cc, parts[0], b)
+            if lhs == "?":
+                return f"? {rel} ?"
             if cc in _CARRY:
                 # ...and with it spelled the carry is the carry out of that sum, as
                 # after `adds`. It printed `?` while the sum left the shift out.
@@ -312,7 +314,9 @@ def _cond_text(prev_cmp, mn, op) -> str:
             b = parts[2] if len(parts) == 3 else _shifted(parts[2:])
             if b is None:
                 return "?"
-            lhs, rhs = f"({parts[1]} + {b})", "0"
+            lhs, rhs = _sum_order(cc, parts[1], b)
+            if lhs == "?":
+                return f"? {rel} ?"
             if cc in _CARRY:
                 if cc in ("hi", "ls"):
                     return f"? {rel} ?"
@@ -342,6 +346,25 @@ def _difference_sign(cc, a, b):
     if cc in ("mi", "pl") and _int(b) != 0:
         return f"({a} - {b})", "0"
     return a, b
+
+
+def _sum_order(cc, a, b):
+    """`(lhs, rhs)` for condition `cc` after the flags of `a + b`, `?` when unspelled.
+
+    lt, ge, gt and le read N and V together: the sign of the sum taken without wrapping,
+    which is the order of a against -b. Printed as `(x5 + x6) < 0` they read the sign of
+    the wrapped sum, false for x5 = 0x7fffffffffffffff and x6 = 1 where the CPU takes lt's
+    fall through (60 of 72 such programs against a CPU, #400). With a constant k the test
+    is `a < -k`, exact since -k fits. With a register, -b overflows at the most negative
+    value and no short spelling is exact, so it is declined. At 32 bits the sum is printed
+    as before: the 32-bit renderer reads it as the sign of a sum of sign-extended halves,
+    which cannot overflow."""
+    if cc not in ("lt", "ge", "gt", "le") or a.startswith("w"):
+        return f"({a} + {b})", "0"
+    k = _int(b)
+    if k is None:
+        return "?", "?"
+    return a, str(-k)
 
 
 def _carry_out(cc, a, b):
