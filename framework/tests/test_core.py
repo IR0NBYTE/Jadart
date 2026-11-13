@@ -3025,6 +3025,38 @@ def test_xrefs_legacy_function_kind(xrefs_cli, capsys):
     assert "resolved as function" in capsys.readouterr().err
 
 
+def test_lift_and_disasm_by_address_name_the_range_as_functions_does():
+    """`lift` and `disasm` asked for a range by its address printed `sub_0x1e9c18` where
+    `functions` lists it as `build`, and the two commands disagreed on one range (#406).
+    They now take the name from callgraph.range_names, as `functions` and `xrefs` do, in
+    the text header and in the `-j` name, and keep `sub_0x...` for a range with none."""
+    _needs_capstone()
+    import io
+    import json
+    import contextlib
+    from jadart import cli
+
+    def run(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = cli.main([*argv])
+        assert rc == 0, argv
+        return out.getvalue()
+
+    for addr, name in (("0x1e9c18", "build"), ("0x13f034", "_parse@0150898"),
+                       ("0x136b08", "sub_0x136b08")):
+        head = [ln for ln in run("lift", CLEAN, addr).splitlines()
+                if ln.startswith("// ")]
+        assert head[0].startswith(f"// {name}("), head[0]
+        head = [ln for ln in run("disasm", CLEAN, addr).splitlines()
+                if ln.startswith("// ")]
+        assert head[0].startswith(f"// {name}  @ {addr}"), head[0]
+        for cmd in ("lift", "disasm"):
+            doc = json.loads(run(cmd, CLEAN, addr, "-j"))
+            assert [f["name"] for f in doc["functions"]] == [name], (
+                cmd, doc["functions"])
+
+
 def test_xrefs_says_which_matching_entries_no_code_loads():
     """A pool entry that matches but that no code loads directly is said, not dropped.
 
@@ -12449,9 +12481,12 @@ def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
 #: Regenerated for compact `-j` off a terminal: the `-j` half of each sample is one line
 #: now. Re-indenting that half by two spaces gives back the previous sha for both
 #: samples, so the text listing and the parsed `-j` value did not move.
+#: Regenerated for #406, which names a range asked for by address as `functions` does:
+#: 181 headers and 181 `-j` names of the clean sample and 8 and 8 of the obf one went from
+#: `sub_0x...` to that name. Checked line by line: same line count, nothing else differs.
 _ARM64_DISASM_SAMPLE_SHA = {
-    "clean": "d1517c63d8195b5a079e4e9f4ebe49f71b1b68b0d94b237625c34ad319ee2e5f",
-    "obf": "6fe914c532c33e8316e65a8bc264ed1ddd074808398373fcc42b14ca293a0650",
+    "clean": "52590ac75a3ed9cc5d7f7f230f109e1e3262f23dd3fadddc8e03228847b307f7",
+    "obf": "be4bb5e064d598877e7da1ed554ad95bb185a2f1919cefa7a1e47ac13c2d9e5c",
 }
 
 
