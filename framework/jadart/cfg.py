@@ -344,7 +344,7 @@ def _cond_text(prev_cmp, mn, op, tier2=False) -> str:
                 # ...and with it spelled the carry is the carry out of that sum, as
                 # after `adds`. It printed `?` while the sum left the shift out.
                 if cc in ("hi", "ls"):
-                    return f"? {rel} ?"
+                    return _carry_above(cc, parts[0], b)
                 rel, rhs = _carry_out(cc, parts[0], b)
         elif pm == "adds" and len(parts) >= 3:
             b = parts[2] if len(parts) == 3 else _shifted(parts[2:])
@@ -355,7 +355,7 @@ def _cond_text(prev_cmp, mn, op, tier2=False) -> str:
                 return f"? {rel} ?"
             if cc in _CARRY:
                 if cc in ("hi", "ls"):
-                    return f"? {rel} ?"
+                    return _carry_above(cc, parts[1], b)
                 rel, rhs = _carry_out(cc, parts[1], b)
         elif pm in _LOGICAL_FLAGS and cc in _Z_N_ONLY:
             a, b = (parts[0], parts[1]) if pm == "tst" else (
@@ -413,8 +413,22 @@ def _carry_out(cc, a, b):
     CPU, #371). The operand named is the constant where there is one and the first
     otherwise, which in an allocation's `adds x1, x0, x2` is the top it loaded and not
     the size it computed. hi and ls also read Z, two tests of the sum in one condition,
-    and the callers leave them unspelled."""
+    and `_carry_above` spells them."""
     return _unsigned(_NEG[_CARRY[cc]]), b if _int(b) is not None else a
+
+
+def _carry_above(cc, a, b):
+    """hi or ls after the flags of `a + b`, `?` where there is no exact short spelling.
+
+    hi is the carry out with a sum that is not zero, and printed `? u<= ?` (#419). The
+    carry of a + k is set when a is above ~k, so with k not zero hi holds when a is
+    above ~k + 1, which is -k at the operand's width: `cmn w1, #5; b.hi` is `w1 u> -5`.
+    With k zero nothing carries and hi never holds, `a u> -1`. Against a register the
+    sum is zero also where b is, which needs a test of its own: declined."""
+    k = _int(b)
+    if k is None:
+        return f"? {_REL[cc]} ?"
+    return f"{a} {_REL[cc]} {-k if k else -1}"
 
 
 #: `cmp x0, x1, lsl #3` compares x0 against x1<<3, and dropping the third operand made
