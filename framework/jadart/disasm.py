@@ -843,16 +843,142 @@ def build_pool_map(fr, arch=None) -> dict:
     slot cost slots times its length, in time and in the labels, in every command that
     names pool entries (#91)."""
     fname = {ref: fr.names.get(nr, "") for ref, nr, ow, kt in fr.functions}
-    m, done, quotes = {}, {}, {}
+    m, done, quotes = PoolMap(), {}, {}
+    m.descs = descs = {}
+    smis, seen, at = None, {}, []
+    first = getattr(fr, "first_ref", 0)
     for idx, (kind, val) in enumerate(fr.pool):
         if kind != "ref":
             continue
         if val not in done:
             done[val] = _pool_label(fr, val, fname, quotes)
+            if done[val] is None:
+                if smis is None:
+                    smis = frozenset((getattr(fr, "smi_values", None) or {}).values())
+                seen[val] = _args_desc(fr, val, smis)
         if done[val] is not None:
             off = pool_byte_offset(idx, arch)
             m[off] = _at(done[val], off)
+        elif seen[val] is not None:
+            at.append((pool_byte_offset(idx, arch), val))
+        elif 1 < val < first:
+            descs[pool_byte_offset(idx, arch)] = CACHED_DESC
+    # A base ref is one object, so the value one descriptor leaves for it is its value
+    # in every other; where two disagree it has none, and neither is read.
+    base = {}
+    for _d, (ref, v) in filter(None, seen.values()):
+        if v is not None:
+            base.setdefault(ref, set()).add(v)
+    for val, got in seen.items():
+        if got is not None and got[1][0] in base:
+            vs = base[got[1][0]]
+            one = len(vs) == 1
+            seen[val] = _args_desc(fr, val, smis, next(iter(vs))) if one else None
+    for off, val in at:
+        if seen[val] is not None:
+            descs[off] = seen[val][0]
     return m
+
+
+class PoolMap(dict):
+    """What `build_pool_map` returns: the labels, and beside them `descs`, pool byte
+    offset -> the arguments descriptor in that slot as `_args_desc` reads it, or
+    CACHED_DESC for a slot naming a base object. A slot has a label or a descriptor,
+    never both, and most have neither."""
+
+    descs: dict = {}
+
+
+#: What `PoolMap.descs` holds for a slot naming a base object: nothing of it is in the
+#: snapshot. One loaded as a call's arguments descriptor is one of the VM's cached ones
+#: (expr.Lifter._plan_desc), and what else a base object can be is not asked here.
+CACHED_DESC = (None, None, None, ())
+
+
+#: A named argument's name as a call prints it. A Dart identifier, and no longer than
+#: any written by hand: the name comes out of the binary and is printed at every call
+#: that passes it, so what a crafted one may cost is bounded here (#83, #91).
+_ARG_NAME = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]{0,63}\Z")
+
+#: The most arguments a descriptor may count and still be read. One of its numbers can
+#: be a base object, and which is found by trying each value up to the count.
+_ARGS_MAX = 255
+
+
+def _args_desc(fr, ref: int, smis, known=None):
+    """((type_args_len, count, size, names), (base ref, its value)) for the
+    ArgumentsDescriptor Array `ref`, or None where the Array is not one this can read
+    in full. The second pair is the base object it names, or (None, None).
+
+    The layout is `dart_entry.h`'s, the same in every release from 2.19.6 to 3.13.0:
+    [type_args_len, count, size, positional_count, (name, position)..., null], the pairs
+    sorted by name, and count and size leaving the type-argument vector out. `count` is
+    the arguments passed and `size` the words of them on the stack, so count - size are
+    in registers; `names[i]` is argument i's name, None for a positional one.
+
+    A number here is a Smi, and a Smi the VM snapshot already holds is not written
+    again: the slot names it by a base ref (below `fr.first_ref`), whose value nothing
+    in this snapshot states. The serializer keeps one ref per Smi value, so a base Smi
+    is one no Smi of this snapshot equals, and where the rest of the descriptor leaves
+    one value for it that is the value: positional_count is count less the names, the
+    positions are positional_count to count - 1, each once, and a size is the one
+    number from 0 to count this snapshot has no Smi for. On every corpus binary that
+    is 0. More than one base ref, or a count that is one, is not read. A
+    type_args_len that is the only base ref stays None, not known, unless `known`
+    gives the value another descriptor left for the same ref.
+
+    `smis` is every Smi and Mint value the snapshot holds."""
+    elems = (getattr(fr, "arrays", None) or {}).get(ref)
+    if not elems or not 5 <= len(elems) <= 5 + 2 * _ARGS_MAX or not len(elems) % 2:
+        return None
+    if elems[-1] != 1:
+        return None
+    vals, first = fr.smi_values, getattr(fr, "first_ref", 0)
+    nums, base = [], None
+    for e in elems[:4] + elems[5:-1:2]:
+        v = vals.get(e)
+        if v is None:
+            if not 1 < e < first or base not in (None, e):
+                return None
+            base = e
+        nums.append(v)
+    names = [fr.strings.get(e) for e in elems[4:-1:2]]
+    if not all(n is not None and _ARG_NAME.match(n) for n in names):
+        return None
+    (tlen, count, size, pos), at = nums[:4], nums[4:]
+    if count is None or not len(names) <= count <= _ARGS_MAX:
+        return None
+    want = count - len(names)
+    v = None
+    if base is not None:
+        v = known
+        if v is not None:
+            pass
+        elif pos is None:
+            v = want
+        elif None in at:
+            left = set(range(want, count)).difference(at)
+            if at.count(None) != 1 or len(left) != 1:
+                return None
+            v = left.pop()
+        elif size is None:
+            free = [x for x in range(count + 1) if x not in smis]
+            if len(free) != 1:
+                return None
+            v = free[0]
+        if v is not None:
+            if v in smis:
+                return None
+            tlen, size = (v if x is None else x for x in (tlen, size))
+            pos, at = v if pos is None else pos, [v if x is None else x for x in at]
+    if pos != want or sorted(at) != list(range(want, count)):
+        return None
+    if not 0 <= size <= count or count - size > want or (tlen is not None and tlen < 0):
+        return None
+    order = [None] * count
+    for n, p in zip(names, at):
+        order[p] = n
+    return (tlen, count, size, tuple(order)), (base, v)
 
 
 def _pool_label(fr, val: int, fname: dict, quotes: dict):
