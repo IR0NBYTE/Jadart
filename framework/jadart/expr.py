@@ -2067,6 +2067,8 @@ def _af_row(mn: str, op: str, note: str):
                     return ("mov", dst, src)          # the decompression
                 if m == "add" and len(ops) == 3 and full(ops[2]):
                     return ("addr", dst, src, canon(ops[2]))
+                if m == "add" and len(ops) == 4:
+                    return ("elem", dst, src)         # an element's address off `src`
             if (m == "csel" and len(ops) >= 4 and src and full(ops[2])
                     and canon(ops[2]) != zero):
                 return ("csel", dst, src, canon(ops[2]))
@@ -2085,7 +2087,9 @@ def _addr_facts(blocks, preds, entries, raw=None) -> tuple:
     a computed address, and of the adds and subs that make a new object's pointer (#329).
 
     `computed` has a load or a store whose BASE, and an `add` or `sub` of an immediate
-    whose SOURCE, may on some path hold a value an arithmetic row made. The walk's own
+    whose SOURCE, may on some path hold a value an arithmetic row made, and an `add`
+    of two registers, the address of an element, whose first may (#387), with `(row,
+    1)` where the second of an unshifted one may. The walk's own
     record (`V.calc`) follows a value it tracks; a register it has lost, at a join, a
     loop header or a label, reads as its bare name or as the name the join gave it,
     and this says what every way in left there. A may-analysis over the rows: a load
@@ -2144,6 +2148,8 @@ def _addr_facts(blocks, preds, entries, raw=None) -> tuple:
         elif kind == "def":
             for d in row[2]:
                 f[d] = _AF_CALC
+        elif kind == "elem":
+            f[row[2]] = _AF_CALC
         elif kind == "load":
             for d in row[3]:
                 f.pop(d, None)
@@ -2284,8 +2290,11 @@ def _addr_facts(blocks, preds, entries, raw=None) -> tuple:
             if kind in ("load", "store", "back"):
                 if not _af_plain(f.get(row[2])):
                     computed.add(row[0])
-            elif kind == "addi" and not _af_plain(f.get(row[3])):
-                computed.add(row[0])
+            elif kind in ("addi", "elem", "addr"):
+                if not _af_plain(f.get(row[3])):
+                    computed.add(row[0])
+                if kind == "addr" and not _af_plain(f.get(row[4])):
+                    computed.add((row[0], 1))         # its second register
             step(f, row)
             if kind == "addi" and f.get(row[2]) == ("n", 1):
                 fresh.add(row[0])
@@ -6395,7 +6404,7 @@ class Lifter:
             else:
                 st.forget(r)
         if st.elem:
-            for key, (b, i, _s, _f) in list(st.elem.items()):
+            for key, (b, i, *_r) in list(st.elem.items()):
                 if _names_frame(b, role) or _names_frame(i, role):
                     del st.elem[key]
         return out
@@ -6530,7 +6539,7 @@ class Lifter:
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
                 holder[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
-        for key, (b, i, _s, _f) in list(st.elem.items()):
+        for key, (b, i, *_r) in list(st.elem.items()):
             if pat.search(b.text) or pat.search(i.text):
                 del st.elem[key]
         return out
@@ -6835,7 +6844,8 @@ class Lifter:
             if budget is None:
                 budget = self._pin_budget = _PIN_WALK * sum(
                     len(b.insns) for b in self.blocks.values())
-            if self._pin_walked <= budget or maybe is not None or anywhere:
+            if (self._pin_walked <= budget or maybe is not None
+                    or anywhere and anywhere is not True):
                 for key in [k for k, v in slots.items() if reads(v.text)]:
                     st.forget_slot(key)
             else:
@@ -6844,11 +6854,14 @@ class Lifter:
                 # text that this store does not write is kept, under everything the
                 # answer is made of, and a store that asks the same thing again asks
                 # only about the texts it has not seen. Not where the analysis of the
-                # body may still be asked (`maybe`, `anywhere`), which is no text's
-                # alone to answer.
+                # body may still be asked (`maybe`, or `anywhere` as rows), which is
+                # no text's alone to answer. A store at an address known to be
+                # computed names every read of the heap, which a text is or is not:
+                # an element off a computed base is one more such store (#387), and
+                # each of them read every slot of the frame again.
                 kept = self._unread
                 what = (texts, alias and alias.pattern, at and len(at), el and len(el),
-                        edge, past, len(wide))
+                        edge, past, len(wide), anywhere)
                 if under is not None:
                     what += (since, len(box["elem_at"][1]),
                              since is not None and len(self._elem_when))
@@ -6863,7 +6876,7 @@ class Lifter:
                         st.forget_slot(key)
                     else:
                         unread.add(text)
-        for key, (b, i, _s, _f) in list(st.elem.items()):
+        for key, (b, i, *_r) in list(st.elem.items()):
             rb, ri = reads(b.text), reads(i.text)
             if not (rb or ri):
                 continue
@@ -6878,7 +6891,7 @@ class Lifter:
                     self.raw_names.add(tmp)
                     v = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
                 got.append(v)
-            st.elem[key] = (got[0], got[1], _s, _f)
+            st.elem[key] = (got[0], got[1], *_r)
         return out
 
     def _at_reads(self, kind="at"):
@@ -7219,6 +7232,9 @@ class Lifter:
                 for i, t in enumerate(blk.insns):
                     at[t[0]] = None if t[0] in at else (b, i)
             box["rowat"] = at
+        second = type(a) is tuple           # the second register of an add of two
+        if second:
+            a = a[0]
         pos = at.get(a, _MISS)
         if pos is _MISS:
             return True                     # no row of the body: the analysis has none
@@ -7233,8 +7249,10 @@ class Lifter:
         kind = got[0] if got is not None else None
         if kind in ("load", "store", "back"):
             r = got[1]
-        elif kind == "addi":
+        elif kind in ("addi", "elem") and not second:
             r = got[2]
+        elif kind == "addr":
+            r = got[3] if second else got[2]
         else:
             return True                     # not a row `computed` can hold
         roles = _af_target()[2]
@@ -7292,7 +7310,7 @@ class Lifter:
                     if r in got[1]:
                         return False
                 elif kind != "back" and got[1] == r:
-                    return False            # addi, addr, csel: arithmetic
+                    return False            # addi, addr, elem, csel: arithmetic
             else:
                 into = self._preds.get(b, ())
                 ways -= len(into)
@@ -7360,6 +7378,24 @@ class Lifter:
             return True
         return self._row_computed(self._here) or (
             v.at is not None and self._row_computed(v.at[3]))
+
+    def _loose(self, rows) -> bool:
+        """Whether the base of an element address may hold an address the lifter
+        computed and not an object pointer (#387), where the value the walk has for
+        it does not say and only the rows on every way in can (`_addr_facts`). `rows`
+        is what the `add` that made the address left to ask about: its own row, or
+        `(row, 1)` where its second register is the base, and the row the base's
+        offset was made at (`V.at`), as `_computed` asks of a field's base. Asked once
+        for each add, by the first access through it, and not at the add, which is
+        the sum of two numbers far more often than it is an address."""
+        made = self._elem_box.get("loose")
+        if made is None:
+            made = self._elem_box["loose"] = {}
+        got = made.get(rows)
+        if got is None:
+            got = made[rows] = self._row_computed(rows[0]) or (
+                rows[1] is not None and self._row_computed(rows[1]))
+        return got
 
     def _at_address(self, base_v: V, disp: int) -> tuple:
         """`_rebase` for a computed base at offset 0: the access at its address.
@@ -8707,9 +8743,26 @@ class Lifter:
                 # x0, #1; add x5, x0, x5, lsl #2` is `x0 + (x5 << 2)` and 1 (`V.at`).
                 total = replace(total, at=(_bin(src.at[0], "+", val, P_ADD), src.at[1],
                                            False, None))
+            # And whether the base may be an address these rows computed, which has no
+            # object's header in front of the element (`_elem_access`, #387): what the
+            # walk has for it says so, or the rows to ask where it does not (`_loose`).
+            # A word the walk still has as the read of memory it was, a field or an
+            # element, is one no arithmetic made on any way in, or the walk would
+            # have lost it: `_addr_facts` has every load plain, and is not asked.
+            if untagged:
+                loose = False
+            elif base_v.smi:
+                loose = base_v.smi == _SMI_TAG
+            elif base_v.calc:
+                loose = True
+            elif base_v.prec == P_POST and base_v.text[-1:] != ")":
+                loose = False
+            else:
+                loose = ((here, 1) if swap else here,
+                         None if base_v.at is None else base_v.at[3])
             st.set(dst, total)
             if not numeric or swap:
-                st.elem[dst] = (base_v, idx_v, scale, offs)
+                st.elem[dst] = (base_v, idx_v, scale, offs, loose)
             return []
         if mn == "sub" and len(ops) >= 3:
             b = g(ops[1])
@@ -8941,7 +8994,7 @@ class Lifter:
                 self._elem_lo = 0
                 return V(f"{_wrap(self._leaf(base_reg, st), P_POST)}"
                          f"[{self._leaf(index_reg, st).text}]", P_POST)
-            base_v, idx_v, s, offs = st.elem[base_reg]
+            base_v, idx_v, s, offs, loose = st.elem[base_reg]
             claim, reach = self.data_offsets
             if offs is None:
                 at = 0
@@ -8963,7 +9016,15 @@ class Lifter:
             # checks an index against the length before it uses it, and the rows are
             # not searched for the check. `asr x8, x7, #63` as the index is -1 or 0,
             # and its element is the word below the data offset (`_pin_mem`, #375).
-            self._elem_lo = max(at + 1 + (k << s if k < 0 else 0), 0) if at else 0
+            # And 0 off a base that may be an address the rows computed: `sub x9, x13,
+            # #0x20; add x16, x9, x8, lsl #3; stur x1, [x16, #0x17]` is spelled `(x13 -
+            # 32)[x8]`, and it is `x13.field_0x18` where x8 is 4 and the header of x13
+            # where it is 1. The spelling stays; what the access may reach is what an
+            # access at a computed address may, any field of any object (#387).
+            if at and loose and loose is not True:
+                loose = self._loose(loose)
+            self._elem_lo = (max(at + 1 + (k << s if k < 0 else 0), 0)
+                             if at and not loose else 0)
             return V(f"{_wrap(base_v, P_POST)}[{idx}]", P_POST)
         self._elem_lo = 0
         base_v = self._leaf(base_reg, st)
@@ -12544,7 +12605,7 @@ def _forget_temps(st: State, gone) -> None:
     for k, (v, _f) in list(st.dropped.items()):
         if late(v.text):
             st.dropped.pop(k, None)
-    for k, (b, i, _s, _f) in list(st.elem.items()):
+    for k, (b, i, *_r) in list(st.elem.items()):
         if late(b.text) or late(i.text):
             del st.elem[k]
 
@@ -12556,7 +12617,7 @@ def _spells_a_temp(st: State) -> bool:
     """Whether anything `_forget_temps` looks at in `st` spells a temp."""
     texts = [v.text for v in st.reg.values()] + [v.text for v in st.slot.values()]
     texts += [v.text for v, _f in st.dropped.values()]
-    texts += [t.text for b, i, _s, _f in st.elem.values() for t in (b, i)]
+    texts += [t.text for b, i, *_r in st.elem.values() for t in (b, i)]
     return any("t" in t and _TMP_NUM_RE.search(t) for t in texts)
 
 #: How many values one function's first walk writes out before a goto (_arrive). A real
