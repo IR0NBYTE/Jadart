@@ -44,6 +44,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from itertools import islice
 
+from .keep import kept
 from .stream import ReadStream, TruncatedSnapshot
 
 # Serialization constants (app_snapshot.cc; identical across the supported epochs).
@@ -456,6 +457,7 @@ def _one_selector(fs, off, entries, parent, kids, concrete, budget) -> bool:
     return True
 
 
+@kept
 def recover_selectors(image, fr, hdr, origin: int = ORIGIN_ELEMENT_ARM64) -> dict:
     """Public entry: call-site immediate -> selector name.
 

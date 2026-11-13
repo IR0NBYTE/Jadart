@@ -16,6 +16,7 @@ first_entry_with_code + i; pc_offset is the byte offset into the instructions im
 from __future__ import annotations
 
 from .errors import InputError, JadartError
+from .keep import in_session, kept
 
 import bisect
 import re
@@ -267,6 +268,7 @@ def check_image_size(text: bytes, pcs: list, arch, symbol: str) -> None:
             f"instructions image ends at {size}.")
 
 
+@kept
 def load_instructions(path):
     """Parse the isolate instructions image + table and build owner_ref -> CodeRange.
     Returns (image, fr, hdr): the InstrImage, the FillResult from walk_fill, and the
@@ -710,6 +712,7 @@ def _parse_addr(text: str, image: "InstrImage | None" = None):
     return n
 
 
+@kept
 def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
     """Map each code's start pc_offset -> owning function name, for call-target naming.
     Snapshot names win; ELF .symtab names (image.symbol_names) backfill the gaps. That
@@ -827,6 +830,7 @@ def pool_byte_offset(idx: int, arch=None) -> int:
     return start + idx * size - tag
 
 
+@kept
 def build_pool_map(fr, arch=None) -> dict:
     """ObjectPool byte-offset -> annotation string. The pool is loaded into PP (X27,
     untagged); a `ldr xN, [x27, #off]` reads pool entry (off - 0x10)//8. Entries keyed
@@ -1350,6 +1354,34 @@ def pool_xrefs(image: InstrImage, offsets) -> dict:
     ranges = image.all_ranges
     if not want or not ranges:
         return out
+    # One command scans for the offsets it was asked about. A session is asked again, so
+    # it scans once for every offset and each later question is a lookup (#352).
+    hits = _all_pool_loads(image) if in_session() else _pool_loads(image, want)
+    for off in out:
+        idx = hits.get(off)
+        if idx:
+            out[off] = [ranges[i] for i in sorted(idx)]
+    return out
+
+
+class _Every:
+    """The set of wanted offsets when every offset is wanted."""
+
+    def __contains__(self, off) -> bool:
+        return True
+
+
+@kept
+def _all_pool_loads(image: InstrImage) -> dict:
+    """`_pool_loads` for every offset there is, as `{pool offset: (range index, ...)}`."""
+    return {off: tuple(sorted(idx))
+            for off, idx in _pool_loads(image, _Every()).items()}
+
+
+def _pool_loads(image: InstrImage, want) -> dict:
+    """The scan behind `pool_xrefs`: `{pool offset: {index into image.all_ranges}}` for
+    the offsets in `want` that some function loads."""
+    ranges = image.all_ranges
     text = image.text
     starts = [cr.pc_offset for cr in ranges]
     word = struct.Struct("<I").unpack_from
@@ -1386,7 +1418,4 @@ def pool_xrefs(image: InstrImage, offsets) -> dict:
             elif _word_dest(v) == reg:
                 break
             q += 4
-
-    for off, idx in hits.items():
-        out[off] = [ranges[i] for i in sorted(idx)]
-    return out
+    return hits

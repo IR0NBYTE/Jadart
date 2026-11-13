@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 580](https://img.shields.io/badge/tests-580-brightgreen.svg)](#tests)
+[![tests: 593](https://img.shields.io/badge/tests-593-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -173,6 +173,7 @@ jadart xrefs app.apk "some literal"        # who references it
 jadart export app.apk out/                 # the whole browsable tree on disk
 jadart symbols app.apk --format r2         # name every function in radare2 (also ida, ghidra)
 jadart hook app.apk Vault.unlock           # a Frida script that logs that function's calls
+jadart serve app.apk --socket ~/.jadart/s  # keep it loaded: later calls take a tenth
 ```
 
 It takes an APK, a directory or a bare `libapp.so`. You do not unzip anything first, and
@@ -251,7 +252,9 @@ Detail and reasoning: [docs/support.md](docs/support.md).
 ## How fast
 
 Every command is a fresh process that parses the snapshot from scratch, so these are the
-prices a script or an agent pays per call, not warm numbers.
+prices a script or an agent pays per call, not warm numbers. `jadart serve` is how not to
+pay them twice on one binary: [many questions about one
+binary](#many-questions-about-one-binary).
 
 <!-- bench:start -->
 | workload | what it does | median | peak RSS |
@@ -414,6 +417,74 @@ its instructions. Point it at a binary and give the agent a shell.
 The one thing to keep, whatever you paste it into, is the rule at the top: never fill in a
 gap the tool deliberately left. Everything else is routing.
 
+### Many questions about one binary
+
+A command reads the binary from the start, and on a large app that is nearly all of the
+call: `lift` of a 200 byte function out of a 26 MB `libapp.so` is 1.38 s, of which the
+lift is 0.004 s. An agent asks hundreds of such questions. `jadart serve` holds the
+binary in one process, and a command that names its socket prints what that process
+answers:
+
+```bash
+mkdir -m 700 -p ~/.jadart                  # a directory only you can write
+jadart serve app.apk --socket ~/.jadart/app.sock >/dev/null 2>&1 &
+jadart --server ~/.jadart/app.sock lift app.apk Vault.unlock
+jadart --server ~/.jadart/app.sock xrefs app.apk function Vault.unlock
+```
+
+`JADART_SERVER=~/.jadart/app.sock` in the environment does what `--server` does. The
+output is byte for byte the output of the command on its own, exit code and stderr
+included. The first command that needs a table builds it, and the ones after do not. On
+FluffyChat
+(88,618 code ranges), each row a fresh process, best of 3:
+
+| command | on its own | through the server |
+|---|---|---|
+| `lift`, a 200 byte function | 1.38 s | 0.09 s |
+| `lift`, a 28 KB function | 1.94 s | 0.35 s |
+| `disasm`, a function | 0.81 s | 0.09 s |
+| `decompile`, a class | 1.58 s | 0.16 s |
+| `xrefs string` | 1.23 s | 0.07 s |
+| `xrefs function` | 2.51 s | 0.10 s |
+| `functions` | 5.54 s | 0.07 s |
+| `functions -f` | 2.70 s | 0.08 s |
+| `classes -f` | 0.69 s | 0.08 s |
+| `strings -g` | 0.68 s | 0.16 s |
+| `symbols -f` | 1.00 s | 0.27 s |
+| `info` | 0.05 s | 0.07 s |
+
+The first command through a new server takes what it takes on its own, with one
+exception. `functions` and `xrefs function` read one call graph, and the server builds
+the whole of it the first time either is asked, 5.5 s here, where a command on its own
+that names one function builds a part of it. About 0.07 s of every served call is the
+client starting and hashing the file, which is all `info` ever cost, so `info` gains
+nothing.
+
+What to know before relying on it:
+
+- The server writes one thing, the socket, at the path you give: mode 0600, removed when
+  it stops. What it keeps is in its memory (813 MB for that app after every command
+  above) and is never written out or read back.
+- The socket has to be in a directory only you can write, which `/tmp` is not: there,
+  another user could leave a socket of their own, or a link, at the path you are about
+  to use. jadart refuses to listen or to ask in such a directory, and does not follow a
+  symbolic link at the socket's path.
+- It stops after 30 minutes with no request (`--idle MINUTES`, 0 for never), on Ctrl-C,
+  or on `kill`.
+- A command is answered by the server only when it read the same bytes (it sends the
+  SHA-256 of the file it was pointed at, so a renamed copy is served and a rebuilt file
+  under the old name is not), is the same build of jadart as the server was when it
+  started, under the same Python and capstone, and the socket belongs to the same
+  user. Otherwise it says why in one line on stderr and answers by itself, so naming a
+  server that is gone costs time and nothing else.
+- A command waits 10 seconds for the server and then answers by itself, with the same
+  line on stderr: `--server-wait SECONDS`, or `JADART_SERVER_WAIT`, changes that. The
+  first `functions` on a very large app can take longer. The server finishes it and
+  keeps the result, so the next call is answered.
+- `export`, and any command given `--sigs`, always answer by themselves. Requests are
+  answered one at a time. It needs unix sockets, so not Windows, and a socket path is
+  limited to about 100 bytes.
+
 ## Documentation
 
 | document | what is in it |
@@ -452,7 +523,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 580 tests
+cd framework && python3 -m pytest tests -q     # 593 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -460,7 +531,7 @@ cd framework && python3 -m pytest tests -q     # 580 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 546 of the 580 to run and the other 34 to
+clone with capstone installed, expect about 559 of the 593 to run and the other 34 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

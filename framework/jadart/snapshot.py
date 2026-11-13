@@ -20,6 +20,7 @@ import struct
 from dataclasses import dataclass
 
 from . import versions
+from .keep import kept
 from .macho import open_container
 
 #: The symbols a library names its snapshot images with: two layouts, and the release
@@ -281,6 +282,7 @@ def _check_header(which: str, kind: int, base_objects: int, epoch):
             f"every ref would be off by the difference.")
 
 
+@kept
 def walk_isolate(path, *, full: bool = False) -> dict:
     """Full M2 pass on the isolate snapshot: parse header, walk the entire alloc
     pass (fail-loud on desync), then recover the canonical String cluster's text.

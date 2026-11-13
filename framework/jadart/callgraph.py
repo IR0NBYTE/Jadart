@@ -38,6 +38,7 @@ from typing import NamedTuple
 
 from .branches import indirect_call, row_kinds
 from .errors import JadartError
+from .keep import in_session, kept
 
 from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassemble_range,
                      va_of, build_pool_map, _mem_base_disp, _add_imm_from_pp,
@@ -164,6 +165,7 @@ def selector_targets(image, fr, offsets, extra_names: dict = None,
     return out
 
 
+@kept
 def build_index(image, fr=None, virtual: bool = True,
                 extra_names: dict = None, only: set = None) -> CallIndex:
     """One pass over every code range, collecting direct, pool-mediated and virtual edges.
@@ -462,6 +464,25 @@ def _read_words(words: A64Words, image, cr, fn_offsets: set, want_virtual: bool)
 # The function table
 # ---------------------------------------------------------------------------
 
+def _graph(image, fr, extra_names, only) -> CallIndex:
+    """build_index for `functions` and `xrefs`: the whole graph, or the part about the
+    ranges in `only`.
+
+    A session keeps the whole graph and never a part, so a part is not there to be
+    read as the whole. The whole one answers for a part too, since a part holds for its
+    ranges what the whole holds for them, except where a range would not decode: the
+    whole drops that range's calls and names it in a note, and a part decodes fewer
+    ranges and may never have tried it. With one of those in the image a part is
+    built here as it is outside a session."""
+    if only is None:
+        return build_index(image, fr, extra_names=extra_names)
+    if extra_names is None and in_session():
+        whole = build_index(image, fr, extra_names=None)
+        if not whole.undecodable:
+            return whole
+    return build_index(image, fr, extra_names=extra_names, only=only)
+
+
 @dataclass
 class Func:
     pc_offset: int
@@ -492,6 +513,7 @@ class Func:
 ORIGINS = ("snapshot", "symtab", "roots", "signature", "anonymous")
 
 
+@kept
 def range_names(image, fr, matched: dict = None) -> dict:
     """pc -> (name, origin) for every range that has a name, the ones `functions` prints.
 
@@ -528,6 +550,7 @@ def range_names(image, fr, matched: dict = None) -> dict:
     return out
 
 
+@kept
 def range_classes(image, fr) -> dict:
     """pc -> the name of the class that owns the range's function, where the snapshot
     records one. A closure, a stub and a top-level function have none."""
@@ -559,7 +582,21 @@ def function_table(image, fr, hdr=None, sigs: str = None, only=None) -> tuple:
     owning libraries all come from the snapshot, which is target-independent. Only the
     columns that need decoded instructions are missing, and the caller says so instead of
     printing zeros that read as "nothing calls this".
+
+    A session keeps the whole table and reads a narrowed query off it: the rows `only`
+    keeps hold the same counts in both, and the caller prints no others. `_graph` says
+    when that is not so, and the narrowed table is then built as it is anywhere else.
     """
+    if only is not None and not sigs and in_session():
+        whole = _table(image, fr, hdr, None, None)
+        if whole[3]:
+            return whole[:3]
+    return _table(image, fr, hdr, sigs, only)[:3]
+
+
+@kept
+def _table(image, fr, hdr, sigs, only) -> tuple:
+    """function_table's rows, error and notes, and whether every range decoded."""
     matched = {}
     if sigs:
         from .signatures import load, match
@@ -598,8 +635,8 @@ def function_table(image, fr, hdr=None, sigs: str = None, only=None) -> tuple:
 
     graph_error = None
     try:
-        idx = build_index(image, fr, extra_names={
-            pc: m.name for pc, m in matched.items()} if matched else None, only=wanted)
+        idx = _graph(image, fr, {
+            pc: m.name for pc, m in matched.items()} if matched else None, wanted)
     except (MissingDisassembler, UnsupportedArch) as e:
         idx, graph_error = CallIndex(), e
     if idx.undecodable:
@@ -625,7 +662,7 @@ def function_table(image, fr, hdr=None, sigs: str = None, only=None) -> tuple:
         f.virtual_callers = len(idx.may_be_called_by.get(pc, ()))
         f.overloads = share.get(pc, 0)
     out.sort(key=lambda f: f.pc_offset)
-    return out, graph_error, notes
+    return out, graph_error, notes, not idx.undecodable
 
 
 def callers_of(image, fr, targets, extra_names: dict = None) -> dict:
@@ -639,7 +676,7 @@ def callers_of(image, fr, targets, extra_names: dict = None) -> dict:
     one at runtime. Collapsing the two would turn a certainty into a maybe with no way to
     tell which is which.
     """
-    idx = build_index(image, fr, extra_names=extra_names, only=set(targets))
+    idx = _graph(image, fr, extra_names, set(targets))
     by_pc = {cr.pc_offset: cr for cr in image.all_ranges}
     share = {}
     for _off, tgts in idx.sel_targets.items():

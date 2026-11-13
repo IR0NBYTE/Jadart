@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .keep import kept
 from .stream import ReadStream
 from .macho import open_container
 from . import versions, cids as C
@@ -272,6 +273,12 @@ class EntryNames:
         return ", ".join(listed)
 
 
+@kept
+def entry_names(image, fr, hdr, arity) -> EntryNames:
+    """EntryNames for a loaded image: built once in a `jadart serve` session (keep.py)."""
+    return EntryNames(image, fr, hdr.epoch, arity)
+
+
 def _function_code(image, fr, epoch) -> tuple:
     """(owner refs, pcs): the code that is a Dart function's and may be entered with its
     fixed parameters in registers. Both empty where the release does not pass them so.
@@ -320,6 +327,7 @@ def _function_code(image, fr, epoch) -> tuple:
     return frozenset(owners), discarded
 
 
+@kept
 def build_program(fr, hdr, raw: bool = False) -> Program:
     """Resolve a completed fill-walk result into the Program model (names, owners,
     fields, superclasses). Shared by recover_program and the decompile view.
@@ -376,6 +384,7 @@ def build_program(fr, hdr, raw: bool = False) -> Program:
                    num_predefined_cids=hdr.epoch.num_predefined_cids)
 
 
+@kept
 def recover_program(path) -> Program:
     """Full pipeline on the isolate snapshot: header -> alloc walk -> fill walk ->
     resolve names/owners/fields/superclasses. Fail-loud on unknown epoch or desync."""
@@ -413,7 +422,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     from .cfg import render_function
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
-    from .fields import recover_allocations, recover_casts, recover_fields
+    from .fields import lift_tables
     image, fr, hdr = load_instructions(path)
     prog = build_program(fr, hdr)
     S = fr.names                         # names, as printed (#74)
@@ -445,12 +454,11 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     lines.append(head + " {")
     # an instance method receives `this` in x1, the first argument (receiver_for)
     arity = make_arity_resolver(image) if lvl >= 3 else None
-    entry = EntryNames(image, fr, hdr.epoch, arity) if lvl >= 3 else None
+    entry = entry_names(image, fr, hdr, arity) if lvl >= 3 else None
     returns = make_return_resolver(image) if lvl >= 3 else None
     selectors = recover_selectors(image, fr, hdr) if lvl >= 3 else None
-    layout = recover_fields(fr, getattr(image, "arch", None)) if lvl >= 3 else None
-    allocs = recover_allocations(image, fr, layout) if lvl >= 3 else None
-    casts = recover_casts(image, fr, layout) if lvl >= 3 else None
+    layout, allocs, casts = (lift_tables(image, fr, False) if lvl >= 3
+                             else (None, None, None))
     for nm, ref, kt in sorted(method_refs)[:max_methods]:
         disp = nm.split(":", 1)[1] if nm.startswith(("get:", "set:")) else nm.rstrip(".")
         dis = disassemble_function(image, ref)
