@@ -770,6 +770,37 @@ def _signed32(v: V) -> V:
     return v if _sext32(v) else _to_signed(v, 32)
 
 
+def _extend(v: V, kind: str, narrow: bool) -> V:
+    """`v` as an extended register operand reads it, before the shift: `add x0, x5, w6,
+    sxtw` adds the low 32 bits of x6 sign-extended, and printed `x5 + x6` (#369). The
+    low 8, 16 or 32 bits, zero-extended for `uxt*` and sign-extended for `sxt*`, and all
+    64 for `uxtx` and `sxtx`. In a 32-bit instruction (`narrow`) the result keeps its
+    low 32 bits alone, so a 32-bit extend there changes none of them. Spelled as the
+    width conversion it is, and left off where the value's own bounds prove it the
+    identity. `v` is the operand as `_leaf` reads it, untruncated."""
+    bits = {"b": 8, "h": 16, "w": 32, "x": 64}[kind[3]]
+    if bits == 64 or (narrow and bits == 32):
+        return v
+    if v.smi:
+        # A tagged register holds a 32-bit signed word (`V.smi`): `sxtw` reads all of
+        # it, and any other extend reads part of the word, not of the value it tags.
+        if kind == "sxtw":
+            return v
+        v = _smi_word(v)
+    if _INT_LITERAL.match(v.text):
+        n = int(v.text, 0) & ((1 << bits) - 1)
+        return _num(n - (1 << bits) if kind[0] == "s" and n >> (bits - 1) else n)
+    if kind[0] == "u":
+        if bits == 32:
+            return _narrow(v)
+        if v.bits <= bits or _fits(v, bits):
+            return v
+        return _bin(v, "&", V(hex((1 << bits) - 1), P_ATOM, bits=bits), P_AND)
+    if bits == 32:
+        return _signed32(v)
+    return v if v.bits < bits or v.sext <= bits else _to_signed(v, bits)
+
+
 #: `V.smi`.
 _SMI_TAG, _SMI_BOX = 1, 2
 
@@ -5502,8 +5533,9 @@ class Lifter:
         if kind in _SHIFT_SYM:
             return _bin(v, _SHIFT_SYM[kind], _num(amt), P_SHIFT) if amt else v
         if kind in _EXTENDS:
-            # The extend itself is a width conversion the value model does not track;
-            # the optional amount after it is a genuine left shift and does matter.
+            # The extend reads part of the register, and the amount after it is a left
+            # shift of what it read (#369).
+            v = _extend(v, kind, ops[0].strip()[:1] == "w")
             return _bin(v, "<<", _num(amt), P_SHIFT) if amt else v
         return None
 
@@ -8151,6 +8183,9 @@ class Lifter:
             # shifted as the machine shifts it, `x4 >> 1`, and says no more than that.
             sh = (ops[3].strip().split()[0].lower()
                   if len(ops) >= 4 and ops[3].strip() else "")
+            if sh in _EXTENDS:
+                # The index is what the extend reads of the register (#369).
+                idx_v = _extend(idx_v, sh, ops[0].strip()[:1] == "w")
             if sh in ("asr", "lsr"):
                 amt = _imm(ops[3].split("#")[-1]) if "#" in ops[3] else 0
                 if idx_v.smi and sh == "asr" and amt == 1:
@@ -8337,8 +8372,8 @@ class Lifter:
                 st.set(dst, _bin(src, "&", V(hex((1 << width) - 1), P_ATOM, bits=width), P_AND))
             else:
                 pad = 64 - width
-                st.set(dst, _bin(_bin(src, "<<", _num(pad), P_SHIFT), ">>",
-                                 _num(pad), P_SHIFT))
+                st.set(dst, replace(_bin(_bin(src, "<<", _num(pad), P_SHIFT), ">>",
+                                         _num(pad), P_SHIFT), sext=width))
             return []
 
         # not modelled: emit the raw arm64 (never wrong, no information lost). Of what
@@ -12038,7 +12073,8 @@ def _extended(v: V, bits: int, signed: bool) -> V:
         return v
     if signed:
         pad = 64 - bits
-        return _bin(_bin(v, "<<", _num(pad), P_SHIFT), ">>", _num(pad), P_SHIFT)
+        return replace(_bin(_bin(v, "<<", _num(pad), P_SHIFT), ">>", _num(pad), P_SHIFT),
+                       sext=bits)
     return _bin(v, "&", V(hex((1 << bits) - 1), P_ATOM, bits=bits), P_AND)
 
 

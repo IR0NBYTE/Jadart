@@ -294,11 +294,19 @@ def _cond_text(prev_cmp, mn, op) -> str:
                 return "?"
             lhs, rhs = parts[1], rhs2
         elif pm == "cmn" and len(parts) >= 2:
-            lhs, rhs = f"({parts[0]} + {parts[1]})", "0"
+            # The third operand shifts or extends the second, as it does for `cmp`:
+            # `cmn x5, w6, sxtw` printed `(x5 + x6)`, the register whole (#369).
+            b = parts[1] if len(parts) == 2 else _shifted(parts[1:])
+            if b is None:
+                return "?"
+            lhs, rhs = f"({parts[0]} + {b})", "0"
             if cc in _CARRY:
-                if len(parts) > 2 or cc in ("hi", "ls"):
+                # ...and with it spelled the carry is the carry out of that sum, as
+                # after `adds`. It printed `?` while the sum left the shift out, and
+                # still does on `w` registers, where the carry is out of bit 31.
+                if cc in ("hi", "ls") or len(parts) > 2 and parts[0].startswith("w"):
                     return f"? {rel} ?"
-                rel, rhs = _carry_out(cc, parts[0], parts[1])
+                rel, rhs = _carry_out(cc, parts[0], b)
         elif pm == "adds" and len(parts) >= 3:
             b = parts[2] if len(parts) == 3 else _shifted(parts[2:])
             if b is None:
