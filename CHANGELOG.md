@@ -107,6 +107,29 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A pair store reads both registers and its address before it stores either word.**
+  `stp` printed as two stores in a row, and the second took its value and its address
+  as they are spelled after the first: `ldur x1, [x13, #8]; stp x2, x1, [x13, #8]`
+  printed `x13.field_0x9 = x2;` and then `x13.field_0x11 = x13.field_0x9;`, which
+  stores x2 twice, where the machine stores the word it loaded (#372). The first store
+  now names what the second register and the base hold wherever either reads the word
+  it writes, so the pair prints `var t0 = x13.field_0x9;`, `x13.field_0x9 = x2;` and
+  `x13.field_0x11 = t0;`. The same at an element, at a raw address, with write back
+  before or after, with 32-bit registers, and where the base is itself loaded off the
+  word the first store writes. A pair pushed to the frame goes through the slots as it
+  did, and `ldp` into a register its own address uses (#293) is untouched. Both
+  fixtures have the case in 61 bodies, 59 of them the copy of a list onto itself, a
+  pair at a time: `ldp x16, x17, [x25, #-0x10]!; stp x16, x17, [x24, #-0x10]!` printed
+  `(t0 - 16).field_0x1 = (t1 - 16).field_0x1;` and then
+  `(t0 - 8).field_0x1 = (t1 - 8).field_0x1;`, the second word read after a store that
+  writes it whenever the two ranges are one word apart, and now prints
+  `var t3 = (t1 - 8).field_0x1;` before the two stores and `(t0 - 8).field_0x1 = t3;`
+  after. In each fixture 61 bodies change and 120 values gain a name, 59 reads at a
+  computed address and 61 field reads, and every other changed line is a temporary
+  renumbered. The unicorn oracle, with a new area that reads a word and stores a pair
+  over it at each kind of address, found a wrong run in 32, 34 and 34 of 3,000 programs
+  on three seeds and finds none. The count of Python calls to lift forty ordinary
+  bodies is 58,032 as it was.
 - **A virtual call prints the object its class id was read from as its receiver.** The
   class id of a dispatch table call is read off the receiver before the arguments are
   put in place, and the call printed whatever the register of that read held by the

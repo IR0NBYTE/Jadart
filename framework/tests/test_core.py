@@ -22222,6 +22222,89 @@ def test_an_element_store_names_an_element_read_through_another_base():
                 ret) == ["x1.field_0x8 = x9;", "return x2[x4];"]
 
 
+def test_a_pair_store_reads_its_registers_and_address_before_either_store():
+    """An `stp` reads both registers, and its address, before it writes either word, and
+    it prints as two stores. The second was built before the first was printed, so a
+    value that read the first word printed as the read under the line that had just
+    changed it: `ldur x1, [x13, #8]; stp x2, x1, [x13, #8]` printed `x13.field_0x9 =
+    x2;` and then `x13.field_0x11 = x13.field_0x9;`, which stores x2 twice where the
+    machine stores the old word (#372). The first store now names what the second
+    reads of the word it writes: the register stored, live after the `stp` or not, and
+    the base the second word is addressed off."""
+    lift = _lift_329
+    # A field, with and without write back, a w pair, and the same register twice.
+    for load, pair, want in (
+            (("ldur", "x1, [x13, #8]"), ("stp", "x2, x1, [x13, #8]"),
+             ["var t0 = x13.field_0x9;", "x13.field_0x9 = x2;", "x13.field_0x11 = t0;",
+              "return x0;"]),
+            (("ldur", "x1, [x13, #0x10]"), ("stp", "x2, x1, [x13, #0x10]!"),
+             ["var t0 = x13.field_0x11;", "x13.field_0x11 = x2;",
+              "x13.field_0x19 = t0;", "x13 += 16;", "return x0;"]),
+            (("ldr", "x1, [x13]"), ("stp", "x2, x1, [x13], #0x10"),
+             ["var t0 = x13.field_0x1;", "x13.field_0x1 = x2;", "x13.field_0x9 = t0;",
+              "x13 += 16;", "return x0;"]),
+            (("ldr", "w1, [x13, #8]"), ("stp", "w2, w1, [x13, #8]"),
+             ["var t0 = x13.field_0x9;", "x13.field_0x9 = x2;", "x13.field_0xd = t0;",
+              "return x0;"]),
+            (("ldr", "x1, [x13, #8]"), ("stp", "xzr, x1, [x13, #8]"),
+             ["var t0 = x13.field_0x9;", "x13.field_0x9 = 0;", "x13.field_0x11 = t0;",
+              "return x0;"])):
+        assert lift(load, pair) == want, (load, pair)
+    # A value computed from the read, and one that is live after the pair.
+    assert lift(("ldr", "x1, [x13, #8]"), ("add", "x1, x1, #5"),
+                ("stp", "x2, x1, [x13, #8]")) == [
+        "var t0 = x13.field_0x9 + 5;", "x13.field_0x9 = x2;", "x13.field_0x11 = t0;",
+        "return x0;"]
+    assert lift(("ldr", "x1, [x13, #8]"), ("stp", "x2, x1, [x13, #8]"),
+                ("mov", "x0, x1")) == [
+        "var t0 = x13.field_0x9;", "x13.field_0x9 = x2;", "x13.field_0x11 = t0;",
+        "return t0;"]
+    # The two words swapped: only the one the first store writes needs a name.
+    assert lift(("ldp", "x1, x2, [x13, #8]"), ("stp", "x2, x1, [x13, #8]")) == [
+        "var t0 = x13.field_0x9;", "x13.field_0x9 = x13.field_0x11;",
+        "x13.field_0x11 = t0;", "return x0;"]
+    # An element and an address the lifter computed.
+    assert lift(("add", "x16, x13, x8, lsl #3"), ("ldr", "x1, [x16]"),
+                ("stp", "x2, x1, [x16]")) == [
+        "var t0 = x13[x8];", "x13[x8] = x2;", "x13[x8 + 1] = t0;", "return x0;"]
+    assert lift(("add", "x16, x13, x8"), ("ldur", "x1, [x16, #8]"),
+                ("stp", "x2, x1, [x16, #8]")) == [
+        "var t0 = (x13 + x8).field_0x9;", "(x13 + x8).field_0x9 = x2;",
+        "(x13 + x8).field_0x11 = t0;", "return x0;"]
+    # The address the second word is stored at reads the first: a base loaded from
+    # the field, and an index read from it.
+    assert lift(("ldr", "x9, [x13, #8]"), ("stp", "x2, x1, [x9, #8]")) == [
+        "var t0 = x13.field_0x9;", "x13.field_0x9.field_0x9 = x2;",
+        "t0.field_0x11 = x1;", "return x0;"]
+    assert lift(("ldr", "x8, [x13, #8]"), ("and", "x8, x8, #7"),
+                ("add", "x16, x13, x8, lsl #3"), ("stp", "x2, x1, [x16, #8]")) == [
+        "var t0 = x13 + ((x13.field_0x9 & 7) << 3);",
+        "(x13 + ((x13.field_0x9 & 7) << 3)).field_0x9 = x2;", "t0.field_0x11 = x1;",
+        "return x0;"]
+
+
+def test_a_pair_store_that_reads_neither_word_prints_as_it_did():
+    """Guards for #372: the second store of a pair takes a name only for what the
+    first store may write. A value that reads the SECOND word, or another field,
+    prints in place; a frame pair is two slots, as before; and an `ldp` into its own
+    base still reads both words off the base as it was (#293)."""
+    lift = _lift_329
+    assert lift(("ldr", "x1, [x13, #0x10]"), ("add", "x1, x1, #1"),
+                ("stp", "x2, x1, [x13, #8]")) == [
+        "x13.field_0x9 = x2;", "x13.field_0x11 += 1;", "return x0;"]
+    assert lift(("ldr", "x2, [x13, #0x10]"), ("stp", "x2, x1, [x13, #8]")) == [
+        "x13.field_0x9 = x13.field_0x11;", "x13.field_0x11 = x1;", "return x0;"]
+    assert lift(("ldr", "x1, [x12, #0x18]"), ("stp", "x2, x1, [x13, #8]")) == [
+        "x13.field_0x9 = x2;", "x13.field_0x11 = x12.field_0x19;", "return x0;"]
+    assert lift(("sub", "x15, x15, #0x20"), ("str", "x3, [x15, #8]"),
+                ("ldr", "x1, [x15, #8]"), ("stp", "x2, x1, [x15, #8]"),
+                ("ldr", "x0, [x15, #0x10]"), ("add", "x15, x15, #0x20")) == [
+        "return x3;"]
+    assert lift(("ldp", "x13, x0, [x13, #8]")) == ["return x13.field_0x11;"]
+    assert lift(("ldp", "x0, x13, [x13, #8]"), ("mov", "x1, x13")) == [
+        "return x13.field_0x9;"]
+
+
 #: `Assembler::TryAllocateObject` and `TryAllocateArray` (assembler_arm64.cc, 3.12.2),
 #: and the register bump of the allocation stubs (stub_code_compiler_arm64.cc,
 #: AllocateArray), each up to the header store.
