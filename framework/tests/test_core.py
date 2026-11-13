@@ -8519,6 +8519,46 @@ def test_one_name_builds_only_its_part_of_the_call_graph():
             assert len(fn["called_by"]) == whole.callers, fn
 
 
+def test_xrefs_names_each_reference_the_way_functions_does():
+    """`xrefs` printed a reference as an address and a size, `0x23b720  168 bytes`, and
+    left the reader to look each one up. Every reference now carries the name `functions`
+    gives its range and the class that owns it, in the text and in `-j`, and a range with
+    no name still prints as its address alone."""
+    _needs_capstone()
+    import io
+    import json
+    import contextlib
+    from jadart import cli, callgraph
+    from jadart.disasm import load_instructions
+
+    image, fr, hdr = load_instructions(CLEAN)
+    label = {f.pc_offset: f.name for f in callgraph.function_table(image, fr, hdr)[0]}
+
+    def run(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert cli.main(list(argv)) == 0, argv
+        return out.getvalue()
+
+    refs = [r for e in json.loads(run("xrefs", CLEAN, "string", "Bench", "-j"))["entries"]
+            for r in e["referenced_by"]]
+    doc = json.loads(run("xrefs", CLEAN, "function", "benchWithdraw", "-j"))
+    (fn,) = doc["functions"]
+    refs += fn["called_by"]
+    assert refs and all("name" in r and "class" in r for r in refs), refs[0]
+    assert [r["name"] for r in refs] == [label[r["pc_offset"]] for r in refs], refs
+    build = next(r for r in refs if r["name"] == "build" and r["class"] == "FluBenchApp")
+
+    text = run("xrefs", CLEAN, "string", "Bench")
+    line = next(ln for ln in text.splitlines() if f"{build['size']} bytes" in ln)
+    assert line.rstrip().endswith("  FluBenchApp.build"), line
+    assert "  benchRunAll" in run("xrefs", CLEAN, "function", "benchWithdraw")
+
+    anon = next(pc for pc, nm in label.items() if not nm)
+    assert cli._ref_line(image, {"pc_offset": anon, "size": 4, "name": "",
+                                 "class": ""}).rstrip().endswith("4 bytes")
+
+
 def test_unresolved_call_targets_are_counted_not_dropped():
     """A bl into a runtime stub outside the instructions table has no range to attach to.
     Counting those keeps the edge totals honest; dropping them silently would make the

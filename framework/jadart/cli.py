@@ -790,6 +790,23 @@ def cmd_strings(args) -> int:
     return EXIT_OK
 
 
+def _ref_namer(image, fr, matched=None):
+    """A function that names a referencing range the way `functions` does: its name and
+    the class that owns it, each "" where the snapshot has none."""
+    from .callgraph import range_classes, range_names
+    names, classes = range_names(image, fr, matched), range_classes(image, fr)
+    return lambda pc: {"name": names.get(pc, ("",))[0], "class": classes.get(pc, "")}
+
+
+def _ref_line(image, ref) -> str:
+    """One reference: its address and size, then Class.name when it has a name."""
+    from .disasm import addr_label
+    who = ".".join(x for x in (ref.get("class"), ref.get("name")) if x) if ref.get(
+        "name") else ""
+    return (f"    {addr_label(image, ref['pc_offset']):<14} "
+            f"{dim(str(ref['size']) + ' bytes')}" + (f"  {who}" if who else ""))
+
+
 def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
     """`xrefs` when the pattern names a function rather than a pool entry: report the
     call sites. Returns an exit code, or None if the pattern names no function.
@@ -816,12 +833,14 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
     targets = {cr.pc_offset: nm for nm, cr in ranges}
     # A --sigs library feeds the selector vote as well as the name column: on an
     # --obfuscate build it is the only thing that gives the vote anything to count.
-    extra = None
+    extra = matched = None
     sigs = getattr(args, "sigs", None)
     if sigs:
         from .signatures import load, match
-        extra = {pc: m.name for pc, m in match(image, fr, load(sigs)).items()}
+        matched = match(image, fr, load(sigs))
+        extra = {pc: m.name for pc, m in matched.items()}
     found = callers_of(image, fr, list(targets), extra_names=extra)
+    who = _ref_namer(image, fr, matched)
     fns = []
     for pc in sorted(targets):
         r = found[pc]
@@ -829,9 +848,9 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
             "name": targets[pc], "pc_offset": pc, "va": va_of(image, pc),
             "overloads": r["overloads"],
             "called_by": [{"pc_offset": c.pc_offset, "va": va_of(image, c.pc_offset),
-                           "size": c.size} for c in r["direct"]],
+                           "size": c.size, **who(c.pc_offset)} for c in r["direct"]],
             "may_be_called_by": [{"pc_offset": c.pc_offset, "va": va_of(image, c.pc_offset),
-                                  "size": c.size}
+                                  "size": c.size, **who(c.pc_offset)}
                                  for c in r["virtual"]],
         })
     total = sum(len(f["called_by"]) for f in fns)
@@ -846,8 +865,7 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
             n = len(f["called_by"])
             print(heading(f"  {n} direct call site{'' if n == 1 else 's'}"))
             for c in f["called_by"]:
-                print(f"    {addr_label(image, c['pc_offset']):<14} "
-                      f"{dim(str(c['size']) + ' bytes')}")
+                print(_ref_line(image, c))
         if f["may_be_called_by"]:
             n, m = f["overloads"], len(f["may_be_called_by"])
             # An honest header. One implementation means the site can only land here; many
@@ -858,8 +876,7 @@ def _xrefs_to_function(args, image, fr, pattern=None) -> int | None:
             print(heading(f"  {m} virtual call site{'' if m == 1 else 's'}")
                   + dim(f"  ({certainty})"))
             for c in f["may_be_called_by"]:
-                print(f"    {addr_label(image, c['pc_offset']):<14} "
-                      f"{dim(str(c['size']) + ' bytes')}")
+                print(_ref_line(image, c))
         if not f["called_by"] and not f["may_be_called_by"]:
             # Still not the same as "unused": a closure is reached through a captured
             # context and leaves no edge any static pass can see.
@@ -1118,15 +1135,20 @@ def _xrefs_filter_class(fr, hdr, refs, class_name):
     return filtered, unattributed
 
 
-def _xrefs_entries(matches, refs, image):
+def _xrefs_entries(matches, refs, image, fr=None, sigs=None):
     from .disasm import va_of
+    matched = None
+    if sigs:
+        from .signatures import load, match
+        matched = match(image, fr, load(sigs))
+    who = _ref_namer(image, fr, matched)
     return [
         {
             "pool_offset": off,
             "entry": matches[off],
             "referenced_by": [
                 {"pc_offset": cr.pc_offset, "va": va_of(image, cr.pc_offset),
-                 "size": cr.size}
+                 "size": cr.size, **who(cr.pc_offset)}
                 for cr in refs.get(off, ())
             ],
         }
@@ -1243,7 +1265,7 @@ def cmd_xrefs(args) -> int:
                 exact=_xrefs_exact(args, resolved_kind, legacy),
             )
 
-    entries = _xrefs_entries(matches, refs, image)
+    entries = _xrefs_entries(matches, refs, image, fr, getattr(args, "sigs", None))
 
     if not entries and unloaded and not class_name:
         if getattr(args, "json", False):
@@ -1303,10 +1325,7 @@ def cmd_xrefs(args) -> int:
             f"// pool_0x{entry['pool_offset']:x}  {entry['entry']}"
         ))
         for ref in entry["referenced_by"]:
-            print(
-                f"    {addr_label(image, ref['pc_offset']):<14} "
-                f"{dim(str(ref['size']) + ' bytes')}"
-            )
+            print(_ref_line(image, ref))
 
     if class_name and unattributed:
         print(
