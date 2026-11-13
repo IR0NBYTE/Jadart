@@ -594,7 +594,8 @@ _BINOP_PREC = {"*": P_MUL, "~/": P_MUL, "+": P_ADD, "-": P_ADD,
 _BINOP_RE = re.compile(r" (" + "|".join(re.escape(o) for o in
                                         sorted(_BINOP_PREC, key=len, reverse=True)) + r") ")
 #: `a op (b op c)` is `(a op b) op c` for these and for no others, which is what decides
-#: whether a compound assignment may keep a remainder at its own precedence.
+#: whether a compound assignment may keep a remainder at its own precedence. That is on
+#: ints: a double rounds after each operation, and there `+` and `*` do not (`V.fp`).
 _ASSOCIATIVE = frozenset({"*", "+", "&", "|", "^"})
 
 
@@ -613,18 +614,20 @@ def _top_level_ops(text: str) -> set:
     return out
 
 
-def _folds_into(sym: str, rest: str) -> bool:
+def _folds_into(sym: str, rest: str, fp: bool = False) -> bool:
     """Whether `lhs sym= rest` says the same thing as `lhs = lhs sym rest`.
 
     It does when everything left at the top of `rest` binds TIGHTER than `sym`, since the
     implied bracket around `rest` then changes nothing, or when the operator is the same
-    one and associates, where the bracket moves but the value does not.
+    one and associates, where the bracket moves but the value does not. Over doubles
+    (`fp`) the value moves too: `(t0 + d1) + d1` rounds twice and `t0 += d1 + d1` adds
+    twice d1 once, 1e16 against 1.0000000000000002e16 for t0 = 1e16 and d1 = 1.0 (#437).
     """
     prec = _BINOP_PREC[sym]
     for op in _top_level_ops(rest):
         if _BINOP_PREC[op] > prec:
             continue
-        if op == sym and sym in _ASSOCIATIVE:
+        if op == sym and sym in _ASSOCIATIVE and not fp:
             continue
         return False
     return True
@@ -692,9 +695,13 @@ class V:
     #: Dropped where the value is given a name, since `base` is text and means what it
     #: meant only until a register in it is written.
     at: "tuple | None" = field(default=None, compare=False)
+    #: The value is a double that `fadd`, `fsub`, `fmul` or `fdiv` computed, the operator
+    #: at the top of the text, which rounds where it stands and does not regroup with
+    #: the one below it (`_folds_into`, #437). Left out of the comparison as `calc` is.
+    fp: bool = field(default=False, compare=False)
 
     def __init__(self, text, prec=P_ATOM, wide=None, bits=64, sext=64, smi=0,
-                 calc=False, at=None):
+                 calc=False, at=None, fp=False):
         # Written out, and not the one the dataclass makes, which stores every field
         # through `object.__setattr__` whatever it holds. A lift builds about two
         # million of these and nearly all of them are a text and a precedence, so a
@@ -717,6 +724,8 @@ class V:
             put(self, "calc", calc)
         if at is not None:
             put(self, "at", at)
+        if fp:
+            put(self, "fp", fp)
 
 
 def _wrap(v: V, ctx: int) -> str:
@@ -8361,7 +8370,7 @@ class Lifter:
             # rendering them the way _bin used to: `fsub d0,d1,d2` with d2 holding `d3 - d4`
             # printed `d1 - d3 - d4`. The integer half of that bug was fixed; this half was
             # a separate call site and kept it.
-            st.set(canon(ops[0]), _bin(a, opsym, b, prec))
+            st.set(canon(ops[0]), replace(_bin(a, opsym, b, prec), fp=True))
             return []
         if mn in ("fneg", "fabs", "fsqrt") and len(ops) >= 2 and _scalar_fp_ops(ops):
             src = g(canon(ops[1]))
@@ -9050,7 +9059,7 @@ class Lifter:
             # taken only when nothing binds looser inside the remainder. Found by
             # tools/irfuzz.py --cfg, which evaluated `t0 *= x14 - (x9 - t1)` against the
             # CPU that had run `mul x6, x3, x14; sub x3, x6, x4`.
-            if rhs.text.startswith(pre) and _folds_into(sym, rhs.text[len(pre):]):
+            if rhs.text.startswith(pre) and _folds_into(sym, rhs.text[len(pre):], rhs.fp):
                 return f"{lhs.text} {sym}= {rhs.text[len(pre):]};"
         return f"{lhs.text} = {rhs.text};{_smi_note(lhs, rhs)}"
 

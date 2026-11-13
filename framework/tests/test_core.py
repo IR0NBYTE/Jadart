@@ -23446,30 +23446,30 @@ def test_a_value_built_with_its_defaults_is_the_value_it_was():
     import dataclasses
     import pickle
     from jadart.expr import V, P_ATOM, _SMI_TAG
-    bare, full = V("x0"), V("x0", P_ATOM, None, 64, 64, 0, False, None)
+    bare, full = V("x0"), V("x0", P_ATOM, None, 64, 64, 0, False, None, False)
     names = [f.name for f in dataclasses.fields(V)]
-    assert names == ["text", "prec", "wide", "bits", "sext", "smi", "calc", "at"]
+    assert names == ["text", "prec", "wide", "bits", "sext", "smi", "calc", "at", "fp"]
     assert [getattr(bare, n) for n in names] == ["x0", P_ATOM, None, 64, 64, 0, False,
-                                                 None]
+                                                 None, False]
     assert bare == full and hash(bare) == hash(full) and repr(bare) == repr(full)
     assert repr(bare) == ("V(text='x0', prec=%d, wide=None, bits=64, sext=64, smi=0, "
-                          "calc=False, at=None)" % P_ATOM)
+                          "calc=False, at=None, fp=False)" % P_ATOM)
     assert dataclasses.replace(bare, text="x1") == V("x1")
     assert dataclasses.asdict(bare) == dict(zip(names, ["x0", P_ATOM, None, 64, 64, 0,
-                                                        False, None]))
+                                                        False, None, False]))
     assert copy.copy(bare) == bare and pickle.loads(pickle.dumps(bare)) == bare
-    other = V("x0", 3, V("x9"), 32, 31, _SMI_TAG, True, (1, 2, 3, 4))
+    other = V("x0", 3, V("x9"), 32, 31, _SMI_TAG, True, (1, 2, 3, 4), True)
     assert [getattr(other, n) for n in names] == ["x0", 3, V("x9"), 32, 31, _SMI_TAG,
-                                                  True, (1, 2, 3, 4)]
+                                                  True, (1, 2, 3, 4), True]
     assert dataclasses.replace(other, text="x1").wide == V("x9")
     assert pickle.loads(pickle.dumps(other)) == other
     for field, value in (("prec", 3), ("wide", V("x9")), ("bits", 32), ("sext", 32),
                          ("smi", _SMI_TAG)):
         assert V("x0", **{field: value}) != bare, field
         assert getattr(dataclasses.replace(bare, **{field: value}), field) == value
-    # `calc` and `at` say where a value came from and are no part of what it is.
-    assert V("x0", calc=True, at=(1, 2, 3, 4)) == bare
-    assert hash(V("x0", calc=True, at=(1, 2, 3, 4))) == hash(bare)
+    # `calc`, `at` and `fp` say where a value came from and are no part of what it is.
+    assert V("x0", calc=True, at=(1, 2, 3, 4), fp=True) == bare
+    assert hash(V("x0", calc=True, at=(1, 2, 3, 4), fp=True)) == hash(bare)
     with pytest.raises(dataclasses.FrozenInstanceError):
         bare.text = "x1"
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -25523,6 +25523,30 @@ def test_hi_and_ls_after_an_add_compare_the_operand_with_minus_the_constant():
     for setter, op in (("cmn", "x1, x2"), ("adds", "w3, w1, w2")):
         for cc in ("hi", "ls"):
             assert "?" in _cond_text((0, setter, op, ""), "b." + cc, "#0"), (op, cc)
+
+
+def test_two_adds_of_a_double_keep_their_order():
+    """`fadd d0, d0, d1` twice across a loop edge printed `t0 += d1 + d1`, which adds
+    twice d1 once: a double rounds after each add, so for t0 = 1e16 and d1 = 1.0 the
+    machine's `(t0 + d1) + d1` is 1e16 and the printed `t0 + (d1 + d1)` is
+    1.0000000000000002e16 (#437). A compound assignment over doubles now keeps only a
+    remainder that binds tighter, and `fmul` had the same fold. Integers wrap, so `+`
+    and `*` regroup there and keep it."""
+    assert (1e16 + 1.0) + 1.0 != 1e16 + (1.0 + 1.0)
+
+    def loop(op, r, cmp):
+        return _lift_rows([(op, f"{r}0, {r}0, {r}1"), (cmp, f"{r}0, {r}2"),
+                           ("b.ge", "#0x14"), (op, f"{r}0, {r}0, {r}1"), ("b", "#0"),
+                           ("ret", "")])
+
+    def body(r, sym, step, latch):
+        return [f"var t0 = {r}0;", "while (true) {", f"if ((t0 {sym} {r}1) >= {r}2) {{",
+                step, "break;", "}", latch, "}", "return t0;"]
+    assert loop("fadd", "d", "fcmp") == body("d", "+", "t0 += d1;", "t0 = t0 + d1 + d1;")
+    assert loop("fmul", "d", "fcmp") == body("d", "*", "t0 *= d1;", "t0 = t0 * d1 * d1;")
+    assert loop("fsub", "d", "fcmp") == body("d", "-", "t0 -= d1;", "t0 = t0 - d1 - d1;")
+    assert loop("add", "x", "cmp") == body("x", "+", "t0 += x1;", "t0 += x1 + x1;")
+    assert loop("mul", "x", "cmp") == body("x", "*", "t0 *= x1;", "t0 *= x1 * x1;")
 
 
 def _sx(v, n):

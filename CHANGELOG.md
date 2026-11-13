@@ -107,6 +107,17 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Two adds of a double keep their order.** `fadd d0, d0, d1` twice across a loop edge
+  printed `t0 += d1 + d1`, which regroups the adds: a double rounds after each one, and
+  for t0 = 1e16 and d1 = 1.0 the machine's `(t0 + d1) + d1` is 1e16 where the printed
+  `t0 + (d1 + d1)` is 1.0000000000000002e16 (#437). A compound assignment of a double
+  now keeps only a remainder that binds tighter, so the line is `t0 = t0 + d1 + d1`,
+  and `fmul` had the same fold, now `t0 = t0 * d1 * d1`. `fsub` and `fdiv` did not
+  regroup and do not change, and integers, which wrap and regroup exactly, keep
+  `t0 += x1 + x1`. Tier 3 dumps of the nine binaries: 1 line changes, in one range
+  of FluffyChat (0xb860b8), a sum of eight doubles that printed
+  `t5.field_0x8[t8] += t5.field_0x8[t8 + 7] + (...) + (...)` and now prints
+  `t5.field_0x8[t8] = t5.field_0x8[t8] + t5.field_0x8[t8 + 7] + (...) + (...)`.
 - **hi and ls after an add compare against minus the constant.** hi after `cmn` or
   `adds` is the carry out of the sum with the sum not zero, and it printed `? u<= ?`
   (#419). With a constant k that is not zero, hi holds exactly when the operand is above
