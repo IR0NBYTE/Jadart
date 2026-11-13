@@ -25660,6 +25660,78 @@ def test_a_signed_load_into_a_w_register_is_extended_to_32_bits():
         assert _dart_int(text, {"f": half}) == _sx(half, 16) & 0xffffffff, (text, half)
 
 
+def test_a_join_past_a_raw_write_names_what_each_way_in_left():
+    # #368. `umulh` prints as the instruction, and the register it wrote reads bare after
+    # it. An arm then wrote the register without printing a line, the join dropped it to
+    # bare, the empty `if` went, and `return x3;` under the raw line said the product on
+    # the way that had put 7 there: 38 of 40 entry states disagreed with the CPU.
+    then = [("umulh", "x3, x5, x6"), ("cbz", "x1, #0xc"), ("mov", "x3, #7"),
+            ("mov", "x0, x3"), ("ret", "")]
+    assert _lift_rows(then) == [
+        "umulh x3, x5, x6", "var t0 = x3;", "if (x1 != 0) {", "t0 = 7;", "}", "return t0;"]
+    # Both arms write it, and neither value is the raw line's.
+    both = [("umulh", "x3, x5, x6"), ("cbz", "x1, #0x10"), ("mov", "x3, #7"),
+            ("b", "#0x14"), ("mov", "x3, #9"), ("mov", "x0, x3"), ("ret", "")]
+    assert _lift_rows(both) == [
+        "umulh x3, x5, x6", "var t0;", "if (x1 != 0) {", "t0 = 7;", "} else {",
+        "t0 = 9;", "}", "return t0;"]
+    # A raw line that reads the register after the join says what it holds there.
+    raw_reader = [("udiv", "x3, x5, x6"), ("cbz", "x1, #0xc"), ("mov", "x3, x2"),
+                  ("clz", "x0, x3"), ("ret", "")]
+    assert _lift_rows(raw_reader) == [
+        "udiv x3, x5, x6", "var t0 = x3;", "if (x1 != 0) {", "t0 = x2;", "}",
+        "clz x0, x3   // x3 holds t0", "return x0;"]
+    # Every instruction the census found printed raw on real code, and a few more, by
+    # one road. The join of a register nothing printed a write to stays bare: that is
+    # the value on entry, a gap and not a claim.
+    for mn, ops in (("smulh", "x3, x5, x6"), ("fcvtms", "x3, d0"), ("fcvtps", "x3, d0"),
+                    ("fcvtms", "w3, d0"), ("ldar", "x3, [x9]"), ("ldar", "w3, [x9]"),
+                    ("adr", "x3, #0x40"), ("csel", "x3, x5, x6, vs"),
+                    ("csinc", "x3, x5, x6, vs"), ("adc", "x3, x5, x6"),
+                    ("adcs", "x3, x5, x6"), ("sbcs", "x3, x5, x6"), ("udiv", "w3, w5, w6"),
+                    ("clz", "x3, x5"), ("smull", "x3, w5, w6"), ("rbit", "x3, x5"),
+                    ("extr", "x3, x5, x6, #3")):
+        got = _lift_rows([(mn, ops)] + then[1:])
+        assert got[0] == f"{mn} {ops}" and got[1:] == [
+            "var t0 = x3;", "if (x1 != 0) {", "t0 = 7;", "}", "return t0;"], (mn, got)
+    assert _lift_rows([("cbz", "x1, #0x8"), ("mov", "x3, #7"), ("mov", "x0, x3"),
+                       ("ret", "")]) == ["return x3;"]
+
+
+def test_joins_past_raw_writes_cost_the_same_per_row_at_any_length():
+    # A guard on the cost, counted and not timed: naming these joins adds no walk that
+    # grows with them, so four times the rows is four times the blocks lifted. Each unit
+    # is a raw write, an arm that writes over it, a join and a read; every fourth is a
+    # join the structurer reaches by a goto.
+    import jadart.expr as expr
+    real, calls = expr.Lifter._lift_block, [0]
+
+    def counted(self, addr, st):
+        calls[0] += 1
+        return real(self, addr, st)
+
+    def per_row(n):
+        rows = []
+        for i in range(n):
+            at = len(rows) * 4
+            if i % 4 == 3:
+                rows += [("clz", "x3, x5"), ("cbz", f"x1, #{at + 0x10:#x}"),
+                         ("mov", "x3, x2"), ("cbz", f"x2, #{at + 0x14:#x}"),
+                         ("add", "x4, x4, #1"), ("stur", "x3, [x11, #15]")]
+            else:
+                rows += [("umulh", "x3, x5, x6"), ("cbz", f"x1, #{at + 0xc:#x}"),
+                         ("mov", "x3, #7"), ("stur", "x3, [x11, #15]")]
+        calls[0] = 0
+        _lift_rows(rows + [("ret", "")])
+        return calls[0] / len(rows)
+    expr.Lifter._lift_block = counted
+    try:
+        small, large = per_row(100), per_row(400)
+        assert 0 < large <= small * 1.25 + 1, (small, large)
+    finally:
+        expr.Lifter._lift_block = real
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

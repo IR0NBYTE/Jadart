@@ -107,6 +107,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A branch after an instruction printed raw keeps the value each arm left.** After
+  `umulh x3, x5, x6`, a `cbz x1` over `mov x3, #7` and a `ret` of `x3` printed
+  `return x3;`, the bare register reading as the last printed write, which was the raw
+  line: the arm that set 7 and the branch with it were gone (#368). The join of two plain
+  values is now named when the register has no printed write of its own yet, so it
+  prints `var t0 = x3; if (x1 != 0) { t0 = 7; } return t0;`. A join with no raw line
+  before it prints as it did. The unicorn oracle, over 6,336 programs (22 raw forms, six
+  branches, six arms, four readers, `x` and `w`) at 40 entry states, went from 2,236
+  programs with a wrong run to none; 1,572 it cannot decide, against 1,656 before. A
+  join reached by a `goto` still claims the raw value, as before (974 of 2,640 such
+  programs wrong on both). On the two fixtures and the seven app-sweep libraries 602 of
+  273,863 ranges change, 52,903 lines out and 59,852 in, none with an error; 98,344 of
+  those 112,755 lines differ only in a temporary's number.
 - **A signed load into a `w` register is extended to 32 bits.** `ldursh w0, [x13, #7]`
   printed `x13.field2_0x8 << 48 >> 48`, the field sign-extended to 64 bits, where the
   register holds it extended to 32 with the top half clear: 0xffff8000 for a field of
