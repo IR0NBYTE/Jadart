@@ -5983,6 +5983,8 @@ class Lifter:
         signed = mn in _SIGNED_LOADS
         if got.text and kind == "x" and (width < 4 or width < 8 and signed):
             got = _extended(got, 8 * width, signed)
+            if signed and reg.strip()[:1] == "w":
+                got = _narrow(got)              # extended to 32 bits, not to 64 (#374)
         if not got.text:
             # The fallback spells the LOAD'S OWN register, right only where the slot held
             # that very register, whose entry value the printed body still reads so the
@@ -6080,6 +6082,8 @@ class Lifter:
             # is still the only thing that says it (#221).
             if _reg_file(op) == "x" and signed and width < 8:
                 v = _extended(v, 8 * width, signed)
+                if op.strip()[:1] == "w":
+                    v = _narrow(v)              # extended to 32 bits, not to 64 (#374)
             tmp, decl = self._mint(st, v.text)
             self.blind_named.add(tmp)
             out.append(decl)
@@ -8260,7 +8264,13 @@ class Lifter:
             if index is not None or (base in st.elem and not second):   # element load
                 elem = self._elem_access(base, index, scale, st, disp)
                 if elem is not None:
-                    st.set(dst, self._elem_read(elem))
+                    elem = self._elem_read(elem)
+                    if mn in _SIGNED_LOADS and ops[0].strip()[:1] == "w":
+                        # The element, sign-extended to the 32 bits a w register
+                        # holds (#374). Into an x register it prints unextended still.
+                        width = _access_width(mn, ops[0])
+                        elem = _narrow(_extended(elem, 8 * width, True))
+                    st.set(dst, elem)
                     return self._bump(st, base, delta)
                 # Not one the lifter can show is an element: the load from the address
                 # it computes, as off any other base (#308). An `ldp` reads each of its
@@ -8319,6 +8329,11 @@ class Lifter:
                     self._at_read(v.text, self._at_computed(base, at_base, bv))
                     if sign and wk < 8 and _reg_file(ops[k]) == "x":
                         v = _extended(v, 8 * wk, True)
+                        if ops[k].strip()[:1] == "w":
+                            # `ldursh w0` extends to 32 bits and clears the top half:
+                            # the extension to 64 printed a negative value for a
+                            # register that holds a positive one (#374).
+                            v = _narrow(v)
                     elif wk <= 4 and _reg_file(ops[k]) == "x":
                         # Zero-extended, which a 32-bit comparison reads (`_known32`). A
                         # value of its own, so nothing else that prints alike is.

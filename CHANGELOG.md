@@ -107,6 +107,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A signed load into a `w` register is extended to 32 bits.** `ldursh w0, [x13, #7]`
+  printed `x13.field2_0x8 << 48 >> 48`, the field sign-extended to 64 bits, where the
+  register holds it extended to 32 with the top half clear: 0xffff8000 for a field of
+  0x8000, not -32768 (#374). `ldrsb`, `ldrsh`, `ldursb` and `ldursh` into a `w`
+  register now print `(x13.field2_0x8 << 48 >> 48).toUnsigned(32)`, off a field, a
+  frame slot read back and an element. Into an `x` register they print as they did.
+  Neither fixture has such a load, so no line of theirs changes after #373, and no line
+  of the seven app-sweep libraries has the new spelling. The unicorn oracle, over the
+  911 programs the assembler accepts of every signed load into `w` and `x` and a use
+  after it, at 40 entry states, went from 268 programs with a wrong run to 94, all 94
+  a signed load into an `x` register at a register offset or off an element, which
+  prints unextended as it did. With the three fixes under this one, 32,704 of 273,863
+  ranges change on the two fixtures and the seven app-sweep libraries, 72,185 lines,
+  none with an error.
+
 - **The README's logo passes the Markdown check again, and the check reads a
   `<picture>`.** The new header serves one logo in light mode and another in dark with
   a `<picture>` element, as GitHub documents it, and `tools/fencecheck.py` refused the
