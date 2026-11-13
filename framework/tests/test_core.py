@@ -25437,6 +25437,58 @@ def test_an_overflow_condition_after_integer_flags_is_declined():
     assert _cond_text((0, "fcmp", "d0, d1", ""), "b.vs", "#0") == "isNaN(d0) || isNaN(d1)"
 
 
+def test_tier_2_spells_a_32_bit_signed_condition_after_an_add():
+    """Tier 2 printed `cmn w5, w6` followed by `b.lt` and by `b.mi` as the same
+    `(w5 + w6) < 0`. mi is the sign of the 32-bit sum as it wrapped, lt the sign taken
+    without wrapping: for w5 = 0x7fffffff and w6 = 1 the sum wraps negative, mi holds
+    and lt does not (#438). Tier 2 now spells lt, ge, gt and le as at 64 bits (#400):
+    against a constant `w5 < -4`, against a register `?`. Tier 3 reads the sum as a sum
+    of sign-extended halves and keeps it. The truth table runs each printed condition
+    and its negation over the 32-bit flags, with w5 read as a signed 32-bit value."""
+    from jadart.cfg import _cond_text, negate_cond, render_function
+
+    def tier2(cc):
+        rows = [("cmn", "w5, w6"), ("b." + cc, "#0x10"), ("mov", "x0, #1"), ("ret", ""),
+                ("mov", "x0, #2"), ("ret", "")]
+        lines = render_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+                                show=None)
+        return [ln.strip() for ln in lines if ln.strip().startswith("if (")]
+    assert tier2("mi") == ["if ((w5 + w6) >= 0) {"]
+    assert tier2("lt") == ["if (? >= ?) {"]
+    m = (1 << 32) - 1
+    edge = [0, 1, 2, 4, 0x7fffffff, 0x7ffffffc, 0x7ffffffb, 0x80000000, 0x80000001,
+            0xfffffffc, 0xfffffffb, 0xfffffff0, m - 1, m]
+
+    def flags(a, k):
+        total = a + k
+        r = total & m
+        return (r >> 31, int(r == 0), total >> 32,
+                int((a >> 31) == (k >> 31) and (r >> 31) != (a >> 31)))
+
+    def reads(cond, a):
+        lhs, rel, rhs = re.fullmatch(r"(.+) ([<>]=?) (.+)", cond).groups()
+        x, y = (eval(side, {}, {"w5": _sx(a, 32)}) for side in (lhs, rhs))
+        return {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[rel]
+    for setter, op, k in (("cmn", "w5, #4", 4), ("adds", "w1, w5, #4", 4),
+                          ("cmn", "w5, #0x10", 0x10), ("cmn", "w5, #0", 0)):
+        for cc, holds in _HOLDS_400.items():
+            cond = _cond_text((0, setter, op, ""), "b." + cc, "#0", True)
+            for a in edge:
+                want = holds(*flags(a, k))
+                assert reads(cond, a) == want, (setter, op, cc, cond, hex(a))
+                assert reads(negate_cond(cond), a) != want, (setter, op, cc, cond)
+    assert _cond_text((0, "cmn", "w5, #4", ""), "b.lt", "#0", True) == "w5 < -4"
+    for setter, op in (("cmn", "w5, w6"), ("adds", "w1, w5, w6")):
+        for cc in _HOLDS_400:
+            assert "?" in _cond_text((0, setter, op, ""), "b." + cc, "#0", True), (op, cc)
+        # mi keeps the sign of the sum, and tier 3 the sum it reads.
+        assert _cond_text((0, setter, op, ""), "b.mi", "#0", True) == "(w5 + w6) < 0"
+        assert _cond_text((0, setter, op, ""), "b.lt", "#0") == "(w5 + w6) < 0"
+
+    assert _lift_rows([("cmn", "w5, w6"), ("cset", "x0, lt"), ("ret", "")]) == [
+        "return (x5.toSigned(32) + x6.toSigned(32)) < 0 ? 1 : 0;"]
+
+
 def _sx(v, n):
     """The low `n` bits of `v`, sign-extended."""
     v &= (1 << n) - 1
