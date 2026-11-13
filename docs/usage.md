@@ -174,7 +174,10 @@ these after `cmp` and `subs`. After `adds` and `cmn`, `hs` and `lo` read the car
 sum, so `adds x1, x5, x6; cset x0, hs` is `(x5 + x6) u< x5 ? 1 : 0`, true where the sum
 wrapped. A condition that is not one comparison of what the rows show, `hi` after `cmn`
 or `lo` after `tst`, prints `?` on a branch, `if (? u<= ?) {`, and leaves a select as
-the raw instruction. Between doubles the operators are the plain ones.
+the raw instruction. Between doubles the operators are the plain ones. So are they
+between `w` registers: the four compare the low halves, which print zero-extended and
+are never negative, so `cmp w5, w6; cset x0, lo` is
+`x5.toUnsigned(32) < x6.toUnsigned(32) ? 1 : 0` and the signed operator says it exactly.
 
 Two things sit outside the tier ladder and matter a lot in practice.
 

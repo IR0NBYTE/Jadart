@@ -40,7 +40,7 @@ from typing import NamedTuple
 
 from .keep import kept
 from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, _REL,
-                  cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
+                  _UNSIGNED, cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
                   entry_reach, UNREACHED, cut_off, dominator_forest, dom_numbers,
                   second_reach, strong_components, past_trap, _cond_for, checks_into,
                   _conditions_from_the_block_before, LoopNest)
@@ -801,6 +801,185 @@ def _extend(v: V, kind: str, narrow: bool) -> V:
     return v if v.bits < bits or v.sext <= bits else _to_signed(v, bits)
 
 
+def _shift32(v: V, sym: str, amt: int) -> V:
+    """`v` shifted as the operand of a 32-bit instruction is: its low 32 bits, by `amt`,
+    `<<`, `>>>` or `>>`. Right in the low 32 bits of the result, which is all a 32-bit
+    consumer keeps. A right shift brings the top half of what it shifts down into them,
+    so it shifts the low half alone, signed for `>>`. `v` is untruncated, as `_leaf`
+    reads a w operand."""
+    if sym == "<<":
+        # A bound the shift keeps under 64 bits is still one: a class id, masked to 20
+        # bits and Smi-tagged, needs no truncation to be compared.
+        mask = _TAIL_MASK.search(v.text) if v.prec == P_AND else None
+        bits = min(v.bits, int(mask.group(1), 0).bit_length() if mask else 64) + amt
+        got = _bin(v, sym, _num(amt), P_SHIFT)
+        return replace(got, bits=min(got.bits, bits)) if bits < 64 else got
+    if sym == ">>":
+        got = _bin(_signed32(v), sym, _num(amt), P_SHIFT)
+        return replace(got, sext=min(got.sext, max(1, 32 - amt)))
+    got = _bin(_narrow(v), sym, _num(amt), P_SHIFT)
+    return replace(got, bits=min(got.bits, max(0, 32 - amt)))
+
+
+#: The tail of a value a condition chose of the two booleans (`_select`).
+_BOOL_ARMS = (" ? true : false", " ? false : true")
+#: `tbz xN, #0` and `tbnz xN, #0` as cfg spells them: the heap tag bit of a register.
+_TAG_BIT = re.compile(r"([wx](?:3[01]|[12]\d|\d)) & 1 (==|!=) 0")
+#: A register a condition skeleton spells by its w view, and the skeleton's operands as
+#: `cfg._cond_text` writes them: a register or an int, either one shifted, and the sum or
+#: the conjunction of two that `cmn`, `adds`, `tst`, `ands` and `bics` test against zero.
+_W_REG = re.compile(r"\bw(?:3[01]|[12]\d|\d)\b")
+_COND_REL = re.compile(rf" (==|!=|(?:{_UNSIGNED})?(?:<=|>=|<|>)) ")
+_COND_ATOM = r"(?:w\d+|-?(?:0x[0-9a-fA-F]+|\d+))"
+_COND_OPND = re.compile(rf"({_COND_ATOM})|\(({_COND_ATOM}) (<<|>>>|>>) (\d+)\)")
+_COND_PAIR = re.compile(rf"\(({_COND_ATOM}) ([+&]) (~?)(.+)\)")
+_CC_SIGNED = frozenset({"lt", "ge", "gt", "le"})
+_CC_UNSIGNED = frozenset({"lo", "cc", "hs", "cs", "hi", "ls"})
+_CC_SIGN = frozenset({"mi", "pl"})
+#: What `Lifter._known32` and `_cond32` say of an operand that may be a reference to an
+#: object: one the program names, what a load of four bytes read, or any value the body
+#: did not compute.
+_MAY_REF = frozenset({"ref", "u32", "obj"})
+
+
+def _cond32(text: str, cc: str, read, known=lambda tok, v: "") -> "str | None":
+    """A 32-bit condition skeleton spelled over the low halves it tests, or None where
+    `text` compares no w register and reads as it is.
+
+    `cfg._cond_text` spells a condition over the registers the instruction names, and
+    `canon` folds `w1` onto `x1`, so `cmp w1, #0; b.lt` printed `x1 < 0` over all 64 bits
+    of a value the CPU reads 32 of: never true of a zero-extended load, and `cbz w5`
+    printed `x5 == 0` for an x5 of 0x100000000 (#370). Each operand is read here as the
+    flags read it. A signed condition (`cc`) compares the low halves sign-extended and an
+    unsigned one zero-extended, which is what makes `<` on Dart's signed ints the
+    unsigned compare. `==` and `!=` hold either way, and take the reading that costs
+    fewer conversions. `mi` and `pl` test bit 31 of the difference. A sum (`cmn`, `adds`)
+    is truncated before it is tested for zero or for its sign, is compared as the sum of
+    the signed halves for a signed condition, and against 2**32 for a carry. A
+    conjunction (`tst`, `ands`, `bics`) is truncated the same way. A conversion a value's
+    own bounds prove the identity is left off, as everywhere.
+
+    cfg spells an unsigned condition with its own operators, `w5 u< w6`, and the carry
+    out of a sum as `(w5 + w6) u< w5` (#371). Neither is kept at 32 bits: two halves
+    zero-extended are not negative, so the plain `<` over them is the unsigned compare
+    and is one character shorter, and the truncated sum is below an operand exactly
+    when the two halves sum to 2**32 or more, which is the form printed.
+
+    `read` gives a register's value untruncated, as `_leaf` reads a w operand, and
+    `known(token, value)` says what else is known of it: `u32` where it has no bit above
+    31, so its low half is the value, and `ref` where it is a reference to an object the
+    VM keeps, which an equality with another reference reads whole. A single bit under
+    32, `tbz`, is the same bit of the whole register. `?` where the condition code is
+    not known or the skeleton is not one of these: a gap, not a guess."""
+    if not _W_REG.search(text):
+        return None
+    neg = text.startswith("!(") and text.endswith(")")
+    parts = _COND_REL.split(text[2:-1] if neg else text)
+    if len(parts) != 3:
+        return None                             # `w1 vs w2`: no relation is spelled
+    lhs, rel, rhs = parts
+    if lhs.endswith("& 1"):
+        return None                             # tbz, tbnz
+    carry = rel.startswith(_UNSIGNED)
+    if carry:
+        if cc not in _CC_UNSIGNED:
+            return "?"
+        rel = rel[len(_UNSIGNED):]
+
+    def operand(tok):
+        m = _COND_OPND.fullmatch(tok)
+        if m is None:
+            return None
+        atom = m.group(1) or m.group(2)
+        if atom[0] == "w":
+            v = read(atom)
+            how = known(atom, v)
+            v = v.wide if v.wide is not None else v
+            if v.smi:
+                v, how = _word(v), ""     # the word: the value, tagged
+            elif how == "u32" and v.bits > 32:
+                v = replace(v, bits=32)
+            elif not how and not v.calc and not _INT_LITERAL.match(v.text):
+                how = "obj"                     # what a register, a field or a call holds
+        else:
+            v, how = replace(_num(int(atom, 0)), text=atom), ""
+        if m.group(3):
+            return _shift32(v, m.group(3), int(m.group(4))), ""
+        return v, how
+
+    def low(v: V, signed: bool) -> V:
+        # The low half of `v`, sign- or zero-extended; a literal is folded.
+        if _INT_LITERAL.match(v.text):
+            n = int(v.text, 0) & 0xffffffff
+            n = n - (1 << 32) if signed and n >> 31 else n
+            return v if n == int(v.text, 0) else _num(n)
+        return _signed32(v) if signed else _narrow(v)
+
+    def done(a: V, b: V) -> str:
+        out = f"{_in_cond(a)} {rel} {_in_cond(b)}"
+        return f"!({out})" if neg else out
+    eq = rel in ("==", "!=")
+    if not eq and cc not in _CC_SIGNED | _CC_UNSIGNED | _CC_SIGN:
+        return "?"
+    zero = V("0", P_ATOM, bits=0)
+    pair = _COND_PAIR.fullmatch(lhs)
+    if pair is not None and (carry or rhs == "0"):
+        a, b = operand(pair.group(1)), operand(pair.group(4))
+        if a is None or b is None:
+            return "?"
+        a, b = a[0], b[0]
+
+        def both(x: V, sym: str, y: V, inv: str = "") -> V:
+            # Bracketed as the skeleton's operands are, each one a single term.
+            return V(f"{_in_cond(x)} {sym} {inv}{_in_cond(y)}",
+                     P_AND if sym == "&" else P_ADD, calc=True,
+                     bits=64 if inv else _bits_of(x, sym, y))
+        if carry:
+            # The carry out of bit 31, which cfg spells `(a + b) u< a`, or `u< b` for a
+            # constant b, and `u>=` for no carry: the truncated sum is below either
+            # operand exactly when the two low halves sum to 2**32 or more. hi and ls
+            # after a sum have no skeleton.
+            if (pair.group(2) != "+" or pair.group(3) or rel not in ("<", ">=")
+                    or rhs not in (pair.group(1), pair.group(4))):
+                return "?"
+            rel = ">=" if rel == "<" else "<"
+            return done(both(_narrow(a), "+", _narrow(b)), _num(1 << 32))
+        if pair.group(2) == "&":
+            if not eq and cc not in _CC_SIGN:
+                return "?"
+            test = both(a, "&", b, pair.group(3))
+            return done(_narrow(test) if eq else _signed32(test), zero)
+        if pair.group(3):
+            return "?"
+        if eq or cc in _CC_SIGN:
+            total = both(a, "+", b)
+            return done(_narrow(total) if eq else _signed32(total), zero)
+        if cc in _CC_SIGNED:
+            return done(both(_signed32(a), "+", _signed32(b)), zero)
+        return "?"                              # a carry cfg did not spell as one
+    a, b = operand(lhs), operand(rhs)
+    if a is None or b is None:
+        return "?"
+    (a, a_how), (b, b_how) = a, b
+    if eq:
+        # Two references, one object or two. Only where the other side may be a
+        # reference as well: a loaded field, a register, a name. A number the body
+        # computed is compared in its low half like any other, `add x1, x22, x5, lsl
+        # #32; cmp w1, w22` is equal whatever x5 holds.
+        if "ref" in (a_how, b_how) and a_how in _MAY_REF and b_how in _MAY_REF:
+            return done(a, b)
+        unsigned, signed = (low(a, False), low(b, False)), (low(a, True), low(b, True))
+        cost = lambda pair: sum(x.text != y.text for x, y in zip(pair, (a, b)))
+        return done(*(unsigned if cost(unsigned) <= cost(signed) else signed))
+    if cc in _CC_SIGNED:
+        return done(low(a, True), low(b, True))
+    if cc in _CC_UNSIGNED:
+        return done(low(a, False), low(b, False))
+    if b.text == "0":
+        return done(low(a, True), zero)         # the sign of the left operand itself
+    return done(_signed32(_bin(a, "-", b, P_ADD)), zero)
+
+
 #: `V.smi`.
 _SMI_TAG, _SMI_BOX = 1, 2
 
@@ -913,6 +1092,23 @@ def _smi_word(v: V) -> V:
     """The machine word of a register holding `v`: `v` itself, or for a tagged value the
     Smi it is, shifted up one."""
     return v if not v.smi else _bin(_smi_value(v), "<<", _num(1), P_SHIFT)
+
+
+def _word(v: V) -> V:
+    """What an instruction that computes with a register reads of it, where it holds
+    `v`: `v`, and for a Smi-tagged register the word and not the value the text
+    names. `sbfiz x1, x3, #1, #31; add x0, x1, #2` adds 2 to x3 shifted up one, and
+    printed `x3 + 2`; a 32-bit comparison of such a sum then compared a number the
+    register never held (#370). The tagged word is the value's low 31 bits,
+    sign-extended and shifted, so bits 31 to 63 of it agree; a 32-bit write of the
+    register cleared the top half (`V.wide`). A register the box-or-tag check left
+    boxed (`_SMI_BOX`) is read as the tagged word too, as its untag is (#290): the
+    path that boxes it as a Mint is the one `strip_boilerplate` cut."""
+    if not v.smi:
+        return v
+    got = _shift32(_smi_value(v), "<<", 1)
+    got = replace(got, sext=min(got.sext, 32))
+    return _narrow(got) if v.wide is not None else got
 
 
 def _narrow(v: V) -> V:
@@ -4439,6 +4635,10 @@ class Lifter:
         self._crossings = None
         #: The names those stores gave; see _lift_function.
         self.slot_names: set = set()
+        #: {id: value} of the values a load of four bytes or fewer zero-extended, and of
+        #: the names given to them; see _known32. By identity, since `V` has no field
+        #: for it and two reads that print alike need not be as wide.
+        self._low32: dict = {}
         #: Names `_phi` and `_render_loop` bind at a join or loop header (#169).
         self.phi_names: set = set()
         #: ({slot: bit}, {block: (live, crossing) masks}) from _slot_crossings, and the
@@ -5430,9 +5630,12 @@ class Lifter:
             # after it, and SP may move between the two.
             (self.raw_names if off_sp else self.slot_names).add(tmp)
             out.append(decl)
+        name = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+        if self._low32.get(id(v)) is v:
+            self._low32[id(name)] = name
         if st.reg.get(reg) == v:
-            st.reg[reg] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
-        st.slot[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+            st.reg[reg] = name
+        st.slot[key] = name
         return out
 
     # leaf rendering
@@ -5521,6 +5724,8 @@ class Lifter:
         term. Silence is recoverable; a wrong operand is not.
         """
         v = self._leaf(ops[i], st)
+        if v.smi:
+            v = _word(v)    # an operand of arithmetic: the word, not the value
         if len(ops) <= i + 1:
             return v
         mod = ops[i + 1].strip().lower()
@@ -5645,8 +5850,54 @@ class Lifter:
         text = _cond_text((0, mn, op, ""), "b." + cc, "")
         if "?" in text:
             return None
-        return _REG_RE.sub(
-            lambda m: _in_cond(vals.get(canon(m.group(1)), V(m.group(1), P_ATOM))), text)
+        low = _cond32(text, cc, lambda r: vals.get(canon(r), V(canon(r), P_ATOM)),
+                      self._known32)
+        if low is not None:
+            return None if low == "?" else low
+
+        def whole(m):
+            v = vals.get(canon(m.group(1)), V(m.group(1), P_ATOM))
+            return _in_cond(_word(v))
+        return _REG_RE.sub(whole, text)
+
+    def _known32(self, tok: str, v: V) -> str:
+        """What a 32-bit comparison knows of an operand beyond its value (`_cond32`).
+
+        `ref`: a reference to an object the program names: the null object, `true` or
+        `false` made off it, a pool object, a string, or what a condition selected of
+        `true` and `false`. A 32-bit `==` of one against another reference is the
+        identity test of the two, which compressed pointers hold in the low half and
+        the lifter spells without the heap base (the decompress, `add xD, xS, HEAP,
+        lsl #32`, prints as its source): `cmp w0, w22; b.eq` is `x0 == NULL`, and
+        `x0 == "name"` is not a comparison of two numbers. Told by the value and not by
+        the register it is read from: `mov x22, x5` leaves x22 holding x5, and the
+        null register is the null object only until the body writes it.
+
+        `u32`: what a load of four bytes or fewer read, zero-extended, so the low half
+        is all of it and `x1.field_0x8 == 0` needs no `.toUnsigned(32)`. Known of the
+        value the load made and of a name given to it (`_low32`), not of its text: an
+        eight-byte read of the same field prints the same, and where two paths join
+        the value is known of only if both loaded it so (`_join_low32`)."""
+        if (not v.calc and v.prec == P_ATOM
+                and (v.text in _T.consts.values() or v.text == _T.consts_base == "NULL"
+                     or v.text.startswith(('"', "pool_0x")))
+                or v.text.endswith(_BOOL_ARMS)):
+            return "ref"
+        return "u32" if self._low32.get(id(v)) is v else ""
+
+    def _join_low32(self, st: State, a: State, b: State):
+        """Past a join, `_low32` for the values the two arms agreed on. `_joined` keeps
+        one arm's value where the two print alike, and a four-byte and an eight-byte
+        read of one field do: `cbz x5, 1f; ldur w1, [x13, #7]; b 2f; 1: ldur x1, [x13,
+        #7]; 2: cmp w1, w2; b.lo` compared all 64 bits the second load read (#370).
+        The value is known zero-extended only where each arm holds one that is."""
+        low = self._low32
+        for held, one, two in ((st.reg, a.reg, b.reg), (st.slot, a.slot, b.slot)):
+            for k, v in held.items():
+                if low.get(id(v)) is v:
+                    x, y = one.get(k), two.get(k)
+                    if low.get(id(x)) is not x or low.get(id(y)) is not y:
+                        held[k] = replace(v)
 
     def _select(self, st: State, mn: str, ops, g) -> list | None:
         """`csel` and friends -> a conditional expression, or None to leave it raw."""
@@ -5660,12 +5911,13 @@ class Lifter:
             yes = V("1" if mn == "cset" else "-1", P_ATOM)
             no = V("0", P_ATOM)
         elif nsrc == 1:                                 # cinc / cinv / cneg
-            a = g(canon(ops[1]))
-            yes = (_bin(a, "+", V("1", P_ATOM), P_ADD) if mn == "cinc"
-                   else _prefix("~" if mn == "cinv" else "-", a))
-            no = a
+            no = _word(g(canon(ops[1])))
+            yes = (_bin(no, "+", V("1", P_ATOM), P_ADD) if mn == "cinc"
+                   else _prefix("~" if mn == "cinv" else "-", no))
         else:                                           # csel / csinc / csinv / csneg
             yes, b = g(canon(ops[1])), g(canon(ops[2]))
+            if mn != "csel" and b.smi:
+                b = _word(b)
             no = (b if mn == "csel"
                   else _bin(b, "+", V("1", P_ATOM), P_ADD) if mn == "csinc"
                   else _prefix("~" if mn == "csinv" else "-", b))
@@ -8060,6 +8312,11 @@ class Lifter:
                     self._at_read(v.text, self._at_computed(base, at_base, bv))
                     if sign and wk < 8 and _reg_file(ops[k]) == "x":
                         v = _extended(v, 8 * wk, True)
+                    elif wk <= 4 and _reg_file(ops[k]) == "x":
+                        # Zero-extended, which a 32-bit comparison reads (`_known32`). A
+                        # value of its own, so nothing else that prints alike is.
+                        v = replace(v)
+                        self._low32[id(v)] = v
                 got.append((r, v))
             for r, v in got:
                 st.set(r, v)
@@ -8076,6 +8333,11 @@ class Lifter:
 
         # data processing
         dst = canon(ops[0]) if ops else ""
+
+        def w(r):
+            # What arithmetic reads of a register: the word a tagged Smi is (`_word`).
+            v = g(r)
+            return _word(v) if v.smi else v
         if mn == "mov" and len(ops) == 2:
             imm = _imm(ops[1])
             st.set(dst, _num(imm) if imm is not None else g(ops[1]))
@@ -8129,8 +8391,9 @@ class Lifter:
                 return []
             if imm is not None:
                 src = g(raw_b)
-                st.set(dst, self._offset(_bin(src, "+", _num(imm), P_ADD), src, b, imm,
-                                         here, ops))
+                st.set(dst, self._offset(
+                    _bin(_word(src) if src.smi else src, "+", _num(imm), P_ADD),
+                    src, b, imm, here, ops))
                 return []
             if _T.roles.get(canon(c)) == "HEAP":               # compressed-pointer decompress
                 st.set(dst, g(b))
@@ -8190,10 +8453,9 @@ class Lifter:
                 amt = _imm(ops[3].split("#")[-1]) if "#" in ops[3] else 0
                 if idx_v.smi and sh == "asr" and amt == 1:
                     val = _smi_value(idx_v)
-                elif idx_v.smi:
-                    val = _bin(_smi_word(idx_v), _SHIFT_SYM[sh], _num(amt), P_SHIFT)
                 idx_v, scale = val, 0
-            src, total = g(raw_b), _bin(g(raw_b), "+", val, P_ADD)
+            src = g(raw_b)
+            total = _bin(_word(src) if src.smi else src, "+", val, P_ADD)
             if src.at is not None and src.at[1] and not src.smi and _whole(ops[:2]):
                 # The constant the base stands off its own base by stays one: `add x0,
                 # x0, #1; add x5, x0, x5, lsl #2` is `x0 + (x5 << 2)` and 1 (`V.at`).
@@ -8205,6 +8467,8 @@ class Lifter:
             return []
         if mn == "sub" and len(ops) >= 3:
             b = g(ops[1])
+            if b.smi:
+                b = _word(b)
             imm = _imm(ops[2])
             if imm is not None and len(ops) >= 4 and "lsl" in ops[3]:
                 imm <<= (_imm(ops[3].split("lsl")[-1]) or 0)
@@ -8217,7 +8481,7 @@ class Lifter:
             st.set(dst, total)
             return []
         if mn == "mul" and len(ops) >= 3:
-            st.set(dst, _bin(g(ops[1]), "*", g(ops[2]), P_MUL))
+            st.set(dst, _bin(w(ops[1]), "*", w(ops[2]), P_MUL))
             return []
         if mn in ("and", "orr", "eor", "bic", "orn", "eon") and len(ops) >= 3:
             sym = {"and": "&", "orr": "|", "eor": "^",
@@ -8234,7 +8498,8 @@ class Lifter:
             if mn == "orr" and canon(ops[1]) == "xzr":
                 st.set(dst, other)
             else:
-                st.set(dst, _bin(g(ops[1]), sym, other, prec))
+                a = g(ops[1])
+                st.set(dst, _bin(_word(a) if a.smi else a, sym, other, prec))
             return []
         if mn in ("neg", "mvn") and len(ops) >= 2:
             src = self._src(ops, 1, st)
@@ -8257,24 +8522,33 @@ class Lifter:
             # INT32_MIN ~/ -1 included: 0x80000000 either way once truncated. A zero
             # divisor gives 0 on the CPU and a throw in Dart; the compiler tests the
             # divisor before it divides, so compiled code never reaches one.
-            a, b = g(ops[1]), g(ops[2])
+            a, b = w(ops[1]), w(ops[2])
             if ops[0].strip()[:1] == "w":
                 a, b = _signed32(a), _signed32(b)
             st.set(dst, _bin(a, "~/", b, P_MUL))
             return []
         if mn in ("madd", "msub") and len(ops) >= 4:
-            prod = _bin(g(ops[1]), "*", g(ops[2]), P_MUL)
-            st.set(dst, _bin(g(ops[3]), "+" if mn == "madd" else "-", prod, P_ADD))
+            prod = _bin(w(ops[1]), "*", w(ops[2]), P_MUL)
+            st.set(dst, _bin(w(ops[3]), "+" if mn == "madd" else "-", prod, P_ADD))
             return []
         if mn == "mneg" and len(ops) >= 3:
-            st.set(dst, _prefix("-", _bin(g(ops[1]), "*", g(ops[2]), P_MUL)))
+            st.set(dst, _prefix("-", _bin(w(ops[1]), "*", w(ops[2]), P_MUL)))
             return []
         if mn in ("lsl", "lsr", "asr") and len(ops) >= 3:
             sym = _SHIFT_SYM[mn]      # one table, so the two spellings cannot drift apart
             amt = _imm(ops[2])
             # A register shift amount is not a shift by zero, which is what `or 0` made it.
-            rhs = _num(amt) if amt is not None else g(ops[2])
+            rhs = _num(amt) if amt is not None else w(ops[2])
             src = g(ops[1])
+            if src.smi and mn == "asr" and amt == 1 and (
+                    src.wide is None or ops[0].strip()[:1] == "w"):
+                # The untag, at either width: the tagged word is sign-extended from
+                # bit 31, so its low half shifted down is the value it tags. Not the
+                # whole of a register a 32-bit write left with a clear top half.
+                st.set(dst, _smi_value(src.wide if src.wide is not None else src))
+                return []
+            if src.smi:
+                src = _word(src)
             narrow = ops[0].strip()[:1] == "w"
             fits = _fits(src, 32 if mn == "lsr" else 31)
             if mn != "lsl" and narrow and not fits:
@@ -8291,7 +8565,8 @@ class Lifter:
             lsb, width = _imm(ops[2]), _imm(ops[3])
             if lsb is None or width is None:
                 return self._raw(st, dst, mn, op)
-            src = g(ops[1])
+            held = g(ops[1])
+            src = _word(held) if held.smi else held
             if lsb == 0:
                 # `& mask` zero-extends, so it is right for ubfx and wrong for sbfx, whose
                 # whole job is to carry the sign. Same bug and same fix as the sxt* forms
@@ -8313,7 +8588,7 @@ class Lifter:
                 # heap base after LoadCompressed: a negative Smi read as a large positive
                 # one (#285). Only the low half is read, so a value a 32-bit write
                 # truncated is read whole, as `_leaf` reads a w operand.
-                u = src.wide if src.wide is not None else src
+                u = held.wide if held.wide is not None else held
                 if u.smi:
                     # A Smi tag read back. The tag prints the value it tags, so the
                     # arithmetic below would divide it a second time: `sbfiz x1, x2, #1,
@@ -8328,8 +8603,10 @@ class Lifter:
                 st.set(dst, _bin(src, sym, _num(lsb), P_SHIFT))
             elif mn == "ubfx":
                 field = f"0x{(1 << width) - 1:x}"
+                # Bounded by the field's width, as the mask of a field at bit 0 is: a
+                # class id tagged and compared at 32 bits needs no truncation (#370).
                 st.set(dst, V(f"({_wrap(src, P_SHIFT)} >> {lsb}) & {field}", P_AND,
-                              calc=True))
+                              bits=width, calc=True))
             else:
                 # sbfx carries the field's top bit up, which `& mask` would clear (#124).
                 inner = _bin(src, ">>", _num(lsb), P_SHIFT)
@@ -8340,11 +8617,13 @@ class Lifter:
             if lsb is None or width is None:
                 return self._raw(st, dst, mn, op)
             src = g(ops[1])
+            if src.smi:
+                src = _word(src)
             if lsb == 1 and width == 31 and mn == "sbfiz":
                 # Smi tag (value << 1) under compressed pointers: show the value, and
                 # record that the register holds it tagged, which the untag reads (#290).
                 # A tag of a tagged register tags the word that register holds.
-                st.set(dst, replace(_smi_word(src), smi=_SMI_TAG, wide=None))
+                st.set(dst, replace(src, smi=_SMI_TAG, wide=None))
             elif lsb == 1 and width == 63 and mn == "sbfiz":
                 st.set(dst, src)                # Smi tag (value << 1): show the value
             else:
@@ -8367,6 +8646,13 @@ class Lifter:
             # ones are a shift pair, and it is exact because `>>` here IS arithmetic,
             # the same fact that makes `lsr` above `>>>` rather than `>>`.
             src = g(ops[1])
+            if src.smi:
+                if mn == "sxtw" and src.wide is None:
+                    # The tagged word is its own low half sign-extended (`_word`), so
+                    # the register holds what it held, tagged still.
+                    st.set(dst, src)
+                    return []
+                src = _word(src)
             width = {"b": 8, "h": 16, "w": 32}[mn[3]]
             if mn.startswith("u"):
                 st.set(dst, _bin(src, "&", V(hex((1 << width) - 1), P_ATOM, bits=width), P_AND))
@@ -9431,21 +9717,50 @@ class Lifter:
         return (st.src not in self._idom
                 and any(p in self._idom for p in preds))
 
-    def _cond(self, cond: str, st: State) -> str:
+    def _cond(self, cond: str, st: State, cc: str = "") -> str:
         """Render cfg's register-level condition with lifted expressions substituted.
 
         From the operands the live comparison captured where it has them: the flags
         were set from those values, and a register the flag-setting instruction
         overwrote no longer holds them: `subs x1, x1, #8; b.ne` printed `x1 == 8` after
         the `subs`, where it reads as the new x1 (#116). A `cbz` or `tbz` reads its
-        register as it is, and _lift_block drops the comparison before one."""
+        register as it is, and _lift_block drops the comparison before one.
+
+        `cc` is the condition code of the branch, which says how a 32-bit comparison
+        reads its operands (`_cond32`, #370)."""
         vals = self._flags[2] if self._flags is not None else {}
 
-        def sub(m):
-            r = canon(m.group(1))
+        def read(r):
+            r = canon(r)
             v = vals.get(r)
-            return _in_cond(v if v is not None else self._leaf(r, st))
-        return _REG_RE.sub(sub, cond)
+            return v if v is not None else self._leaf(r, st)
+        low = _cond32(cond, cc, read, self._known32)
+        if low is not None:
+            return low
+
+        def whole(m):
+            return _in_cond(_word(read(m.group(1))))
+        bit = _TAG_BIT.fullmatch(cond)
+        if bit is not None:
+            v = read(bit.group(1))
+            if v.smi == _SMI_BOX and v.wide is None:
+                # Bit 0 of a register the box-or-tag check filled says which of its two
+                # paths filled it: clear on the Smi, set on the Mint, which the value
+                # is boxed as where it does not fit in 31 bits. The one read of such a
+                # register the compiler makes because either path may have run.
+                return f"{_in_cond(v)} {bit.group(2)} {_in_cond(_to_signed(v, 31))}"
+        return _REG_RE.sub(whole, cond)
+
+    def _branch_cc(self, head, cond: str) -> str:
+        """The condition code of the branch `cond` was spelled from: the one ending
+        block `head`, where `cond` is that block's condition or its negation. `eq` for
+        `cbz` and `cbnz`, which test for zero, and "" where it is not known."""
+        blk = self.blocks.get(head)
+        if blk is None or not blk.insns or not blk.cond or (
+                cond != blk.cond and cond != negate_cond(blk.cond)):
+            return ""
+        mn = blk.insns[-1][1]
+        return "eq" if mn in ("cbz", "cbnz") else cond_of(mn)
 
     def _entered(self, lines) -> bool:
         """Whether `lines` define a label a goto the walk meets jumps to: one out of a
@@ -9814,9 +10129,9 @@ class Lifter:
                 alive = False
             elif kind == "if":
                 _, cond, then, els = s
-                cond_txt = self._cond(cond, st)
-                a, b = st.copy(), st.copy()
                 head = self._last_block if self._last_block is not None else self.entry
+                cond_txt = self._cond(cond, st, self._branch_cc(head, cond))
+                a, b = st.copy(), st.copy()
                 tlines, tfalls = self.walk(then, a, indent, depth + 1, joins[i])
                 elines, efalls = self.walk(els, b, indent, depth + 1, joins[i])
                 named = {}
@@ -9837,6 +10152,8 @@ class Lifter:
                 out.extend(self._render_if(cond_txt, tlines, elines, pad, indent))
                 if tfalls and efalls:
                     _merge(st, a, b)
+                    if self._low32:
+                        self._join_low32(st, a, b)
                     # ...and the join value of a named phi is that name, not the register
                     # `_merge` dropped to. Same second half as `_render_loop`: naming the
                     # value and then forgetting it puts the machine register back into
