@@ -832,7 +832,7 @@ _W_REG = re.compile(r"\bw(?:3[01]|[12]\d|\d)\b")
 _COND_REL = re.compile(rf" (==|!=|(?:{_UNSIGNED})?(?:<=|>=|<|>)) ")
 _COND_ATOM = r"(?:w\d+|-?(?:0x[0-9a-fA-F]+|\d+))"
 _COND_OPND = re.compile(rf"({_COND_ATOM})|\(({_COND_ATOM}) (<<|>>>|>>) (\d+)\)")
-_COND_PAIR = re.compile(rf"\(({_COND_ATOM}) ([+&]) (~?)(.+)\)")
+_COND_PAIR = re.compile(rf"\(({_COND_ATOM}) ([-+&]) (~?)(.+)\)")
 _CC_SIGNED = frozenset({"lt", "ge", "gt", "le"})
 _CC_UNSIGNED = frozenset({"lo", "cc", "hs", "cs", "hi", "ls"})
 _CC_SIGN = frozenset({"mi", "pl"})
@@ -944,6 +944,11 @@ def _cond32(text: str, cc: str, read, known=lambda tok, v: "") -> "str | None":
                 return "?"
             rel = ">=" if rel == "<" else "<"
             return done(both(_narrow(a), "+", _narrow(b)), _num(1 << 32))
+        if pair.group(2) == "-":
+            # The sign of a difference, mi and pl after `cmp` (#399): bit 31 of it.
+            if pair.group(3) or cc not in _CC_SIGN:
+                return "?"
+            return done(_signed32(_bin(a, "-", b, P_ADD)), zero)
         if pair.group(2) == "&":
             if not eq and cc not in _CC_SIGN:
                 return "?"
