@@ -23959,6 +23959,141 @@ def test_a_served_failure_is_json_only_when_this_command_asked(monkeypatch):
         served.close()
 
 
+def _dispatch_rows(*mid, recv="x2"):
+    """A dispatch-table call on the object in `recv`: the class id read, `mid`, which
+    makes the row out of it in x30, and the call through the table."""
+    return [("ldur", f"x0, [{recv}, #-1]"), ("ubfx", "x0, x0, #0xc, #0x14"), *mid,
+            ("ldr", "x30, [x21, x30, lsl #3]"), ("blr", "x30"), ("ret", "")]
+
+
+def test_a_selector_offset_keeps_the_shift_of_its_immediate():
+    """`sub x30, x0, #1, lsl #12` selects the row 0x1000 below the class id. The pass
+    that follows the class id to the call read the immediate and dropped its shift, so
+    the call printed as `sel_m0x1`, the name of another selector: 312 calls on the
+    clean build, `_syncAll`'s among them (#376). An offset in a register is added whole
+    or taken away whole, and a 32-bit move into it clears its top half."""
+    from jadart.expr import detect_dispatch
+
+    def call(*mid):
+        return _lift_rows(_dispatch_rows(*mid))
+
+    def offset(*mid):
+        rows = _dispatch_rows(*mid)
+        got = detect_dispatch([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        assert len(got) == 1, got
+        return next(iter(got.values()))[1]
+    assert call(("sub", "x30, x0, #1, lsl #12")) == ["return x2.sel_m0x1000(...);"]
+    assert call(("add", "x30, x0, #1, lsl #12")) == ["return x2.sel_0x1000(...);"]
+    assert offset(("sub", "x30, x0, #0xfff, lsl #12")) == -0xfff000
+    assert offset(("add", "x30, x0, #0xabc, lsl #12")) == 0xabc000
+    assert offset(("mov", "x17, #0x48e9"), ("sub", "x30, x0, x17")) == -0x48e9
+    assert offset(("mov", "w17, #-0x1234"), ("add", "x30, x0, x17")) == 0xffffedcc
+
+
+def test_a_selector_offset_the_pass_cannot_add_up_names_no_selector():
+    """Where the row is not the class id plus a number the pass has read whole, the call
+    has no selector, and it had one: a register shifted or extended as it is added was
+    taken as the register, and a 32-bit add, which wraps where the 64-bit one does not,
+    as the 64-bit one (#376)."""
+    declined = ["var t0 = dispatch(...);   // virtual dispatch", "return t0;"]
+    for mid in ([("mov", "x17, #0x48e9"), ("add", "x30, x0, x17, lsl #2")],
+                [("mov", "x17, #0x48e9"), ("add", "x30, x0, w17, uxtw")],
+                [("mov", "x17, #0x48e9"), ("add", "x30, x0, w17, sxtw #2")],
+                [("mov", "x17, #0x48e9"), ("sub", "x30, x0, x17, lsl #12")],
+                [("sub", "w30, w0, #1")], [("sub", "w30, w0, #1, lsl #12")],
+                [("add", "w30, w0, #5")]):
+        assert _lift_rows(_dispatch_rows(*mid)) == declined, mid
+
+
+def test_a_register_a_row_writes_keeps_no_dispatch_fact():
+    """What the pass knows of a register ends where a row writes it. It ended only at
+    the first register a row names, so the second register of an `ldp`, a base a load
+    moves and whatever a call may write kept theirs: `mov x17, #5; ldp x3, x17, [x9];
+    add x30, x0, x17` printed `sel_0x5`, and a call through the pool after a table
+    call printed the table call's selector a second time (#376)."""
+    declined = ["var t0 = dispatch(...);   // virtual dispatch", "return t0;"]
+    for mid in ([("mov", "x17, #5"), ("ldp", "x3, x17, [x9]"), ("add", "x30, x0, x17")],
+                [("mov", "x17, #5"), ("ldp", "x3, x17, [x9]"), ("sub", "x30, x0, x17")],
+                [("mov", "x17, #5"), ("ldpsw", "x3, x17, [x9]"), ("add", "x30, x0, x17")],
+                [("ldp", "x3, x0, [x9]"), ("add", "x30, x0, #5")],
+                [("ldp", "x3, x0, [x9]"), ("mov", "x30, x0")]):
+        assert _lift_rows(_dispatch_rows(*mid)) == declined, mid
+    # A base that moves prints as the store or the load that moved it, then the call.
+    for moved in (("ldr", "x3, [x17], #8"), ("ldr", "x3, [x17, #8]!"),
+                  ("str", "x3, [x17, #8]!"), ("stp", "x3, x4, [x17], #0x10")):
+        for add in (("add", "x30, x0, x17"), ("sub", "x30, x0, x17")):
+            got = _lift_rows(_dispatch_rows(("mov", "x17, #5"), moved, add))
+            assert "= dispatch(...);" in got[-2], (moved, add, got)
+            assert not any("sel_" in ln for ln in got), (moved, add, got)
+    # A call writes the registers a class id and a number are kept in.
+    for mid in ([("bl", "#0x4000"), ("sub", "x30, x0, #5")],
+                [("mov", "x17, #5"), ("bl", "#0x4000"), ("add", "x30, x0, x17")],
+                [("mov", "x17, #5"), ("blr", "x9"), ("add", "x30, x0, x17")]):
+        got = _lift_rows(_dispatch_rows(*mid))
+        assert "= dispatch(...);" in got[-2], (mid, got)
+        assert not any("sel_" in ln for ln in got), (mid, got)
+    # The target a table call loaded is not the target of the next call.
+    again = _dispatch_rows(("sub", "x30, x0, #5"))[:-1] + [
+        ("add", "x16, x27, #0xf, lsl #12"), ("ldp", "x5, x30, [x16, #0x8d8]"),
+        ("blr", "x30"), ("ret", "")]
+    assert _lift_rows(again) == ["x2.sel_m0x5(...);", "return pool_0xf8e0(...);"]
+    twice = _dispatch_rows(("sub", "x30, x0, #5"))[:-1] + [("blr", "x30"), ("ret", "")]
+    got = _lift_rows(twice)
+    assert [ln for ln in got if "sel_" in ln] == ["x2.sel_m0x5(...);"], got
+
+
+def test_a_selector_offset_in_one_step_or_two_guard():
+    """A guard: these already printed the offset the machine uses, or none. An immediate
+    as written, a constant moved into a register and added, a copy of the class id,
+    which is offset zero; and an offset made by two subtractions, or by a constant
+    built with `movk`, has no selector."""
+    def call(*mid):
+        return _lift_rows(_dispatch_rows(*mid))
+    declined = ["var t0 = dispatch(...);   // virtual dispatch", "return t0;"]
+    assert call(("sub", "x30, x0, #1")) == ["return x2.sel_m0x1(...);"]
+    assert call(("sub", "x30, x0, #0xfd8")) == ["return x2.sel_m0xfd8(...);"]
+    assert call(("add", "x30, x0, #0x123")) == ["return x2.sel_0x123(...);"]
+    assert call(("mov", "x17, #0x48e9"), ("add", "x30, x0, x17")) == [
+        "return x2.sel_0x48e9(...);"]
+    assert call(("mov", "x17, #-0x1234"), ("add", "x30, x0, x17")) == [
+        "return x2.sel_m0x1234(...);"]
+    assert call(("mov", "x30, x0")) == ["return x2.sel_0x0(...);"]
+    assert call(("sub", "x30, x0, #1, lsl #12"), ("sub", "x30, x30, #0x234")) == declined
+    assert call(("mov", "x17, #0x48e9"), ("movk", "x17, #1, lsl #16"),
+                ("add", "x30, x0, x17")) == declined
+
+
+def test_every_dispatch_offset_on_the_clean_build_is_the_one_in_the_word():
+    """Each dispatch site whose row is made by an add or a subtract of an immediate, read
+    again off the instruction word: twelve bits, the shift bit, the sign. 312 of the
+    clean build's are shifted and each printed the unshifted number (#376); the body of
+    `_syncAll` holds one."""
+    _needs_capstone()
+    import struct
+    import jadart
+    from jadart.disasm import disassemble_range, load_instructions
+    from jadart.expr import detect_dispatch
+    image, _fr, _ = load_instructions(CLEAN)
+    seen = shifted = 0
+    wrong = []
+    for cr in image.all_ranges:
+        dis = disassemble_range(image, cr)
+        for addr, (_recv, off) in detect_dispatch(dis).items():
+            (w,) = struct.unpack_from("<I", image.text, addr - 8)
+            if off is None or w & 0xBF80001F != 0x9100001E:
+                continue                 # not `add x30, xN, #imm` or `sub x30, xN, #imm`
+            seen += 1
+            shifted += w >> 22 & 1
+            imm = (w >> 10 & 0xfff) << (12 if w >> 22 & 1 else 0)
+            if off != (-imm if w >> 30 & 1 else imm):
+                wrong.append((hex(addr), off))
+    assert not wrong, (len(wrong), wrong[:5])
+    assert (seen, shifted) == (1685, 312), (seen, shifted)
+    body = [ln for f in jadart.decompile(CLEAN, "_syncAll") for ln in f["body"]]
+    assert any(".sel_m0x1000(" in ln for ln in body), body
+    assert not any(".sel_m0x1(" in ln for ln in body), body
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

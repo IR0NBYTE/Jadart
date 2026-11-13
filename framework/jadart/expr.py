@@ -10915,6 +10915,11 @@ def detect_dispatch(dis) -> dict:
     # ONE fact per register, not five parallel maps. The five kinds are mutually
     # exclusive by construction: every branch below invalidates its destination and then
     # records at most one thing about it, so a register can never be two of them at once.
+    # A fact is about the value in a register, so every register a row writes loses its
+    # own: the second register of an `ldp`, a base that a load or a store moves, what a
+    # call may write. `mov x17, #5; ldp x3, x17, [x9]; add x30, x0, x17` named the
+    # selector at offset 5, and a call through the pool after a table call,
+    # `ldp x5, x30, [x16]; blr x30`, named the table call's selector again.
     # As five dicts, invalidation was five pops on every instruction whether or not
     # anything was known, 2.2M of them on one `functions` run.
     fact = {}
@@ -10930,6 +10935,8 @@ def detect_dispatch(dis) -> dict:
         ops = _split_ops(t[2])
         if mn == "blr":
             f = fact.get(canon(ops[0])) if ops else None
+            for r in [r for r in fact if r in _CALL_CLOBBERS]:
+                del fact[r]
             if f is not None and f[0] == _F_DTARGET:
                 out[t[0]] = f[1]
             continue
@@ -10938,9 +10945,13 @@ def detect_dispatch(dis) -> dict:
         dst = canon(ops[0])
         if (mn == "ldur" or mn == "ldr") and len(ops) >= 2:
             m = _mem(ops[-1])
-            if m and m[2] is None and m[1] == -1 and m[0] not in _UNTAGGED:
+            if m is None or m[4]:
+                # the base moves: `ldr x3, [x17], #8` writes x17 as well
+                for r in _def_use(mn, t[2])[0]:
+                    fact.pop(r, None)
+            elif m[2] is None and m[1] == -1 and m[0] not in _UNTAGGED:
                 fact[dst] = (_F_TAGS, m[0])                     # tags word of a tagged object
-            elif (m and _T.roles.get(m[0]) == "DISPATCH"
+            elif (_T.roles.get(m[0]) == "DISPATCH"
                   and m[2] is not None):                       # dispatch-table indexed load
                 f = fact.get(canon(m[2]))                       # read first: dst may BE the index
                 fact[dst] = (_F_DTARGET,
@@ -10960,7 +10971,8 @@ def detect_dispatch(dis) -> dict:
             imm = _imm(ops[1])
             fact.pop(dst, None)
             if imm is not None:
-                fact[dst] = (_F_IMM, imm)
+                # A 32-bit move clears the top half: `mov w17, #-5` leaves 0xfffffffb.
+                fact[dst] = (_F_IMM, imm if ops[0][:1] != "w" else imm & 0xffffffff)
             elif f is not None:
                 if f[0] == _F_CID:
                     fact[dst] = (_F_DISP, (f[1], 0))
@@ -10970,15 +10982,32 @@ def detect_dispatch(dis) -> dict:
         if (mn == "add" or mn == "sub") and len(ops) >= 3:
             fs = fact.get(canon(ops[1]))
             ft = fact.get(canon(ops[2]))
-            off = _imm(ops[2])
             fact.pop(dst, None)
-            if fs is not None and fs[0] == _F_CID:
+            # The row is the class id plus what the machine adds, in 64 bits. An
+            # immediate is twelve bits, as written or shifted left by twelve, and
+            # `sub x30, x0, #1, lsl #12` is the row 0x1000 below, not the one below
+            # (#376). A register is added whole only when nothing shifts or extends it.
+            # Any other form, and a 32-bit add, which wraps where this one does not,
+            # is left with no offset, and the call prints without a selector.
+            if (fs is not None and fs[0] == _F_CID
+                    and ops[0][:1] == "x" and ops[1][:1] == "x"):
+                off = _imm(ops[2])
+                if off is not None:
+                    if len(ops) == 4 and ops[3] == "lsl #12":
+                        off <<= 12
+                    elif len(ops) != 3:
+                        off = None
+                elif (len(ops) == 3 and ops[2][:1] == "x"
+                      and ft is not None and ft[0] == _F_IMM):
+                    off = ft[1]
                 if off is not None:
                     fact[dst] = (_F_DISP, (fs[1], off if mn == "add" else -off))
-                elif mn == "add" and ft is not None and ft[0] == _F_IMM:
-                    fact[dst] = (_F_DISP, (fs[1], ft[1]))
             continue
         fact.pop(dst, None)
+        defs = _def_use(mn, t[2])[0]
+        if defs:
+            for r in [r for r in fact if r in defs]:
+                del fact[r]
     return out
 
 

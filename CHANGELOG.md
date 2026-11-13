@@ -107,6 +107,35 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A virtual call names the selector its shifted immediate adds up to.** A call through
+  the dispatch table adds the selector offset to the class id and loads its target from
+  the table at the sum. The pass that reads the offset took the immediate of that `add`
+  or `sub` and dropped its shift: `sub x30, x0, #1, lsl #12` is offset -0x1000 and
+  printed `t0.sel_m0x1(...)`, the name of another selector (#376). The shift is applied
+  now. An addend in a register counts only where it is a whole `x` register a `mov`
+  loaded, with nothing shifting or extending it, under `sub` as under `add`, and a
+  `mov` into a `w` register loads 32 bits. What the pass knows of a register goes with
+  every write of it, not only a write by the row's first operand: the second register
+  of an `ldp`, a base that a load or store moves, and what a call may write.
+  `mov x17, #5; ldp x3, x17, [x9]; add x30, x0, x17` named the selector at offset 5,
+  and a call through the pool after a table call, `ldp x5, x30, [x16]; blr x30`,
+  printed as the table call again. A sum the pass cannot make prints `dispatch(...)`
+  and names nothing. A separate reading of the instruction words at every dispatch
+  site, written for this, disagreed with 312 of the 2,580 offsets the pass gives on the
+  clean fixture and with 3,624 of the 53,680 on the seven app-sweep libraries, and
+  agrees with every one now; 105 more calls in four of the libraries were no table
+  call at all, 68 of them under a selector. Over the two fixtures and the seven
+  libraries 2,199 bodies change, 4,359 lines out and 4,387 in: 4,248 calls go from
+  offset -1 to -0x1000, 312 of them in 164 bodies of each fixture. Three of the lines:
+  `if ((t8.sel_m0x1(...) >> 4) & 1 != 0) {` is now
+  `if ((t8.sel_m0x1000(...) >> 4) & 1 != 0) {`, `var t4 = t3.sel_m0x1(...);` is now
+  `var t4 = t3.sel_m0x1000(...);`, and `var t5 = x3.sel_m0x12b();` is now
+  `var t5 = (pool_base_0xb000 + 0xd90).field_0x9(t4);`. No call gains or loses a
+  source name on the clean fixture, 607 before and after. `jadart xrefs` reads virtual
+  call sites with the same pass, so on the clean fixture those 312 sites go from the 7
+  functions at offset -1 to the 12 at -0x1000, and the edges a virtual call may take
+  from 14,583 to 15,536. The pass takes 47 ms over the clean fixture's 457,622 rows
+  against 85, in three alternating runs.
 - **The agent skill gave the wrong exit codes.** It said `0` on success and `2` on
   failure, but a name that is not in the binary exits `1`, a bug in jadart exits `3` and
   an interrupt `130`, so an agent branching on `2` read a miss as success. The skill,
