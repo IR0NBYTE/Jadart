@@ -75,7 +75,8 @@ class CallIndex:
     undecodable: list = field(default_factory=list)  # pcs of ranges that would not decode
 
 
-def selector_targets(image, fr, offsets, extra_names: dict = None) -> dict:
+def selector_targets(image, fr, offsets, extra_names: dict = None,
+                     reach: set = None) -> dict:
     """Selector call-site immediate -> the set of functions a site could reach.
 
     This is what makes a virtual edge real rather than a label. The dispatch table maps
@@ -102,6 +103,12 @@ def selector_targets(image, fr, offsets, extra_names: dict = None) -> dict:
     vote has nothing to vote with and virtual resolution collapses to a handful of
     selectors. `extra_names` (pc -> name) is how signature matching feeds it, so the two
     features compose instead of each stopping at the same wall.
+
+    `reach` (a set of pcs) passes over every offset whose candidates cannot include one
+    of them: a pc is a candidate at an offset only through a row k that holds it, at the
+    class id `k - sel`, so an offset no such row lines up with has nothing to offer. The
+    offsets that are kept get the whole vote, so their sets are the ones the call without
+    `reach` returns, which is what an overload count needs.
     """
     from collections import Counter
     from .dispatch import find_dispatch_table, ORIGIN_ELEMENT_ARM64, _slot_names
@@ -115,9 +122,18 @@ def selector_targets(image, fr, offsets, extra_names: dict = None) -> dict:
     slot_name = _slot_names(fr, image)
     cids = sorted({cid & 0xFFFFFFFF for _r, _n, cid, _s in fr.classes})
     npc, nrows = len(image.pcs), len(entries)
+    rows = None
+    if reach is not None:
+        rows = [k for k, ci in enumerate(entries)
+                if ci is not None and 0 < ci <= npc and image.pcs[ci - 1] in reach]
+        cidset = set(cids)
+        if len(rows) > len(cids):
+            rows = None                         # the test would cost more than the vote
     out = {}
     for off in offsets:
         sel = off + ORIGIN_ELEMENT_ARM64        # call-site immediate back to row space
+        if rows is not None and not any(k - sel in cidset for k in rows):
+            continue
         cand = []
         for c in cids:
             k = c + sel
@@ -149,7 +165,7 @@ def selector_targets(image, fr, offsets, extra_names: dict = None) -> dict:
 
 
 def build_index(image, fr=None, virtual: bool = True,
-                extra_names: dict = None) -> CallIndex:
+                extra_names: dict = None, only: set = None) -> CallIndex:
     """One pass over every code range, collecting direct, pool-mediated and virtual edges.
 
     A direct call whose target is not the start of a known range, or one the instruction
@@ -169,6 +185,14 @@ def build_index(image, fr=None, virtual: bool = True,
     Everything else is answered from the words, and the answer is the same one: capstone
     decodes every word of every range on all sixteen arm64 binaries in the corpus, so the
     words it would have printed a `bl` for are exactly the words read here.
+
+    `only` (a set of pcs) builds the part of the graph that touches those ranges and no
+    more: their callers, callees and register calls, the virtual sites that may reach
+    them, and the selector sets they belong to, each one what the whole graph holds for
+    them. Every range is still read, since any one of them may call these, but one that
+    is not in `only` is decoded only where a call into `only` could hide in it: a pool
+    load naming one of them, or a dispatch site. Nothing about any other range is
+    complete. This is what a query naming one function pays instead of the whole image.
     """
     idx = CallIndex()
     ranges = image.all_ranges
@@ -192,15 +216,21 @@ def build_index(image, fr=None, virtual: bool = True,
     # The raw word reading is arm64 only; any other decoder keeps the full sweep.
     words = A64Words(image.text) if arch_name == "arm64" else None
     fn_offsets = set(fn_by_pool)
+    # The pool entries that name a range in `only`: the one way into it besides a `bl`
+    # that a range outside it can hold.
+    into = fn_offsets if only is None else {
+        off for off, nm in fn_by_pool.items() if name_to_pc.get(nm) in only}
 
     for cr in ranges:
         src = cr.pc_offset
+        keep = None if only is None or src in only else only
         if words is not None and src % 4 == 0:
-            rw = _read_words(words, image, cr, fn_offsets, want_virtual)
+            rw = _read_words(words, image, cr, fn_offsets if keep is None else into,
+                             want_virtual)
         else:
             rw = _RangeWords(None, 0, want_virtual, True, None)
         if not (rw.need_virtual or rw.need_pool):
-            _words_edges(idx, src, rw.targets, rw.nblr, starts)
+            _words_edges(idx, src, rw.targets, rw.nblr, starts, keep)
             continue
         # detect_dispatch answers each `blr` from the instructions before it, so a range
         # decoded only for dispatch can stop at its last `blr`. Nothing past that point
@@ -231,7 +261,7 @@ def build_index(image, fr=None, virtual: bool = True,
         if not rw.need_pool:
             # Decoded for detect_dispatch alone. The words already hold every `bl` and
             # `blr` in order, so re-reading them from text would only cost the time.
-            _words_edges(idx, src, rw.targets, rw.nblr, starts)
+            _words_edges(idx, src, rw.targets, rw.nblr, starts, keep)
             continue
         # A pool-mediated edge interleaves with the direct ones in instruction order and
         # shares their dedupe, so a range that may have one keeps the whole decoded walk.
@@ -246,7 +276,7 @@ def build_index(image, fr=None, virtual: bool = True,
                 if t is None:
                     idx.unresolved += 1
                 else:
-                    _direct_edge(idx, src, t, starts, seen)
+                    _direct_edge(idx, src, t, starts, seen, keep)
             elif indirect_call(image, addr):
                 # Off the word: `mn == "blr"` knew only arm64's name, and every function
                 # of every arm32 build read 0 indirect sites, so 0 opaque ones too (#54).
@@ -263,8 +293,9 @@ def build_index(image, fr=None, virtual: bool = True,
                 t = name_to_pc.get(fn_by_pool.get(off)) if off is not None else None
                 if t is not None and t not in seen:
                     seen.add(t)
-                    idx.callees.setdefault(src, []).append(t)
-                    idx.callers.setdefault(t, []).append(src)
+                    if keep is None or t in keep:
+                        idx.callees.setdefault(src, []).append(t)
+                        idx.callers.setdefault(t, []).append(src)
 
             fb = _add_imm_from_pp(op) if mn == "add" else None
             if fb is not None:
@@ -280,28 +311,33 @@ def build_index(image, fr=None, virtual: bool = True,
 
     if want_virtual and idx.sites:
         offsets = {off for sites in idx.sites.values() for _a, off in sites}
-        idx.sel_targets = selector_targets(image, fr, offsets, extra_names)
+        idx.sel_targets = selector_targets(image, fr, offsets, extra_names, reach=only)
         for caller, sites in idx.sites.items():
             for _addr, off in sites:
                 for t in idx.sel_targets.get(off, ()):
+                    if only is not None and t not in only:
+                        continue
                     idx.may_call.setdefault(caller, set()).add(t)
                     idx.may_be_called_by.setdefault(t, set()).add(caller)
     return idx
 
 
-def _words_edges(idx: CallIndex, src: int, targets: list, nblr: int, starts: set) -> None:
+def _words_edges(idx: CallIndex, src: int, targets: list, nblr: int, starts: set,
+                 keep: set = None) -> None:
     """The direct edges and the `blr` count of one range, as read off its words."""
     seen = set()
     for t in targets:
-        _direct_edge(idx, src, t, starts, seen)
+        _direct_edge(idx, src, t, starts, seen, keep)
     if nblr:
         idx.indirect[src] = idx.indirect.get(src, 0) + nblr
 
 
-def _direct_edge(idx: CallIndex, src: int, t: int, starts: set, seen: set) -> None:
-    """Record `src` calling `t`, once per pair, or count it when `t` is not a range."""
+def _direct_edge(idx: CallIndex, src: int, t: int, starts: set, seen: set,
+                 keep: set = None) -> None:
+    """Record `src` calling `t`, once per pair, or count it when `t` is not a range.
+    With `keep`, an edge is recorded only when `t` is in it."""
     if t in starts:
-        if t not in seen:
+        if t not in seen and (keep is None or t in keep):
             seen.add(t)
             idx.callees.setdefault(src, []).append(t)
             idx.callers.setdefault(t, []).append(src)
@@ -456,8 +492,13 @@ class Func:
 ORIGINS = ("snapshot", "symtab", "roots", "signature", "anonymous")
 
 
-def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
+def function_table(image, fr, hdr=None, sigs: str = None, only=None) -> tuple:
     """Every code range in the image as a Func. Returns (rows, graph_error, notes).
+
+    `only` is a test on a row's name, origin and library, the columns that need no call
+    graph. With it the graph is built for the rows it keeps (build_index's `only`), and
+    every other row comes back with None in its call columns rather than a count nobody
+    computed. A query for one name then costs a read of the image, not the whole graph.
 
     `notes` is a list of things the caller should print beside the table: ranges that
     were dropped from the graph, or a library attribution that could not be made. They
@@ -511,24 +552,6 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
             lib_by_pc = {}
             notes.append(f"library attribution unavailable: {e}")
 
-    graph_error = None
-    try:
-        idx = build_index(image, fr, extra_names={
-            pc: m.name for pc, m in matched.items()} if matched else None)
-    except (MissingDisassembler, UnsupportedArch) as e:
-        idx, graph_error = CallIndex(), e
-    if idx.undecodable:
-        shown = ", ".join(f"0x{pc:x}" for pc in idx.undecodable[:5])
-        more = f" and {len(idx.undecodable) - 5} more" if len(idx.undecodable) > 5 else ""
-        notes.append(f"{len(idx.undecodable)} code ranges would not decode and are absent "
-                     f"from the call graph: {shown}{more}")
-    # How many implementations share a target's selector. 1 means a virtual site reaching
-    # it has exactly one possible landing, which is as good as a direct edge.
-    share = {}
-    for _off, tgts in idx.sel_targets.items():
-        for t in tgts:
-            share[t] = max(share.get(t, 0), len(tgts))
-
     out = []
     for cr in image.all_ranges:
         pc = cr.pc_offset
@@ -545,13 +568,37 @@ def function_table(image, fr, hdr=None, sigs: str = None) -> tuple:
         else:
             origin = "snapshot" if nm else "anonymous"
         out.append(Func(pc_offset=pc, size=cr.size, name=nm, origin=origin,
-                        va=va_of(image, pc),
-                        library=lib_by_pc.get(pc, ""),
-                        callers=len(idx.callers.get(pc, ())),
-                        callees=len(idx.callees.get(pc, ())),
-                        indirect=idx.indirect.get(pc, 0),
-                        virtual_callers=len(idx.may_be_called_by.get(pc, ())),
-                        overloads=share.get(pc, 0)))
+                        va=va_of(image, pc), library=lib_by_pc.get(pc, "")))
+    wanted = None if only is None else {f.pc_offset for f in out if only(f)}
+
+    graph_error = None
+    try:
+        idx = build_index(image, fr, extra_names={
+            pc: m.name for pc, m in matched.items()} if matched else None, only=wanted)
+    except (MissingDisassembler, UnsupportedArch) as e:
+        idx, graph_error = CallIndex(), e
+    if idx.undecodable:
+        shown = ", ".join(f"0x{pc:x}" for pc in idx.undecodable[:5])
+        more = f" and {len(idx.undecodable) - 5} more" if len(idx.undecodable) > 5 else ""
+        notes.append(f"{len(idx.undecodable)} code ranges would not decode and are absent "
+                     f"from the call graph: {shown}{more}")
+    # How many implementations share a target's selector. 1 means a virtual site reaching
+    # it has exactly one possible landing, which is as good as a direct edge.
+    share = {}
+    for _off, tgts in idx.sel_targets.items():
+        for t in tgts:
+            share[t] = max(share.get(t, 0), len(tgts))
+
+    for f in out:
+        pc = f.pc_offset
+        if wanted is not None and pc not in wanted:
+            f.callers = f.callees = f.indirect = f.virtual_callers = f.overloads = None
+            continue
+        f.callers = len(idx.callers.get(pc, ()))
+        f.callees = len(idx.callees.get(pc, ()))
+        f.indirect = idx.indirect.get(pc, 0)
+        f.virtual_callers = len(idx.may_be_called_by.get(pc, ()))
+        f.overloads = share.get(pc, 0)
     out.sort(key=lambda f: f.pc_offset)
     return out, graph_error, notes
 
@@ -567,7 +614,7 @@ def callers_of(image, fr, targets, extra_names: dict = None) -> dict:
     one at runtime. Collapsing the two would turn a certainty into a maybe with no way to
     tell which is which.
     """
-    idx = build_index(image, fr, extra_names=extra_names)
+    idx = build_index(image, fr, extra_names=extra_names, only=set(targets))
     by_pc = {cr.pc_offset: cr for cr in image.all_ranges}
     share = {}
     for _off, tgts in idx.sel_targets.items():
