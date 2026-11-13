@@ -47,6 +47,7 @@ Every one of these means *the tool declined*, not *the tool failed*:
 | `f(...)` in a signature | a function whose argument list was not read: a descriptor, the stack, or a double | "takes no arguments" |
 | `f()`, `f(a1, a3)` in a signature | the argument registers the body reads; a parameter it never reads is not listed | "takes no arguments", "takes two parameters" |
 | `field_0x8` | an instance field at byte offset 8; its name was not recovered | "the `balance` field" |
+| `x1 u< x2`, `u>=` | an unsigned comparison; Dart has no operator for one | "`x1 < x2`" |
 | `(...)` | a call whose arguments were not reconstructed | "called with the user id" |
 | `pool_0x1234` | an object pool slot that resolved to no name | "the HTTP client" |
 | `sub_0x1234` | a call to an unnamed function at that address | "the validator" |

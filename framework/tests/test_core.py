@@ -22049,7 +22049,7 @@ def test_a_computed_address_is_one_under_a_name_and_past_a_join():
     assert lift(("add", "x1, x0, #0x10"), ("stur", "w22, [x1, #-1]"),
                 ("add", "x1, x1, #0x10"), ("cmp", "x1, x3"), ("b.lo", "#0x4")) == [
         "var t0 = x0 + 16;", "while (true) {", "(t0 - 1).field_0x1 = NULL;",
-        "if ((t0 + 16) >= x3) {", "t0 += 16;", "break;", "}", "t0 += 16;", "}",
+        "if ((t0 + 16) u>= x3) {", "t0 += 16;", "break;", "}", "t0 += 16;", "}",
         "return x0;"]
     # Named because a store went by.
     assert lift(("add", "x0, x0, #1"), ("ldur", "w6, [x5, #0x4f]"),
@@ -24688,6 +24688,124 @@ def test_following_a_dispatch_receiver_costs_the_same_per_row_guard():
     small, large = per_row(8), per_row(32)
     assert large <= small * 1.25 + 1, (small, large)
     assert large <= getattr(expr, "_RECV_WINDOW", 64), large
+
+
+def _flags_371(setter, a, b):
+    """N, Z, C and V as an arm64 CPU leaves them after `cmp a, b` (or `subs`) and
+    after `cmn a, b` (or `adds`), for two 64-bit values."""
+    m = (1 << 64) - 1
+    y, carry = ((~b) & m, 1) if setter in ("cmp", "subs") else (b, 0)
+    total = a + y + carry
+    r = total & m
+    return (r >> 63, int(r == 0), total >> 64,
+            int((a >> 63) == (y >> 63) and (r >> 63) != (a >> 63)))
+
+
+_HOLDS_371 = {
+    "hs": lambda n, z, c, v: c == 1, "lo": lambda n, z, c, v: c == 0,
+    "hi": lambda n, z, c, v: c == 1 and z == 0,
+    "ls": lambda n, z, c, v: c == 0 or z == 1}
+
+
+def _reads_371(cond, env):
+    """What a printed condition says for the register values `env`: Dart's 64-bit
+    wrapping arithmetic either side of one comparison, signed unless the operator
+    carries the unsigned mark."""
+    m = (1 << 64) - 1
+    lhs, rel, rhs = re.fullmatch(r"(.+) (u?(?:[<>]=?)|[=!]=) (.+)", cond).groups()
+    a, b = (eval(side, {}, env) & m for side in (lhs, rhs))
+    if not rel.startswith("u"):
+        a, b = (v - (1 << 64) if v >> 63 else v for v in (a, b))
+    return {"==": a == b, "!=": a != b, "<": a < b, "<=": a <= b, ">": a > b,
+            ">=": a >= b}[rel.lstrip("u")]
+
+
+def test_a_condition_reads_what_the_flags_hold():
+    """Each unsigned condition `_cond_text` spells after an integer compare, a subtract
+    or an add holds exactly when the CPU's flags make the branch go, over the values
+    where the readings part: zero, the two ends of the signed range and of the unsigned.
+
+    hs, lo, hi and ls read the carry, and printed `x5 < x6` for lo they were the signed
+    comparison: `cmp x5, x6; cset x0, lo` disagreed with a CPU on 24 of 40 random
+    entry states, and a bounds check, one unsigned compare of the index against the
+    length, read as passing a negative index (#371). After an add the carry is the
+    carry out, which printed as the sign of the sum. A condition with no exact
+    spelling prints `?`, which nothing takes for a claim."""
+    from jadart.cfg import _cond_text
+    edge = [0, 1, 2, 7, (1 << 63) - 1, 1 << 63, (1 << 63) + 1, (1 << 64) - 2, (1 << 64) - 1]
+    rows = {"cmp": "x5, x6", "subs": "x1, x5, x6", "cmn": "x5, x6", "adds": "x1, x5, x6"}
+    spelled = 0
+    for setter, op in rows.items():
+        for cc, holds in _HOLDS_371.items():
+            cond = _cond_text((0, setter, op, ""), "b." + cc, "#0")
+            if "?" in cond:
+                continue
+            spelled += 1
+            for a in edge:
+                for b in edge:
+                    assert (_reads_371(cond, {"x5": a, "x6": b})
+                            == holds(*_flags_371(setter, a, b))), (
+                        setter, cc, cond, hex(a), hex(b))
+    # All four after each of the two subtracts; after an add hs and lo, the carry out,
+    # and hi and ls declined.
+    assert spelled == 12
+    # ...and against a constant.
+    for setter, op in (("cmp", "x5, #7"), ("subs", "x1, x5, #7"), ("cmn", "x5, #7"),
+                       ("adds", "x1, x5, #7"), ("cmp", "x5, #0"), ("cmn", "x5, #0")):
+        k = int(op.rsplit("#", 1)[1])
+        for cc, holds in _HOLDS_371.items():
+            cond = _cond_text((0, setter, op, ""), "b." + cc, "#0")
+            if "?" in cond:
+                assert setter in ("cmn", "adds") and cc in ("hi", "ls"), (setter, cc)
+                continue
+            for a in edge + [(1 << 64) - 7, (1 << 63) - 7, (1 << 63) + 7]:
+                assert _reads_371(cond, {"x5": a}) == holds(*_flags_371(setter, a, k)), (
+                    setter, cc, cond, hex(a))
+
+
+def test_the_unsigned_conditions_are_not_spelled_as_the_signed_ones():
+    """The spelling: the signed operator with a `u` in front, `x5 u< x6`, on a branch, a
+    conditional select and a conditional set alike, and its negation is unsigned too.
+    The issue's three programs (#371)."""
+    from jadart.cfg import _cond_text, negate_cond
+    for cc, rel in (("hs", "u>="), ("cs", "u>="), ("lo", "u<"), ("cc", "u<"),
+                    ("hi", "u>"), ("ls", "u<=")):
+        assert _cond_text((0, "cmp", "x5, x6", ""), "b." + cc, "#0") == f"x5 {rel} x6"
+        assert _cond_text((0, "subs", "x1, x5, x6", ""), "b." + cc, "#0") == f"x5 {rel} x6"
+    assert negate_cond("x5 u< x6") == "x5 u>= x6" and negate_cond("x5 u> 3") == "x5 u<= 3"
+    assert negate_cond("(x5 + x6) u< x5") == "(x5 + x6) u>= x5"
+    assert _lift_rows([("cmp", "x5, x6"), ("cset", "x0, lo"), ("ret", "")]) == [
+        "return x5 u< x6 ? 1 : 0;"]
+    assert _lift_rows([("cmp", "x5, x6"), ("b.hi", "#0x10"), ("mov", "x0, #1"),
+                       ("ret", ""), ("mov", "x0, #2"), ("ret", "")]) == [
+        "if (x5 u<= x6) {", "return 1;", "} else {", "return 2;", "}"]
+    assert _lift_rows([("adds", "x1, x5, x6"), ("cset", "x0, hs"), ("ret", "")]) == [
+        "return (x5 + x6) u< x5 ? 1 : 0;"]
+    # The select family, and the operands as they read at the compare.
+    assert _lift_rows([("cmp", "x5, x6"), ("csel", "x0, x2, x3, hs"), ("ret", "")]) == [
+        "return x5 u>= x6 ? x2 : x3;"]
+    assert _lift_rows([("add", "x5, x5, #1"), ("cmp", "x5, x6"), ("cinc", "x0, x2, ls"),
+                       ("ret", "")]) == ["return (x5 + 1) u<= x6 ? x2 + 1 : x2;"]
+    assert _lift_rows([("subs", "x5, x5, x6"), ("b.lo", "#0x10"), ("mov", "x0, #1"),
+                       ("ret", ""), ("mov", "x0, #2"), ("ret", "")])[:2] == [
+        "var t0 = x5;", "if (t0 u>= x6) {"]
+    # hi and ls after an add read the carry and Z at once: declined, the select raw.
+    assert _lift_rows([("cmn", "x5, x6"), ("cset", "x0, hi"), ("ret", "")]) == [
+        "cset x0, hi", "return x0;"]
+    assert "?" in _cond_text((0, "adds", "x1, x5, x6", ""), "b.ls", "#0")
+    # The conditions that are not the carry read as they did.
+    assert _cond_text((0, "cmp", "x5, x6", ""), "b.mi", "#0") == "x5 < x6"
+    assert _cond_text((0, "cmn", "x5, #4", ""), "b.lt", "#0") == "(x5 + 4) < 0"
+
+
+def test_a_floating_point_compare_keeps_the_plain_operators():
+    """Guard. The carry conditions after `fcmp` order two doubles, which have no
+    unsigned reading: `fcmp d0, d1; b.lo` is `d0 < d1`."""
+    from jadart.cfg import _cond_text
+    for cc, rel in (("lo", "<"), ("hs", ">="), ("hi", ">"), ("ls", "<="), ("mi", "<"),
+                    ("pl", ">="), ("lt", "<"), ("ge", ">=")):
+        assert _cond_text((0, "fcmp", "d0, d1", ""), "b." + cc, "#0") == f"d0 {rel} d1"
+    assert _cond_text((0, "fcmp", "d0, d0", ""), "b.vs", "#0") == "isNaN(d0)"
 
 
 if __name__ == "__main__":
