@@ -107,6 +107,65 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A 32-bit comparison reads the low half of its operands.** `ldur w1, [x13, #7];
+  cmp w1, #0; cset x0, lt` printed `x13.field_0x8 < 0 ? 1 : 0`, which a zero-extended
+  load never is, and `cbz w5` printed `if (x5 != 0)`, true of an x5 of 0x100000000 that
+  the branch reads as zero: the condition was spelled over the whole registers (#370).
+  `cmp`, `cmn`, `tst`, `subs`, `adds`, `ands`, `bics`, `cbz` and `cbnz` on `w`
+  registers now read each operand as the flags do, by the condition, and `csel` and
+  `cset` with them. `lt`, `ge`, `gt` and `le` compare the halves sign-extended,
+  `x5.toSigned(32) < x6.toSigned(32)`. `lo`, `hs`, `hi` and `ls` compare them
+  zero-extended, `x5.toUnsigned(32) < x6.toUnsigned(32)`, with the plain operator: a
+  zero-extended half is never negative, so `<` is the unsigned comparison there and the
+  `u<` of a 64-bit one would say nothing more. `mi` and `pl` test bit 31 of the
+  difference, `(x5 - x6).toSigned(32) < 0`. `==` and `!=` hold either way and take the
+  reading with fewer conversions. The sum of a `cmn` and the conjunction of a `tst` are
+  truncated before they are tested, and a carry is the sum of the two low halves
+  against `0x100000000`, after a `cmn` with a shifted operand as well; `hi` and `ls`
+  after an `adds` or a `cmn` are declined, `? u> ?`, as they are at 64 bits. A
+  conversion the value's own bounds prove the identity is left off: after a load of
+  four bytes or fewer, a mask, or a sign extension. A value that is a four-byte load
+  on one path and an eight-byte load on the other keeps it.
+  An equality stays the identity test it is, `x0 == NULL`, only where one side is an
+  object every path names (the null register while it holds null, `true`, `false`, a
+  pool object, a string) and the other is a register, a field, a call result or a
+  value with no bit above 31: compressed pointers are compared in their low half and
+  print without the heap base. A sum is not one, and neither is the null register once
+  it is written: `mov x22, x5; cmp w1, w22` is
+  `x1.toUnsigned(32) == x5.toUnsigned(32)`.
+  Comparing at 32 bits showed what a Smi-tagged register had been read as. After
+  `sbfiz x1, x3, #1, #31` tier 3 names x1 by the value it tags, and `add x0, x1, #2`
+  printed `x3 + 2` where the CPU adds to the tagged word; a 32-bit comparison of such
+  a result was right only where two errors cancelled. Every instruction that computes
+  with a tagged register now reads the word, `(x3.toSigned(31) << 1) + 2`, at either
+  width: arithmetic, logic, shifts, bitfields, extends, a shifted or extended operand,
+  a conditional select and a condition. A shift right by one still gives the value
+  back and a store still prints the value. Bit 0 of a register past the box-or-tag
+  check says which of its two paths filled it, and `tbz w1, #0` prints
+  `x3 == x3.toSigned(31)`; any other `tbz` or `tbnz` reads the same bit of the whole
+  register as before. A 64-bit unsigned condition over a tagged register reads the
+  word like the rest, `(x3.toSigned(31) << 1) u> 0x800`, exact for the half of the
+  words that are negative as well.
+  After #369, 1,337 ranges of 8,194 change on the clean fixture and 1,337 of 8,188 on
+  the obfuscated one, 2,858 and 2,859 lines: `if ((x4.field_0x14 - 4) >= 2) {` is now
+  `if ((x4.field_0x14 - 4).toSigned(32) >= 2) {`,
+  `if (THR.field_0x78.field_0x981 == THR.field_0x90) {` is
+  `if (THR.field_0x78.field_0x981.toUnsigned(32) == THR.field_0x90.toUnsigned(32)) {`,
+  and `if (a2 < 0x800) {`, which printed the value of a Smi-tagged register against a
+  bound on the tagged word, is `if ((a2 << 1) < 0x800) {`. Of the clean fixture's 2,858
+  lines, 1,895 are an equality where an operand nothing proves to be 32 bits wide gains
+  `.toUnsigned(32)`, 1,052 of them against a thread field such as `THR.field_0x90`;
+  139 are an ordered comparison that gains a conversion; 800 follow a Smi-tagged
+  register, 575 of them gaining the `<< 1` of the word; 14 drop a conversion a
+  bound now proves; and 10 are an unsigned comparison of operands a mask proves 32
+  bits wide, which drops its `u`: `if ((t21 & 0xffffffff & 15) u< 0xa) {` is
+  `if ((t21 & 0xffffffff & 15) < 0xa) {`. No condition that printed is declined. The
+  unicorn oracle, over 2,988 programs of those instructions on `w` registers under
+  every condition at 40 entry states, went from 1,093 programs with a wrong run to
+  none, and the 48 the extend sweep had left agree as well. Over 816 more, the four
+  unsigned conditions on a tagged register at 100 entry states, 766 agree and 50 are
+  the declined `hi` and `ls` after an add. The forty ordinary bodies of the call count
+  test take 58,008 calls, 32 more than before.
 - **An extended register operand reads the part it extends.** `add x0, x5, w6, sxtw`
   adds the low 32 bits of x6, sign-extended, and tier 3 printed `return x5 + x6;`, the
   register whole: the extend was dropped and only the shift after it kept (#369). Each

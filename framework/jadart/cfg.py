@@ -302,9 +302,8 @@ def _cond_text(prev_cmp, mn, op) -> str:
             lhs, rhs = f"({parts[0]} + {b})", "0"
             if cc in _CARRY:
                 # ...and with it spelled the carry is the carry out of that sum, as
-                # after `adds`. It printed `?` while the sum left the shift out, and
-                # still does on `w` registers, where the carry is out of bit 31.
-                if cc in ("hi", "ls") or len(parts) > 2 and parts[0].startswith("w"):
+                # after `adds`. It printed `?` while the sum left the shift out.
+                if cc in ("hi", "ls"):
                     return f"? {rel} ?"
                 rel, rhs = _carry_out(cc, parts[0], b)
         elif pm == "adds" and len(parts) >= 3:

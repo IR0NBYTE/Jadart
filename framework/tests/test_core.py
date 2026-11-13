@@ -10813,14 +10813,14 @@ def test_tier3_places_the_body_behind_a_monomorphic_entry():
     miss = "br x16   // x16 holds THR.field_0x258"
     plain = _lift_rows(_MONO_ROWS, 0x1000, receiver={"x1": "this"})
     assert plain == [miss, "// " + UNREACHED, "L_0x1008:",
-                     "if (x5 == (((x0.tags >> 12) & 0xfffff) << 1)) {",
+                     "if (x5.toUnsigned(32) == (((x0.tags >> 12) & 0xfffff) << 1)) {",
                      "return x1.field_0x8;", "} else {", miss, "}"], plain
     from jadart.expr import MONOMORPHIC_ENTRY
     assert "its normal entry is 24 bytes in" in MONOMORPHIC_ENTRY
     body = _lift_rows(_MONO_ROWS, 0x1000, receiver={"x1": "this"}, mono=0x1008)
     assert body == [miss, "// " + MONOMORPHIC_ENTRY, "L_0x1008:",
-                    "if (x5 != (((x0.tags >> 12) & 0xfffff) << 1)) {", miss, "}",
-                    "return x1.field_0x8;"], body
+                    "if (x5.toUnsigned(32) != (((x0.tags >> 12) & 0xfffff) << 1)) {",
+                    miss, "}", "return x1.field_0x8;"], body
     # not a monomorphic entry: the address is not where the section starts
     assert _lift_rows(_MONO_ROWS, 0x1000, mono=0x100c)[1] == "// " + UNREACHED
 
@@ -10956,7 +10956,7 @@ def test_a_monomorphic_section_is_lifted_as_a_body_of_its_own():
                              ("ret", "")]
     body = _lift_rows(loop, 0x1000, receiver={"x1": "this"}, mono=0x1008)
     assert body[1:6] == ["// " + MONOMORPHIC_ENTRY, "L_0x1008:",
-                         "if (x5 != (((x0.tags >> 12) & 0xfffff) << 1)) {",
+                         "if (x5.toUnsigned(32) != (((x0.tags >> 12) & 0xfffff) << 1)) {",
                          "br x16   // x16 holds THR.field_0x258", "}"], body
     assert body[6:] == ["var t0 = 0;", "while (true) {", "if ((t0 + 1) >= x1) {",
                         "t0 += 1;", "break;", "}", "t0 += 1;", "}", "return t0;"], body
@@ -11139,7 +11139,7 @@ def test_lift_prints_a_monomorphic_closure_as_it_reads_from_its_entry():
     assert "goto L_0x1be920;" not in sec, sec
     assert any(re.fullmatch(r"if \(t\d+ == NULL\) \{", ln) for ln in sec), sec
     regs = [ln for ln in sec if _REG_RE.search(ln.split("//")[0])]
-    assert regs == ["if (x5 != (((x0.tags >> 12) & 0xfffff) << 1)) {",
+    assert regs == ["if (x5.toUnsigned(32) != (((x0.tags >> 12) & 0xfffff) << 1)) {",
                     "br x16   // x16 holds THR.field_0x258"], regs
 
 
@@ -25229,7 +25229,8 @@ def test_an_extended_register_operand_reads_the_part_it_extends():
     cmn = lambda cc: _cond_text((0, "cmn", "x5, x6, lsl #3", ""), "b." + cc, "#0")
     assert cmn("eq") == "(x5 + (x6 << 3)) == 0"
     assert cmn("hs") == "(x5 + (x6 << 3)) u< x5" and cmn("hi") == "? u> ?"
-    assert _cond_text((0, "cmn", "w5, w6, lsl #3", ""), "b.hs", "#0") == "? u>= ?"
+    assert _cond_text((0, "cmn", "w5, w6, lsl #3", ""), "b.hs", "#0") == (
+        "(w5 + (w6 << 3)) u< w5")   # read at 32 bits where it is printed (#370)
     for cc in ("hs", "lo"):
         for _ in range(60):
             env = _w_env(rng)
@@ -25239,6 +25240,301 @@ def test_an_extended_register_operand_reads_the_part_it_extends():
     for flags in ("cmn", "cmp"):
         body = _lift_rows([(flags, "x5, w6, sxtw"), ("cset", "x0, lt"), ("ret", "")])
         assert body == ["cset x0, lt", "return x0;"], body
+
+
+def _flags32(kind, a, b):
+    """N, Z, C, V as arm64 sets them for 32-bit `a - b` (`cmp`), `a + b` (`cmn`) or
+    `a & b` (`tst`)."""
+    m = 0xffffffff
+    a, b = a & m, b & m
+    if kind == "tst":
+        r = a & b
+        return r >> 31, r == 0, 0, 0
+    if kind == "cmp":
+        r = (a - b) & m
+        return r >> 31, r == 0, a >= b, ((a ^ b) & (a ^ r)) >> 31
+    r = (a + b) & m
+    return r >> 31, r == 0, (a + b) >> 32, (~(a ^ b) & (a ^ r) & m) >> 31
+
+
+_HOLDS = {"eq": lambda n, z, c, v: z, "ne": lambda n, z, c, v: not z,
+          "hs": lambda n, z, c, v: c, "lo": lambda n, z, c, v: not c,
+          "mi": lambda n, z, c, v: n, "pl": lambda n, z, c, v: not n,
+          "hi": lambda n, z, c, v: c and not z, "ls": lambda n, z, c, v: not c or z,
+          "ge": lambda n, z, c, v: n == v, "lt": lambda n, z, c, v: n != v,
+          "gt": lambda n, z, c, v: not z and n == v,
+          "le": lambda n, z, c, v: z or n != v}
+
+
+def test_a_32_bit_comparison_reads_the_low_half_of_its_operands():
+    """`cmp w1, #0; cset x0, lt` over a four-byte load printed `x13.field_0x8 < 0`, all
+    64 bits of a value the CPU reads 32 of and never true, and `cbz w5` printed `x5 == 0`
+    for an x5 of 0x100000000 (#370). A condition on w registers reads the low halves,
+    sign-extended for a signed condition and zero-extended for an unsigned one. Every
+    condition of `cmp`, `cmn` and `tst`, against a register, an immediate and a shifted
+    register, is checked against the flags arm64 defines on random inputs."""
+    import random
+    cset = lambda rows, cc: _untag_text(list(rows) + [("cset", f"x0, {cc}")])
+    load = [("ldur", "w1, [x13, #7]")]
+    one = lambda rows, cc: cset(rows, cc)[:-len(" ? 1 : 0")]
+    assert one(load + [("cmp", "w1, #0")], "lt") == "x13.field_0x8.toSigned(32) < 0"
+    assert one([("cmp", "w5, w6")], "lt") == "x5.toSigned(32) < x6.toSigned(32)"
+    assert one([("cmp", "w5, w6")], "lo") == "x5.toUnsigned(32) < x6.toUnsigned(32)"
+    assert one([("cmp", "w5, #7")], "eq") == "x5.toUnsigned(32) == 7"
+    assert one([("cmp", "w5, #0")], "mi") == "x5.toSigned(32) < 0"
+    assert one([("cmp", "w5, w6")], "mi") == "(x5 - x6).toSigned(32) < 0"
+    assert one([("cmn", "w5, w6")], "eq") == "(x5 + x6).toUnsigned(32) == 0"
+    assert one([("tst", "w5, w6")], "ne") == "(x5 & x6).toUnsigned(32) != 0"
+    # What a load of four bytes zero-extended is its own low half, and so is its name.
+    assert one(load + [("cmp", "w1, #0")], "eq") == "x13.field_0x8 == 0"
+    assert one(load + [("cmp", "w1, #4")], "hi") == "x13.field_0x8 > 4"
+    assert one(load + [("cmp", "w1, w6")], "eq") == "x13.field_0x8 == x6.toUnsigned(32)"
+    # An eight-byte read of the same field prints the same and is not known to fit.
+    assert one([("ldur", "x1, [x13, #7]"), ("cmp", "w1, #0")], "eq") == (
+        "x13.field_0x8.toUnsigned(32) == 0")
+    # Two references are one object or two: the null register and a pool object are
+    # read whole by `==`, and no other condition knows the pool object for one.
+    assert one([("cmp", "w5, w22")], "eq") == "x5 == NULL"
+    pool = [("ldr", "x16, [x27, #0x120]"), ("cmp", "w5, w16")]
+    assert one(pool, "ne") == "x5 != pool_0x120"
+    assert one(pool, "lo") == "x5.toUnsigned(32) < pool_0x120.toUnsigned(32)"
+    # What a condition chose of `true` and `false` is one of the two objects, and the
+    # `?` it is spelled with is not the `?` of a condition the lifter declines.
+    chose = [("add", "x16, x22, #0x20"), ("add", "x17, x22, #0x30"), ("cmp", "x5, x6"),
+             ("csel", "x1, x16, x17, gt"), ("cmp", "w1, w7")]
+    assert one(chose, "eq") == "(x5 > x6 ? true : false) == x7"
+    # An equality holds read either way, and reads the way that changes fewer operands.
+    assert one([("mov", "x6, #-5"), ("cmp", "w5, w6")], "eq") == "x5.toSigned(32) == -5"
+    # A Smi-tagged register is compared as the word it holds, and a class id, 20 bits
+    # tagged, needs no truncation. An immediate keeps its spelling.
+    assert one([("sbfiz", "x6, x5, #1, #31"), ("cmp", "w6, #0x800")], "lt") == (
+        "(x5.toSigned(31) << 1) < 0x800")
+    cid = [("ubfx", "x16, x16, #0xc, #0x14"), ("lsl", "x16, x16, #1")]
+    assert one(cid + [("cmp", "w16, #0xbc")], "ne") == (
+        "(((x16 >> 12) & 0xfffff) << 1) != 0xbc")
+    # A branch reads its operand the same way, and one bit of it is that bit.
+    arms = [("mov", "x0, #1"), ("ret", ""), ("mov", "x0, #2"), ("ret", "")]
+    branch = lambda mn, op: _lift_rows([(mn, f"{op}, #0xc")] + arms)[0]
+    assert branch("cbz", "w5") == "if (x5.toUnsigned(32) != 0) {"
+    assert branch("cbnz", "w5") == "if (x5.toUnsigned(32) == 0) {"
+    assert branch("tbz", "w5, #3") == "if ((x5 >> 3) & 1 != 0) {"
+    less = _lift_rows([("cmp", "w5, w6"), ("b.ge", "#0x10")] + arms)[0]
+    assert less == "if (x5.toSigned(32) < x6.toSigned(32)) {"
+
+    rng = random.Random(370)
+    shift = {"lsl": lambda v, n: v << n, "lsr": lambda v, n: (v & 0xffffffff) >> n,
+             "asr": lambda v, n: _sx(v, 32) >> n}
+    forms = [("cmp", "w5, w6", None), ("cmn", "w5, w6", None), ("tst", "w5, w6", None),
+             ("cmp", "w5, #7", 7), ("cmp", "w5, #0", 0), ("cmn", "w5, #3", 3),
+             ("tst", "w5, #0xff00", 0xff00)]
+    forms += [("cmp", f"w5, w6, {sh} #{n}", (sh, n))
+              for sh in shift for n in (1, 3, 31)]
+    told = 0
+    for kind, op, right in forms:
+        for cc, holds in _HOLDS.items():
+            text = cset([(kind, op)], cc)
+            if text == "x0":
+                # Declined, the `cset` left raw: only where the flags have no spelling,
+                # which after an add is hi and ls, the carry and the zero flag at once.
+                assert (kind == "tst" and cc not in ("eq", "ne", "mi", "pl")
+                        or kind == "cmn" and cc in ("hi", "ls")), (op, cc)
+                continue
+            told += 1
+            assert text.endswith(" ? 1 : 0"), text
+            cond = text[:-len(" ? 1 : 0")].replace(">>>", ">>")
+            for _ in range(60):
+                env = _w_env(rng)
+                b = (env["x6"] if right is None else right if isinstance(right, int)
+                     else shift[right[0]](env["x6"], right[1]))
+                want = bool(holds(*_flags32(kind, env["x5"], b)))
+                assert bool(_dart_int(cond, env)) == want, (kind, op, cc, text, env)
+    assert told == len(forms) * 12 - 2 * 8 - 2 * 2, told
+
+
+
+def test_arithmetic_on_a_smi_tagged_register_reads_the_word_it_holds():
+    """`sbfiz x1, x3, #1, #31` leaves x1 holding x3's low 31 bits shifted up one, and
+    tier 3 names the register by the value it tags (#290). An instruction that computes
+    with the register read that name: `add x0, x1, #2` printed `x3 + 2` where the CPU
+    has `(x3.toSigned(31) << 1) + 2`, and so for every arithmetic, logical, shift and
+    bitfield instruction, an operand with a shift or an extend, and a condition. A
+    32-bit comparison of such a result compared a number the register never held
+    (#370). Each reads the tagged word now, a shift right by one still gives the value
+    back, and a store still prints the value. Every form is checked against arm64 on
+    random inputs, the register past a box-or-tag check on those that take the Smi
+    path."""
+    import random
+    tag = [("sbfiz", "x1, x3, #1, #0x1f")]
+    box = tag + [("cmp", "x3, x1, asr #1"), ("b.eq", "#0x10"), ("nop", "")]
+    one = lambda rows: _untag_text(tag + rows)
+    assert one([("add", "x0, x1, #2")]) == "(x3.toSigned(31) << 1) + 2"
+    assert one([("mul", "x0, x1, x4")]) == "(x3.toSigned(31) << 1) * x4"
+    assert one([("add", "w0, w1, w4")]) == "((x3.toSigned(31) << 1) + x4).toUnsigned(32)"
+    assert one([("asr", "x0, x1, #1")]) == "x3.toSigned(31)"
+    assert one([("mov", "x0, x1")]) == "x3"
+    assert _untag_text(box + [("add", "x0, x1, #2")]) == "(x3 << 1) + 2"
+    assert _untag_text(box + [("asr", "x0, x1, #1")]) == "x3"
+    assert one([("mov", "w1, w1"), ("asr", "w0, w1, #1")]) == (
+        "x3.toSigned(31).toUnsigned(32)")
+    assert one([("mov", "w1, w1"), ("asr", "x0, x1, #1")]) == (
+        "(x3.toSigned(31) << 1).toUnsigned(32) >> 1")
+    # The tagged word is its own low half sign-extended, so `sxtw` leaves it tagged.
+    assert one([("sxtw", "x0, w1"), ("asr", "x0, x0, #1")]) == "x3.toSigned(31)"
+    assert _untag_text(box + [("sxtw", "x1, w1"), ("add", "x0, x4, x1, asr #1")]) == (
+        "x4 + x3")
+    # Bit 0 of a boxed register says which path of the box-or-tag check filled it, the
+    # Mint where the value does not fit in 31 bits; any other bit is a bit of the word.
+    arms = [("mov", "x0, #1"), ("ret", ""), ("mov", "x0, #2"), ("ret", "")]
+    assert _lift_rows(box + [("tbnz", "w1, #0, #0x1c")] + arms)[0] == (
+        "if (x3 == x3.toSigned(31)) {")
+    assert _lift_rows(box + [("tbz", "w1, #0, #0x1c")] + arms)[0] == (
+        "if (x3 != x3.toSigned(31)) {")
+    assert _lift_rows(box + [("tbz", "w1, #4, #0x1c")] + arms)[0] == (
+        "if (((x3 << 1) >> 4) & 1 != 0) {")
+    assert _lift_rows(tag + [("tbz", "w1, #4, #0x10")] + arms)[0] == (
+        "if (((x3.toSigned(31) << 1) >> 4) & 1 != 0) {")
+    # A 64-bit unsigned condition reads the word with the unsigned operators (#371).
+    # The signed ones fail for the half of the words that are negative.
+    over = [("mov", "w2, #0x800"), ("cmp", "x1, x2")]
+    assert one(over + [("cset", "x0, hi")]) == "(x3.toSigned(31) << 1) u> 0x800 ? 1 : 0"
+    assert _lift_rows(tag + over + [("b.ls", "#0x18")] + arms)[0] == (
+        "if ((x3.toSigned(31) << 1) u> 0x800) {")
+    assert one(over + [("cset", "x0, gt")]) == "(x3.toSigned(31) << 1) > 0x800 ? 1 : 0"
+    assert one([("adds", "x7, x1, x6"), ("cset", "x0, hs")]) == (
+        "((x3.toSigned(31) << 1) + x6) u< (x3.toSigned(31) << 1) ? 1 : 0")
+    rng = random.Random(371)
+    for setter, op in (("cmp", "x1, x6"), ("cmp", "x6, x1"), ("adds", "x7, x1, x6")):
+        for cc, holds in _HOLDS_371.items():
+            text = one([(setter, op), ("cset", "x0, " + cc)])
+            if text == "x0":
+                assert setter == "adds" and cc in ("hi", "ls"), (setter, cc)
+                continue
+            lhs, rel, rhs = re.fullmatch(r"(.+) (u[<>]=?) (.+) \? 1 : 0", text).groups()
+            for _ in range(60):
+                env = _w_env(rng, ("x3", "x6"))
+                word = _sx(env["x3"], 31) << 1 & (1 << 64) - 1
+                a, b = (env["x6"], word) if op == "x6, x1" else (word, env["x6"])
+                got = {"u<": int.__lt__, "u<=": int.__le__, "u>": int.__gt__,
+                       "u>=": int.__ge__}[rel](_dart_int(lhs, env), _dart_int(rhs, env))
+                assert got == holds(*_flags_371(setter, a, b)), (text, env)
+    # The three a 32-bit comparison made wrong where two errors had cancelled.
+    twice = [("lsl", "w1, w1, #1"), ("mov", "x2, #-2")]
+    assert one(twice + [("cmp", "w1, w2"), ("cset", "x0, eq")]) == (
+        "(x3.toSigned(31) << 1 << 1).toSigned(32) == -2 ? 1 : 0")
+    assert one(twice + [("cmn", "w1, #2"), ("cset", "x0, eq")]) == (
+        "((x3.toSigned(31) << 1 << 1) + 2).toUnsigned(32) == 0 ? 1 : 0")
+
+    mask, m32 = (1 << 64) - 1, 0xffffffff
+    s32, s64 = (lambda v: _sx(v, 32)), (lambda v: _sx(v, 64))
+    forms = {                                   # w is the tagged word, y is x4
+        "add x0, x1, #2": lambda w, y: w + 2,
+        "add x0, x4, x1": lambda w, y: y + w,
+        "add x0, x4, x1, lsl #2": lambda w, y: y + (w << 2),
+        "add x0, x4, w1, sxtw": lambda w, y: y + s32(w),
+        "add x0, x4, w1, uxtw #2": lambda w, y: y + ((w & m32) << 2),
+        "sub x0, x1, x4": lambda w, y: w - y,
+        "sub x0, x4, x1": lambda w, y: y - w,
+        "neg x0, x1": lambda w, y: -w,
+        "mul x0, x4, x1": lambda w, y: y * w,
+        "madd x0, x1, x4, x4": lambda w, y: y + w * y,
+        "and x0, x1, #0xff": lambda w, y: w & 0xff,
+        "orr x0, x1, x4": lambda w, y: w | y,
+        "eor x0, x4, x1": lambda w, y: y ^ w,
+        "bic x0, x4, x1": lambda w, y: y & ~w,
+        "mvn x0, x1": lambda w, y: ~w,
+        "lsl x0, x1, #2": lambda w, y: w << 2,
+        "asr x0, x1, #2": lambda w, y: s64(w) >> 2,
+        "asr x0, x1, #1": lambda w, y: s64(w) >> 1,
+        "ubfx x0, x1, #2, #8": lambda w, y: (w >> 2) & 0xff,
+        "sbfx x0, x1, #2, #8": lambda w, y: _sx(w >> 2, 8),
+        "sbfiz x0, x1, #2, #20": lambda w, y: _sx(w, 20) << 2,
+        "ubfiz x0, x1, #2, #20": lambda w, y: (w & 0xfffff) << 2,
+        "uxtw x0, w1": lambda w, y: w & m32,
+        "add w0, w1, #2": lambda w, y: (w + 2) & m32,
+        "sub w0, w4, w1": lambda w, y: (y - w) & m32,
+        "lsl w0, w1, #1": lambda w, y: (w << 1) & m32,
+        "lsr w0, w1, #1": lambda w, y: (w & m32) >> 1,
+        "asr w0, w1, #3": lambda w, y: (s32(w) >> 3) & m32,
+        "and w0, w1, w4": lambda w, y: w & y & m32,
+        "mul w0, w1, w4": lambda w, y: w * y & m32,
+        "cmp x1, #8; cset x0, lt": lambda w, y: s64(w) < 8,
+        "cmp x1, x4; cset x0, eq": lambda w, y: w == y,
+        "tst x1, #0x10; cset x0, ne": lambda w, y: w & 0x10 != 0,
+        "cmp w1, #8; cset x0, lt": lambda w, y: s32(w) < 8,
+        "cmp w1, w4; cset x0, eq": lambda w, y: (w ^ y) & m32 == 0,
+        "cmp w1, w4; cset x0, hi": lambda w, y: w & m32 > y & m32,
+        "cmn w1, #2; cset x0, eq": lambda w, y: (w + 2) & m32 == 0,
+        "lsl w1, w1, #1; mov x2, #-2; cmp w1, w2; cset x0, eq":
+            lambda w, y: (w << 1) & m32 == 0xfffffffe,
+        "lsl w1, w1, #1; mov x2, #-2; cmp w1, w2; cset x0, ne":
+            lambda w, y: (w << 1) & m32 != 0xfffffffe,
+        "lsl w1, w1, #1; cmn w1, #2; cset x0, eq":
+            lambda w, y: ((w << 1) + 2) & m32 == 0,
+        "lsl w1, w1, #1; cmp w1, #4; cset x0, lt": lambda w, y: s32(w << 1) < 4,
+    }
+    rng = random.Random(3701)
+    edge = (0x3fffffff, 0x40000000, 0x7fffffff, 0x80000000, (1 << 64) - 1, 1 << 63)
+    for head, fits in ((tag, False), (box, True)):
+        for form, machine in forms.items():
+            rows = [tuple(p.strip().split(" ", 1)) for p in form.split(";")]
+            text = _untag_text(head + rows).replace(">>>", ">>")
+            cond = text.endswith(" ? 1 : 0")
+            text = text[:-len(" ? 1 : 0")] if cond else text
+            for _ in range(60):
+                env = {r: rng.choice((rng.getrandbits(64), rng.getrandbits(32),
+                                      rng.getrandbits(30), mask - rng.getrandbits(30),
+                                      rng.choice(edge))) for r in ("x3", "x4")}
+                if fits and _sx(env["x3"], 31) & mask != env["x3"]:
+                    continue                    # the Mint path, which the strip cuts
+                want = machine((_sx(env["x3"], 31) << 1) & mask, env["x4"])
+                got = _dart_int(text, env)
+                assert (bool(got) == want if cond else got == want & mask), (
+                    form, text, {r: hex(v) for r, v in env.items()})
+
+
+def test_a_32_bit_equality_reads_whole_only_what_every_path_proves_a_reference():
+    """Three operands of a 32-bit comparison that printed whole and are read by half
+    (#370). The null register was known by its name, and holds null only until the
+    body writes it: `mov x22, x5; cmp w1, w22` printed `x1 == x5`. An equality with
+    null was the identity test whatever the other side, and a number the body computed
+    is no reference: `add x1, x22, x5, lsl #32; cmp w1, w22` is equal for every x5 and
+    printed `(NULL + (x5 << 32)) == NULL`. And a four-byte load was known for its own
+    low half past a join with an eight-byte load of the same field, which prints the
+    same: `x13.field_0x8 < x2.toUnsigned(32)`."""
+    import random
+    one = lambda rows, cc: _untag_text(list(rows) + [("cset", f"x0, {cc}")])[:-len(
+        " ? 1 : 0")]
+    moved = one([("mov", "x22, x5"), ("cmp", "w1, w22")], "eq")
+    assert moved == "x1.toUnsigned(32) == x5.toUnsigned(32)"
+    summed = one([("add", "x1, x22, x5, lsl #32"), ("cmp", "w1, w22")], "eq")
+    assert summed == "(NULL + (x5 << 32)).toUnsigned(32) == NULL.toUnsigned(32)"
+    assert one([("add", "x1, x5, #1"), ("cmp", "w1, w22")], "ne") == (
+        "(x5 + 1).toUnsigned(32) != NULL.toUnsigned(32)")
+    pool = [("ldr", "x16, [x27, #0x120]"), ("add", "x1, x5, #1"), ("cmp", "w1, w16")]
+    assert one(pool, "ne") == "(x5 + 1).toUnsigned(32) != pool_0x120.toUnsigned(32)"
+    rng = random.Random(3702)
+    for _ in range(200):
+        env = _w_env(rng, ("x1", "x5"))
+        env["NULL"] = rng.getrandbits(64)
+        assert bool(_dart_int(moved, env)) == ((env["x1"] ^ env["x5"]) & 0xffffffff == 0)
+        assert _dart_int(summed, env) == 1, env
+    # What may be a reference is still compared whole with one: a register, a field
+    # of four bytes or of eight, a frame slot.
+    assert one([("cmp", "w1, w22")], "eq") == "x1 == NULL"
+    for load in ("ldur w1, [x13, #7]", "ldur x1, [x13, #7]"):
+        assert one([tuple(load.split(" ", 1)), ("cmp", "w1, w22")], "ne") == (
+            "x13.field_0x8 != NULL")
+
+    def joined(first, second):
+        return _lift_rows([("cbz", "x3, #0xc"), ("ldur", first), ("b", "#0x10"),
+                           ("ldur", second), ("cmp", "w1, w2"), ("cset", "x0, lo"),
+                           ("ret", "")])[-1]
+    assert joined("w1, [x13, #7]", "x1, [x13, #7]") == (
+        "return x13.field_0x8.toUnsigned(32) < x2.toUnsigned(32) ? 1 : 0;")
+    assert joined("x1, [x13, #7]", "w1, [x13, #7]") == (
+        "return x13.field_0x8.toUnsigned(32) < x2.toUnsigned(32) ? 1 : 0;")
+    assert joined("w1, [x13, #7]", "w1, [x13, #7]") == (
+        "return x13.field_0x8 < x2.toUnsigned(32) ? 1 : 0;")
 
 
 if __name__ == "__main__":
