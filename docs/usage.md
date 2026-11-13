@@ -295,7 +295,7 @@ $ jadart xrefs libapp.so benchWithdraw
 // resolved as function
 // benchWithdraw  0x1eebac
   1 direct call site
-    0x1ee830       428 bytes
+    0x1ee830       428 bytes  benchRunAll
 ```
 
 A string or pool entry can match and still have no load in the code that the scan sees,

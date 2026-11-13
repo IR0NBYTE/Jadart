@@ -24,6 +24,14 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **`xrefs` names the function behind each reference, so its printed output changes.** A
+  reference printed as `0x23b720       168 bytes` now prints as `0x23b720       168 bytes
+  FluBenchApp.build`: the name `functions` gives the range, after the class that owns it
+  where the snapshot records one. A range with no name still prints as its address. In
+  `-j` every entry of `referenced_by`, `called_by` and `may_be_called_by` gains `name`
+  and `class`, each `""` when there is none. 50 references drawn at random on the clean
+  fixture carry the name `functions` and `lift` give the same range, with no mismatch.
+
 - **`functions -f NAME` and `xrefs function NAME` build the call graph for that name
   only.** Both decoded every range in the image and then kept one row. A filter on name,
   library, `--named` or `--anonymous` now picks the rows first, and the graph keeps only

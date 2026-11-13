@@ -492,6 +492,55 @@ class Func:
 ORIGINS = ("snapshot", "symtab", "roots", "signature", "anonymous")
 
 
+def range_names(image, fr, matched: dict = None) -> dict:
+    """pc -> (name, origin) for every range that has a name, the ones `functions` prints.
+
+    `matched` is a signature match (pc -> Match), whose names are inferences and carry
+    the mark that says so. Shared by `functions` and `xrefs`, so the two call a range by
+    the same name."""
+    from .disasm import function_name_by_pc
+    from .fill import NAME_CUT, visible
+    from .signatures import MARK
+
+    snapshot_names = set()
+    for ref, name_ref, _ow, _kt in fr.functions:
+        cr = image.code_ranges.get(ref)
+        if fr.names.get(name_ref, "") and cr is not None:
+            snapshot_names.add(cr.pc_offset)
+    symtab = image.symbol_names or {}
+    roots = stub_names(image, fr, getattr(image, "epoch", None))
+    names = function_name_by_pc(image, fr)
+    matched = matched or {}
+    out = {}
+    for pc in set(names) | set(matched):
+        nm = names.get(pc, "")
+        if nm and pc in snapshot_names:
+            out[pc] = (nm, "snapshot")
+        elif nm and pc in symtab:
+            out[pc] = (nm, "symtab")
+        elif nm and pc in roots:
+            out[pc] = (nm, "roots")
+        elif pc in matched:
+            out[pc] = (visible(matched[pc].name, limit=NAME_CUT) + MARK,     # #74, #94
+                       "signature")
+        elif nm:
+            out[pc] = (nm, "snapshot")
+    return out
+
+
+def range_classes(image, fr) -> dict:
+    """pc -> the name of the class that owns the range's function, where the snapshot
+    records one. A closure, a stub and a top-level function have none."""
+    cls = {ref: fr.names.get(nr, "") for ref, nr, _cid, _s in fr.classes}
+    owner = {ref: ow for ref, _nr, ow, _kt in fr.functions}
+    out = {}
+    for ref, cr in image.code_ranges.items():
+        nm = cls.get(owner.get(ref))
+        if nm:
+            out[cr.pc_offset] = nm
+    return out
+
+
 def function_table(image, fr, hdr=None, sigs: str = None, only=None) -> tuple:
     """Every code range in the image as a Func. Returns (rows, graph_error, notes).
 
@@ -511,20 +560,6 @@ def function_table(image, fr, hdr=None, sigs: str = None, only=None) -> tuple:
     columns that need decoded instructions are missing, and the caller says so instead of
     printing zeros that read as "nothing calls this".
     """
-    from .disasm import function_name_by_pc
-    from .fill import NAME_CUT, visible
-    from .signatures import MARK
-
-    snapshot_names = {}
-    for ref, name_ref, _ow, _kt in fr.functions:
-        nm = fr.names.get(name_ref, "")
-        cr = image.code_ranges.get(ref)
-        if nm and cr is not None:
-            snapshot_names[cr.pc_offset] = nm
-    symtab = dict(image.symbol_names or {})
-    roots = stub_names(image, fr, getattr(image, "epoch", None))
-
-    names = function_name_by_pc(image, fr)
     matched = {}
     if sigs:
         from .signatures import load, match
@@ -552,21 +587,11 @@ def function_table(image, fr, hdr=None, sigs: str = None, only=None) -> tuple:
             lib_by_pc = {}
             notes.append(f"library attribution unavailable: {e}")
 
+    named = range_names(image, fr, matched)
     out = []
     for cr in image.all_ranges:
         pc = cr.pc_offset
-        nm = names.get(pc, "")
-        if nm and pc in snapshot_names:
-            origin = "snapshot"
-        elif nm and pc in symtab:
-            origin = "symtab"
-        elif nm and pc in roots:
-            origin = "roots"
-        elif pc in matched:
-            nm = visible(matched[pc].name, limit=NAME_CUT) + MARK     # a name (#74, #94)
-            origin = "signature"
-        else:
-            origin = "snapshot" if nm else "anonymous"
+        nm, origin = named.get(pc, ("", "anonymous"))
         out.append(Func(pc_offset=pc, size=cr.size, name=nm, origin=origin,
                         va=va_of(image, pc), library=lib_by_pc.get(pc, "")))
     wanted = None if only is None else {f.pc_offset for f in out if only(f)}
