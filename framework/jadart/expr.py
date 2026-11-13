@@ -43,7 +43,7 @@ from .cfg import (build_cfg, structure, negate_cond, label_targets, _cond_text, 
                   _UNSIGNED, cond_of, cut_goto, flat, flat_rows, TOO_DEEP, TRAPS, _target,
                   entry_reach, UNREACHED, cut_off, dominator_forest, dom_numbers,
                   second_reach, strong_components, past_trap, _cond_for, checks_into,
-                  _conditions_from_the_block_before, LoopNest)
+                  _conditions_from_the_block_before, LoopNest, _CCS)
 
 # ── operand / register plumbing ─────────────────────────────────────────────
 
@@ -2672,6 +2672,10 @@ _CSEL = {"csel": 2, "csinc": 2, "csinv": 2, "csneg": 2,
          "cinc": 1, "cinv": 1, "cneg": 1, "cset": 0, "csetm": 0}
 
 
+#: Every conditional branch `cond_of` reads a condition code off, in both spellings.
+_BCC = frozenset(b + cc for cc in _CCS for b in ("b.", "b"))
+
+
 def _flags_read(insns) -> frozenset:
     """The addresses of the flag-setting instructions in one block whose flags are read
     before anything replaces them: by a conditional select, or by the branch that ends
@@ -4548,6 +4552,10 @@ class Lifter:
         self._flags = None
         # The addresses of the flag-setting instructions whose flags something reads.
         self._flag_reads = frozenset()
+        #: `_flags_wanted`: the rows of the block in hand it last answered for, and per
+        #: block what its rows do with the comparison it is entered with.
+        self._flag_scan = None
+        self._flag_kind: dict = {}
         # Registers live after the instruction currently being lifted, as a mask.
         self._live_after = 0
         #: (call reads, live in, live out) per block; see _printed_liveness.
@@ -5854,6 +5862,111 @@ class Lifter:
             self._flags = None      # an operand of the live comparison was overwritten
         return out
 
+    def _flags_wanted(self) -> bool:
+        """Whether a row after the one being stepped may read the comparison in hand:
+        a conditional select or the branch that ends the block, before a row that
+        sets the flags again or drops what is known of them, or a block that takes the
+        comparison from this one (`_flags_in`). Where nothing does, its operands are
+        text nothing prints, and naming one before a store would be a declaration
+        nothing reads (#386).
+
+        Each run of rows is read once: the answer for the row in hand holds for
+        every row up to the one that gave it, so a block of stores under one
+        comparison reads its rows once and not once a store."""
+        insns, at = self._insns, self._at
+        got = self._flag_scan
+        if got is not None and got[0] is insns and got[1] <= at < got[2]:
+            return got[3]
+        k, want = at + 1, None
+        for k in range(at + 1, len(insns)):
+            mn = insns[k][1]
+            if mn in _CSEL or mn in _BCC:
+                want = True
+                break
+            if mn in _FLAG_SRC or mn in _FLAG_KILL:
+                want = False
+                break
+        if want is None:
+            k = len(insns)
+            want = (insns[-1][1] not in _CONDB
+                    and self._flags_taken(self._last_block, 2))
+        self._flag_scan = (insns, at, max(k, at + 1), want)
+        return want
+
+    def _flags_taken(self, addr, deeper: int) -> bool:
+        """Whether a block that is handed the comparison `addr` leaves live, one with
+        `addr` as its only way in (`_flags_in`), may read it: it reads the flags
+        before it sets them, or sets and reads nothing and hands them on in turn.
+        Followed `deeper` blocks on and taken as read past that, which costs a name
+        nothing reads (`_drop_unread`) and never a comparison printed stale."""
+        blocks, kinds = self.blocks, self._flag_kind
+        blk = blocks.get(addr)
+        for s in blk.succ if blk is not None else ():
+            if s not in blocks or len(self._preds.get(s, ())) != 1 or s in self.roots:
+                continue
+            kind = kinds.get(s, _MISS)
+            if kind is _MISS:
+                kind, rows = None, blocks[s].insns
+                for (_a, mn, _op, _n) in rows:
+                    if mn in _CSEL or mn in _BCC:
+                        kind = True
+                        break
+                    if mn in _FLAG_SRC or mn in _FLAG_KILL:
+                        kind = False
+                        break
+                if kind is None and rows and rows[-1][1] in _CONDB:
+                    kind = False
+                kinds[s] = kind
+            if kind or kind is None and (not deeper or self._flags_taken(s, deeper - 1)):
+                return True
+        return False
+
+    def _pin_flags(self, st: State, reads, named=None) -> list:
+        """Name each operand of the comparison in hand that `reads` says the store
+        about to be printed may write, where something still reads the comparison
+        (`_flags_wanted`), and give back the lines that declare them (#386).
+
+        The operands are kept as text, as a register's value is, and printed where
+        the flags are read: `ldur x4, [x13, #0x17]; cmp x4, x2; stur x1, [x13, #0x17];
+        cset x0, eq` printed `return x13.field_0x18 == x2 ? 1 : 0;` under the store,
+        which compares the word the store wrote. x4 is dead after the `cmp`, so the
+        register map named nothing: the comparison is the only thing that still
+        reads the value, and it is asked what a live register is asked (`_pin_mem`,
+        `_raw_write`).
+
+        `named` is {register: (the text it held, the value it was named as)} for the
+        registers the same store has just named, so a register that is live as well
+        gets one name and not two. The register an operand was read from takes the
+        name too where it still holds the text, live or not: a block that is handed
+        the comparison reads its operands back from the registers (`_flags_in`)."""
+        fl = self._flags
+        out, vals = [], None
+        for r, v in sorted(fl[2].items()):
+            text = v.text
+            if "." not in text and "[" not in text:
+                continue                      # every read of memory has one of them
+            got = named.get(r) if named else None
+            if got is not None and got[0] == text:
+                new = got[1]
+            elif reads(text):
+                tmp, decl = self._mint(st, text)
+                out.append(decl)
+                self.raw_names.add(tmp)
+                new = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                if self._low32.get(id(v)) is v:
+                    self._low32[id(new)] = new
+            else:
+                continue
+            if vals is None:
+                vals = dict(fl[2])
+            vals[r] = new
+            held = st.reg.get(r)
+            if held is not None and held is not new and held.text == text:
+                st.reg[r] = new
+        if vals is not None:
+            self._flags = (fl[0], fl[1], vals, fl[3])
+        return out
+
     def _flag_cond(self, cc: str):
         """The live comparison spelled for condition code `cc`, or None.
 
@@ -5964,6 +6077,9 @@ class Lifter:
             _forget_frame(st)       # and it may write the heap all the same
         st.stale_mem()
         out = self._pin_call(st, _def_use(mn, op)[0])
+        if self._flags is not None and self._flags_wanted():
+            # And what a comparison still to be read holds of memory (#386).
+            out += self._pin_flags(st, self._reads_mem)
         for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
             st.forget_slot(k)
         return out
@@ -6685,6 +6801,14 @@ class Lifter:
         # taking them in map order would make the numbering depend on Python's per-process
         # string hash seed. One unsorted iteration was enough to make two runs over the
         # same binary differ.
+        # The operands of a comparison something still reads are live values too,
+        # in no register the liveness counts (`_pin_flags`, #386).
+        flags = None
+        if self._flags is not None:
+            for v in self._flags[2].values():
+                if "." in v.text or "[" in v.text:
+                    flags = {} if self._flags_wanted() else None
+                    break
         for key, v in sorted(st.reg.items()):
             if v.prec == P_ATOM and v.text == key:
                 continue                      # already opaque: nothing to preserve
@@ -6696,6 +6820,10 @@ class Lifter:
             out.append(decl)
             self.raw_names.add(tmp)
             st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+            if flags is not None:
+                flags[key] = (v.text, st.reg[key])
+        if flags is not None:
+            out += self._pin_flags(st, reads, flags)
         # A stack slot has no liveness to consult, it is read back by a later load or not
         # at all, so a slot that reads the written location is dropped rather than named.
         # Dropping is honest (the reload renders as the bare destination register) and does
