@@ -6404,7 +6404,8 @@ def test_fencecheck_reports_fences_that_do_not_pair_up(tmp_path, capsys):
                       "<a href=u>link\n", "<sub>x\n", "<b>x</b><i>\n", "<b><i>x</i>\n",
                       "<SUB>x\n", "<div><sub>x</b>\n", "<sub><sub>x</sub>\n"):
         assert "unsupported" in kinds(left_open), left_open
-    closes_on_line = "a b code em h1 h2 h3 h4 h5 h6 i kbd span strong sub sup".split()
+    closes_on_line = ("a b code em h1 h2 h3 h4 h5 h6 i kbd picture span strong sub "
+                      "sup").split()
     assert _CLOSE_ON_LINE == set(closes_on_line)
     left_open = "element left open at the end of its line"   # the 'open' message only
     for tag in closes_on_line:
@@ -6413,11 +6414,13 @@ def test_fencecheck_reports_fences_that_do_not_pair_up(tmp_path, capsys):
     # a block tag inside an open inline element can make a browser or GitHub ignore or
     # undo the element's closer, and a closer holding more than its name can be text to
     # CommonMark: either way the element can stay open over the rest of the page
-    inline = "a b br code em i img kbd span strong sub sup".split()
+    inline = "a b br code em i img kbd picture source span strong sub sup".split()
     assert _INLINE == set(inline)
-    assert _ALLOWED == set("a b br code div em h1 h2 h3 h4 h5 h6 hr i img kbd p span "
-                           "strong sub sup table tbody td th thead tr".split())
-    assert _ALLOWED_ATTRS == set("align alt height href src title width".split())
+    assert _ALLOWED == set("a b br code div em h1 h2 h3 h4 h5 h6 hr i img kbd p picture "
+                           "source span strong sub sup table tbody td th thead "
+                           "tr".split())
+    assert _ALLOWED_ATTRS == set(
+        "align alt height href media src srcset title width".split())
     for tag in sorted(_ALLOWED - _INLINE):
         assert "unsupported" in kinds(f"<div><code><{tag}></code></div>\n"), tag
     for kept_open in ("<div><code><div></code></div>\n",
@@ -6656,6 +6659,32 @@ def test_fencecheck_reports_fences_that_do_not_pair_up(tmp_path, capsys):
                  f"{folder}:0: unreadable", f"{bom}:1: unsupported"):
         assert line in out, out
     assert main([]) == 2                 # nothing to check is a failure, not a pass
+
+
+def test_fencecheck_reads_a_picture_that_serves_a_logo_for_dark_mode():
+    """The README serves one logo in light mode and another in dark with a `<picture>`,
+    the way GitHub documents it, and tools/fencecheck.py refused both tags, so every
+    pull request failed the step (#411). A `<picture>` is read like any inline element:
+    it closes on the line that opens it and may stand in a heading. A `<source>` is read
+    only inside one, where the `<img>` beside it is what a renderer falls back to; on
+    its own it is still the media tag renderers disagree about."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    from fencecheck import check
+    logo = ('<h1 align="center"><picture><source media="(prefers-color-scheme: dark)" '
+            'srcset="a-dark.png"><img src="a.png" alt="Jadart" width="600"></picture>'
+            "</h1>\n")
+    assert check(logo + "\n```\nx\n```\n") == []
+    spread = ('<h1 align="center">\n  <picture>\n    <source media="(prefers-color-'
+              'scheme: dark)" srcset="a-dark.png">\n    <img src="a.png" alt="Jadart">\n'
+              "  </picture>\n</h1>\n")
+    assert check(spread), "a heading and a picture left open past their lines"
+    for alone in ('<p><source srcset="a.png"></p>\n', '<source srcset="a.png">\n',
+                  '<picture></picture><source srcset="a.png">\n'):
+        assert "unsupported" in [k for _n, k, _m in check(alone)], alone
+    assert "left open at the end of its line" in check("<picture><img src=a.png>\n")[0][2]
+    for attr in ("style", "onload", "sizes", "type"):
+        bad = f'<picture><source {attr}="x" srcset="a.png"><img src="a.png"></picture>\n'
+        assert "unsupported" in [k for _n, k, _m in check(bad)], attr
 
 
 def test_fencecheck_reads_a_heading_after_a_quote_in_a_list():
