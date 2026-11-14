@@ -91,6 +91,9 @@ _FUNCTION_KINDS = (
     "DynamicInvocationForwarder", "FfiTrampoline", "RecordFieldGetter",
 )
 _KIND_INDEX = {name: i for i, name in enumerate(_FUNCTION_KINDS)}
+#: The kinds whose implicit parameter is the closure they were called through.
+_CLOSURE_KINDS = frozenset({_KIND_INDEX["ClosureFunction"],
+                            _KIND_INDEX["ImplicitClosureFunction"]})
 
 # Only the kinds that get a label; anything else prints as a plain method.
 _FN_KIND = {_KIND_INDEX["Constructor"]: "ctor",
@@ -232,6 +235,12 @@ class EntryNames:
         #: register convention, and then the resolver is never asked.
         has_code = bool(self._owners or self._discarded)
         self._regs = tgt.arg_regs if tgt is not None and has_code else ()
+        # What a stack argument is named by: the counts of each Function's signature
+        # (#420). Only for a target tier 3 lifts.
+        self._fr = fr if tgt is not None else None
+        self._kinds = None
+        from .hooks import _register_cc
+        self._reg_cc = epoch is not None and _register_cc(epoch.dart)
 
     def _read(self, cr) -> tuple:
         """(the resolver's count, the registers to name) for the code at `cr`: (None, ())
@@ -254,7 +263,73 @@ class EntryNames:
             names.setdefault(reg, f"a{self._regs.index(reg)}")
         return names
 
-    def params(self, cr) -> str:
+    def stack(self, cr) -> dict:
+        """{offset from FP: name} for the arguments the code at `cr` is handed on the
+        stack, where the snapshot states how many there are; {} anywhere else (#420).
+
+        The count is the signature's: a FunctionType's packed_parameter_counts, which
+        the fill reads (fillwalk.FillResult.ftype_counts) as UntaggedFunctionType lays
+        it out in raw_object.h, 2.19.6 to 3.13.0: one bit of implicit parameters (the
+        receiver or the closure), one saying the optional ones are named, then fourteen
+        bits of fixed parameters, the implicit one among them, and fourteen of optional
+        ones. On the clean fixture 1,605 of the 6,849 Functions with code keep one.
+
+        Where they are is the calling convention's. Before 3.4, and for the kinds the VM
+        always calls through the stack (hooks.STACK_KINDS), every fixed parameter is
+        pushed, the first one first, so parameter i of n sits at FP + 0x10 + 8 * (n - 1 -
+        i) once the frame is set up: the wrapper at 0x2f5ff8 is an implicit closure of
+        four, its closure and three arguments, and reads 0x20, 0x18 and 0x10. From 3.4 a
+        function of another kind is handed its first six in registers and the rest on
+        the stack, unless it is generic or the type flow analysis kept them all on the
+        stack, which the snapshot does not say. Its own entry code does: one that reads
+        only the stack and has no more than six parameters takes all of them there, since
+        six in registers would have left it nothing to read. One that reads registers and
+        the stack (a StackArity) is declined: a double it never reads may have taken a V
+        register, and then the registers do not say where the stack part starts.
+
+        The name is the parameter's index in that order, `a0` first. The first is `this`,
+        the name x1 gets under the register convention, where it is the implicit
+        parameter of an instance method's. A closure's implicit parameter is the closure,
+        and keeps `a0`. This says only which slot each parameter was pushed to: the lift
+        decides where a slot still holds it (expr._args_kept).
+
+        Declined, so that the slots keep printing as frame reads, where the count is not
+        all there is to it: a function with optional parameters, which is handed an
+        arguments descriptor and copies them into its frame as it counts them, a generic
+        one, which may be handed a type argument vector too, an entry that reads the
+        arguments descriptor, and, from 3.4, a function that reads a double argument or
+        has more than six parameters and reads only the stack: either could have been
+        handed some in registers, and how many is not said."""
+        fr, args = self._fr, getattr(self._arity, "entry", None)
+        if fr is None or args is None:
+            return {}
+        counts = fr.ftype_counts.get(fr.func_signature.get(cr.owner_ref, -1))
+        if counts is None or counts[1]:
+            return {}
+        packed = counts[0]
+        n, optional = (packed >> 2) & 0x3FFF, (packed >> 16) & 0x3FFF
+        entry = args(cr.pc_offset)
+        if not n or optional or entry is None or entry[1]:
+            return {}
+        from .hooks import STACK_KINDS
+        if self._kinds is None:
+            self._kinds = {r: kt & 0x1F for r, _n, _o, kt in fr.functions}
+        kind = self._kinds.get(cr.owner_ref)
+        if kind is None or kind >= len(_FUNCTION_KINDS):
+            return {}
+        if self._reg_cc and _FUNCTION_KINDS[kind] not in STACK_KINDS:
+            # A double is handed in a V register beside these, so a function that reads
+            # one does not say which parameters the six registers held.
+            if (entry[2] or self._arity(cr.pc_offset) is not None or entry[0]
+                    or n > 6):
+                return {}
+        out = {0x10 + 8 * (n - 1 - i): f"a{i}" for i in range(n)}
+        if (packed & 1 and kind not in _CLOSURE_KINDS
+                and receiver_for(cr.owner_ref, instance_refs=self._instance)):
+            out[0x10 + 8 * (n - 1)] = "this"
+        return out
+
+    def params(self, cr, body=None) -> str:
         """What a signature line puts between its brackets: the names the body reads its
         register arguments by, in call order and without the receiver; nothing where it
         reads none; and `...` where the list is not read, the spelling a call whose list
@@ -262,8 +337,16 @@ class EntryNames:
 
         It lists what the BODY READS. A parameter the body never reads is not in it, so
         `f(a1, a3)` reads the registers either side of one it leaves alone, and nothing
-        here says how many parameters the Dart function declares."""
+        here says how many parameters the Dart function declares.
+
+        `body` is the function's lifted Body. Where it read its stack arguments by name
+        (`stack`, #420) the list is every parameter the signature counts, `a0` to the
+        last, without the receiver, whether the body reads it or not: never a part of
+        them. Where the lift declined them the list is what it was before."""
         from .expr import StackArity
+        stack = getattr(body, "stack_params", ())
+        if stack:
+            return ", ".join(n for n in stack if n != "this")
         k, regs = self._read(cr)
         if k is None or (k and not regs):
             return "..."
@@ -476,30 +559,33 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
         cut = truncated_by(cr, dis)
         note = f", TRUNCATED: {len(dis)} of {len(dis) + cut} instructions" if cut else ""
         # The names the tier 3 body reads its arguments by. The other tiers print the
-        # machine's registers, so their brackets stay empty, as they were.
-        params = entry.params(cr) if entry is not None else ""
-        lines.append(f"  {disp}({params}) {{  // {addr_label(image, cr.pc_offset)}, "
-                     f"{cr.size} bytes{note}")
+        # machine's registers, so their brackets stay empty, as they were. Asked after
+        # the lift, which says which stack arguments the body read by name (#420).
+        body = None
         if lvl >= 3:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
-            lines.extend(lift_function(ann, pool_map,
-                                       receiver=entry.names(cr),
-                                       arity=arity, indent="  ", depth=2,
-                                       selectors=selectors,
-                                       arch=getattr(image, "arch", None),
-                                       fields=layout.for_function(ref),
-                                       allocs=allocs, casts=casts,
-                                       show=rebaser(image), cut_end=cut_end(cr, dis),
-                                       returns=returns,
-                                       mono=monomorphic_entry(image, cr)))
+            body = lift_function(ann, pool_map, receiver=entry.names(cr),
+                                 arity=arity, indent="  ", depth=2,
+                                 selectors=selectors,
+                                 arch=getattr(image, "arch", None),
+                                 fields=layout.for_function(ref),
+                                 allocs=allocs, casts=casts,
+                                 show=rebaser(image), cut_end=cut_end(cr, dis),
+                                 returns=returns,
+                                 mono=monomorphic_entry(image, cr),
+                                 stack=entry.stack(cr))
         elif lvl == 2:
             ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
-            lines.extend(render_function(ann, exits=exits(image, dis),
-                                         cut_end=cut_end(cr, dis), indent="  ", depth=2,
-                                         show=rebaser(image)))
+            body = render_function(ann, exits=exits(image, dis),
+                                   cut_end=cut_end(cr, dis), indent="  ", depth=2,
+                                   show=rebaser(image))
         else:
-            lines.extend(render_body(dis, pc_to_name, pool_map, indent="      ",
-                                     kinds=row_kinds(image, dis), show=rebaser(image)))
+            body = render_body(dis, pc_to_name, pool_map, indent="      ",
+                               kinds=row_kinds(image, dis), show=rebaser(image))
+        params = entry.params(cr, body) if entry is not None else ""
+        lines.append(f"  {disp}({params}) {{  // {addr_label(image, cr.pc_offset)}, "
+                     f"{cr.size} bytes{note}")
+        lines.extend(body)
         lines.append("  }")
     lines.append("}")
     return "\n".join(lines)

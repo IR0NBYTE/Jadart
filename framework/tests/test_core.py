@@ -29117,6 +29117,97 @@ def test_a_frame_or_stack_slot_is_spelled_at_the_offset_it_reads():
         "x1.field_0x8 = x4;", "return (FP - 16).field_0xf;"]
 
 
+def _stack_lift(rows, frame=True, **kw):
+    """(lines, stack_read) of `rows` lifted, inside a frame of 0x20 bytes unless
+    `frame` is False, and ended by a `ret` (#420)."""
+    from jadart.expr import lift_function
+    pro = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+           ("sub", "x15, x15, #0x20")] if frame else []
+    epi = [("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10")] if frame else []
+    rows = [*pro, *rows, *epi, ("ret", "")]
+    body = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)], **kw)
+    return [ln.strip() for ln in body], body.stack_read
+
+
+def test_a_stack_argument_reads_as_its_parameter():
+    """An argument the caller pushed was read as a bare frame slot, `ldr x0, [x29,
+    #0x10]` as `FP.field_0x10`, where the snapshot states how many parameters there are
+    and so which slot holds which (#420). With those slots named, each read prints the
+    parameter's name, the first parameter at the highest slot. A store to a slot, or FP
+    escaping into another register, keeps every slot bare: the name would outlive the
+    value. A word read is not the argument and keeps its spelling, and so does a slot
+    read off SP, which nothing here maps to a parameter."""
+    lift, st = _stack_lift, {0x18: "a0", 0x10: "a1"}
+    assert lift([("ldr", "x0, [x29, #0x10]"), ("ldr", "x1, [x29, #0x18]"),
+                 ("add", "x0, x0, x1")], stack=st) == (
+        ["var t0 = a1;", "var t1 = a0;", "return t0 + t1;"], ("a0", "a1"))
+    assert lift([("ldp", "x1, x0, [x29, #0x10]"), ("add", "x0, x0, x1")], stack=st) == (
+        ["var t0 = a1;", "var t1 = a0;", "return t1 + t0;"], ("a0", "a1"))
+    assert lift([("ldr", "x0, [x29, #0x18]")], stack=st)[1] == ("a0",)
+    for rows in ([("str", "x2, [x29, #0x10]"), ("ldr", "x0, [x29, #0x18]")],
+                 [("add", "x2, x29, #0x10"), ("ldr", "x0, [x29, #0x18]")],
+                 [("mov", "x2, x29"), ("ldr", "x0, [x29, #0x18]")]):
+        got = lift(rows, stack=st)
+        assert got[1] == () and "var t0 = FP.field_0x18;" in got[0], (rows, got)
+    assert lift([("ldur", "w0, [x29, #0x10]")], stack=st) == (
+        ["var t0 = FP.field_0x10;", "return t0;"], ())
+    got = lift([("ldr", "x0, [x15, #0x18]")], frame=False, stack=st)
+    assert got[0][0] == "var t0 = SP.field_0x18;", got
+    assert lift([("ldr", "x0, [x29, #0x18]")])[0][0] == "var t0 = FP.field_0x18;"
+    if not _capstone_available():
+        _skip("test_a_stack_argument_reads_as_its_parameter (no capstone)")
+    # On the fixture: _ffi_resolver_function takes three, and its implicit closure four,
+    # the closure first, both on the stack (ffi_resolver at 0x138f54, the wrapper at
+    # 0x2f5ff8). A signature with optional parameters, or a generic one, declines.
+    from jadart.branches import row_kinds
+    from jadart.disasm import annotate, disassemble_range, load_instructions
+    from jadart.expr import lift_function, make_arity_resolver
+    from jadart.program import EntryNames
+    image, fr, hdr = load_instructions(CLEAN)
+    entry = EntryNames(image, fr, hdr.epoch, make_arity_resolver(image))
+    by_pc = {cr.pc_offset: cr for cr in image.all_ranges}
+    want = {0x24d4: ({0x20: "a0", 0x18: "a1", 0x10: "a2"}, "a0, a1, a2"),
+            0x1bf578: ({0x28: "a0", 0x20: "a1", 0x18: "a2", 0x10: "a3"},
+                       "a0, a1, a2, a3")}
+    for pc, (names, header) in want.items():
+        cr = by_pc[pc]
+        assert entry.stack(cr) == names, (hex(pc), entry.stack(cr))
+        dis = disassemble_range(image, cr)
+        body = lift_function(annotate(dis, {}, {}, kinds=row_kinds(image, dis)),
+                             stack=entry.stack(cr))
+        assert entry.params(cr, body) == header, (hex(pc), entry.params(cr, body))
+        assert not any("FP.field_0x" in ln for ln in body), body
+    assert entry.stack(by_pc[0x1050]) == {} and entry.stack(by_pc[0x25a0]) == {}
+
+
+
+def test_a_stack_argument_is_named_only_where_its_slot_still_holds_it():
+    """A stack argument was named where its slot no longer held what the caller pushed
+    (#420). The runtime writes a parameter's slot back when it unwinds to a catch entry,
+    so the catch section read it as `var t4 = a1;`: a read in code a catch entry reaches
+    keeps its frame spelling. A store through SP onto the slot, a q store at FP + 8
+    over it, a read once the frame is torn down, or no frame at all keeps every slot
+    bare, as does a read past the slots the count names: the count is not this code's."""
+    lift, st = _stack_lift, {0x18: "a0", 0x10: "a1"}
+    epi = [("mov", "x15, x29"), ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")]
+    lines, read = lift([("ldr", "x0, [x29, #0x18]"), *epi, ("sub", "x15, x29, #0x20"),
+                        ("ldr", "x0, [x29, #0x10]")], stack=st)
+    assert read == ("a0",) and "var t0 = a0;" in lines, lines
+    assert "var t1 = FP.field_0x10;" in lines and "a1" not in str(lines), lines
+    for rows, kw in (([("str", "x1, [x15, #0x30]")], {}),
+                     ([("str", "q0, [x29, #8]")], {}),
+                     ([("mov", "x3, x15"), ("str", "x1, [x3, #0x30]")], {}),
+                     ([("ldr", "x1, [x29, #0x20]")], {}),
+                     ([], {"frame": False})):
+        lines, read = lift([*rows, ("ldr", "x0, [x29, #0x10]")], stack=st, **kw)
+        assert read == () and any("FP.field_0x10" in ln for ln in lines), (rows, lines)
+    lines, read = lift([*epi[:2], ("ldr", "x0, [x29, #0x10]")], frame=False, stack=st)
+    assert read == (), lines
+    lines, read = lift([("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
+                        *epi[:2], ("ldr", "x0, [x29, #0x10]")], frame=False, stack=st)
+    assert read == () and "a1" not in str(lines), lines
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
