@@ -85,6 +85,16 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   rather than sent to a line this run leaves out. An offset no list sits at exits 1 and
   says so, and prints no neighbour. Without an offset the output is unchanged.
 
+- **`docs/x86_64-design.md` proposes how to read x86_64 code (#448).** An x86_64
+  `libapp.so` parses and stops at structure. The page sets the x64 register roles and
+  the calling convention beside arm64's, and the machine code each tier reads beside
+  the form the x64 assembler emits, cited to the SDK at one pinned commit. It
+  recommends capstone's x86 mode over a decoder of our own, says what variable length
+  instructions break and how instruction boundaries are proven on each binary, sizes
+  the change file by file, and stages it: tier 1 at about 750 lines, tier 2 at about
+  450, tier 3 not proposed. No x86_64 binary was read for it and nothing is built, so
+  `disasm` and `lift` refuse x86_64 as before.
+
 - **`docs/whats-coming.md` reads three Dart SDK changes at one commit (#450).** Modular
   AOT module snapshots, dynamic modules run as bytecode inside the AOT runtime, and
   arm64e pointer authentication each change what a binary holds. The page cites the SDK
