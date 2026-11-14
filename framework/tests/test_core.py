@@ -1551,7 +1551,10 @@ def test_a_loop_does_not_leave_stale_values_behind_it():
     body = _lift_asm([("mov", "x9, #5"), ("mov", "x9, #7"), ("cbnz", "x2, #4"),
                       ("mov", "x0, x9"), ("ret", "")])
     assert "return 5;" not in body, body
-    assert "return x9;" in body, body
+    # Nor `return x9;`, which reads as the x9 the function came in with: the loop sets
+    # a name on each way out of it, and the return reads that (#468).
+    assert "return x9;" not in body and "t0 = 7;" in body, body
+    assert body.splitlines()[-1].strip() == "return t0;", body
 
 
 def test_tier3_strips_smi_box_idiom():
@@ -14034,8 +14037,9 @@ def test_a_branch_reads_the_operands_its_flags_were_set_from():
     body = lift([(0, "ldr", "x0, [x3], #8", ""), (4, "str", "x0, [x4], #8", ""),
                  (8, "subs", "x1, x1, #8", ""), (12, "b.ne", "#0x0", ""),
                  (16, "ret", "", "")])
-    assert "if (t0 == 8) {" in body, body
-    assert "t0 -= 8;" in body, body
+    # (t1: the x0 each trip loads and the code after the loop returns has t0, #468)
+    assert "if (t1 == 8) {" in body, body
+    assert "t1 -= 8;" in body, body
     # The flags are set from the sources, and an x1 the instruction only writes is no
     # source: nothing is named for it.
     assert lift([(0, "subs", "x1, x0, x2", ""), (4, "b.ne", "#0xc", ""),
@@ -14819,7 +14823,8 @@ def test_lr_is_untagged_only_while_every_way_in_holds_a_return_address():
     got = lift([("ldr", "x0, [x30, #8]"), ("stur", "x0, [x19, #7]"),
                 ("ldr", "x30, [x27, #0x10]"), ("subs", "x2, x2, #1"), ("b.ne", "#0x0"),
                 ("ret", "")])
-    assert through(got) == ["x19.field_0x8 = t1.field_0x9;"], got
+    # (t2: the x0 the loop loads and the function returns is named first, #468)
+    assert through(got) == ["x19.field_0x8 = t2.field_0x9;"], got
 
     # Code no edge reaches falls into the read: the body has no proof there, and the
     # block printed again under the section, from the section's pool load, takes it too.
@@ -15005,7 +15010,9 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
         [(0, "eor", "v0.16b, v0.16b, v0.16b", ""), (4, "mov", "v0.16b, v1.16b", ""),
          (8, "subs", "x3, x3, #1", ""), (12, "b.ne", "#0x4", ""),
          (16, "stur", "d0, [x2, #7]", ""), (20, "ret", "", "")])]
-    assert "x2.field_0x8 = d0;" in after, after
+    # It holds what the last trip left, d1, under the name the loop sets (#468).
+    assert "x2.field_0x8 = 0.0;" not in after and "t0 = d1;" in after, after
+    assert "x2.field_0x8 = t0;" in after, after
     # A join one arm of which is the 0.0 the eor made is named, as a computed one is, so a
     # spill of it read back after a call still says what it holds.
     joined = [ln.strip() for ln in lift_function(
@@ -15382,7 +15389,8 @@ def test_a_frame_slot_past_the_displacement_is_its_own_slot():
         got = lift([("stur", "x2, [x29, #-8]"), ("ldur", "x0, [x29, #-8]"),
                     ("stur", "x0, [x1, #7]"), ("str", f"x3, [{base}, x4]"),
                     ("cbnz", "x5, #4")])
-        assert ["var t0 = (FP - 8).field_0x1;", "x1.field_0x8 = t0;"] == got[1:3], got
+        # (t1, after `var t0 = x0;`: the x0 the code past the loop returns, #468)
+        assert ["var t1 = (FP - 8).field_0x1;", "x1.field_0x8 = t1;"] == got[2:4], got
     # Only an offset set in the same block counts: x17 here is -0x158 or -0x160.
     assert lift([("mov", "x17, #-0x158"), ("cbz", "x5, #0xc"), ("mov", "x17, #-0x160"),
                  ("str", "x1, [x29, x17]"), ("mov", "x17, #-0x158"),
@@ -16236,12 +16244,13 @@ def test_a_loop_names_what_it_computed_over_a_raw_write_it_printed():
     body = [ln.strip() for ln in lift_function(
         [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
     assert "var t0 = x5 + x1;" in body and "x2.field_0x60 = t0;" in body, body
-    # Where the body prints no write to it, the bare register reads as nothing it says.
+    # Where the body prints no write to it either: bare, the register read as the x7
+    # the function came in with (#468).
     rows = [("mov", "x9, #2"), ("add", "x7, x5, x1"), ("sub", "x9, x9, #1"),
             ("tbz", "x9, #63, #0x4"), ("stur", "x7, [x2, #95]"), ("ret", "")]
     body = [ln.strip() for ln in lift_function(
         [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])]
-    assert "x2.field_0x60 = x7;" in body, body
+    assert "t0 = x5 + x1;" in body and "x2.field_0x60 = t0;" in body, body
 
 
 def test_a_goto_backwards_out_of_a_loop_leaves_it():
@@ -16414,7 +16423,10 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
             ("add", "x7, x6, x1"), ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8"),
             ("ret", "")]
     body = lift([("add", "x7, x5, x1")] + loop + out)
-    assert body[-3:] == ["L_0x20:", "x2.field_0x60 = x7;", "return x0;"], body
+    # ...and has the loop name what a trip leaves in it, where the bare register read
+    # as the x7 the function came in with (#468).
+    assert body[0] == "var t0 = x5 + x1;" and body.count("t0 = x6 + x1;") == 2, body
+    assert body[-3:] == ["L_0x20:", "x2.field_0x60 = t0;", "return x0;"], body
     # One the loop does not write keeps its value, written after the loop or not.
     body = lift([("add", "x8, x5, x1")] + loop + [("stur", "x8, [x2, #95]"),
                                                   ("mov", "x8, #5"), ("ret", "")])
@@ -16468,13 +16480,14 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                  ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8")] + out[1:] + out)
     assert body[0] == "var t1;" and "t1 = x7;" in body, body
     assert "x2.field_0x60 = t1;" in body, body
-    # A goto out of two loops reads what the outer one wrote, and where a printed line
-    # writes it, the outer loop carries it: on its first trip x8 is still x5 + x1.
+    # A goto out of two loops reads what the outer one wrote, and the outer loop
+    # carries it, with a printed line writing it or with none (#468): on its first trip
+    # x7, and below x8, is still x5 + x1.
     body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("add", "x10, x9, #3"),
                  ("cmp", "x10, #1"), ("b.eq", "#0x2c"), ("sub", "x10, x10, #1"),
                  ("tbz", "x10, #63, #0xc"), ("add", "x7, x6, x1"), ("sub", "x9, x9, #1"),
                  ("tbz", "x9, #63, #0x8"), ("ret", "")] + out)
-    assert "x2.field_0x60 = x7;" in body, body
+    assert body[0] == "var t0 = x5 + x1;" and "x2.field_0x60 = t0;" in body, body
     body = lift([("add", "x8, x5, x1"), ("mov", "x9, #2"), ("mov", "x10, #3"),
                  ("cmp", "x10, #1"), ("b.eq", "#0x30"), ("sub", "x10, x10, #1"),
                  ("tbz", "x10, #63, #0xc"), ("umulh", "x8, x6, x1"),
@@ -16520,14 +16533,23 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
     assert "x2.field_0x60 = x5 + x1;" in body, body
     # A register each trip reloads from the slot it was saved in, after a call takes
     # it, still holds its value from before the loop: `compareTo` reads x6 so.
-    def reload(mid, call=("bl", "#0x100"), pre=None, reg="x6"):
+    def reload(mid, call=("bl", "#0x100"), pre=None, reg="x6", whole=False):
         rows = list(pre or [("mov", "x6, #5"), ("stur", "x6, [x29, #-8]")])
         rows.append(("mov", "x19, #2"))
         head = len(rows) * 4
         rows += [("cmp", "x19, #1"), None, call] + mid + [
             ("sub", "x19, x19, #1"), ("tbz", f"x19, #63, #{head:#x}"), ("ret", "")]
         rows[head // 4 + 1] = ("b.eq", f"#{len(rows) * 4:#x}")
-        return lift(rows + [("stur", f"{reg}, [x2, #95]"), ("ret", "")])[-2]
+        body = lift(rows + [("stur", f"{reg}, [x2, #95]"), ("ret", "")])
+        return body if whole else body[-2]
+
+    def declined(mid, *more, **kw):
+        """The store reads the register: bare, or under a name the loop sets on its way
+        round where a trip writes it (#468), and not the value from before the loop."""
+        body = reload(mid, *more, whole=True, **kw)
+        m = re.fullmatch(r"x2\.field_0x60 = ([xd]6|t\d+);", body[-2])
+        return m is not None and (m.group(1)[0] != "t" or any(
+            ln.startswith(m.group(1) + " = ") for ln in body))
     assert reload([("ldur", "x6, [x29, #-8]")]) == "x2.field_0x60 = 5;"
     # The base is a name here: this trip's `ldur x2` is the loop's own write, so after
     # the loop the machine holds the slot's value and not the x2 the function came in
@@ -16559,28 +16581,28 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                       ([("ldrsw", "x6, [x29, #-8]")], None),
                       ([("add", "x29, x29, #0x10"), ("ldur", "x6, [x29, #-8]")], None),
                       ([("nop", "")], None)):
-        assert reload(mid, call or ("bl", "#0x100")) == "x2.field_0x60 = x6;", mid
+        assert declined(mid, call or ("bl", "#0x100")), mid
     # The same, for a trip that loads x2 itself. The store's base is a NAME there, because
     # after the loop the machine holds what the trip loaded and x2's own spelling says the
     # value the function came in with (#208). The reload is what this asserts, and it
-    # still declines.
-    assert reload([("ldur", "x2, [x29, #-8]"), ("mov", "w6, w2")],
-                  ("bl", "#0x100")).endswith(".field_0x60 = x6;")
+    # still declines: the x6 the store reads is the name the loop sets to what the trip
+    # itself worked out, the low half of the slot's 5 (#468).
+    body = reload([("ldur", "x2, [x29, #-8]"), ("mov", "w6, w2")], ("bl", "#0x100"),
+                  whole=True)
+    assert body[-2] == "t1.field_0x60 = t2;" and body.count("t2 = 5;") == 2, body
     for mid in ([("ldr", "q6, [x29, #-0x20]")], [("ldur", "q6, [x29, #-0x20]")],
                 [("ldp", "q6, q7, [x29, #-0x40]")], [("ldr", "d6, [x29, #-0x20]")]):
-        assert reload(mid, ("nop", ""), double, "d6") == "x2.field_0x60 = d6;", mid
+        assert declined(mid, ("nop", ""), double, "d6"), mid
     # Nor where the register held another value before the loop than the slot it is
     # reloaded from, or comes round with one the way in did not hand it: x6 = x7 is 9.
-    assert reload([("ldur", "x6, [x29, #-0x10]")], pre=[
+    assert declined([("ldur", "x6, [x29, #-0x10]")], pre=[
         ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"), ("mov", "x7, #7"),
-        ("stur", "x7, [x29, #-0x10]")]) == "x2.field_0x60 = x6;"
-    assert reload([("mov", "x6, x7"), ("ldur", "x7, [x29, #-8]")], ("nop", ""), [
-        ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"), ("mov", "x7, #9")]) == (
-        "x2.field_0x60 = x6;")
+        ("stur", "x7, [x29, #-0x10]")])
+    assert declined([("mov", "x6, x7"), ("ldur", "x7, [x29, #-8]")], ("nop", ""), [
+        ("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"), ("mov", "x7, #9")])
     # ...or where a frame address reaches a register, and a store through it can change
     # the slot.
-    assert reload([("ldur", "x6, [x29, #-8]"), ("sub", "x3, x29, #0x10")]) == (
-        "x2.field_0x60 = x6;")
+    assert declined([("ldur", "x6, [x29, #-8]"), ("sub", "x3, x29, #0x10")])
     # A loop inside that takes it on its own way round, with nothing to reload it, is
     # one more way back.
     body = lift([("mov", "x6, #5"), ("stur", "x6, [x29, #-8]"), ("mov", "x19, #2"),
@@ -16596,7 +16618,13 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
                  ("add", "x7, x6, #1"), ("mov", "x19, #2"), ("cmp", "x19, #1"),
                  ("b.eq", "#0x30"), ("bl", "#0x100"), ("ldur", "x7, [x29, #-8]"),
                  ("sub", "x19, x19, #1"), ("tbz", "x19, #63, #0x14"), ("ret", "")] + out)
-    assert body[-3:] == ["L_0x30:", "x2.field_0x60 = x7;", "return x0;"], body
+    # The loop names it all the same (#468): `t1 + 1` on the way in, on the x6 the
+    # call left, and from each trip the slot's `x6 + 1`, on the x6 the function came in
+    # with.
+    assert "var t4 = t1 + 1;" in body and body.count("t4 = x6 + 1;") == 2, body
+    assert body[-3:] == ["L_0x30:", "x2.field_0x60 = t4;", "return x0;"], body
+    # Not where the slot holds a read of the field a trip stores to: the reload would
+    # print that read again, which a later trip does not load, so no name is set.
     body = lift([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x29, #-8]"), ("mov", "x19, #2"),
                  ("cmp", "x19, #1"), ("b.eq", "#0x28"), ("ldur", "x7, [x29, #-8]"),
                  ("stur", "x0, [x1, #7]"), ("sub", "x19, x19, #1"),
@@ -16633,7 +16661,7 @@ def test_a_loop_reload_costs_its_length():
     def took(ann):
         start = time.perf_counter()
         body = lift_function(ann)
-        assert body[-2].strip() == "x2.field_0x60 = x0;", body[-2:]
+        assert body[-2].strip() == "x2.field_0x60 = t0;", body[-2:]
         return time.perf_counter() - start
     for slots, body in ((2000, [("mov", f"x14, #{j % 7}") for j in range(8000)]),
                         (5000, [("stur", "x14, [x29, #-8]")] * 20000)):
@@ -18436,8 +18464,10 @@ def test_a_store_through_a_base_the_loop_wrote_names_it_unknown():
     # The loop loads x2 every trip, and the store after it is based on x2.
     got = lift([("mov", "x9, #3"), ("ldur", "x2, [x1, #7]"), ("sub", "x9, x9, #1"),
                 ("cbnz", "x9, #0x4"), ("stur", "x5, [x2, #0xb]"), ("ret", "")])
-    assert "var t1;" in got, got
-    assert "t1.field_0xc = x5;" in got, got
+    # It was a name with no value, `var t1;`. The loop now sets one to what each trip
+    # loads, and the store goes through that (#468).
+    assert "var t1;" not in got and got.count("t0 = x1.field_0x8;") == 2, got
+    assert "t0.field_0xc = x5;" in got, got
     # A loop that only CALLS keeps the bare base: that is #216's class, not this one.
     called = lift([("mov", "x9, #3"), ("bl", "#0x100"), ("sub", "x9, x9, #1"),
                    ("cbnz", "x9, #0x4"), ("stur", "x5, [x2, #0xb]"), ("ret", "")])
@@ -18633,7 +18663,7 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
                  ("cmp", "x19, #1"), ("b.eq", "@out"), ("bl", "#0x100"),
                  ("ldur", "x6, [x29, #-8]"), ("sub", "x19, x19, #1"),
                  ("tbz", "x19, #63, @top"), ("ret", ""), "out",
-                 ("stur", "x6, [x2, #95]")])[-2] == "x2.field_0x60 = x6;"
+                 ("stur", "x6, [x2, #95]")])[-2] == "x2.field_0x60 = t1;"
     # q1 of a pair sits 16 bytes on, and 8 bytes into q0 is no slot, so the load names
     # the read rather than keeping d3 (#198).
     assert lift([("stp", "q0, q1, [x29, #-0x20]"), ("ldur", "d3, [x29, #-0x18]"),
@@ -18780,7 +18810,7 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
                       "top", ("cbz", "x9, @out"), ("bl", "#0x200"),
                       ("str", "x7, [x15, #8]"), ("ldur", "x6, [x29, #-8]"),
                       ("cbnz", "x4, @top"), ("ret", ""), "out",
-                      ("stur", "x6, [x2, #7]")))[-2] == "x2.field_0x8 = x6;"
+                      ("stur", "x6, [x2, #7]")))[-2] == "x2.field_0x8 = t0;"
     # A slot that starts below a push and ends in it; and what a call takes off the stack
     # before a loop, which a call in the loop takes, as `_drop_outgoing` has it.
     got = lift(frame(0x10, ("stur", "x0, [x29, #-0x14]"), ("str", "x1, [x15]"),
@@ -27385,31 +27415,159 @@ def test_naming_goto_joins_takes_no_more_walks_as_they_grow():
         expr.Lifter.__init__, expr.Lifter._lift_block = init, block
 
 
-def test_an_if_only_a_plain_join_would_print_reads_no_lost_condition():
-    """`add x2, x4, #8` in a loop leaves x2 holding a value no line prints, and
-    `cbnz x2, 1f; mov x4, #5; 1: mov x0, x4` after the loop joins two plain values
-    under that x2. Naming the join printed `if (x2 == 0) {` for it, the one line that
-    reads x2 and reads it as the x2 the function came in with (#409). An `if` that
-    printed nothing before such a join had a name prints nothing now where its
-    condition reads a register a loop wrote and its exit dropped: the first shape is
-    as it was on main, the others have the names main did not give them."""
-    loop = [("add", "x2, x4, #8"), ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x0")]
+def test_a_register_a_loop_wrote_reads_after_it_as_the_name_the_loop_set():
+    """`and x2, x4, #1` in a loop that never reads x2 prints no line, so the loop gave
+    x2 no name, and `cbnz x2, 1f; mov x4, #5; 1: mov x0, x4` after it read x2 bare: the
+    x2 the function came in with. The `if` was then left out as one that reads a value
+    the loop lost, and `return x4;` stood for both paths (#468). A register the loop
+    writes and the code after it reads has a name the loop sets on each way out, the
+    one a printed write already got it (#123)."""
+    loop = [("and", "x2, x4, #1"), ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x0")]
     tail = [("mov", "x4, #5"), ("mov", "x0, x4"), ("ret", "")]
     got = _lift_rows(loop + [("cbnz", "x2, #0x14")] + tail)
-    assert not [ln for ln in got if "x2" in ln] and got[-1] == "return x4;", got
-    # Under a register nothing wrote the join has its name, and so it has under the
-    # lost one where the `if` prints for an arm that computed something as well.
+    assert got[:2] == ["var t0 = x2;", "var t1 = x7;"] and got.count("t0 = x4 & 1;") == 2
+    assert got[-5:] == ["var t2 = x4;", "if (t0 == 0) {", "t2 = 5;", "}",
+                        "return t2;"], got
+    # Read in a comparison, as the value or the base of a store, in what is returned and
+    # in a call's arguments, which print `(...)` where they cannot all be named.
+    got = _lift_rows(loop + [("cmp", "x2, x6"), ("b.lt", "#0x18")] + tail)
+    assert got[-4:] == ["if (t0 >= x6) {", "t2 = 5;", "}", "return t2;"], got
+    got = _lift_rows(loop + [("stur", "x2, [x5, #7]"), ("ret", "")])
+    assert got[-2:] == ["x5.field_0x8 = t0;", "return x0;"], got
+    got = _lift_rows(loop + [("stur", "x5, [x2, #7]"), ("ret", "")])
+    assert got[-2:] == ["t0.field_0x8 = x5;", "return x0;"], got
+    got = _lift_rows(loop + [("mov", "x1, x2"), ("mov", "x2, #9"), ("bl", "#0x100"),
+                             ("ret", "")], arity=lambda pc: 2)
+    assert got[-1] == "return sub_0x100(t0, 9);" and got.count("t0 = x4 & 1;") == 2, got
+    # Two registers, and the second loop reading what the first left.
+    got = _lift_rows(loop[:1] + [("add", "x3, x5, #3")] + [
+        ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x0"), ("add", "x0, x2, x3"), ("ret", "")])
+    assert got[-1] == "return t0 + t1;" and got.count("t1 = x5 + 3;") == 2, got
+    got = _lift_rows(loop + [("and", "x3, x2, #1"), ("sub", "x8, x8, #1"),
+                             ("cbnz", "x8, #0xc"), ("add", "x0, x2, x3"), ("ret", "")])
+    assert got[-1] == "return t0 + t2;" and got.count("t2 = t0 & 1;") == 2, got
+    # A loop left at its top, and one left from the middle with another value.
+    got = _lift_rows([("cbz", "x7, #0x10"), ("and", "x2, x4, #1"), ("sub", "x7, x7, #1"),
+                      ("b", "#0x0"), ("cbnz", "x2, #0x18")] + tail)
+    assert got[:5] == ["var t0 = x2;", "var t1 = x7;", "while (true) {",
+                       "if (t1 == 0) break;", "t0 = x4 & 1;"], got
+    assert got[-4:] == ["if (t0 == 0) {", "t2 = 5;", "}", "return t2;"], got
+    got = _lift_rows([("and", "x2, x4, #1"), ("cbnz", "x5, #0x14"), ("add", "x2, x6, #3"),
+                      ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x0"), ("cbnz", "x2, #0x1c")]
+                     + tail)
+    at = got.index("} else {")
+    assert got[at + 1:at + 3] == ["t0 = x4 & 1;", "break;"], got
+    assert got.count("t0 = x6 + 3;") == 2 and got[-4] == "if (t0 == 0) {", got
+    # A loop in a loop: the outer one has the name on its own way out as well.
+    got = _lift_rows([("mov", "x6, #2"), ("and", "x2, x4, x6"), ("sub", "x6, x6, #1"),
+                      ("cbnz", "x6, #0x4"), ("add", "x4, x4, #1"), ("sub", "x7, x7, #1"),
+                      ("cbnz", "x7, #0x0"), ("cbnz", "x2, #0x24")] + tail)
+    assert got[0] == "var t0 = x2;" and got.count("t3 = t1 & t4;") == 2, got
+    assert got.count("t0 = t3;") == 2 and got[-4] == "if (t0 == 0) {", got
+    # Under a register nothing wrote, the `if` is as it was.
     assert _lift_rows(loop + [("cbnz", "x3, #0x14")] + tail)[-5:] == [
         "var t1 = x4;", "if (x3 == 0) {", "t1 = 5;", "}", "return t1;"]
-    both = _lift_rows(loop + [("cbnz", "x2, #0x18"), ("mov", "x4, #5"),
-                              ("add", "x5, x5, #1"), ("mov", "x0, x4"),
-                              ("stur", "x5, [x0, #7]"), ("ret", "")])
-    assert both[-6:] == ["if (x2 == 0) {", "t1 = 5;", "t2 = x5 + 1;", "}",
-                         "t1.field_0x8 = t2;", "return t1;"], both
     # And x2 written and put back with no loop between is the x2 that came in.
     back = _lift_rows([("mov", "x6, x2"), ("add", "x2, x4, #8"), ("mov", "x2, x6"),
                        ("cbnz", "x2, #0x14")] + tail)
     assert back == ["var t0 = x4;", "if (x2 == 0) {", "t0 = 5;", "}", "return t0;"], back
+
+
+def test_a_branch_on_a_register_a_loop_lost_says_so_where_no_name_is_set():
+    """Where the loop sets no name, the branch after it still prints, on `?`: what it
+    tests has no name there, and neither `if (x2 == 0)` nor `return x4;` on every path
+    is true (#468). No name is set where a slot comes into the loop holding a read of
+    memory and a trip stores to memory: the reload prints that read, which a later
+    trip does not load. Nor for a register the loop does not write itself: x7 here is
+    the callee's to change, #216's class, and reads as it did."""
+    got = _lift_rows([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x29, #-8]"),
+                      ("add", "x2, x4, #8"), ("ldur", "x7, [x29, #-8]"),
+                      ("stur", "x7, [x1, #7]"), ("sub", "x9, x9, #1"),
+                      ("cbnz", "x9, #0x8"), ("cbnz", "x2, #0x24"), ("mov", "x4, #5"),
+                      ("mov", "x0, x4"), ("ret", "")])
+    assert got[-5:] == ["var t1 = x4;", "if (? == 0) {", "t1 = 5;", "}",
+                        "return t1;"], got
+    assert not [ln for ln in got if "x2" in ln], got
+    got = _lift_rows([("mov", "x9, #3"), ("bl", "#0x100"), ("sub", "x9, x9, #1"),
+                      ("cbnz", "x9, #0x4"), ("stur", "x5, [x7, #0xb]"), ("ret", "")])
+    assert "x7.field_0xc = x5;" in got, got
+
+
+def test_a_copy_of_a_register_a_loop_wrote_keeps_its_name_past_a_write_to_it():
+    """`mov x1, x2; mov x2, x5` after a loop that wrote x2 leaves the loop's value in
+    x1 under the spelling `x2`, and the write cleared the mark on x2, so the call
+    printed `sub_0x100(x2, x5)`, the store `x3.field_0x8 = x2;` and a branch in a
+    later block `if (x2 == 0)`, each on the x2 the function came in with. Named, a
+    call's list with a lost register beside it printed that for the first time
+    where it had been `(...)` (#468). Where no name is set the list stays `...`
+    and the branch reads `?`."""
+    loop = [("and", "x2, x4, #1"), ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x0")]
+    copy = [("mov", "x1, x2"), ("mov", "x2, x5")]
+    two = dict(arity=lambda pc: 2)
+    got = _lift_rows(loop + copy + [("bl", "#0x100"), ("ret", "")], **two)
+    assert "t0 = x4 & 1;" in got and got[-1] == "return sub_0x100(t0, x5);", got
+    got = _lift_rows(loop + [("add", "x2, x2, #1")] + copy
+                     + [("bl", "#0x100"), ("ret", "")], **two)
+    assert got[-1] == "return sub_0x100(t0 + 1, x5);", got
+    got = _lift_rows(loop + copy + [("stur", "x1, [x3, #7]"), ("mov", "x0, x2"),
+                                    ("ret", "")])
+    assert got[-2:] == ["x3.field_0x8 = t0;", "return x5;"], got
+    got = _lift_rows(loop + [("mov", "x1, x2"), ("mov", "x2, #9"),
+                             ("cbnz", "x1, #0x1c"), ("mov", "x4, #5"),
+                             ("add", "x0, x4, x2"), ("ret", "")])
+    assert got[-5:] == ["var t2 = x4;", "if (t0 == 0) {", "t2 = 5;", "}",
+                        "return t2 + 9;"], got
+    unsure = [("ldur", "x7, [x1, #7]"), ("stur", "x7, [x29, #-8]"),
+              ("add", "x2, x4, #8"), ("ldur", "x7, [x29, #-8]"),
+              ("stur", "x7, [x1, #7]"), ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8")]
+    got = _lift_rows(unsure + copy + [("bl", "#0x100"), ("ret", "")], **two)
+    assert got[-1] == "return sub_0x100(...);", got
+    got = _lift_rows(unsure + [("mov", "x3, x2"), ("mov", "x2, #9"),
+                               ("cbnz", "x3, #0x2c"), ("mov", "x4, #5"),
+                               ("add", "x0, x4, x2"), ("ret", "")])
+    assert got[-5:] == ["var t1 = x4;", "if (? == 0) {", "t1 = 5;", "}",
+                        "return t1 + 9;"], got
+
+
+def test_naming_what_a_row_of_loops_left_takes_two_walks_at_any_length():
+    # The cost, counted and not timed: each loop here writes an x2 the store after it
+    # reads, so each sets a name, and all of them on the one second walk. Which of the
+    # names nothing reads is asked of the lines once: asked once a loop, 2,000 loops
+    # took 25 s where main took 0.4 s and this takes 0.8 s (#468).
+    import jadart.expr as expr
+    from jadart.expr import lift_function
+    init, never, made, asked = expr.Lifter.__init__, expr._never_read, [0], [0]
+
+    def counted_init(self, *args, **kw):
+        made[0] += 1
+        return init(self, *args, **kw)
+
+    def counted_never(lines, names):
+        asked[0] += 1
+        return never(lines, names)
+
+    def row(n):
+        rows = []
+        for i in range(n):
+            rows += [("and", "x2, x4, #1"), ("sub", "x7, x7, #1"),
+                     ("cbnz", f"x7, #{len(rows) * 4:#x}"),
+                     ("stur", f"x2, [x5, #{7 + 8 * (i % 50)}]")]
+        return rows + [("ret", "")]
+
+    def walks(n):
+        made[0] = asked[0] = 0
+        got = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(row(n))])
+        return made[0], asked[0], [ln.strip() for ln in got]
+    expr.Lifter.__init__, expr._never_read = counted_init, counted_never
+    try:
+        (few, once, small), (many, again, large) = walks(8), walks(60)
+    finally:
+        expr.Lifter.__init__, expr._never_read = init, never
+    assert few == many == 2 and once == again == 1, (few, many, once, again)
+    assert small[-3:-1] == ["}", "x5.field_0x40 = t14;"], small[-4:]
+    stores = [ln for ln in large if re.fullmatch(r"x5\.field_0x[0-9a-f]+ = t\d+;", ln)]
+    assert len(stores) == 60, large[-6:]
+    assert len(large) - len(small) == 12 * 52, (len(small), len(large))
 
 
 def test_a_run_of_joins_that_each_lose_the_next_is_not_walked_try_by_try():
