@@ -57,6 +57,15 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   rather than sent to a line this run leaves out. An offset no list sits at exits 1 and
   says so, and prints no neighbour. Without an offset the output is unchanged.
 
+- **`docs/whats-coming.md` reads three Dart SDK changes at one commit (#450).** Modular
+  AOT module snapshots, dynamic modules run as bytecode inside the AOT runtime, and
+  arm64e pointer authentication each change what a binary holds. The page cites the SDK
+  source at one pinned commit for what each adds, says what jadart does with it today,
+  and names the bytes a refusal would test. Nothing is refused by name yet: a made-up
+  module header is an unknown epoch with stream bytes for a hash, an arm64e features
+  string is said to name no architecture, and a bytecode file is an unrecognised
+  container.
+
 ### Changed
 
 - **`follow` finds a join one way, off the dominator tree, and the scan is gone.** It had
