@@ -232,6 +232,32 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A join an `if` falls into is named on the way in from each arm (#461).** `umulh x3,
+  x5, x6; cbz x1, 1f; mov x3, #7; cbz x2, 2f; mov x3, #8; cbz x5, 1f; mov x3, #9; 1: add
+  x4, x4, #1; 2: mov x0, x3` printed `t1 = x3;` under the label `1:`, which three ways
+  reach, one with the `umulh` in x3, one with 8 and one with 9, and returned the wrong
+  value from 39 of 40 entry states; with no raw line it printed `return x3;` under no
+  branch at all. The walk recorded a way into a join against the block that decided the
+  `if` above it, for both arms, so the block holding `mov x3, #9` was never seen to reach
+  the label, and a join is named only when every way in is printed: this one was dropped
+  and read the register bare. The state now says which blocks it leaves, one for each arm
+  that runs on, and the name is set above the label, `t1 = t0;`, and before the goto, `t1
+  = x3;`. Of ten forms of the join (three and four ways in, with a raw line and without,
+  out of a loop, into a store, a compare and a call, two registers, an arm that leaves)
+  eight disagreed with the CPU, in 20 to 39 of 40 entry states each, and all ten agree in
+  all 40. The unicorn oracle's 20,420 generated programs stand where they stood, 16,540
+  agreeing and 3 wrong, and of 10,600 more 8,135 agree where 8,060 did; no program that
+  agreed is wrong now. A function with such a join and a run of joins after it is walked
+  twice where it was walked three times (2,000 joins in 0.80 s against 1.03 s), and 4,000
+  of the join in a row take 2.5 s against 1.3 s, two walks where one walk printed `x3`;
+  the twelve other shapes #409 timed are within 1.1 times what they took. 71 ranges change
+  on each fixture, 3,172 lines replaced by 3,912 on the clean one and 3,171 by 3,911 on
+  the obfuscated one, all but 220 of the lines out a temporary's number moving up: `return
+  isPointerAllowed(x2, a1);` to `return isPointerAllowed(t1, a1);` under `t1 = this;` on
+  both ways in, `return x0;` to `return t5;` under `t5 = a1 - a3;` and `t5 = 0;`, and
+  `x1.field_0x18 = NULL;` to `t2.field_0x18 = NULL;` under `t2 = this;`. The 8,123 ranges
+  of the clean fixture that print as before lift in 21.0 s against 21.6 s.
+
 - **Values that meet at a join have a name the lines after it read (#409, #414).** `cbz
   x5, 1f; mov x2, x6; b 2f; 1: mov x2, x4; 2: mov x1, x2; mov x2, #9; bl f` printed
   `f(x2, 9)` under no branch at all: a join had a name only when an arm computed
