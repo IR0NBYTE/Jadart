@@ -12566,7 +12566,11 @@ def detect_dispatch(dis) -> dict:
             # (#376). A register is added whole only when nothing shifts or extends it.
             # Any other form, and a 32-bit add, which wraps where this one does not,
             # is left with no offset, and the call prints without a selector.
-            if (fs is not None and fs[0] == _F_CID
+            # A whole copy of the class id is the class id plus nothing, and adding to
+            # one is adding to the class id: `mov x0, x1; add x30, x0, x17` printed
+            # `dispatch(...)` (#404). A sum of two adds is still not read.
+            if (fs is not None
+                    and (fs[0] == _F_CID or fs[0] == _F_DISP and fs[1][1] == 0)
                     and ops[0][:1] == "x" and ops[1][:1] == "x"):
                 off = _imm(ops[2])
                 if off is not None:
@@ -12578,7 +12582,8 @@ def detect_dispatch(dis) -> dict:
                       and ft is not None and ft[0] == _F_IMM):
                     off = ft[1]
                 if off is not None:
-                    fact[dst] = (_F_DISP, (fs[1], off if mn == "add" else -off))
+                    read = fs[1] if fs[0] == _F_CID else fs[1][0]
+                    fact[dst] = (_F_DISP, (read, off if mn == "add" else -off))
             continue
         fact.pop(dst, None)
         defs = _def_use(mn, t[2])[0]

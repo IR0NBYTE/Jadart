@@ -107,6 +107,35 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A virtual call whose class id is moved before the add names its selector.**
+  Most calls give the class id to the add in another register, `mov x0, x1` then
+  `sub x30, x0, #0xfc2`, and only a class id added to where it was read was followed,
+  so these printed `dispatch(...)` with no selector and the receiver as an argument
+  (#404). A copy of the class id is now read as the class id, once or twice moved; a
+  sum of two adds, a copy through the frame and a register written over in between
+  still print `dispatch(...)`. The clean fixture had 755 such lines in 454 functions
+  and has 4 in 3. Ranges changed: clean 451 of 8,194 (869 lines out, 805 in), obf 448
+  of 8,188 (864 out, 801 in), fluffychat 2,351 of 88,618 (4,312 out, 4,145 in), where
+  `dispatch(` lines go from 8,733 to 4,916. Three of them on the clean fixture:
+
+      var t5 = dispatch(a3, a4 + t4);   // virtual dispatch
+      var t5 = a3.sel_m0xfc2(a4 + t4);
+
+      var t19 = dispatch(t18, growable: false);   // virtual dispatch
+      var t19 = t18.toList(growable: false);
+
+      var t0 = dispatch(...);   // virtual dispatch
+      var t0 = this.field_0x14.sel_m0x1000(...);
+
+  The call graph reads a virtual site by the same offset, so `functions` and `xrefs
+  function` change with it. On the clean fixture the sites it reads go from 2,580 to
+  3,331, and 468 of the 8,194 functions list more virtual callers, 15,536 to 22,509
+  summed over them: `xrefs function removeLast` lists 5 virtual call sites where it
+  listed 2. Direct callers and callees are the same.
+
+  The lift of each fixture takes the same CPU: 24.2 s against 24.0, and 23.9 against
+  23.7, one run each.
+
 - **A virtual call lifted with no arity resolver lists what it pushed, or `(...)`.**
   With no resolver the list of a dispatch call is the words pushed, and where its
   receiver is in a register the first of them was dropped as the receiver without
