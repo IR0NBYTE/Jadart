@@ -129,6 +129,48 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **Values that meet at a join have a name the lines after it read (#409, #414).** `cbz
+  x5, 1f; mov x2, x6; b 2f; 1: mov x2, x4; 2: mov x1, x2; mov x2, #9; bl f` printed
+  `f(x2, 9)` under no branch at all: a join had a name only when an arm computed
+  something, two moves left the register bare, and a bare register past the join reads
+  as the value it had on entry. And `umulh x3, x5, x6; cbz x1, 1f; mov x3, #7; cbz x2,
+  2f; 1: add x4, x4, #1; 2: mov x0, x3` printed `t0 = 7;` on the way that jumps to `2:`
+  and `t0 = x3;` under the label `1:`, which the way holding 7 reaches as well, so the
+  7 read as the `umulh`: at a join a goto reaches, only a register a loop carries had
+  a name. A join has a name now whatever the arms hold, `var t0; if (x5 != 0) { t0 =
+  x6; } else { t0 = x4; }` and then `f(t0, 9)`, with an arm that writes nothing (`var
+  t0 = x2;`) and with three ways in. At a join a goto reaches, every register the ways
+  in write and the code after it reads has one, set on each edge: above the label by
+  the block that falls into it and before each goto, in one parallel copy with the
+  loop's write-back where the goto also leaves a loop. Five declines keep the bare
+  register, a gap as before: an arm that changed the register and has no value to
+  give, such as a `q0` pushed and popped around an allocation stub; a join the walk
+  does not print every edge into; a register one way in lost; the join at the normal
+  entry behind a monomorphic one, which callers reach by no printed edge; and an `if`
+  whose arms print nothing, where its condition reads a register a loop wrote in no
+  printed line, since `add x2, x4, #8` in a loop and `cbnz x2, 1f; mov x4, #5; 1: mov
+  x0, x4` after it would print `if (x2 == 0)` on the x2 the function came in with.
+  Which names a walk would lose is counted off what the walks so far saw each name
+  rest on, and checked by the one walk that follows, where each used to be found by
+  walking again without it; and a declaration that only moves to the top of the body
+  moves in the lines already printed. 1,500 random functions dense in gotos take
+  3,857 walks, against 2,502 before the change and 5,580 walking each try. 4,000
+  joins a goto reaches lift in 1.5 s against 1.0 s, in 4.8 s against 3.2 s when each
+  follows a call, and in 6.0 s against 4.0 s where each loses the next; 4,000
+  one-armed joins in a row take 0.29 s against 0.19 s and print 16,002 lines where
+  they printed 2; a function of 7,085 rows that took 11.3 s takes 11.7 s; and 949
+  joins nested after a raw line (#422) lift in 0.07 s where they took 3.3 s, since
+  `_phi` reads each line once and not once for every `if` or loop around it. A
+  function whose joins all end with no name is walked 3 times against 2. Lifting the
+  nine binaries takes 640 s of CPU against 672 s. In the unicorn oracle's 20,420
+  generated programs with joins, 40 entry states each, the ones that agree with the
+  CPU go from 12,430 to 16,540 and the ones with a wrong run from 1,102 to 3, which
+  were wrong before and not at a join; no program that agreed is wrong now. 25,312 of
+  273,863 ranges change on the nine binaries, 1,069 and 1,070 of them on the fixtures,
+  and 875,155 lines are replaced by 1,222,141, such as `markNeedsLayout(x1);` to
+  `markNeedsLayout(t4);` under `t4 = this;` on both ways in, and `return x0;` to
+  `return t5;` under `t5 = x8;` and `t5 = x1;`.
+
 - **The suite's listing helper leaves nothing behind (#466).** While it runs it stands
   a remembering function in for `disasm.build_pool_map`, and `jadart.callgraph`, imported
   for the first time in that window since #406, kept it: a test that built a call graph

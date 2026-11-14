@@ -776,11 +776,13 @@ def test_a_join_keeps_what_the_two_arms_computed():
     assert m, body
     ret = m.group(1)
     assert f"{ret} = x1 + x2;" in body and f"{ret} = x1 - x2;" in body, body
-    # A register the arms merely move around is left alone: it costs a statement and says
-    # nothing the reader could not already see.
+    # A register the arms merely move around is named too. Left alone it printed
+    # `return x0;` under no `if` at all, the x0 the function came in with, which neither
+    # arm leaves there (#409).
     body = _lift_asm([("cmp", "x1, x2"), ("b.lt", "#0x10"), ("mov", "x0, x1"),
                       ("b", "#0x14"), ("mov", "x0, x2"), ("ret", "")])
-    assert "= x1;" not in body and "= x2;" not in body, body
+    ret = _re.search(r"return (\S+);", body).group(1)
+    assert f"{ret} = x1;" in body and f"{ret} = x2;" in body, body
 
 
 def test_an_overwritten_receiver_does_not_read_back_as_this():
@@ -795,7 +797,11 @@ def test_an_overwritten_receiver_does_not_read_back_as_this():
     body = "\n".join(lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
                                    receiver={"x1": "this"}))
     assert "this.field_0x8" not in body, body
-    assert "x1.field_0x8" in body, body
+    # ...and not as the x1 it came in with either, which is what `this` is: the join
+    # has a name, x1 on the way that kept it and 5 on the other (#409).
+    assert "x1.field_0x8" not in body, body
+    assert [ln.strip() for ln in body.splitlines()] == [
+        "var t0 = x1;", "if (x2 != 0) {", "t0 = 5;", "}", "return t0.field_0x8;"], body
 
 
 def test_a_call_does_not_leave_the_values_it_destroyed_behind_it():
@@ -11009,16 +11015,19 @@ def test_a_catch_entry_past_a_trap_says_what_it_does_in_the_body():
 def test_sections_past_a_trap_meet_each_other_at_their_labels():
     """A goto from one section past a trap into another is a way in the walk meets at
     the label, as one between the sections after the body is, and keeps no note: the
-    join drops `x3` to the bare register. The section's own way into the body's `ret`
-    returns what it computed, `x3 + 1`, and not the body's `return 3;` (#283)."""
+    join names `x3`, which each way in sets (#414). The section's own way into the
+    body's `ret` returns what it computed, the name plus one, and not the body's
+    `return 3;` (#283)."""
     rows = [("cbnz", "x2, #0x1024"), ("brk", "#0"),
             ("mov", "x3, #1"), ("add", "x0, x3, #1"), ("cbz", "x4, #0x1028"),
             ("brk", "#0"), ("mov", "x3, #9"), ("b", "#0x100c"), ("brk", "#0"),
             ("mov", "x0, #3"), ("ret", "")]
     body = _lift_rows(rows, 0x1000, receiver={"x1": "this"})
-    assert body[:3] == ["if (x2 != 0) {", "return 3;", "}"], body
-    assert ["L_0x100c:", "if (x4 == 0) {", "return x3 + 1;", "}"] == body[5:9], body
-    assert "goto L_0x100c;" in body and not any("goto L_0x1028" in ln for ln in body)
+    assert body[:4] == ["var t0;", "if (x2 != 0) {", "return 3;", "}"], body
+    assert ["L_0x1008:", "t0 = 1;", "L_0x100c:", "if (x4 == 0) {", "return t0 + 1;",
+            "}"] == body[5:11], body
+    at = body.index("goto L_0x100c;")
+    assert body[at - 1] == "t0 = 9;" and not any("goto L_0x1028" in ln for ln in body)
 
 
 def test_a_slow_path_laid_out_after_a_throw_keeps_its_goto():
@@ -11121,7 +11130,9 @@ def test_a_section_running_into_a_monomorphic_body_takes_the_rejoin_note():
                              ("sub", "x15, x29, #0x20"), ("mov", "x3, #9"),
                              ("b", "#0x102c")]
     body = _lift_rows(rows, 0x1000, receiver={"x1": "this"}, mono=0x1008)
-    assert "if ((x1.field_0x8 + x4) != 0) {" in body, body
+    # x4 is 1 or 2 at the body's own join, which has a name since #409.
+    assert "if ((x1.field_0x8 + t0) != 0) {" in body, body
+    assert "t0 = 1;" in body and "t0 = 2;" in body, body
     assert body[-3:] == ["// " + UNREACHED, "L_0x1040:",
                          "goto L_0x102c;   // " + REJOIN], body
     back = [("b", "#0x1020"), ("brk", "#0")] + _MONO_ROWS[2:6] + [
@@ -11150,7 +11161,9 @@ def test_a_check_that_also_branches_into_the_body_is_not_a_proven_entry():
     the root of a body. One that also branches into the body dominated, as a root, a join
     the callers reach from +24 without it, and the meet there kept the `mov x4, #5` only
     the check ran: `return 5 + x2;`. Lifted as a section nothing reaches, it keeps x4
-    (#278)."""
+    (#278). The join at +24 is the one the callers come in at, by no edge the walk
+    prints, so it has no name for x4 where the snapshot says the code has such an
+    entry, and without that word the same rows are a section whose joins have (#414)."""
     from jadart.cfg import UNREACHED
     from jadart.expr import MONOMORPHIC_ENTRY
     rows = [("ldr", "x16, [x26, #0x258]"), ("br", "x16"), ("mov", "x4, #5"),
@@ -11160,8 +11173,14 @@ def test_a_check_that_also_branches_into_the_body_is_not_a_proven_entry():
             ("add", "x0, x4, x2"), ("ret", "")]
     body = _lift_rows(rows, 0x1000, mono=0x1008)
     plain = _lift_rows(rows, 0x1000)
-    assert body[1] == "// " + MONOMORPHIC_ENTRY and plain[1] == "// " + UNREACHED
-    assert body[2:] == plain[2:] and "return x4 + x2;" in body, body
+    assert body[2] == "// " + MONOMORPHIC_ENTRY and plain[4] == "// " + UNREACHED
+    assert body[:2] == ["var t0;", "br x16   // x16 holds THR.field_0x258"], body
+    assert body[-8:] == ["t0 = x2 + 1;", "L_0x1034:", "return x4 + t0;", "}", "} else {",
+                         "t0 = x2;", "goto L_0x1034;", "}"], body
+    assert not [ln for ln in body if ln.endswith("= 5;")], body
+    assert plain[-10:] == ["t1 = x2 + 1;", "t2 = t0;", "L_0x1034:", "return t2 + t1;",
+                           "}", "} else {", "t1 = x2;", "t2 = 5;", "goto L_0x1034;",
+                           "}"], plain
 
 
 def test_lone_branches_after_the_normal_entry_read_no_flags_of_the_check():
@@ -13322,15 +13341,17 @@ _GOTO_SHAPES = {
                  (0xd65f03c0, "ret", "")],
                 {"x1": 3}, ["t0 += 1;", "goto L_0x28;"], "return t0 + 100;",
                 "return t0 + 1 + 100;"),
-    # The same goto to a block another path reaches too: that block is entered from
-    # nothing (`_reenter`), so nothing is written out for it, x1 included.
+    # The same goto to a block another path reaches too: that block is a join, and x1
+    # has a name there which this way in sets before the write-back, since x1 holds
+    # the t0 from before it. Set after it, the name was one more than the CPU's (#414).
     "joined": ([(0xd2800003, "mov", "x3, #0"), (0xb4000122, "cbz", "x2, #0x28"),
                 (0xaa0303e1, "mov", "x1, x3"), (0x91000463, "add", "x3, x3, #1"),
                 (0xeb04007f, "cmp", "x3, x4"), (0x540000a0, "b.eq", "#0x28"),
                 (0xf100247f, "cmp", "x3, #9"), (0x54ffff61, "b.ne", "#8"),
                 (0xd2800000, "mov", "x0, #0"), (0xd65f03c0, "ret", ""),
                 (0xaa0103e0, "mov", "x0, x1"), (0xd65f03c0, "ret", "")],
-               None, ["t0 += 1;", "goto L_0x28;"], "return x1;", "var t1 = t0;"),
+               {"x2": 1, "x4": 3}, ["t1 = t0;", "t0 += 1;", "goto L_0x28;"],
+               "return t1;", "return x1;"),
     # x1 holds t0 from before the write-back and is the argument of the call there,
     # which liveness does not count as a read. Not run: the printed call has no value.
     "call_arg": ([(0xd2800003, "mov", "x3, #0"), (0xaa0303e1, "mov", "x1, x3"),
@@ -13422,10 +13443,12 @@ def test_a_goto_target_reads_what_the_jump_left():
     finally:
         expr.Lifter.__init__ = init
     # A second walk is what keeps a value written out for nothing out of the output;
-    # one nothing past the jump can read is not written out to begin with. `pinned` takes
-    # a third now: its two pins are read at the goto target, so the hoist wants them and
-    # the hoist decides on the lines as they will ship, which costs one more walk (#204).
-    assert [lifted[k][1] for k in ("renamed", "joined", "pinned")] == [1, 1, 3], lifted
+    # one nothing past the jump can read is not written out to begin with. `pinned` took
+    # a third: its two pins are read at the goto target, so the hoist wants them and
+    # the hoist decides on the lines as they will ship (#204). Moving a declaration to
+    # the top changes that one line, so the lines are rewritten and not walked again.
+    # `joined` takes a second, the one that writes the name its join has (#414).
+    assert [lifted[k][1] for k in ("renamed", "joined", "pinned")] == [1, 2, 2], lifted
 
     # And on a CPU: the value the printed program returns is the one the machine does.
     if not _unicorn_available() or not _capstone_available():
@@ -14221,9 +14244,9 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
     assert not any(re.fullmatch(r"var t\d+ = x0;", l) for l in body), body
     assert any(re.fullmatch(r"var t\d+;", l) for l in body), body
     bare = [re.fullmatch(r"var (t\d+);", l).group(1) for l in body
-            if re.fullmatch(r"var t\d+;", l) and f"{l[4:-1]} = x0;" in body]
+            if re.fullmatch(r"var t\d+;", l) and f"{l[4:-1]} = false;" in body]
     assert len(bare) == 1, (bare, body)
-    assert body.index("L_0xae0b0:") < body.index(f"{bare[0]} = x0;"), body
+    assert body.index("L_0xae0b0:") < body.index(f"{bare[0]} = false;"), body
     # ...and a phi an entered arm sets is set on every path into the `if`'s join, though
     # not on every path through its head: `ui.dart`'s goto into the arm keeps reading it.
     cr = next(c for c in image.all_ranges if c.pc_offset == 0x18d4e4)
@@ -14369,6 +14392,7 @@ def test_a_raw_line_survives_a_pinned_name_the_hoist_took():
     assert _DECL_RE.match(hoisted) is None, "the premise: it is not a declaration"
     lf = Lifter.__new__(Lifter)
     lf.raw_names = set()
+    lf._decl_leaned = set()
     lf._printed_regs = set()
     lf._live_after = 0
     lf.alias = {}
@@ -14648,7 +14672,9 @@ def test_a_copy_of_thr_is_the_thread_only_while_every_way_in_holds_it():
                      ("mov", other), ("ldr", "x9, [x25, #0x7d0]"),
                      ("stur", "x9, [x19, #7]"), ("ret", "")])
     assert join("x25, x26")[0] == "x19.field_0x8 = THR.field_0x7d0;", join("x25, x26")
-    assert join("x25, x1")[0] == "x19.field_0x8 = x25.field_0x7d1;", join("x25, x1")
+    assert join("x25, x1") == [
+        "var t0;", "if (x3 != 0) {", "t0 = THR;", "} else {", "t0 = x1;", "}",
+        "x19.field_0x8 = t0.field_0x7d1;", "return x0;"], join("x25, x1")
 
     # A section no edge leads into copies the thread and falls into the join: the body
     # does not take the copy from it, and the block printed again under the section,
@@ -14657,7 +14683,8 @@ def test_a_copy_of_thr_is_the_thread_only_while_every_way_in_holds_it():
                 ("mov", "x25, x26"), ("ldr", "x9, [x25, #0x7d0]"),
                 ("stur", "x9, [x19, #7]"), ("ret", "")])
     at = got.index("// " + UNREACHED)
-    assert got[:at] == ["x19.field_0x8 = x25.field_0x7d1;", "return x0;"], got
+    assert got[:at] == ["var t0 = x25;", "if (x3 != 0) {", "t0 = x1;", "}",
+                        "x19.field_0x8 = t0.field_0x7d1;", "return x0;"], got
     assert got[at + 1:] == ["L_0xc:", "x19.field_0x8 = THR.field_0x7d0;",
                             "return x0;"], got
     # ...and the section after a trap, falling into a join a goto also reaches, hands it
@@ -14769,7 +14796,7 @@ def test_lr_is_untagged_only_while_every_way_in_holds_a_return_address():
     def join(arm):
         return through(lift([("cbz", "x2, #0xc"), arm, ("nop", "")] + read))
     assert join(("add", "x3, x3, #1")) == ["x19.field_0x8 = LR.field_0x8;"]
-    assert join(("ldr", "x30, [x27, #0x10]")) == ["x19.field_0x8 = x30.field_0x9;"]
+    assert join(("ldr", "x30, [x27, #0x10]")) == ["x19.field_0x8 = t0.field_0x9;"]
     got = through(lift([("cbz", "x2, #0xc"), ("bl", "#0x100"), ("b", "#0x10"),
                         ("bl", "#0x200")] + read))
     assert len(got) == 1 and got[0].endswith(".field_0x8;"), got
@@ -14826,13 +14853,14 @@ def test_get_ffi_native_resolver_on_the_clean_fixture_calls_the_code_entry_point
     import io
     from jadart import cli
     body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x25a0")[0]["body"]]
-    assert "pool_0x13e0.field_0x8(x1, NULL);" in body, body
+    # The first argument is NULL, a slot or a pool object by the way in (#409).
+    assert "pool_0x13e0.field_0x8(t1, NULL);" in body, body
     assert "pool_0x13e8.field_0x8(...);" in body, body
     assert not [ln for ln in body if ".field_0x7(" in ln], body
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         assert cli.main(["lift", CLEAN, "0x25a0"]) == 0
-    assert "pool_0x13e0.field_0x8(x1, NULL);" in out.getvalue(), out.getvalue()
+    assert "pool_0x13e0.field_0x8(t1, NULL);" in out.getvalue(), out.getvalue()
 
 
 def test_the_low_doubleword_lane_of_a_v_register_reads_what_dn_holds():
@@ -14899,10 +14927,10 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
                 (12, "ret", "", "")]
         return [ln.strip() for ln in lift_function(rows)]
 
-    # An `if` that leaves 0.0 in d1 on one arm names it at the join, unless the other
-    # arm's d1 is the bare register: a join inside that arm lost the value, which reads
-    # just like the d1 from before the `if`, and the name would carry that one down an
-    # arm that loaded a field.
+    # An `if` that leaves 0.0 in d1 on one arm names it at the join. The other arm
+    # loads d1 from one of two fields, a join of two plain values that was once left
+    # as the bare register, and the outer join with it: the store read the d1 the
+    # function came in with (#409). Both have a name now.
     # The `nop` after the `b` is a block nothing reaches, placed after the body since
     # #266, and the label its goto names keeps the arm it opens from vanishing.
     rows = [("cbz", "x0, #0x10"), ("movi", "d1, #0"), ("b", "#0x24"), ("nop", ""),
@@ -14910,8 +14938,10 @@ def test_a_write_to_any_view_of_a_simd_register_reaches_the_double_in_it():
             ("ldur", "d1, [x3, #0xf]"), ("nop", ""), ("stur", "d1, [x4, #7]"),
             ("ret", "")]
     assert [ln.strip() for ln in lift_function(
-        [(i * 4, *r, "") for i, r in enumerate(rows)])][:5] == [
-        "if (x0 == 0) {", "L_0x10:", "}", "x4.field_0x8 = d1;", "return x0;"]
+        [(i * 4, *r, "") for i, r in enumerate(rows)])][:15] == [
+        "var t1;", "if (x0 != 0) {", "t1 = 0.0;", "} else {", "L_0x10:", "var t0;",
+        "if (x2 != 0) {", "t0 = x3.field_0x8;", "} else {", "t0 = x3.field_0x10;", "}",
+        "t1 = t0;", "}", "x4.field_0x8 = t1;", "return x0;"]
 
     # the two ways the VM zeroes a double are 0.0
     for mid in ((4, "eor", "v0.16b, v0.16b, v0.16b", ""), (4, "movi", "v0.2d, #0", ""),
@@ -15342,7 +15372,9 @@ def test_a_frame_slot_past_the_displacement_is_its_own_slot():
     assert lift([("mov", "x17, #-0x158"), ("cbz", "x5, #0xc"), ("mov", "x17, #-0x160"),
                  ("str", "x1, [x29, x17]"), ("mov", "x17, #-0x158"),
                  ("ldr", "x0, [x29, x17]")]) == [
-        "str x1, [x29, x17]", "var t0 = (FP - 0x158).field_0x1;", "return t0;"]
+        "var t0 = -0x158;", "if (x5 != 0) {", "t0 = -0x160;", "}",
+        "str x1, [x29, x17]   // x17 holds t0",
+        "var t1 = (FP - 0x158).field_0x1;", "return t1;"]
 
 
 def test_a_register_list_load_writes_every_register_in_it():
@@ -15403,27 +15435,34 @@ def test_a_value_read_only_as_a_call_argument_is_live_up_to_the_call():
     # The first argument is no longer the entry x6: x6 is the call's to clobber, so the
     # arm that calls leaves the name the call declares for it and the join takes a phi
     # over the two. Main passed x6 where the callee may have left anything (#176).
-    want = ["var t2;", "var t3 = x6;", "if (x3 != 0) {", "var t0;",
-            "var t1 = sub_0x500(...);", "t2 = t1;", "t3 = t0;", "} else {", "t2 = x2;",
-            "}", "return sub_0x200(t3, t2);"]
-    for then, other in ((("ldur", "x2, [x5, #7]"), ("ldur", "x2, [x5, #0xf]")),
-                        (("add", "x7, x7, #1"), ("ldur", "x2, [x5, #0xf]")),
-                        (("ldur", "x2, [x5, #7]"), ("add", "x7, x7, #1"))):
+    # The inner join has a name of its own now, so the arm ends holding that (#409).
+    head = ["var t3;", "var t4 = x6;", "if (x3 != 0) {", "var t0;",
+            "var t1 = sub_0x500(...);", "t3 = t1;", "t4 = t0;", "} else {"]
+    tail = ["t3 = t2;", "}", "return sub_0x200(t4, t3);"]
+    both = ["var t2;", "if (x4 != 0) {", "t2 = x5.field_0x8;", "} else {",
+            "t2 = x5.field_0x10;", "}"]
+    second = ["var t2 = x2;", "if (x4 == 0) {", "t2 = x5.field_0x10;", "}"]
+    first = ["var t2 = x2;", "if (x4 != 0) {", "t2 = x5.field_0x8;", "}"]
+    for then, other, inner in (
+            (("ldur", "x2, [x5, #7]"), ("ldur", "x2, [x5, #0xf]"), both),
+            (("add", "x7, x7, #1"), ("ldur", "x2, [x5, #0xf]"), second),
+            (("ldur", "x2, [x5, #7]"), ("add", "x7, x7, #1"), first)):
         assert lift([("mov", "x1, x6"), ("cbz", "x3, #0x14"), ("bl", "#0x500"),
                      ("mov", "x2, x0"), ("b", "#0x24"), ("cbz", "x4, #0x20"), then,
                      ("b", "#0x24"), other, ("mov", "x1, x6"), ("bl", "#0x200")],
-                    2) == want, (then, other)
+                    2) == head + inner + tail, (then, other)
     # The same holds for a value recomputed after the loss: `x1 + 1` from x1 loaded in
     # the inner `if` is spelled as the `x1 + 1` from before the outer one, and is not it.
     assert lift([("add", "x2, x1, #1"), ("cbz", "x3, #0x20"), ("cbz", "x4, #0x14"),
                  ("ldur", "x1, [x5, #7]"), ("b", "#0x18"), ("ldur", "x1, [x5, #0xf]"),
                  ("add", "x2, x1, #1"), ("b", "#0x24"), ("mov", "x2, x7"),
                  ("bl", "#0x200")], 2) == [
-        "var t0;", "if (x3 != 0) {", "t0 = x2;", "} else {", "t0 = x7;", "}",
-        "return sub_0x200(...);"]
-    # ...and the list is not printed: its first argument is the x1 the inner `if` lost,
-    # and a bare `x1` there would say the value the function came in with (#358). It
-    # printed `sub_0x200(x1, t0)`.
+        "var t1 = x1;", "var t2;", "if (x3 != 0) {", "var t0;", "if (x4 != 0) {",
+        "t0 = x5.field_0x8;", "} else {", "t0 = x5.field_0x10;", "}", "t1 = t0;",
+        "t2 = t0 + 1;", "} else {", "t2 = x7;", "}", "return sub_0x200(t1, t2);"]
+    # ...and the list is printed now that the inner `if` names what it loaded (#409):
+    # it printed `sub_0x200(x1, t0)`, the x1 the function came in with, and then
+    # `sub_0x200(...)` (#358).
 
 
 def test_a_dispatch_offset_other_selectors_share_is_not_named():
@@ -15826,12 +15865,15 @@ def test_a_call_prints_no_list_with_an_argument_it_cannot_write():
     assert _lift_358(_REGS_358 + [("fmov", "d0, #1.0")] + load(0x48) + call, pool,
                      _callee_358(None, ("x1", "x2"), desc=True)) == [
         "return sub_0x100(...);"]
-    # x1 is the incoming x2 and x2 what one way in loaded: one name, two values
+    # x1 is the incoming x2 and x2 what one way in loaded: one name, two values, and
+    # no list, until the join had a name of its own (#409)
     lost = [("mov", "x1, x2"), ("cbz", "x0, #0xc"), ("ldur", "x2, [x9, #7]")]
-    assert _lift_358(lost + call, None, two)[-1] == "return sub_0x100(...);"
-    # ...and a word pushed out of the register the join lost
+    assert _lift_358(lost + call, None, two) == [
+        "var t0 = x2;", "if (x0 != 0) {", "t0 = x9.field_0x8;", "}",
+        "return sub_0x100(x2, t0);"]
+    # ...and a word pushed out of that register is the name
     assert _lift_358(lost + [("str", "x2, [x15]")] + load(0x18) + call, pool,
-                     _callee_358(None, (), desc=True))[-1] == "return sub_0x100(...);"
+                     _callee_358(None, (), desc=True))[-1] == "return sub_0x100(t0);"
     # a descriptor the VM made does not count: two more words pushed one way in only
     some = [("str", "x22, [x15]"), ("cbz", "x0, #0xc"), ("stp", "x22, x22, [x15, #8]")]
     assert _lift_358(some + load(0x18) + call, pool,
@@ -17493,18 +17535,19 @@ def test_a_value_a_join_lost_is_not_read_back_from_a_slot_as_the_register():
                 "L2", ("ldr", "x6, [x20, #0x2f]"),
                 "J2", ("stur", "x6, [x20, #0x37]"),
                 ("ldur", "x0, [x29, #-8]"), ("stur", "x0, [x20, #0x3f]")])
-    # the slot read (field_0x40) must not share the bare `x6` the direct store has: the
-    # two are different values. The reload reads its own register.
-    assert "x20.field_0x38 = x6;" in out, out
-    assert "x20.field_0x40 = x6;" not in out, out
-    assert _reads_frame(out, "x20.field_0x40"), out
+    # the slot read (field_0x40) must not share a name with the direct store: the two
+    # are different values. Each join has its own name now (#409), and the reload reads
+    # the first one's.
+    assert out[1:7] == ["var t0;", "if (x5 != 0) {", "t0 = x20.field_0x18;", "} else {",
+                        "t0 = x20.field_0x20;", "}"], out
+    assert out[-3:] == ["x20.field_0x38 = t1;", "x20.field_0x40 = t0;", "return t0;"], out
     # a slot holding a lost register whose register is never reassigned still reads it:
     # here x6 is lost at the join, spilled, and read straight back.
     out = lift([("cbz", "x5, @A"), ("ldr", "x6, [x1, #7]"), ("b", "@B"),
                 "A", ("ldr", "x6, [x1, #0xf]"),
                 "B", ("stur", "x6, [x29, #-8]"), ("ldur", "x3, [x29, #-8]"),
                 ("stur", "x3, [x20, #7]")])
-    assert "x20.field_0x8 = x6;" in out, out      # still named, x6 not reassigned
+    assert out[-2:] == ["x20.field_0x8 = t0;", "return x0;"], out   # the join's name
 
     # A loop that carries a lost register renames it; the slot that spilled it is dropped
     # there too, so a reload in the body reads the register, not the dangling name.
@@ -17513,9 +17556,9 @@ def test_a_value_a_join_lost_is_not_read_back_from_a_slot_as_the_register():
                 "LH", ("ldur", "x9, [x29, #-8]"), ("stur", "x9, [x20, #0x40]"),
                 ("add", "x6, x6, #1"), ("subs", "x3, x3, #1"), ("cbnz", "x3, @LH"),
                 ("stur", "x6, [x20, #0x48]")])
-    # Still not x6, the value the join lost. Not x9 either now: the reload says the read
-    # it is rather than keeping the load's own register (#198).
-    assert _reads_frame(out, "x20.field_0x41"), out
+    # Still not x6, which the loop steps. The slot holds the join's name, written once
+    # above the loop, and the reload reads that on every trip (#409).
+    assert "x20.field_0x41 = t0;" in out, out
     assert "x20.field_0x41 = x6;" not in out, out
 
     # A lost value tied in only the else arm of a join: the slot is dropped, not left
@@ -17525,7 +17568,7 @@ def test_a_value_a_join_lost_is_not_read_back_from_a_slot_as_the_register():
                 "F", ("ldur", "x6, [x1, #0x17]"), "G", ("stur", "x6, [x29, #-8]"),
                 "M", ("stur", "x6, [x29, #-8]"), ("ldur", "x6, [x1, #0x1f]"),
                 ("ldur", "x9, [x29, #-8]"), ("stur", "x9, [x20, #0x27]")])
-    assert _reads_frame(out, "x20.field_0x28"), out
+    assert out[-2:] == ["x20.field_0x28 = t1;", "return x0;"], out
     assert "x20.field_0x28 = x6;" not in out, out
 
 
@@ -18481,9 +18524,10 @@ def test_a_store_through_a_base_the_join_lost_names_it_unknown():
     got = lift([("cbz", "x3, #0x10"), ("ldur", "x2, [x2, #7]"), ("b", "#0x14"),
                 ("nop", ""), ("mov", "x2, x4"),
                 ("stur", "x1, [x2, #0xb]"), ("ret", "")])
-    assert got[:3] == ["if (x3 == 0) {", "L_0x10:", "}"], got
-    assert got[3] == "var t0;", got
-    assert got[4] == "t0.field_0xc = x1;", got
+    # Since #409 the join has a name, so the base is known and no longer `var t0;`
+    # with nothing assigned to it.
+    assert got[:8] == ["var t0;", "if (x3 != 0) {", "t0 = x2.field_0x8;", "} else {",
+                       "L_0x10:", "t0 = x4;", "}", "t0.field_0xc = x1;"], got
     # Where the arms AGREE the register is not lost and keeps its own name, which is the
     # value the function came in with and reads right.
     agree = lift([("cbz", "x3, #0x10"), ("mov", "x5, #1"), ("b", "#0x14"),
@@ -20735,10 +20779,11 @@ def test_a_name_holds_only_while_the_register_holds_what_it_came_in_with():
     # rewritten on the straight line: the value that was moved in
     assert lift([("mov", "x2, x5"), ("ldur", "x0, [x2, #7]"), ("ret", "")]) == (
         "  return a3.field_0x8;")
-    # rewritten on one arm of a join: bare after it
+    # rewritten on one arm of a join: the join's name after it (#409)
     body = lift([("cbz", "x3, #0xc"), ("mov", "x2, x5"), ("b", "#0xc"),
                  ("ldur", "x0, [x2, #7]"), ("ret", "")])
-    assert "x2.field_0x8" in body and "a1" not in body, body
+    assert "t0 = a3;" in body and "return t0.field_0x8;" in body, body
+    assert "x2.field_0x8" not in body and "a1" not in body, body
     # destroyed by a call: a fresh name for a value nobody knows, never the argument
     body = lift([("bl", "#0x100", "  ; -> foo"), ("ldur", "x0, [x2, #7]"), ("ret", "")])
     assert "return t0.field_0x8;" in body and "a1" not in body, body
@@ -21964,13 +22009,13 @@ def test_copywith_on_the_clean_fixture_untags_its_named_argument_index_signed():
     import io
     from jadart import cli
     body = [ln.strip() for ln in jadart.decompile(CLEAN, "0x5d10")[0]["body"]]
-    assert "t0 = ((x2 << 1) + 2).toSigned(32) >> 1;" in body, body
+    assert "t2 = ((t0 << 1) + 2).toSigned(32) >> 1;" in body, body
     assert sum(".toSigned(32) >> 1;" in ln for ln in body) == 6, body
     assert not [ln for ln in body if ".toUnsigned(32) >> 1" in ln], body
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         assert cli.main(["lift", CLEAN, "0x5d10"]) == 0
-    assert "t5 = ((t4 << 1) + 2).toSigned(32) >> 1;" in out.getvalue(), out.getvalue()
+    assert "t2 = ((t0 << 1) + 2).toSigned(32) >> 1;" in out.getvalue(), out.getvalue()
 
 
 def test_a_width_conversion_is_neither_a_call_nor_a_read_of_memory():
@@ -22247,10 +22292,11 @@ def test_a_read_through_x29_past_a_write_that_is_not_the_frame_reads_its_value()
     # Two write-backs through it are its own, not FP's moves for `_frame_plan`.
     assert lift([("mov", "x29, x9"), ("ldr", "x2, [x29, #8]!"), ("ldr", "x3, [x29, #8]!"),
                  ("add", "x0, x29, #8"), ("ret", "")])[-1] == "return x29 + 8;"
-    # Where only one way in wrote it, x29 is the register, and no slot is claimed.
+    # Where only one way in wrote it, the join has a name, and no slot is claimed.
     assert lift([("cbz", "x2, #0xc"), ("ldr", "x29, [x0, #8]"), ("nop", ""),
                  ("ldur", "x0, [x29, #-8]"), ("ret", "")]) == [
-        "return (x29 - 8).field_0x1;"]
+        "var t0 = x29;", "if (x2 != 0) {", "t0 = x0.field_0x9;", "}",
+        "return (t0 - 8).field_0x1;"]
     # The frame chain prints as it did: the push and the pop, and an FFI frame's, whose
     # pop off SP comes right after `mov x15, x29`. Without that move a pop off SP puts
     # what was pushed in x29, and is the value it reads as.
@@ -22294,9 +22340,9 @@ def test_x29_and_x30_read_as_their_role_again_where_the_frame_chain_gives_it_bac
     # At a join: the way that lost it and got it back, and the one that never lost it.
     assert lift([("cbz", "x2, #0x10"), lose, ("nop", ""), ("mov", "x29, x15"),
                  ("mov", "x0, x29"), ("ret", "")]) == ["return FP;"]
-    # And the way that lost it and did not is still a register where they meet.
-    assert lift([("cbz", "x2, #0xc"), lose, ("mov", "x0, x29"), ("ret", "")]) == [
-        "return x0;"]
+    # And the way that lost it and the one that did not meet under a name (#409).
+    assert lift([("cbz", "x2, #0x8"), lose, ("mov", "x0, x29"), ("ret", "")]) == [
+        "var t0 = x29;", "if (x2 != 0) {", "t0 = x0.field_0x9;", "}", "return t0;"]
     # LR: the pair's pop puts the return address back.
     assert lift([("ldr", "x30, [x0, #8]"), ("ldp", "x29, x30, [x15], #0x10"),
                  ("mov", "x0, x30"), ("ret", "")]) == ["return LR;"]
@@ -22985,7 +23031,7 @@ def test_a_body_walked_again_tells_the_reads_before_an_allocation_from_those_aft
     counts are that walk's: kept with what the walks share, an earlier walk's were
     searched along with this one's, and the read before the allocation was named with
     the one after, `var t4 = x13[t2]; var t5 = x12[t2];`. The loop is the `pinned`
-    one of `_GOTO_SHAPES`, which takes three walks; only the read after is named, and
+    one of `_GOTO_SHAPES`, which takes two walks; only the read after is named, and
     main, with no such rule, names neither."""
     from jadart import expr
     loop = [r[1:] for r in _GOTO_SHAPES["pinned"][0][:13]]
@@ -23001,7 +23047,7 @@ def test_a_body_walked_again_tells_the_reads_before_an_allocation_from_those_aft
             ("mov", "x6, x0"), ("add", "x0, x5, x7"))
     finally:
         expr.Lifter.__init__ = init
-    assert len(walks) == 3, walks
+    assert len(walks) == 2, walks
     assert got[-6:] == [
         "t3 = THR.field_0x50;", "THR.field_0x50 += 48;", "(t3 + 1).tags = x2;",
         "var t4 = x12[t2];", "(t3 + 1).field_0x18 = t1;", "return x13[t2] + t4;"], got
@@ -26252,8 +26298,10 @@ def test_a_join_past_a_raw_write_names_what_each_way_in_left():
         got = _lift_rows([(mn, ops)] + then[1:])
         assert got[0] == f"{mn} {ops}" and got[1:] == [
             "var t0 = x3;", "if (x1 != 0) {", "t0 = 7;", "}", "return t0;"], (mn, got)
+    # With no raw line it printed `return x3;`, the same wrong line (#409).
     assert _lift_rows([("cbz", "x1, #0x8"), ("mov", "x3, #7"), ("mov", "x0, x3"),
-                       ("ret", "")]) == ["return x3;"]
+                       ("ret", "")]) == [
+        "var t0 = x3;", "if (x1 != 0) {", "t0 = 7;", "}", "return t0;"]
 
 
 def test_joins_past_raw_writes_cost_the_same_per_row_at_any_length():
@@ -27125,6 +27173,260 @@ def test_lift_json_fields_are_kept_when_the_body_is_printed_flat():
     assert got == {"calls": [{"name": "Foo", "kind": "direct", "count": 2},
                              {"name": "x5", "kind": "indirect"}],
                    "strings": []}, got
+
+def test_a_join_of_two_moves_has_a_name_the_lines_after_it_read():
+    """`cbz x5, 1f; mov x2, x6; b 2f; 1: mov x2, x4; 2: mov x1, x2; mov x2, #9; bl f`
+    printed `f(x2, 9)` under no branch at all: the machine passes x6 or x4 and never
+    the x2 it came in with (#409). A join of two plain values, a name, a constant or a
+    field read on each way in, was left as the bare register, and a bare register
+    past the join reads as the value on entry. It has a name now, as a join of two
+    computed values has: read through a copy, through a temporary computed from it,
+    past the call, by a plain return, with one way in that writes nothing, and with
+    three ways in."""
+    two = dict(arity=lambda pc: 2)
+    join = [("cbz", "x5, #0xc"), ("mov", "x2, x6"), ("b", "#0x10"), ("mov", "x2, x4")]
+    named = ["var t0;", "if (x5 != 0) {", "t0 = x6;", "} else {", "t0 = x4;", "}"]
+    call = [("mov", "x2, #9"), ("bl", "#0x100")]
+    assert _lift_rows(join + [("mov", "x1, x2")] + call + [("ret", "")], **two) == \
+        named + ["return sub_0x100(t0, 9);"]
+    assert _lift_rows(join + [("add", "x3, x2, #1"), ("mov", "x1, x3")] + call
+                      + [("ret", "")], **two) == named + ["return sub_0x100(t0 + 1, 9);"]
+    # x1 past the call is the call's to clobber, so the return reads the name the call
+    # declares for it, as it did; the argument is the join's.
+    assert _lift_rows(join + [("mov", "x1, x2")] + call + [("mov", "x0, x1"),
+                      ("ret", "")], **two) == named + [
+        "var t1;", "sub_0x100(t0, 9);", "return t1;"]
+    assert _lift_rows(join + [("mov", "x0, x2"), ("ret", "")]) == named + ["return t0;"]
+    # One way in writes nothing: the name starts as what the register came in with.
+    assert _lift_rows([("cbz", "x5, #0x8"), ("mov", "x2, x6"), ("mov", "x0, x2"),
+                       ("ret", "")]) == [
+        "var t0 = x2;", "if (x5 != 0) {", "t0 = x6;", "}", "return t0;"]
+    # Three ways in, as the issue's comment has it: it printed `return x3;`.
+    assert _lift_rows([("cbz", "x1, #0x18"), ("cbz", "x2, #0x10"), ("mov", "x3, #1"),
+                       ("b", "#0x1c"), ("mov", "x3, #2"), ("b", "#0x1c"),
+                       ("mov", "x3, #3"), ("mov", "x0, x3"), ("ret", "")]) == [
+        "var t1;", "if (x1 != 0) {", "var t0;", "if (x2 != 0) {", "t0 = 1;", "} else {",
+        "t0 = 2;", "}", "t1 = t0;", "} else {", "t1 = 3;", "}", "return t1;"]
+
+
+def test_a_join_one_way_in_lost_the_register_at_stays_the_register():
+    """A guard, which passes on main: where one way in changed the register and ends
+    with it spelled as itself, that way has no value to give a name, so the join stays
+    the bare register, which is a gap and says nothing false (#409). Here the slow
+    path of an allocation pushes q0, calls the stub and pops q0 again."""
+    stub = "  ; -> _iso_stub_AllocateDoubleStub"
+    rows = [("ldur", "d0, [x0, #7]", ""), ("cbz", "x5, #0x14", ""),
+            ("str", "q0, [x15, #-0x10]!", ""), ("bl", "#0x100", stub),
+            ("ldr", "q0, [x15], #0x10", ""), ("stur", "d0, [x1, #7]", ""),
+            ("ret", "", "")]
+    from jadart.expr import lift_function
+    got = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, note) for i, (mn, op, note) in enumerate(rows)])]
+    assert "t5.field_0x8 = d0;" in got, got
+    assert not [ln for ln in got if re.search(r"t\d+ = d0;", ln)], got
+
+
+def test_naming_plain_joins_costs_the_same_per_row_at_any_length():
+    # The cost, counted and not timed: a name for a join of plain values adds no walk
+    # that grows with the joins (#409). The counts hold on main as well; what fails
+    # there is the store at the end, which read the bare x3. Two shapes: one-armed
+    # joins in a row, each writing x3, and joins nested inside each other after a raw
+    # write to x3 or a write the lifter models.
+    import jadart.expr as expr
+    real, calls = expr.Lifter._lift_block, [0]
+
+    def counted(self, addr, st):
+        calls[0] += 1
+        return real(self, addr, st)
+
+    def row(n):
+        rows = []
+        for i in range(n):
+            rows += [("cbz", f"x{1 + i % 2}, #{(len(rows) + 2) * 4:#x}"),
+                     ("mov", f"x3, #{i % 100}")]
+        return rows
+
+    def nest(n, first):
+        rows, end = [(first, "x3, x5, x6")], (1 + 2 * n) * 4
+        for i in range(n):
+            rows += [("cbz", f"x{1 + i % 2}, #{end:#x}"), ("mov", f"x3, #{i % 100}")]
+        return rows
+
+    def per_row(rows):
+        calls[0] = 0
+        got = _lift_rows(rows + [("stur", "x3, [x11, #15]"), ("ret", "")])
+        assert re.fullmatch(r"x11\.field_0x10 = t\d+;", got[-2]), got[-2:]
+        return calls[0] / len(rows)
+    expr.Lifter._lift_block = counted
+    try:
+        for shape in (row, lambda n: nest(n, "umulh"), lambda n: nest(n, "mul")):
+            small, large = per_row(shape(100)), per_row(shape(400))
+            assert 0 < large <= small * 1.25 + 1, (small, large)
+    finally:
+        expr.Lifter._lift_block = real
+
+
+def test_a_join_a_goto_reaches_has_a_name_every_way_in_writes():
+    """`umulh x3, x5, x6; cbz x1, 1f; mov x3, #7; cbz x2, 2f; 1: add x4, x4, #1; 2: mov
+    x0, x3` printed `t0 = 7;` on the way that jumps to `2:` and `t0 = x3;` under the
+    label `1:`, which both other ways reach: one with the `umulh` in x3 and one with
+    7, and the 7 read as the `umulh` (#414). Only a register a loop carries had a
+    name at a join a goto reaches. Each register the ways in disagree about and the
+    code after it reads has one now, written on every edge into the join: by the
+    block that falls into the label, above it, and before each goto."""
+    tail = [("cbz", "x1, #0x10"), ("mov", "x3, #7"), ("cbz", "x2, #0x14"),
+            ("add", "x4, x4, #1"), ("mov", "x0, x3"), ("ret", "")]
+    assert _lift_rows([("umulh", "x3, x5, x6")] + tail) == [
+        "var t0;", "var t1;", "umulh x3, x5, x6", "if (x1 != 0) {", "t1 = 7;",
+        "if (x2 != 0) {", "t0 = 7;", "L_0x10:", "t1 = t0;", "}", "} else {",
+        "t0 = x3;", "goto L_0x10;", "}", "return t1;"]
+    # With no raw line it printed `return x3;` under no branch at all.
+    assert _lift_rows(tail, base=4) == [
+        "var t0;", "var t1;", "if (x1 != 0) {", "t1 = 7;", "if (x2 != 0) {", "t0 = 7;",
+        "L_0x10:", "t1 = t0;", "}", "} else {", "t0 = x3;", "goto L_0x10;", "}",
+        "return t1;"]
+
+
+def test_a_way_into_a_goto_join_that_lost_the_register_leaves_it_bare():
+    """A guard, which passes on main: a way into a join a goto reaches that changed
+    the register and ends with it spelled as itself has no value to give a name, so
+    that register stays bare there, a gap, and the others the ways in disagree about
+    are named (#414). The slow path of an allocation pops q0 after the stub's call."""
+    stub = "  ; -> _iso_stub_AllocateDoubleStub"
+    rows = [("ldur", "d0, [x0, #7]", ""), ("cbz", "x1, #0x18", ""),
+            ("str", "q0, [x15, #-0x10]!", ""), ("bl", "#0x100", stub),
+            ("ldr", "q0, [x15], #0x10", ""), ("cbz", "x2, #0x1c", ""),
+            ("add", "x4, x4, #1", ""), ("stur", "d0, [x3, #7]", ""),
+            ("stur", "x4, [x3, #15]", ""), ("ret", "", "")]
+    from jadart.expr import lift_function
+    got = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, note) for i, (mn, op, note) in enumerate(rows)])]
+    assert re.fullmatch(r"t\d+\.field_0x8 = d0;", got[-3]), got
+    assert re.fullmatch(r"t\d+\.field_0x10 = t\d+;", got[-2]), got
+    assert not [ln for ln in got if re.search(r"t\d+ = d0;", ln)], got
+
+
+def test_naming_goto_joins_takes_no_more_walks_as_they_grow():
+    # A guard on the cost, counted and not timed, which passes on main: naming the
+    # joins takes the two walks the function took before, however many there are and
+    # whichever names a way in could not set, and the blocks lifted per row do not
+    # grow either (#414). Each unit is two joins a goto reaches; in the second shape
+    # every way in that falls through has lost d0 at a stub's call, and in the third
+    # every other.
+    import jadart.expr as expr
+    from jadart.expr import lift_function
+    init, block, made, calls = expr.Lifter.__init__, expr.Lifter._lift_block, [0], [0]
+    stub = "  ; -> _iso_stub_AllocateDoubleStub"
+
+    def counted_init(self, *args, **kw):
+        made[0] += 1
+        return init(self, *args, **kw)
+
+    def counted_block(self, addr, st):
+        calls[0] += 1
+        return block(self, addr, st)
+
+    def chain(n, lost):
+        rows = [("ldur", "d0, [x0, #7]", "")]
+        for i in range(n):
+            at = len(rows)
+            if lost and i % lost == 0:
+                rows += [("cbz", f"x1, #{(at + 5) * 4:#x}", ""),
+                         ("str", "q0, [x15, #-0x10]!", ""), ("bl", "#0x100000", stub),
+                         ("ldr", "q0, [x15], #0x10", ""),
+                         ("cbz", f"x2, #{(at + 6) * 4:#x}", ""),
+                         ("add", "x4, x4, #1", "")]
+            else:
+                rows += [("cbz", f"x1, #{(at + 3) * 4:#x}", ""), ("mov", "x3, x6", ""),
+                         ("cbz", f"x2, #{(at + 4) * 4:#x}", ""),
+                         ("add", "x4, x4, #1", "")]
+        return rows + [("stur", "d0, [x11, #15]", ""), ("stur", "x3, [x11, #23]", ""),
+                       ("stur", "x4, [x11, #31]", ""), ("ret", "", "")]
+
+    def cost(n, lost):
+        rows = chain(n, lost)
+        made[0] = calls[0] = 0
+        lift_function([(i * 4, mn, op, note) for i, (mn, op, note) in enumerate(rows)])
+        return made[0], calls[0] / len(rows)
+    expr.Lifter.__init__, expr.Lifter._lift_block = counted_init, counted_block
+    try:
+        for lost in (0, 1, 2):
+            (walks, small), (more, large) = cost(50, lost), cost(200, lost)
+            # Two: one that finds the joins and one that names them. The names a
+            # way in could not set are counted off the first and not walked for.
+            assert walks == more == 2, (lost, walks, more)
+            assert 0 < large <= small * 1.25 + 1, (lost, small, large)
+    finally:
+        expr.Lifter.__init__, expr.Lifter._lift_block = init, block
+
+
+def test_an_if_only_a_plain_join_would_print_reads_no_lost_condition():
+    """`add x2, x4, #8` in a loop leaves x2 holding a value no line prints, and
+    `cbnz x2, 1f; mov x4, #5; 1: mov x0, x4` after the loop joins two plain values
+    under that x2. Naming the join printed `if (x2 == 0) {` for it, the one line that
+    reads x2 and reads it as the x2 the function came in with (#409). An `if` that
+    printed nothing before such a join had a name prints nothing now where its
+    condition reads a register a loop wrote and its exit dropped: the first shape is
+    as it was on main, the others have the names main did not give them."""
+    loop = [("add", "x2, x4, #8"), ("sub", "x7, x7, #1"), ("cbnz", "x7, #0x0")]
+    tail = [("mov", "x4, #5"), ("mov", "x0, x4"), ("ret", "")]
+    got = _lift_rows(loop + [("cbnz", "x2, #0x14")] + tail)
+    assert not [ln for ln in got if "x2" in ln] and got[-1] == "return x4;", got
+    # Under a register nothing wrote the join has its name, and so it has under the
+    # lost one where the `if` prints for an arm that computed something as well.
+    assert _lift_rows(loop + [("cbnz", "x3, #0x14")] + tail)[-5:] == [
+        "var t1 = x4;", "if (x3 == 0) {", "t1 = 5;", "}", "return t1;"]
+    both = _lift_rows(loop + [("cbnz", "x2, #0x18"), ("mov", "x4, #5"),
+                              ("add", "x5, x5, #1"), ("mov", "x0, x4"),
+                              ("stur", "x5, [x0, #7]"), ("ret", "")])
+    assert both[-6:] == ["if (x2 == 0) {", "t1 = 5;", "t2 = x5 + 1;", "}",
+                         "t1.field_0x8 = t2;", "return t1;"], both
+    # And x2 written and put back with no loop between is the x2 that came in.
+    back = _lift_rows([("mov", "x6, x2"), ("add", "x2, x4, #8"), ("mov", "x2, x6"),
+                       ("cbnz", "x2, #0x14")] + tail)
+    assert back == ["var t0 = x4;", "if (x2 == 0) {", "t0 = 5;", "}", "return t0;"], back
+
+
+def test_a_run_of_joins_that_each_lose_the_next_is_not_walked_try_by_try():
+    # The cost, counted and not timed: each join here reads the name of the one before
+    # through an `if`, the first has a way in that lost x3, and so every walk made
+    # without the lost one finds the next lost. Three tries end with only what a loop
+    # carries named. They were three walks of the whole function and a fourth for the
+    # answer; the walk that names every join says which ones lean on which, so the
+    # second and third are counted and three walks are made, at any length (#414).
+    import jadart.expr as expr
+    from jadart.expr import lift_function
+    init, made = expr.Lifter.__init__, [0]
+
+    def counted_init(self, *args, **kw):
+        made[0] += 1
+        return init(self, *args, **kw)
+
+    def cliff(n):
+        rows = [("cbz", "x1, #0x18"), ("mov", "x3, #7"), ("cbz", "x2, #0x1c"),
+                ("mov", "x3, #8"), ("cbz", "x5, #0x18"), ("mov", "x3, #9"),
+                ("add", "x4, x4, #1")]
+        for i in range(n):
+            at = len(rows)
+            rows += [("cbz", f"x1, #{(at + 3) * 4:#x}"), ("mov", f"x3, #{10 + i % 50}"),
+                     ("cbz", f"x2, #{(at + 4) * 4:#x}"), ("add", "x4, x4, #1")]
+        return rows + [("stur", "x3, [x11, #23]"), ("stur", "x4, [x11, #31]"),
+                       ("ret", "")]
+
+    def walks(n):
+        made[0] = 0
+        got = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(cliff(n))])
+        return made[0], got
+    expr.Lifter.__init__ = counted_init
+    try:
+        (few, small), (many, large) = walks(8), walks(60)
+    finally:
+        expr.Lifter.__init__ = init
+    assert few == many == 3, (few, many)
+    # No join a goto reaches kept a name: the labels read what the `if`s named.
+    assert not [ln for ln in large if ln.strip() == "t2 = x3;"], large[:30]
+    assert len(small) == 97 and len(large) == 617, (len(small), len(large))
+
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
