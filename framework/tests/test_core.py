@@ -993,7 +993,7 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
             # the function came in with (#198). The name comes from there and not from
             # `_slot_crossings`, which is what this case is about and what the assertion
             # on `named` below still checks.
-            m = re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;", body)
+            m = re.search(r"var (t\d+) = \(FP - 16\)\.field_0x0;", body)
             assert m and f"return {m.group(1)};" in body, (why, body)
             # Two names now. The call declares what it left in x6, which the loop reads
             # again, where a bare x6 read as the value the function came in with (#176).
@@ -1019,7 +1019,7 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
     # Neither spill is named, and the reload at the end says the read it is rather than
     # keeping x0, which read as the value the function came in with (#198).
     assert "x20.field_0xc" not in body and "x2.field_0xc" not in body, body
-    m = re.search(r"var (t\d+) = \(FP - 24\)\.field_0x1;", body)
+    m = re.search(r"var (t\d+) = \(FP - 24\)\.field_0x0;", body)
     assert m and f"return {m.group(1)};" in body, body
     assert named([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
                   ("bl", "#0x100"), ("ldur", "x2, [x29, #-0x10]"),
@@ -1047,7 +1047,7 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
         assert not re.search(r"\{\n\s*\}", body), body
         # The join forgot the slot, so the reload says the read rather than keeping x0,
         # which read as the value the function came in with (#198).
-        m = re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;", body)
+        m = re.search(r"var (t\d+) = \(FP - 16\)\.field_0x0;", body)
         assert m and f"return {m.group(1)};" in body, body
         # Two names: the arm's, and the reload after the call, which says the read it
         # is rather than keeping x0 (#198).
@@ -1088,7 +1088,7 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
     # field itself is in the body, folded back into the condition above.
     assert not re.search(r"var t\d+ = x20\.field_0xc;", body), body
     assert body.count("var ") == 2 and re.search(r"var t\d+;", body), body
-    assert re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;\n\s*return \1;", body), body
+    assert re.search(r"var (t\d+) = \(FP - 16\)\.field_0x0;\n\s*return \1;", body), body
     assert named([("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x10]"),
                   ("cbz", "x4, #0x10"), ("bl", "#0x200"), ("mov", "x6, #0"),
                   ("bl", "#0x100"), ("stur", "x6, [x29, #-0xc]"),
@@ -1105,7 +1105,7 @@ def test_a_spilled_field_is_named_where_it_is_stored_when_a_call_comes_between()
         # Two names: the loop's call declares what it left in x6, which the loop reads
         # again (#176). The fold is still not named, which is what this case is for.
         assert body.count("var ") == 2 and re.search(r"var t\d+;", body), (want, body)
-        assert re.search(r"var (t\d+) = \(FP - 16\)\.field_0x1;\n\s*return \1;",
+        assert re.search(r"var (t\d+) = \(FP - 16\)\.field_0x0;\n\s*return \1;",
                          body), (want, body)
         assert named(_then_forget(rows)), want              # named, then found unread
     # ...and a value that reads no memory cannot be changed by the callee.
@@ -14533,7 +14533,7 @@ def test_an_access_of_sixteen_bytes_says_so_and_not_eight():
     got = lift(frame)
     # The base is the name the call declares for x2, which it clobbers like any other
     # volatile register (#216).
-    assert ["var t2 = (FP - 24).field16_0x1;", "t0.field16_0x10 = t2;"] == [
+    assert ["var t2 = (FP - 24).field16_0x0;", "t0.field16_0x10 = t2;"] == [
         ln for ln in got if "field16" in ln], got
     # A narrower access through that file still declines rather than claim a width: an
     # `s` read is four bytes and a masked double is not what the machine loaded.
@@ -14622,7 +14622,7 @@ def test_a_displacement_below_the_base_is_not_a_negative_field_offset():
     # displacement rather than the biased offset: the address is base + disp either way.
     # THR - 8 is one byte below where the old spelling's `THR.field_0x-8` would have read.
     assert lift([("ldur", "x2, [x26, #-8]"), ("mov", "x0, x2"), ("ret", "")])[0] == \
-        "return (THR - 8).field_0x1;"
+        "return (THR - 8).field_0x0;"
 
 
 def test_a_copy_of_thr_is_read_and_written_at_the_offset_as_written():
@@ -14644,7 +14644,7 @@ def test_a_copy_of_thr_is_read_and_written_at_the_offset_as_written():
     got = lift([("mov", "x25, x26"), ("mov", "x0, x25"), ("str", "x1, [x0, #0x6c8]"),
                 ("ldur", "x2, [x25, #-8]"), ("stur", "x2, [x19, #7]"), ("ret", "")])
     assert got[:2] == ["THR.field_0x6c8 = x1;",
-                       "x19.field_0x8 = (THR - 8).field_0x1;"], got
+                       "x19.field_0x8 = (THR - 8).field_0x0;"], got
     # An element off a copy keeps its displacement, as one off x26 does. It was
     # dropped, which named another slot.
     assert lift([("mov", "x25, x26"), ("add", "x0, x25, x1, lsl #3"),
@@ -15360,7 +15360,7 @@ def test_a_frame_slot_past_the_displacement_is_its_own_slot():
     assert re.fullmatch(r"str x1, \[x29, x17\]   // x1 holds t\d+, x17 holds t\d+",
                         got[3]), got
     assert "0x158" not in "\n".join(got), got
-    m = re.fullmatch(r"var (t\d+) = \(FP - 0x160\)\.field_0x1;", got[4])
+    m = re.fullmatch(r"var (t\d+) = \(FP - 0x160\)\.field_0x0;", got[4])
     assert m and got[5] == f"return {m.group(1)};", got
     # ...and the 5 is gone with it: the call declares what it left in x17, where a bare
     # x17 read as the value the function came in with (#176).
@@ -15378,7 +15378,7 @@ def test_a_frame_slot_past_the_displacement_is_its_own_slot():
     # written any slot.
     assert lift([("stur", "x2, [x29, #-8]"), ("str", "x1, [x29, x3]"),
                  ("ldur", "x0, [x29, #-8]")]) == [
-        "str x1, [x29, x3]", "var t0 = (FP - 8).field_0x1;", "return t0;"]
+        "str x1, [x29, x3]", "var t0 = (FP - 8).field_0x0;", "return t0;"]
     assert lift([("stur", "x2, [x29, #-8]"), ("ldr", "x0, [x29, x3]")]) == [
         "ldr x0, [x29, x3]", "return x0;"]
     # A loop that stores through one rewrites every slot, the -8 it reloads too, off SP
@@ -15390,14 +15390,14 @@ def test_a_frame_slot_past_the_displacement_is_its_own_slot():
                     ("stur", "x0, [x1, #7]"), ("str", f"x3, [{base}, x4]"),
                     ("cbnz", "x5, #4")])
         # (t1, after `var t0 = x0;`: the x0 the code past the loop returns, #468)
-        assert ["var t1 = (FP - 8).field_0x1;", "x1.field_0x8 = t1;"] == got[2:4], got
+        assert ["var t1 = (FP - 8).field_0x0;", "x1.field_0x8 = t1;"] == got[2:4], got
     # Only an offset set in the same block counts: x17 here is -0x158 or -0x160.
     assert lift([("mov", "x17, #-0x158"), ("cbz", "x5, #0xc"), ("mov", "x17, #-0x160"),
                  ("str", "x1, [x29, x17]"), ("mov", "x17, #-0x158"),
                  ("ldr", "x0, [x29, x17]")]) == [
         "var t0 = -0x158;", "if (x5 != 0) {", "t0 = -0x160;", "}",
         "str x1, [x29, x17]   // x17 holds t0",
-        "var t1 = (FP - 0x158).field_0x1;", "return t1;"]
+        "var t1 = (FP - 0x158).field_0x0;", "return t1;"]
 
 
 def test_a_register_list_load_writes_every_register_in_it():
@@ -15669,12 +15669,12 @@ def test_registers_saved_round_a_call_are_not_its_arguments():
     # x0 is what was saved, but spelled exactly like a reload that had given up (#198).
     saved = call([("str", "x0, [x15, #-8]!"), ("mov", "x0, #0x46"), ("bl", "#0x100"),
                   ("ldr", "x0, [x15], #8")])
-    assert saved == ["sub_0x100(...);", "var t0 = SP.field_0x1;", "return t0;"], saved
+    assert saved == ["sub_0x100(...);", "var t0 = SP.field_0x0;", "return t0;"], saved
     # a pair saved with stp and reloaded with ldp, as 0x18d4e4 does. Only x0 is read
     # again, so only x0's half is named.
     pair = call([("stp", "x0, x1, [x15, #-0x10]!"), ("mov", "x0, #0x42"),
                  ("bl", "#0x100"), ("ldp", "x0, x1, [x15], #0x10")])
-    assert pair == ["sub_0x100(...);", "var t0 = SP.field_0x1;", "return t0;"], pair
+    assert pair == ["sub_0x100(...);", "var t0 = SP.field_0x0;", "return t0;"], pair
     # the same push with no reload after is a real argument and still reads.
     arg = call([("str", "x0, [x15, #-8]!"), ("bl", "#0x100")])
     assert arg == ["return sub_0x100(x0);"], arg
@@ -16690,14 +16690,14 @@ def test_a_double_result_read_past_the_next_instruction_is_named():
     # to, so it names the read rather than keeping x0 (#198); the result is still the
     # call's, which is what this test is about.
     assert lift(reload, "d0")[:3] == [
-        "var t0 = foo(...);", "var t1 = (FP - 8).field_0x1;", "t1.field_0x8 = t0;"]
+        "var t0 = foo(...);", "var t1 = (FP - 8).field_0x0;", "t1.field_0x8 = t0;"]
     assert lift(reload, None)[:3] == [
-        "foo(...);", "var t0 = (FP - 8).field_0x1;", "t0.field_0x8 = d0;"]
+        "foo(...);", "var t0 = (FP - 8).field_0x0;", "t0.field_0x8 = d0;"]
     # Where the callers say nothing, the callee's own code decides (code_d0).
     assert lift(reload, None, own=True)[:3] == [
-        "var t0 = foo(...);", "var t1 = (FP - 8).field_0x1;", "t1.field_0x8 = t0;"]
+        "var t0 = foo(...);", "var t1 = (FP - 8).field_0x0;", "t1.field_0x8 = t0;"]
     assert lift(reload, None, own=False)[:3] == [
-        "foo(...);", "var t0 = (FP - 8).field_0x1;", "t0.field_0x8 = d0;"]
+        "foo(...);", "var t0 = (FP - 8).field_0x0;", "t0.field_0x8 = d0;"]
     mixed = [("cbz", "x1, #0x10", ""), ("bl", "#0x100", "  ; -> foo"), ("b", "#0x14", ""),
              ("nop", "", ""), ("fmov", "d0, #1.0", ""), ("ret", "", "")]
     # (the `nop` nothing reaches goes after the body, and its goto names the else arm)
@@ -17443,7 +17443,7 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     # the reload now names the read as well, rather than keeping q1, which the printed
     # body never assigns; where the slot survives, q0 IS what it holds, the register the
     # function came in with, and that reads right.
-    assert ["var t1 = (FP - 32).field16_0x1;", "x2.field16_0x10 = t1;"] == [
+    assert ["var t1 = (FP - 32).field16_0x0;", "x2.field16_0x10 = t1;"] == [
         l for l in wide(("stur", "x5, [x29, #-0x18]")) if "field16" in l]
     assert "x2.field16_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x10]"))
     assert "x2.field16_0x10 = q0;" in wide(("stur", "x5, [x29, #-0x28]"))
@@ -17462,7 +17462,7 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
         # Anchored to the frame the function was entered with, not spelled off the live
         # SP: this shape's frame is 0x50, so the read 8 above SP is FP - 72, and it stays
         # that whatever the loop did to SP in between (#207).
-        m = [re.fullmatch(r"var (t\d+) = \(FP - 72\)\.field_0x1;", l) for l in out]
+        m = [re.fullmatch(r"var (t\d+) = \(FP - 72\)\.field_0x0;", l) for l in out]
         named = next((g.group(1) for g in m if g), None)
         assert named and f"x2.field_0x10 = {named};" in out, out
     # A text that reads memory goes where the loop stores to memory or calls, and one
@@ -17473,7 +17473,7 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     out = counted(("stur", "x5, [x1, #7]"), before=field)
     # The store took the slot, so the reload says the read rather than keeping x6, which
     # read as the value the function came in with (#198).
-    m = re.fullmatch(r"var (t\d+) = \(FP - 32\)\.field_0x1;", out[-3])
+    m = re.fullmatch(r"var (t\d+) = \(FP - 32\)\.field_0x0;", out[-3])
     assert m and out[-2] == f"x2.field_0x10 = {m.group(1)};", out
     # Across a call it has a name from before the loop (_slot_crossings), which holds.
     out = counted(("bl", "#0x100"), before=field)
@@ -17769,7 +17769,7 @@ def test_a_declined_frame_read_is_not_scored_as_a_disagreement():
     this shape. A spill to a frame slot is tracked in the slot map and printed as
     nothing, so the CPU's slot holds the register it spilled while the printed body's
     still holds the bytes the run started with, and the read #198 prints where the reload
-    declines, `var t1 = (FP - 24).field_0x1;`, is the one line that reads one of each.
+    declines, `var t1 = (FP - 24).field_0x0;`, is the one line that reads one of each.
     The text is right; the harness was comparing two different images and calling the gap
     a wrong answer, which is the one thing an oracle may not do.
 
@@ -17798,7 +17798,7 @@ def test_a_declined_frame_read_is_not_scored_as_a_disagreement():
     oracle = pbfuzz.Oracle()
     out = oracle.score(rows, trials=12, seed=7, bind_values=True)
     body = "\n  ".join(l.strip() for l in out[-1])
-    assert "var t1 = (FP - 24).field_0x1;" in body, body   # the shape, still the shape
+    assert "var t1 = (FP - 24).field_0x0;" in body, body   # the shape, still the shape
     assert out[1] == 0, (
         f"the scorer called a declined frame read a disagreement in {out[1]} of 12 "
         f"environments (#238):\n  {body}")
@@ -18056,8 +18056,8 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
     So the rule is `_phi_name`'s, at the other end: always a fresh one, never the
     register. The read is spelled the way the lifter already spells that address when it
     is held in a register, `sub x0, x29, #0x40; ldur x3, [x0, #8]` printing
-    `(FP - 64).field_0x9`, so the negative part of the displacement goes into the base
-    and the field offset carries the tag bias.
+    `(FP - 64).field_0x8`, so the negative part of the displacement goes into the base
+    and the field offset is the one read, with no tag bias (#407).
 
     Every assertion here prints a bare `x3` on main, except the two marked as guards."""
     from jadart.expr import lift_function
@@ -18080,36 +18080,36 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
 
     # A slot the walk never saw a store to, below FP and above SP.
     assert lift([("ldur", "x3, [x29, #-8]")] + keep)[:2] == [
-        "var t0 = (FP - 8).field_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 8).field_0x0;", "x2.field_0x8 = t0;"]
     assert lift([("ldur", "x3, [x15, #0x10]")] + keep)[:2] == [
-        "var t0 = SP.field_0x11;", "x2.field_0x8 = t0;"]
+        "var t0 = SP.field_0x10;", "x2.field_0x8 = t0;"]
     assert lift([("ldur", "x3, [x29]")] + keep)[:2] == [
-        "var t0 = FP.field_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = FP.field_0x0;", "x2.field_0x8 = t0;"]
     # A load narrower than a word says how many bytes it read, where it used to print
     # the eight-byte spelling masked, which said the same thing twice (#221).
     assert lift([("ldurh", "w3, [x29, #-8]")] + keep)[:2] == [
-        "var t0 = (FP - 8).field2_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 8).field2_0x0;", "x2.field_0x8 = t0;"]
     assert lift([("ldurb", "w3, [x29, #-8]")] + keep)[:2] == [
-        "var t0 = (FP - 8).field1_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 8).field1_0x0;", "x2.field_0x8 = t0;"]
     # The SIGN is a separate fact about the destination's 64 bits, and the shift pair is
     # still the only thing that says it.
     assert lift([("ldursh", "x3, [x29, #-8]")] + keep)[:2] == [
-        "var t0 = (FP - 8).field2_0x1 << 48 >> 48;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 8).field2_0x0 << 48 >> 48;", "x2.field_0x8 = t0;"]
     # Four bytes keeps the plain spelling: this target compresses pointers, so a four-byte
     # read is what a reference field read looks like and the width is the representation's
     # rather than the value's (#221).
     assert lift([("ldur", "w3, [x29, #-8]")] + keep)[:2] == [
-        "var t0 = (FP - 8).field_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 8).field_0x0;", "x2.field_0x8 = t0;"]
     # Only the half of a pair that is read again is named.
     assert lift([("ldp", "x3, x4, [x29, #-0x10]")] + keep)[:2] == [
-        "var t0 = (FP - 16).field_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 16).field_0x0;", "x2.field_0x8 = t0;"]
     # The pass that drops a name nothing reads keeps one that is all its block holds: an
     # `if` arm is the walk's to render, and taking its only line prints `if (c) {` with
     # `}` under it. 112 empty blocks in 47 ranges of the clean build shipped without this.
     from jadart.expr import _drop_unread
-    sole = ["  if (c) {", "    var t0 = (FP - 8).field_0x1;", "  }", "  f(x1);"]
+    sole = ["  if (c) {", "    var t0 = (FP - 8).field_0x0;", "  }", "  f(x1);"]
     assert _drop_unread(sole, {"t0"}) == sole, _drop_unread(sole, {"t0"})
-    more = ["  if (c) {", "    var t0 = (FP - 8).field_0x1;", "    f(x1);", "  }"]
+    more = ["  if (c) {", "    var t0 = (FP - 8).field_0x0;", "    f(x1);", "  }"]
     assert _drop_unread(more, {"t0"}) == [more[0], more[2], more[3]]
     # Liveness is keyed by `_regs` and not by `canon`, and the two disagree for the
     # floating-point file. Asking the state key minted a bit that is never live, so every
@@ -18125,7 +18125,7 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
         got = lift([("ldur", f"{r}, [x29, #-8]"), ("stur", f"{r}, [x2, #7]")] + keep)
         assert not any("field_0x" in l and "var " in l for l in got), (r, got)
     assert lift([("ldur", "d3, [x29, #-8]"), ("stur", "d3, [x2, #7]")] + keep)[:2] == [
-        "var t0 = (FP - 8).field_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 8).field_0x0;", "x2.field_0x8 = t0;"]
     # A guard: a register nothing reads again gets no line, because naming it would print
     # a value the reader never meets.
     assert lift([("ldur", "x3, [x29, #-8]"), ("mov", "x3, #1")] + keep)[0] == (
@@ -18142,8 +18142,8 @@ def test_a_declined_frame_reload_names_the_read_and_not_the_register():
     got = lift([("mov", "x9, #3"), "top", ("ldur", "x3, [x29, #-8]"),
                 ("cbz", "x1, @out"), ("sub", "x9, x9, #1"), ("cbnz", "x9, @top"),
                 ("ret", ""), "out", ("stur", "x3, [x2, #7]"), ("ret", "")])
-    assert got[0] == "var t1;" and "t1 = (FP - 8).field_0x1;" in got, got
-    assert "var t1 = (FP - 8).field_0x1;" not in got, got
+    assert got[0] == "var t1;" and "t1 = (FP - 8).field_0x0;" in got, got
+    assert "var t1 = (FP - 8).field_0x0;" not in got, got
 
 
 def test_a_frame_read_off_sp_says_where_it_is_in_the_frame_it_was_entered_with():
@@ -18172,19 +18172,19 @@ def test_a_frame_read_off_sp_says_where_it_is_in_the_frame_it_was_entered_with()
     out = lift(enter + body)
     # A post-indexed load reads where SP is BEFORE its write-back, so the first pop takes
     # the pair 32 bytes under the frame and the second the pair 16 under it.
-    assert ["var t0 = sub_0x100(...);", "var t1 = (FP - 32).field_0x1;",
-            "var t2 = (FP - 16).field_0x1;"] == out[:3], out
+    assert ["var t0 = sub_0x100(...);", "var t1 = (FP - 32).field_0x0;",
+            "var t2 = (FP - 16).field_0x0;"] == out[:3], out
     # Nothing to anchor to without a prologue: FP there is the caller's frame pointer, so
     # the reads stay off SP and the text still stands for both. This is the issue's own
     # listing, and it is the shape the fix does NOT reach.
-    assert [l for l in lift(body) if "field_0x1;" in l] == [
-        "var t1 = SP.field_0x1;", "var t2 = SP.field_0x1;"], lift(body)
+    assert [l for l in lift(body) if "field_0x0;" in l] == [
+        "var t1 = SP.field_0x0;", "var t2 = SP.field_0x0;"], lift(body)
     # An alignment leaves SP known only to within fifteen bytes, which names no address,
     # so the read declines and keeps the spelling that says only "off SP".
     aligned = enter + [("sub", "x15, x15, #0x20"), ("str", "x0, [x15, #8]"),
                        ("and", "x15, x15, #0xfffffffffffffff0"),
                        ("ldr", "x3, [x15, #8]"), ("stur", "x3, [x20, #7]"), ("ret", "")]
-    assert "var t0 = SP.field_0x9;" in lift(aligned), lift(aligned)
+    assert "var t0 = SP.field_0x8;" in lift(aligned), lift(aligned)
 
 
 def test_no_frame_slot_record_outlives_the_path_that_made_it():
@@ -18412,7 +18412,7 @@ def test_a_reload_of_a_dropped_slot_reads_the_value_it_held():
     finally:
         expr.Lifter._reload = real
     assert "x20.field_0x8 = x7.field_0x11;" not in out, out
-    assert ["var t0 = (FP - 8).field_0x1;", "x20.field_0x8 = t0;"] == out[:2], out
+    assert ["var t0 = (FP - 8).field_0x0;", "x20.field_0x8 = t0;"] == out[:2], out
 
     # a register reassigned by a reload off the frame drops the OTHER slots it names, not
     # just the straight-line writes: the slot it reads back is kept (dropping it would
@@ -18668,11 +18668,11 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     # the read rather than keeping d3 (#198).
     assert lift([("stp", "q0, q1, [x29, #-0x20]"), ("ldur", "d3, [x29, #-0x18]"),
                  ("stur", "d3, [x2, #7]")])[:2] == [
-        "var t0 = (FP - 24).field_0x1;", "x2.field_0x8 = t0;"]
+        "var t0 = (FP - 24).field_0x0;", "x2.field_0x8 = t0;"]
     # A write-back store lands off FP where it was, and FP is then 8 lower.
     assert lift([("str", "x0, [x29, #-8]!"), ("ldur", "x3, [x29, #-8]"), keep[0],
                  ("ldr", "x4, [x29]"), ("stur", "x4, [x2, #15]")])[:3] == [
-        "var t0 = (FP - 8).field_0x1;", "x2.field_0x8 = t0;", "x2.field_0x10 = x0;"]
+        "var t0 = (FP - 8).field_0x0;", "x2.field_0x8 = t0;", "x2.field_0x10 = x0;"]
     # Stores `_step` leaves raw: off the frame, also in a loop, and to the heap a field,
     # or a slot holding one, was read from.
     got = lift([("stur", "x0, [x29, #-0x10]"), ("stnp", "x4, x5, [x29, #-0x10]"),
@@ -18895,16 +18895,16 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     # 1. FP moved by a move strip_boilerplate blanks, by arithmetic, and by a load into
     # it; SP by a blanked `sub` or `add`, an `and`, and a load through itself.
     assert lift([spill, ("mov", "x29, x15"), load] + keep)[:2] == gone_at(
-        "(FP - 8).field_0x1")
+        "(FP - 8).field_0x0")
     assert lift(frame(0x20, spill, ("mov", "x29, x15"), load, *keep))[:2] == gone_at(
-        "(FP - 40).field_0x1")
+        "(FP - 40).field_0x0")
     # x29 here is the pointer the `ldr` just put in it, not the frame, so the read is off
     # that value as through any other register, and claims no slot (#307).
     assert lift(frame(0x20, spill, ("ldr", "x29, [x1]"), load, *keep))[:2] == [
         "x2.field_0x8 = (x1.field_0x1 - 8).field_0x1;", "return x0;"]
     # FP moved by an amount known reads its slots where they now are.
     assert lift(frame(0x20, spill, ("add", "x29, x29, #8"), load, *keep))[:2] == gone_at(
-        "FP.field_0x1")
+        "FP.field_0x0")
     assert lift(frame(0x20, spill, ("add", "x29, x29, #8"), ("ldur", "x3, [x29, #-0x10]"),
                       *keep))[0] == held
     push, top = ("str", "x0, [x15, #8]"), ("ldr", "x3, [x15, #8]")
@@ -18913,18 +18913,18 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     # entered with, each says where it really is: the frame is 0x20, so SP sits at FP - 32
     # before the move, and a read 8 above SP follows SP. The alignment is the one that
     # cannot be said, because it leaves SP known only to within 15 bytes (#207).
-    for move, want in ((("sub", "x15, x15, #8"), "(FP - 32).field_0x1"),
-                       (("add", "x15, x15, #8"), "(FP - 16).field_0x1"),
-                       (("and", "x15, x15, #0xfffffffffffffff0"), "SP.field_0x9")):
+    for move, want in ((("sub", "x15, x15, #8"), "(FP - 32).field_0x0"),
+                       (("add", "x15, x15, #8"), "(FP - 16).field_0x0"),
+                       (("and", "x15, x15, #0xfffffffffffffff0"), "SP.field_0x8")):
         assert lift(frame(0x20, push, move, top, *keep))[:2] == gone_at(want), move
     # A load INTO SP is a declined reload of its own, and its name goes unread, so
     # `_drop_unread` takes that line and the slot read keeps the number after it.
     got = lift(frame(0x20, push, ("ldr", "x15, [x15]"), top, *keep))
-    assert lost(got) and not any("SP.field_0x1;" in l for l in got), got
+    assert lost(got) and not any("SP.field_0x0;" in l for l in got), got
     # Dropped rather than moved with SP, so this is a fresh read; the address is the
     # pushed slot's own, which SP - 8 plus 0x10 comes back to, and it now says so (#207).
     assert lift(frame(0x20, push, ("sub", "x15, x15, #8"), ("ldr", "x3, [x15, #0x10]"),
-                      *keep))[:2] == gone_at("(FP - 24).field_0x1")
+                      *keep))[:2] == gone_at("(FP - 24).field_0x0")
     # An FFI call's frame and a leaf call's put FP back where it was: a slot kept from
     # before reads the same after, an access through the moved FP is to where it points,
     # and a store through it changes the slot it lands in.
@@ -19019,7 +19019,7 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     # function came in with, and the name reads as the bits that are there (#198).
     assert lift([spill, ("ldur", "d3, [x29, #-8]"), ("fadd", "d4, d3, d3"),
                  ("stur", "d4, [x2, #7]")])[:2] == [
-        "var t0 = (FP - 8).field_0x1;", "x2.field_0x8 = t0 + t0;"]
+        "var t0 = (FP - 8).field_0x0;", "x2.field_0x8 = t0 + t0;"]
     got = lift([("fadd", "d0, d1, d2"), ("stur", "d0, [x29, #-8]"), load] + keep)
     assert lost(got), got
     assert lift([("fadd", "d0, d1, d2"), ("stur", "d0, [x29, #-8]"),
@@ -22351,10 +22351,10 @@ def test_a_read_through_x29_past_a_write_that_is_not_the_frame_reads_its_value()
     assert lift([("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
                  ("ldur", "x0, [x29, #0x10]"), ("mov", "x15, x29"),
                  ("ldp", "x29, x30, [x15], #0x10"), ("ret", "")]) == [
-        "var t0 = FP.field_0x11;", "return t0;"]
+        "var t0 = FP.field_0x10;", "return t0;"]
     assert lift([("str", "x29, [x15, #-8]!"), ("mov", "x29, x15"), ("mov", "x15, x29"),
                  ("ldr", "x29, [x15], #8"), ("ldur", "x0, [x29, #-8]"), ("ret", "")]) == [
-        "var t1 = (FP - 8).field_0x1;", "return t1;"]
+        "var t1 = (FP - 8).field_0x0;", "return t1;"]
     assert lift([("str", "x0, [x15, #-8]!"), ("ldr", "x29, [x15], #8"),
                  ("ldur", "x0, [x29, #-8]"), ("ret", "")]) == [
         "return (x0 - 8).field_0x1;"]
@@ -22624,7 +22624,7 @@ def test_tags_is_printed_only_off_an_object_pointer():
             ([("add", "x0, x2, #1"), ("ldurb", "w0, [x0, #-1]")], "x2.field1_0x1"),
             ([("add", "x0, x2, #2"), ("ldur", "x0, [x0, #-1]")], "x2.field_0x2"),
             ([("add", "x0, x22, #1"), ("ldur", "x0, [x0, #-1]")], "NULL.field_0x1"),
-            ([("add", "x0, x29, #1"), ("ldur", "x0, [x0, #-1]")], "FP.field_0x1"),
+            ([("add", "x0, x29, #1"), ("ldur", "x0, [x0, #-1]")], "FP.field_0x0"),
             ([("ldur", "x0, [x22, #-1]")], "NULL.tags"),
             ([("ldur", "x0, [x1, #-1]")], "x1.tags")):
         assert lift(*rows) == [f"return {want};"], rows
@@ -22793,10 +22793,10 @@ def test_a_store_names_a_live_read_made_at_a_computed_address():
                 ("mov", "x0, x3")) == ["return (x1 + x5 - 1).field_0x1;"]
     assert lift(("sub", "x0, x29, #0x10"), ("ldur", "x3, [x0, #0xf]"),
                 ("stur", "x4, [x1, #7]"), ("mov", "x0, x3")) == [
-        "x1.field_0x8 = x4;", "return (FP - 16).field_0x10;"]
+        "x1.field_0x8 = x4;", "return (FP - 16).field_0xf;"]
     assert lift(("add", "x0, x29, #8"), ("ldur", "x3, [x1, #0xf]"),
                 ("stur", "x4, [x0, #-1]"), ("mov", "x0, x3")) == [
-        "FP.field_0x8 = x4;", "return x1.field_0x10;"]
+        "FP.field_0x7 = x4;", "return x1.field_0x10;"]
     elem = ("add", "x5, x2, x6, lsl #3")
     assert lift(elem, ("ldur", "x3, [x5, #0x17]"), ("stur", "x4, [x1, #7]"),
                 ("mov", "x0, x3")) == ["x1.field_0x8 = x4;", "return x2[x6];"]
@@ -22981,9 +22981,9 @@ def test_a_field_read_and_an_element_that_may_be_one_word_are_named_before_the_s
     # The frame is not the heap, and neither is the thread.
     frame = ("sub", "x0, x29, #0x10")
     assert lift(frame, ("ldur", "x4, [x0, #0x1f]"), elem, ("stur", "x1, [x16, #0x17]"),
-                ret) == ["x13[x8] = x1;", "return (FP - 16).field_0x20;"]
+                ret) == ["x13[x8] = x1;", "return (FP - 16).field_0x1f;"]
     assert lift(frame, elem, ("ldur", "x4, [x16, #0x17]"), ("stur", "x1, [x0, #0x1f]"),
-                ret) == ["(FP - 16).field_0x20 = x1;", "return x13[x8];"]
+                ret) == ["(FP - 16).field_0x1f = x1;", "return x13[x8];"]
     assert lift(("ldr", "x4, [x26, #0x700]"), elem, ("stur", "x1, [x16, #0x17]"),
                 ret) == ["x13[x8] = x1;", "return THR.field_0x700;"]
     assert lift(elem, ("ldur", "x4, [x16, #0x17]"), ("str", "x1, [x26, #0x700]"),
@@ -23010,12 +23010,12 @@ def test_a_store_through_a_pointer_read_out_of_the_thread_or_the_frame_names_ele
         "var t0 = x13[x8];", "THR.field_0x40.field_0x8.field_0x18 = x1;", "return t0;"]
     assert lift(*read, ("sub", "x10, x29, #0x20"), ("ldr", "x9, [x10]"),
                 ("stur", "x1, [x9, #0x17]"), ret) == [
-        "var t0 = x13[x8];", "(FP - 32).field_0x1.field_0x18 = x1;", "return t0;"]
+        "var t0 = x13[x8];", "(FP - 32).field_0x0.field_0x18 = x1;", "return t0;"]
     # Into the thread, the frame and the object pool, which are no object's words.
     assert lift(*read, ("str", "x1, [x26, #0x40]"), ret) == [
         "THR.field_0x40 = x1;", "return x13[x8];"]
     assert lift(*read, ("sub", "x10, x29, #0x20"), ("str", "x1, [x10, #0x18]"),
-                ret) == ["(FP - 32).field_0x19 = x1;", "return x13[x8];"]
+                ret) == ["(FP - 32).field_0x18 = x1;", "return x13[x8];"]
     assert lift(*read, ("str", "x1, [x27, #0x40]"), ret) == [
         "PP.field_0x40 = x1;", "return x13[x8];"]
 
@@ -23777,9 +23777,9 @@ def test_an_address_off_sp_follows_sp_past_a_move():
     # Every reader: a load and a store through it, a compare, a call's argument.
     move = ("sub", "x15, x15, #0x20")
     assert _lift_340([("add", "x1, x15, #0x238"), move,
-                      ("ldr", "x0, [x1]")]) == ["return (SP + 0x258).field_0x1;"]
+                      ("ldr", "x0, [x1]")]) == ["return (SP + 0x258).field_0x0;"]
     assert _lift_340([("add", "x17, x15, #0x238"), ("str", "x2, [x15, #-8]!"),
-                      ("str", "x1, [x17]")]) == ["(SP + 0x240).field_0x1 = x1;",
+                      ("str", "x1, [x17]")]) == ["(SP + 0x240).field_0x0 = x1;",
                                                  "return x0;"]
     assert _lift_340([("add", "x1, x15, #0x238"), move, ("cmp", "x1, x3"),
                       ("b.lt", "#0x18"), ("mov", "x0, #1"), ("ret", ""),
@@ -23787,7 +23787,7 @@ def test_an_address_off_sp_follows_sp_past_a_move():
     # Without a move nothing changes: the guard, which passes before the fix too.
     assert _lift_340([hold]) == ["return SP + 0x238;"]
     assert _lift_340([("add", "x1, x15, #0x238"),
-                      ("ldr", "x0, [x1]")]) == ["return (SP + 0x238).field_0x1;"]
+                      ("ldr", "x0, [x1]")]) == ["return (SP + 0x238).field_0x0;"]
 
 
 def test_a_value_naming_sp_is_named_before_a_move_it_cannot_follow():
@@ -23831,7 +23831,7 @@ def test_a_value_naming_sp_is_named_before_a_move_it_cannot_follow():
     # A read through the address is the bytes there when it was read.
     assert _lift_340([("add", "x17, x15, #0x238"), ("ldr", "x5, [x17]"),
                       ("str", "x2, [x15, #-8]!"), ("str", "x1, [x15, #0x240]"),
-                      ("mov", "x0, x5")]) == named("(SP + 0x238).field_0x1")
+                      ("mov", "x0, x5")]) == named("(SP + 0x238).field_0x0")
     # The rows strip_boilerplate blanks move SP as much as the ones it leaves.
     assert _lift_340(_PRO_340 + [("add", "x0, x15, #8"), move]
                      + _EPI_340) == named("SP + 40")
@@ -23883,7 +23883,7 @@ def test_a_value_naming_sp_is_right_past_a_loop_and_a_join():
     # this printed `var t0 = x15;` and `t0 = SP & 0xfffffffffffffff0;` in the arm.
     assert _lift_340([("cbz", "x2, #0xc"), ("mov", "x19, x15"),
                       ("and", "x15, x15, #0xfffffffffffffff0"),
-                      ("ldr", "x0, [x15, #8]")]) == ["var t0 = SP.field_0x9;",
+                      ("ldr", "x0, [x15, #8]")]) == ["var t0 = SP.field_0x8;",
                                                      "return t0;"]
 
 
@@ -23912,7 +23912,7 @@ def test_a_value_naming_fp_is_right_past_a_move_of_fp():
         "return FP - 64;"]
     assert _lift_340(inner + [("mov", "x0, x29")] + _FFI_OUT_340) == ["return FP - 72;"]
     assert _lift_340(inner + [("ldr", "x0, [x29, #8]")] + _FFI_OUT_340) == [
-        "var t0 = (FP - 64).field_0x1;", "return t0;"]
+        "var t0 = (FP - 64).field_0x0;", "return t0;"]
     assert _lift_340(_PRO_340 + [("add", "x0, x29, #8")] + _FFI_IN_340
                      + _FFI_OUT_340) == ["return FP + 8;"]
     assert _lift_340(_PRO_340 + [("add", "x1, x29, #8"), ("sub", "x29, x29, #0x20"),
@@ -23943,23 +23943,23 @@ def test_a_store_through_a_held_frame_address_agrees_with_the_reads_beside_it():
     held = ("add", "x17, x15, #0x238")
     assert _lift_340([held, push, ("str", "x3, [x15, #0x240]"), ("str", "x1, [x17]"),
                       ("ldr", "x0, [x15, #0x240]")]) == [
-        "(SP + 0x240).field_0x1 = x1;", "var t0 = SP.field_0x241;", "return t0;"]
+        "(SP + 0x240).field_0x0 = x1;", "var t0 = SP.field_0x240;", "return t0;"]
     assert _lift_340([("ldr", "x5, [x15, #0x240]"), held, push, ("str", "x1, [x17]"),
                       ("mov", "x0, x5")]) == [
-        "var t0 = SP.field_0x241;", "(SP + 0x240).field_0x1 = x1;", "return t0;"]
+        "var t0 = SP.field_0x240;", "(SP + 0x240).field_0x0 = x1;", "return t0;"]
     assert _lift_340([("add", "x16, x15, #0x238"), held, ("ldr", "x5, [x16]"), push,
                       ("str", "x1, [x17]"), ("mov", "x0, x5")]) == [
-        "var t0 = (SP + 0x238).field_0x1;", "(SP + 0x240).field_0x1 = x1;",
+        "var t0 = (SP + 0x238).field_0x0;", "(SP + 0x240).field_0x0 = x1;",
         "return t0;"]
     assert _lift_340([held, push, ("str", "x1, [x15, #0x240]"),
-                      ("ldr", "x0, [x17]")]) == ["return (SP + 0x240).field_0x1;"]
+                      ("ldr", "x0, [x17]")]) == ["return (SP + 0x240).field_0x0;"]
     # With no move between them both spellings were right already: the guard.
     assert _lift_340([("ldr", "x5, [x15, #0x238]"), held, ("str", "x1, [x17]"),
                       ("mov", "x0, x5")]) == [
-        "var t0 = SP.field_0x239;", "(SP + 0x238).field_0x1 = x1;", "return t0;"]
+        "var t0 = SP.field_0x238;", "(SP + 0x238).field_0x0 = x1;", "return t0;"]
     assert _lift_340([("ldur", "x5, [x29, #-0x10]"), ("sub", "x17, x29, #0x10"), push,
                       ("str", "x1, [x17]"), ("mov", "x0, x5")]) == [
-        "var t0 = (FP - 16).field_0x1;", "(FP - 16).field_0x1 = x1;", "return t0;"]
+        "var t0 = (FP - 16).field_0x0;", "(FP - 16).field_0x0 = x1;", "return t0;"]
 
 
 def test_an_address_off_a_frame_register_is_what_the_cpu_returns():
@@ -26460,7 +26460,7 @@ def test_a_store_names_a_live_read_it_writes_part_of_from_another_offset():
         assert lift(ptr, read, ("stur", "w2, [x9, #0x13]"), ("mov", "x0, x1")) == [
             "var t0 = x13.field_0x10;", tgt + ".field_0x14 = x2;", "return t0;"], ptr
     assert lift(("ldr", "x9, [x29, #0x20]"), read, ("stur", "w2, [x9, #0x13]"),
-                ("mov", "x0, x1")) == ["var t0 = FP.field_0x21;",
+                ("mov", "x0, x1")) == ["var t0 = FP.field_0x20;",
                                        "var t1 = x13.field_0x10;",
                                        "t0.field_0x14 = x2;", "return t1;"]
     # A recovered name is the word at its offset: eight bytes where the body read
@@ -29068,6 +29068,53 @@ def test_disasm_graph_is_the_lifters_block_graph():
         (f"0x{e['from']:x}", f"0x{e['to']:x}", e["kind"]) for e in fn["edges"])
     text = _graph_cli("disasm", CLEAN, "benchComputeChecksum", "--graph")[0]
     assert f"{len(fn['blocks'])} blocks, {len(fn['edges'])} edges" in text
+
+
+def test_a_frame_or_stack_slot_is_spelled_at_the_offset_it_reads():
+    """A frame or stack slot that fell through to the generic field spelling printed
+    with the heap object's tag bias, `ldr x0, [x29, #0x10]` as `FP.field_0x11` and
+    `ldur x0, [x29, #-8]` as `(FP - 8).field_0x1`: a byte off from the one read, where a
+    slot of the thread printed the offset as written (#407). 9,127 lines of the clean
+    fixture spelled FP or SP that way. Each slot now prints at the offset read, at
+    each width, through a copy of FP or SP and through a sum off one."""
+    lift = _lift_329
+    for rows, want in (
+            ([("ldr", "x0, [x29, #0x10]")], ["var t0 = FP.field_0x10;"]),
+            ([("ldur", "x0, [x29, #-8]")], ["var t0 = (FP - 8).field_0x0;"]),
+            ([("ldur", "x0, [x29, #-16]")], ["var t0 = (FP - 16).field_0x0;"]),
+            ([("ldur", "x0, [x29, #-24]")], ["var t0 = (FP - 24).field_0x0;"]),
+            ([("ldr", "x0, [x15, #0x10]")], ["var t0 = SP.field_0x10;"]),
+            ([("ldr", "x0, [x15]")], ["var t0 = SP.field_0x0;"]),
+            ([("ldur", "w0, [x29, #-12]")], ["var t0 = (FP - 12).field_0x0;"]),
+            ([("ldp", "x0, x1, [x29, #-16]"), ("add", "x0, x0, x1")],
+             ["var t0 = (FP - 16).field_0x0;", "var t1 = (FP - 8).field_0x0;"]),
+            ([("ldp", "x0, x1, [x29, #0x10]"), ("sub", "x0, x1, x0")],
+             ["var t0 = FP.field_0x10;", "var t1 = FP.field_0x18;"]),
+            ([("mov", "x2, x29"), ("ldur", "x0, [x2, #-16]")],
+             ["return (FP - 16).field_0x0;"]),
+            ([("sub", "x2, x29, #0x20"), ("ldr", "x0, [x2, #8]")],
+             ["return (FP - 32).field_0x8;"]),
+            ([("add", "x2, x29, #0x20"), ("ldur", "x0, [x2, #-8]")],
+             ["return FP.field_0x18;"]),
+            ([("mov", "x2, x15"), ("ldr", "x0, [x2, #0x18]")], ["return SP.field_0x18;"]),
+            ([("mov", "x2, x29"), ("stur", "x1, [x2, #-8]"), ("ldur", "x0, [x29, #-8]")],
+             ["(FP - 8).field_0x0 = x1;", "var t0 = (FP - 8).field_0x0;"]),
+            ([("sub", "x2, x29, #16"), ("stur", "x1, [x2, #-8]"),
+              ("ldur", "x0, [x29, #-24]")],
+             ["(FP - 24).field_0x0 = x1;", "var t0 = (FP - 24).field_0x0;"]),
+            ([("mov", "x2, x29"), ("stur", "w1, [x2, #-12]"),
+              ("ldur", "w0, [x29, #-12]")],
+             ["(FP - 12).field_0x0 = x1;", "var t0 = (FP - 12).field_0x0;"]),
+            ([("mov", "x2, x15"), ("str", "x1, [x2, #8]"), ("ldr", "x0, [x15, #8]")],
+             ["SP.field_0x8 = x1;", "var t0 = SP.field_0x8;"])):
+        got = lift(*rows)
+        assert got[:len(want)] == want, (rows, got)
+        assert not any(".field_0x1;" in l or "_0x11;" in l for l in got), (rows, got)
+    # The frame and the heap are apart: a store to an object does not name a frame
+    # read off a copy of FP, whatever offset each is spelled at.
+    assert lift(("sub", "x0, x29, #0x10"), ("ldur", "x3, [x0, #0xf]"),
+                ("stur", "x4, [x1, #7]"), ("mov", "x0, x3")) == [
+        "x1.field_0x8 = x4;", "return (FP - 16).field_0xf;"]
 
 
 if __name__ == "__main__":

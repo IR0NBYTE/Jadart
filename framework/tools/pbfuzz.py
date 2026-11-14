@@ -19,7 +19,8 @@ Two things make a register write PRINTED, and both are outside what irfuzz can s
     prints that note instead of an assignment on purpose (#120).
   * a MOVING base. `irfuzz._mem_expr` maps `x20.field_0xN` to a fixed slot key, so a
     `_bump` that advances the base still reads the old slot. Here memory is a real byte
-    array and `.field_0xN` is a load from (base + N - 1), so a moved base is modelled.
+    array and `.field_0xN` is a load from (base + N - 1), or (base + N) off the frame or
+    the thread (#407), so a moved base is modelled.
 
 A printed register write is the PRECONDITION for the staleness #187 is about: with none,
 a folded expression still reads the entry registers and is right. So this is the oracle
@@ -321,6 +322,15 @@ BINOP = ((ast.Add, operator.add), (ast.Sub, operator.sub), (ast.Mult, operator.m
          (ast.BitXor, operator.xor))
 
 
+def _bias(n) -> int:
+    """The tag bias of a field read off `n`: 1 off an object pointer, none off the frame
+    or the thread, which the lifter spells at the offset read, `(FP - 8).field_0x0`
+    (#407). The root is the left end of a sum, `(FP - 16 - 8)`."""
+    while isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub)):
+        n = n.left
+    return 0 if isinstance(n, ast.Name) and n.id in ("FP", "SP", "THR") else 1
+
+
 class Body:
     """The printed body, interpreted. Registers start at the values the function came in
     with and mean what the body last assigned them; memory is a real array its stores
@@ -392,7 +402,7 @@ class Body:
             if isinstance(n, ast.Attribute):
                 if not n.attr.startswith("field_"):
                     raise Undecidable(f"unknown attribute {n.attr}")
-                return self.load(go(n.value) + int(n.attr[6:], 16) - 1)
+                return self.load(go(n.value) + int(n.attr[6:], 16) - _bias(n.value))
             if isinstance(n, ast.UnaryOp):
                 v = go(n.operand)
                 if isinstance(n.op, ast.USub):
@@ -503,7 +513,8 @@ class Body:
                 continue
             m = FLDA.match(s)
             if m:
-                addr = self.ev(m.group(1)) + int(m.group(2), 16) - 1
+                addr = self.ev(m.group(1)) + int(m.group(2), 16) - _bias(
+                    ast.parse(m.group(1).strip(), mode="eval").body)
                 val = self.ev(m.group(4))
                 if m.group(3):
                     val = COMPOUND[m.group(3)](self.load(addr), val) & MASK
