@@ -100,6 +100,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **A pool slot loaded into a `d` register prints its double (#362).** `linearized`
+  printed `return a0.toDouble() / pool_0x3aa8 / pool_0x79b8 * pool_0x7978;`, where the
+  three slots hold the bits of 255.0, 12.92 and 100.0 and the `d` register they are
+  loaded into says they are a double. It prints `return a0.toDouble() / 255.0 / 12.92 *
+  100.0;` now. The number is written so that it reads back to the same 64 bits: -0.0
+  stays -0.0, 1e16 is `1e+16`, the infinities are `double.infinity` and
+  `-double.infinity`, the one NaN Dart spells is `double.nan`, and a NaN with any other
+  payload, which no literal gives, prints as its offset as before. A slot loaded into an
+  `s` or an `x` register prints as before. Tier 3 dumps of the nine binaries: 3,591
+  ranges change, 18,564 lines out and 18,561 in (120 ranges and 1,106 / 1,107 lines on
+  each fixture, 736 and 3,750 / 3,746 on FluffyChat, the most). Typical lines:
+  `t1.field_0x20 = pool_0x7ed0;` is `t1.field_0x20 = 75.0;`, `if ((t12 - t6) >
+  pool_0xc418) {` is `if ((t12 - t6) > -1e-10) {`, and `var t1 = t0.field_0x8 /
+  pool_0x99c0;` is `var t1 = t0.field_0x8 / 1000000.0;`.
+
 - **`follow` finds a join one way, off the dominator tree, and the scan is gone.** It had
   two: a scan that pushed a tag per arm forward in reverse postorder, and `meet`, which
   reads the same join off the dominator tree and which took over once the scans of a

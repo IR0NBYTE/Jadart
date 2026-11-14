@@ -4460,6 +4460,9 @@ class Lifter:
         self.called, self.read_strs = [], []
         self.pool_at = {}
         self.pool_strs = getattr(pool_map, "strs", None) or ()
+        #: What each pool slot holds (held.Holdings, disasm.PoolMap.held), asked only
+        #: of a slot the pool map gives no name.
+        self.pool_held = getattr(pool_map, "held", None)
         #: The displacements an element access is read at, `Target.data_offsets`'s pair
         #: for compressed pointers unless `lift_function` is told otherwise, and per
         #: element address the ones its accesses reach (`_elem_offsets`), made when
@@ -6081,6 +6084,22 @@ class Lifter:
             v = vals.get(canon(m.group(1)), V(m.group(1), P_ATOM))
             return _in_cond(_word(v))
         return _REG_RE.sub(whole, text)
+
+    def _pool_slot(self, r: str, off: int, ops) -> V:
+        """A load of the pool slot at `off` that the pool map gives no name, into `r`.
+
+        A `d` register as the instruction spells it says the slot's word is the bits of
+        a double, and the double is printed, in a form `float()` reads back to the same
+        64 bits; NaN payloads no literal gives stay as the offset. `canon` makes `s0`
+        `d0`, and four bytes are not a double, so the spelling is read from `ops`, not
+        from `r`. Anything else prints the offset (#362)."""
+        held = self.pool_held
+        raw = [o.strip() for o in ops[:2] if canon(o) == r]
+        if (held is not None and raw and raw[0][:1] == "d" and raw[0][1:].isdigit()):
+            text = held.lift_double(off)
+            if text is not None:
+                return V(text, P_UNARY if text[:1] == "-" else P_ATOM)
+        return V(f"pool_0x{off:x}", P_ATOM)
 
     def _known32(self, tok: str, v: V) -> str:
         """What a 32-bit comparison knows of an operand beyond its value (`_cond32`).
@@ -8592,7 +8611,7 @@ class Lifter:
             words = [(dst, disp)] + ([second] if second else [])
             if _T.roles.get(base) == "PP":                   # unresolved ObjectPool entry
                 for r, d in words:
-                    st.set(r, V(f"pool_0x{d:x}", P_ATOM))
+                    st.set(r, self._pool_slot(r, d, ops))
                 return []
             if base in st.poolbase:              # far load: add base, then ldr off it
                 # Both offsets before either register is written, which can be the base.
@@ -8601,7 +8620,7 @@ class Lifter:
                     lbl = self.pool_map.get(off)
                     if off in self.pool_strs:
                         self.read_strs.append((off, lbl))
-                    st.set(r, V(lbl if lbl else f"pool_0x{off:x}", P_ATOM))
+                    st.set(r, V(lbl, P_ATOM) if lbl else self._pool_slot(r, off, ops))
                 return []
             frame = self._frame_base(base)
             if frame and index is not None:
