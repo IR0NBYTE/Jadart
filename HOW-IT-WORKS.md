@@ -214,7 +214,7 @@ class BenchAccount {
 }
 ```
 
-1,843 named classes with their members, purely from the snapshot. This is where the other
+2,231 named classes with their members, purely from the snapshot. This is where the other
 static tools stop.
 
 **Tier 1** annotates the disassembly: direct calls named, ObjectPool constants resolved.
@@ -407,7 +407,7 @@ Three cross-checks decide whether this is safe to print, and all three are byte-
 
 | check | what it compares | corpus |
 |---|---|---|
-| G12 | the offset against the owner's own `instance_size` | 226 fields, 0 outside |
+| G12 | the offset against the owner's own `instance_size` | 245 fields, 0 outside |
 | G14 | the offset against the displacement an implicit getter compiled to | 58 getters, 0 disagree |
 | G15 | the unboxed bit against the register width that getter used | 58 getters, 0 disagree |
 

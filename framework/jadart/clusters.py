@@ -223,11 +223,20 @@ def _pattern_for(cid: int, epoch, arch=None, is_root_unit: bool = True) -> str:
 
 def walk_alloc(st: ReadStream, num_base_objects: int, num_objects: int,
                num_clusters: int, *, epoch, is_root_unit: bool = True,
-               arch=None) -> list[Cluster]:
+               arch=None, vm: bool = False) -> list[Cluster]:
     """Consume the entire alloc pass. `st` must be positioned at the first cluster
     tag (right after the 5 header varints). `epoch` is the resolved versions.Epoch
     (provides tag decode, cid boundary, typed-data range). Returns the ordered
-    cluster list. Raises AllocError on desync (assigned refs != num_objects)."""
+    cluster list. Raises AllocError on desync (assigned refs != num_objects).
+
+    `vm` reads the vm snapshot, which is a root unit with one difference: its String
+    cluster is canonical and carries no canonical-set layout. The deserializer builds
+    that cluster with `!is_non_root_unit_ && isolate_group() != Dart::vm_isolate_group()`
+    (app_snapshot.cc:9375 at 3.12.2; the same line in every release from 2.19.6 to
+    3.12.2), because the vm isolate's symbol table is written as an object of its own
+    and handed over as a root. A String cluster in the RO data image is not that
+    cluster: it keeps its layout in the vm snapshot too (RODataSerializationCluster,
+    `is_canonical && IsStringClassId(cid)`), and is read above as any root unit's."""
     if epoch is None:
         raise AllocError("epoch is required")
     tag_decode = epoch.tag.decode
@@ -373,7 +382,8 @@ def walk_alloc(st: ReadStream, num_base_objects: int, num_objects: int,
 
         # canonical-set layout suffix (root unit + canonical only)
         csl = None
-        if cid in r.csl_cids and is_root_unit and canon:
+        if (cid in r.csl_cids and is_root_unit and canon
+                and not (vm and pattern == STRING)):
             table_length = st.read_unsigned()
             first_element = st.read_unsigned()
             num_gap = count - first_element

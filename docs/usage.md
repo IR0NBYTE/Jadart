@@ -77,7 +77,7 @@ handled by one rule with neither special-cased.
 
 | tier | what you get | honest fallback |
 |------|--------------|-----------------|
-| 0 | class / method / field skeleton with the resolved superclass hierarchy (`FluBenchApp extends StatelessWidget`). 1843 named classes, 5756 members, 9013 strings on the clean corpus | classes whose names were stripped keep their structure |
+| 0 | class / method / field skeleton with the resolved superclass hierarchy (`FluBenchApp extends StatelessWidget`). 2231 named classes, 6730 members, 9013 strings on the clean corpus | classes whose names were stripped keep their structure |
 | 1 | per-function arm64 with direct call targets named and ObjectPool constants resolved to their string or function, including far pool loads (`add xD, x27, #hi; ldr [xD, #lo]`) | unresolved pool slots print their raw offset |
 | 2 | `if`/`else` and loops reconstructed as pseudo-Dart from the CFG, using forward and post-dominators, plus a Cifuentes follow node for the 36% of conditionals whose arms each end in their own `return` and so post-dominate at the virtual exit | 19.2% of functions still emit at least one `goto`, against 7.8% that are genuinely irreducible. `tools/cfgcheck.py` reads the structured tree back as a program and checks, for every block in the image, that the rendering claims exactly the successors the CFG has |
 | 3 | expressions, by abstract interpretation over the register file: field load/store, arithmetic, `bool`/`null`/int constants, element access, compound `-=`, `return <expr>`, and scalar floating point (including int-to-double and double-to-int conversions, and `math.max`) | any instruction the lifter doesn't model prints as its arm64 line |

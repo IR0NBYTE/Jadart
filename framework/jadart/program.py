@@ -17,6 +17,7 @@ from . import versions, cids as C
 from .snapshot import images, parse_blob, UnknownEpoch
 from .clusters import walk_alloc
 from .fillwalk import walk_fill
+from .baseobjects import base_objects
 
 
 @dataclass
@@ -379,7 +380,12 @@ def build_program(fr, hdr, raw: bool = False) -> Program:
             owner.members.append(Member(name=nm, kind="field", offset=off,
                                         unboxed=bool(fi and fi.unboxed)))
 
-    return Program(epoch_name=hdr.epoch.name, dart=hdr.epoch.dart, strings=fr.strings,
+    # The program's own strings: a base object's is the vm snapshot's (baseobjects.py),
+    # there to resolve a name, and the count `classes` prints is not of those.
+    own = fr.strings
+    if fr.base_first_ref:
+        own = {ref: s for ref, s in own.items() if ref >= fr.first_ref}
+    return Program(epoch_name=hdr.epoch.name, dart=hdr.epoch.dart, strings=own,
                    classes=classes, num_objects=hdr.num_objects,
                    num_predefined_cids=hdr.epoch.num_predefined_cids)
 
@@ -401,7 +407,8 @@ def recover_program(path) -> Program:
         st.read_unsigned()
     clusters = walk_alloc(st, hdr.num_base_objects, hdr.num_objects, hdr.num_clusters,
                           epoch=hdr.epoch, is_root_unit=True, arch=hdr.arch)
-    fr = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch)
+    fr = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch,
+                   base=base_objects(container, hdr, src.data))
     return build_program(fr, hdr)
 
 
