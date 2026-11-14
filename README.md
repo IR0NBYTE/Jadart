@@ -2,7 +2,7 @@
 
 [![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![python: 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#install)
-[![tests: 682](https://img.shields.io/badge/tests-682-brightgreen.svg)](#tests)
+[![tests: 688](https://img.shields.io/badge/tests-688-brightgreen.svg)](#tests)
 
 **A Flutter decompiler.** Point it at an APK and get back a class tree, method bodies as
 pseudo-Dart, the string pool, embedded data tables, and the source names of virtual calls.
@@ -199,7 +199,7 @@ Full walkthroughs: [docs/usage.md](docs/usage.md). Per-command help: `jadart <cm
 | 2 | `if`/`else` and loops reconstructed as pseudo-Dart from the CFG, using forward and post-dominators, plus a Cifuentes follow node for the 38.5% of conditionals whose arms each end in their own `return` and so post-dominate at the virtual exit | 1,414 of 8,194 functions (17.3%) print at least one `goto`, and 201 of them hold a region that is genuinely irreducible, where no `goto`-free rendering exists at all. `tools/cfgcheck.py` reads the structured tree back as a program and checks, for every block in the image, that the rendering claims exactly the successors the CFG has |
 | 3 | expressions, by abstract interpretation over the register file: field load/store, arithmetic, `bool`/`null`/int constants, element access, compound `-=`, `return <expr>`, and scalar floating point (including int-to-double and double-to-int conversions, and `math.max`) | any instruction the lifter doesn't model prints as its arm64 line |
 | 3.1 | call arguments from the callee's register arity, read at the target address and so not dependent on the callee having a recovered name (`benchWithdraw(t9, (t4.toSigned(32) >> 1) ~/ 2)`). A call whose result is read gets that result named, so the value can be followed to its use. The function being lifted is read the same way: an argument register its body reads before writing is named by its slot, `a1`, and the signature lists them, `checksum(a1)`, which takes the clean fixture's lines carrying a bare register from 19,446 to 12,289 | the stack convention, an arguments descriptor, and a target outside the image print `(...)` rather than a guess, at the call and in the signature alike |
-| 3.2 | VM runtime stubs rendered as source operations: `throw`, `throw NullCastError()`, `new List()`. A stub is identified by its index in the snapshot's object-store roots, so this works on a plain `--release` build, which keeps no symbol and no `Function` for one: 76 stubs named on each fixture, taking the clean image's `(...)` calls from 9,196 to 5,139. A `Class` owns exactly one kind of code, its own allocation stub, so the `bl` that allocated a value says which class it is: 3,848 of the clean fixture's 4,425 `new` sites print a class. Pure machinery is stripped so it never reaches output: frame setup, the stack-overflow check, the write barrier, type tests, and the Smi box-or-tag idiom, which surfaces as a bogus `if (x != x)` if you leave it in | anything else stays a named `bl` |
+| 3.2 | VM runtime stubs rendered as source operations: `throw`, `throw NullCastError()`, `new List()`. A stub is identified by its index in the snapshot's object-store roots, so this works on a plain `--release` build, which keeps no symbol and no `Function` for one: 76 stubs named on each fixture, taking the clean image's `(...)` calls from 9,196 to 5,139. A `Class` owns exactly one kind of code, its own allocation stub, so the `bl` that allocated a value says which class it is: 3,848 of the clean fixture's 4,425 `new` sites print a class. A closure allocation prints the function it runs and the context it captured, `new Closure(sub_0x1eec70, t0)`, each where the rows prove it and `...` where they do not: all 942 on the clean fixture print the function and 913 the context. Pure machinery is stripped so it never reaches output: frame setup, the stack-overflow check, the write barrier, type tests, and the Smi box-or-tag idiom, which surfaces as a bogus `if (x != x)` if you leave it in | anything else stays a named `bl` |
 | 3.3 | virtual and interface calls attributed to a receiver plus a stable selector offset, `x1.sel_0xb34(...)`. 2,580 of the clean fixture's 3,333 dispatch sites recover both (77.4%) | the rest print `(dynamic call)` |
 | 3.4 | that offset resolved to a **source selector name**: `x2.toString()`, `x2.addListener(...)`. 133 selectors on the clean corpus, naming 23.5% of the dispatch sites that have a recovered offset | names need two agreeing classes, an untied vote AND an offset no other function is known to be placed at, so the rest keep `sel_0x<off>` |
 
@@ -524,7 +524,7 @@ docs/                 usage, support, the Flutter internals explainer, and the l
 ## Tests
 
 ```bash
-cd framework && python3 -m pytest tests -q     # 682 tests
+cd framework && python3 -m pytest tests -q     # 688 tests
 ./check.sh                                     # the suite, the gates, the measured claims
 ./check.sh --full                              # adds the CFG edge check, determinism, the bench
 ```
@@ -532,7 +532,7 @@ cd framework && python3 -m pytest tests -q     # 682 tests
 Some tests need something this repository does not ship: a multi-version corpus, an
 `--obfuscate` build of another app, `unicorn` for the differential oracles. Those skip
 with the reason named, and pytest reports them as skips rather than passes. On a fresh
-clone with capstone installed, expect about 648 of the 682 to run and the other 34 to
+clone with capstone installed, expect about 654 of the 688 to run and the other 34 to
 skip for one of those reasons.
 
 The arm64 FluBench fixtures, clean and `--obfuscate`, are committed, so a fresh clone runs

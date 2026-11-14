@@ -366,7 +366,29 @@ _ALLOC_TYPE = {"Array": "List", "GrowableArray": "List", "Mint": "int", "Double"
                # size, GenerateAllocateClosureStub(1) to (4) (stub_code_compiler.cc).
                # The class allocated is Closure whichever it is.
                "Closure1": "Closure", "Closure2": "Closure", "Closure3": "Closure",
-               "Closure4": "Closure"}
+               "Closure4": "Closure",
+               # 3.4 to 3.12 have four, by whether the closure is generic and whether
+               # it takes instantiator type arguments (stub_code_compiler.cc,
+               # GenerateAllocateClosureStub(has_instantiator_type_args, is_generic)).
+               # They printed `new ClosureTA()`, a class no program has (#442).
+               "ClosureGeneric": "Closure", "ClosureTA": "Closure",
+               "ClosureTAGeneric": "Closure"}
+
+#: The register a closure allocation stub takes the closure's Function in
+#: (AllocateClosureABI::kFunctionReg, constants_arm64.h: R1 from 2.19.6 to 3.13.0).
+_CLOSURE_FN = "x1"
+#: The register it takes the context in, by the stub's name, which is what says which
+#: ABI the call follows (AllocateClosureABI::kContextReg). R2 through 3.12. 3.13 put
+#: the closure's length and flags in R2 and moved the context to R3, and renamed the
+#: stubs with it, one for each size. Read from the header of each release from 2.19.6
+#: to 3.13.0, and off the stubs themselves on a build of each (#442): the register
+#: the stub stores in the closure's context slot is this one on all of them.
+_CLOSURE_CTX = {"AllocateClosure": "x2", "AllocateClosureGeneric": "x2",
+                "AllocateClosureTA": "x2", "AllocateClosureTAGeneric": "x2",
+                "AllocateClosure1": "x3", "AllocateClosure2": "x3",
+                "AllocateClosure3": "x3", "AllocateClosure4": "x3"}
+#: Symbols::AnonymousClosure (fields.ANONYMOUS_CLOSURE): a name that names nothing.
+_ANONYMOUS = "<anonymous closure>"
 
 
 def _returns_x0(base: str) -> bool:
@@ -4511,6 +4533,9 @@ class Lifter:
         # class the snapshot names, so the result is the SECOND base in the register file
         # whose class is read rather than guessed; every other one keeps its offset.
         self.allocs = {} if allocs is None else allocs.by_pc
+        #: pool byte offset -> (name, pc offset or None) of the Function in that slot
+        #: (fields.closure_functions): what a closure allocation was handed.
+        self.closures = getattr(allocs, "closures", None) or {}
         #: The names this body minted for such a result, name -> AllocSite. Keyed by TEXT,
         #: which is sound because `_mint` hands each name out once per lift and the only
         #: line that assigns one is the `new` that produced it, so `t7` means that object
@@ -7784,6 +7809,93 @@ class Lifter:
             return None
         return site.fields.get(byte_off)
 
+    def _last_def(self, reg: str, before: int):
+        """The index of the row of this block that last writes `reg` ahead of row
+        `before`, or None where none does or a call stands between. Every way to row
+        `before` runs the rows of its block ahead of it, so what that row wrote is
+        what `reg` holds there. A call ends the scan because it writes every register
+        it may, so the rows a block scans for all of its calls are its length."""
+        insns = self._insns
+        for k in range(before - 1, -1, -1):
+            mn, op = insns[k][1], insns[k][2]
+            if mn in _CALLS:
+                return None
+            if reg in _def_use(mn, op)[0]:
+                return k
+        return None
+
+    def _pool_load(self, reg: str):
+        """The pool byte offset `reg` was loaded from, where a row of this block loaded
+        it whole and nothing since wrote it, or None. Both forms the compiler writes:
+        `ldr xN, [x27, #off]`, and past the reach of that the pair `add xB, x27, #hi`
+        then `ldr xN, [xB, #lo]`."""
+        insns = self._insns
+        k = self._last_def(reg, self._at)
+        if k is None or insns[k][1] != "ldr":
+            return None
+        ops = _split_ops(insns[k][2])
+        m = _mem(ops[1]) if len(ops) == 2 and ops[0] == reg else None
+        if m is None or m[2] is not None or m[4]:
+            return None                      # indexed, written back, or no load of it
+        base, disp = m[0], m[1]
+        if _T.roles.get(base) == "PP":
+            return disp
+        j = self._last_def(base, k)
+        if j is None or insns[j][1] != "add":
+            return None
+        aops = _split_ops(insns[j][2])
+        if not (3 <= len(aops) <= 4 and aops[0] == base
+                and _T.roles.get(canon(aops[1])) == "PP"):
+            return None
+        hi = _imm(aops[2])
+        if hi is None:
+            return None
+        if len(aops) == 4:
+            shift = _imm(aops[3].split("lsl")[-1]) if "lsl" in aops[3] else None
+            if shift is None:
+                return None
+            hi <<= shift
+        return hi + disp
+
+    def _closure_args(self, st: State, stub: str) -> str:
+        """What a closure allocation was handed, `function, context`, each where the
+        rows prove it and `...` where they do not; `...` alone where neither is (#442).
+
+        The function is the Function in the pool slot the stub's function register was
+        loaded from in this block, and the walk has to hold that same slot's value in
+        the register: two readings of one load. It prints by name, or as the address
+        of its code where its name is the one every anonymous closure has
+        (`fields.closure_functions`). The context is what the walk holds in the
+        register the stub of that name takes it in, where that prints as the value
+        passed (`_exact`) and not as a register: a context the body built, `this` for
+        a tear-off, null."""
+        m = _STUB_RE.search(stub or "")
+        ctx_reg = _CLOSURE_CTX.get(m.group(1)) if m else None
+        if ctx_reg is None:
+            return "..."
+        fn = None
+        off = self._pool_load(_CLOSURE_FN)
+        held = st.reg.get(_CLOSURE_FN)
+        got = self.closures.get(off) if off is not None else None
+        if (got is not None and held is not None
+                and held.text == (self.pool_map.get(off) or f"pool_0x{off:x}")):
+            name, pc = got
+            if name and name != _ANONYMOUS:
+                fn = name
+            elif pc is not None:
+                fn = self._sub(pc)
+        ctx = st.reg.get(ctx_reg)
+        # A bare register is how a value the walk does not follow prints (a frame slot
+        # nothing here stored, the caller's stack), and it names nothing a reader can
+        # look up: 29 of the clean fixture's 942 sites, 28 of them a tear-off getter
+        # that reads its receiver off the caller's stack.
+        if ctx is not None and (_REG_RE.fullmatch(ctx.text)
+                                or not self._exact(st, [ctx])):
+            ctx = None
+        if fn is None and ctx is None:
+            return "..."
+        return f"{fn or '...'}, {ctx.text if ctx is not None else '...'}"
+
     def _call_args(self, target, st: State, pushed, plan) -> str:
         """Reconstruct a direct call's argument list, or `...` when it cannot be done
         safely. `plan` is `_call_plan`'s answer for the call. Register-convention calls
@@ -8189,6 +8301,10 @@ class Lifter:
                                                    and ent.search(st.reg[r].text)):
                                 st.forget(r)
                     return []
+                # Read before the call's clobber, as `exc` is: the function and the
+                # context are in registers the stub is free to destroy.
+                made = (self._closure_args(st, name)
+                        if kind == "alloc" and label == "Closure" else "")
                 pre = self._clobber_call(st)
                 if kind == "throw":
                     self.called.append(("throw", "stub", target))
@@ -8201,7 +8317,7 @@ class Lifter:
                     return pre + [f"throw {label}();"]
                 if kind == "alloc":
                     self.called.append((label, "alloc", target))
-                    return pre + self._result(st, f"new {label}()", _T.ret_int)
+                    return pre + self._result(st, f"new {label}({made})", _T.ret_int)
                 terse = label.replace("stub ", "").replace("_iso_stub_", "")
                 self.called.append((terse, "stub", target))
                 # terse, without the stub prefix; a stub's result is an object

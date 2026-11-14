@@ -363,6 +363,11 @@ class AllocLayout:
     unnamed: int = 0           # ...whose owner Class's name did not survive
     disagreed: int = 0         # ...that name another class, which refuses the whole map
     refused: str = ""          # non-empty when the map is deliberately empty
+    #: pool byte offset -> (name, pc offset or None) for every pool slot that holds a
+    #: Function: what a closure allocation loads into its function register
+    #: (`closure_functions`). Read beside the stubs and independent of them, so a
+    #: refused stub map keeps it.
+    closures: dict = _dcfield(default_factory=dict)
 
 
 def _tags_immediate(words) -> int | None:
@@ -387,6 +392,50 @@ def _tags_immediate(words) -> int | None:
         else:
             acc = (acc & ~(0xFFFF << (((w >> 21) & 3) * 16))) | part
     return acc
+
+
+#: What the VM names a closure that has no name of its own (Symbols::AnonymousClosure,
+#: symbols.h, the same string from 2.19.6 to 3.13.0). It says nothing about which
+#: closure, so one is printed by where its code is.
+ANONYMOUS_CLOSURE = "<anonymous closure>"
+
+
+def closure_functions(image, fr) -> dict:
+    """pool byte offset -> (name, pc offset or None) for each pool slot holding a
+    Function.
+
+    A closure is allocated by a stub that takes the closure's Function in a register,
+    and compiled code loads that Function from the object pool (AllocateClosureInstr's
+    function input is a constant, il.cc). So the slot says which function the closure
+    runs, and it is a Function object in every release read here: a closure function
+    for a function literal or a local function, an implicit closure function for a
+    tear-off of a method. On the clean fixture 941 of 942 allocation sites load such a
+    slot; 591 hold an anonymous closure, 47 a named one and 303 an implicit one.
+
+    From the Function to its code there are two ways and one of them is not enough.
+    The Code whose owner is the Function is what `image.code_ranges` is keyed on, and
+    136 of those 941 have none: instructions two functions share are kept once, under
+    one owner (dedup_instructions). The Function's own `code_index` is the statement
+    the VM itself follows, instructions-table slot `code_index - 1`, 0 where it has no
+    code (Deserializer::GetCodeByIndex, the rule dispatch.py and verify's G7 read);
+    all 941 have one. The same field is written by every release from 2.19.6 to
+    3.13.0, so nothing here depends on the epoch.
+
+    The name is the snapshot's, escaped and cut as every name is (`fr.names`). Keyed
+    like `build_pool_map`, by the offset a load off PP carries. One entry a slot at
+    most, each a dict lookup."""
+    from .disasm import pool_byte_offset
+    names = {ref: fr.names.get(nr, "") for ref, nr, _ow, _kt in fr.functions}
+    pcs = image.pcs
+    arch = getattr(image, "arch", None)
+    out = {}
+    for idx, (kind, val) in enumerate(fr.pool):
+        if kind != "ref" or val not in names:
+            continue
+        ci = fr.func_code_index.get(val, 0)
+        out[pool_byte_offset(idx, arch)] = (
+            names[val], pcs[ci - 1] if 0 < ci <= len(pcs) else None)
+    return out
 
 
 def recover_allocations(image, fr, layout: FieldLayout) -> AllocLayout:
@@ -434,6 +483,7 @@ def recover_allocations(image, fr, layout: FieldLayout) -> AllocLayout:
     if arch is None or arch.name != "arm64" or not image.text:
         out.refused = "the allocation-stub reader decodes A64 only"
         return out
+    out.closures = closure_functions(image, fr)
     cws = arch.compressed_word_size
     align = arch.word_size * 2          # kObjectAlignment, 2 * kWordSize
     cls_cid = {ref: cid & 0xFFFFFFFF for ref, _n, cid, _s in fr.classes}
@@ -499,7 +549,7 @@ def recover_allocations(image, fr, layout: FieldLayout) -> AllocLayout:
         return AllocLayout(stubs=out.stubs, confirmed=out.confirmed,
                            unreadable=out.unreadable, ambiguous=out.ambiguous,
                            size_disagreed=out.size_disagreed, unnamed=out.unnamed,
-                           disagreed=out.disagreed,
+                           disagreed=out.disagreed, closures=out.closures,
                            refused=f"{out.disagreed} allocation stubs carry a class id "
                                    f"their owner Class does not")
     return out
