@@ -282,6 +282,41 @@ binary and no list of known packages.
 `--anonymous` is the one to reach for after a signature pass: what no reference could name
 is, by construction, the code somebody wrote for this app.
 
+### What one lifted body calls and reads: `calls` and `strings` in `lift -j`
+
+Each function `lift -j` prints carries two lists beside `body`, so a script does not have
+to grep the text for them. Both come from what the lifter resolved while it printed that
+body, never from reading the text back.
+
+`calls` has one entry per callee, in the order it first appears. `count` is the number of
+times the body calls it, given only where that is more than once. `kind` is `direct`,
+`alloc` (an allocation stub or site), `stub` (a runtime stub: `throw`, `rethrow`,
+`NullCastError` and the like), `tail` (the `goto sub_0x...` a body leaves by), `virtual`
+(a dispatch, named by its selector as printed: `build`, `sel_0xf0a`, a getter `field`, a
+setter `field=`) or `indirect` (a call through a value, named by the expression it calls,
+or by its register in a body printed flat). An entry whose callee is a code range in this
+binary also has its `va`, the address `lift` and `disasm` take; a virtual or indirect one
+has none. A call printed with its arguments cut, `Positioned.directional(...)`, counts
+like any other.
+
+`strings` has one entry per pool slot the body prints a String from: `text`, the
+literal as the body prints it, and `pool`, the slot's offset as `xrefs <path> pool`
+takes it. A String the lifter loaded but no line prints is not listed.
+
+```
+$ jadart lift libapp.so benchFetchToken -j | jq -c '.functions[0] | {calls, strings}'
+{"calls":[{"name":"sub_0x15765c","kind":"direct","va":1406556}, ...
+{"name":"sub_0x157164","kind":"tail","va":1405284}],
+"strings":[{"text":"\"FLUBENCH{async_marker}:\"","pool":"0x96f8"}]}
+```
+
+Names and strings are the very text `body` prints, escaped and cut by the same code, so a
+name from the binary is never printed two ways. Neither list can outgrow the body: an
+entry is a callee or a slot that a line of `body` prints, and repeats only raise
+`count`. A body printed flat, because it was too deep to structure, still has both
+fields, read off its rows. `decompile -j` prints classes, not functions, and has neither
+field; `jadart.decompile()` has both.
+
 ### xrefs now answers for functions too
 
 Explicit kinds are supported for strings, pool entries, and functions:

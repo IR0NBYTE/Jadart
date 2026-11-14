@@ -4455,6 +4455,12 @@ class Lifter:
         self.pool_map = pool_map or {}
         #: Pool byte offset -> the arguments descriptor there (disasm.PoolMap.descs).
         self.pool_descs = getattr(pool_map, "descs", None) or {}
+        #: What `lift -j` lists (`lift_function`): each call as the walk prints it,
+        #: (name, kind, target pc_offset or None), and each String read off the pool,
+        #: (pool offset, label). `pool_at` is `annotate`'s, row -> the String's slot.
+        self.called, self.read_strs = [], []
+        self.pool_at = {}
+        self.pool_strs = getattr(pool_map, "strs", None) or ()
         #: The displacements an element access is read at, `Target.data_offsets`'s pair
         #: for compressed pointers unless `lift_function` is told otherwise, and per
         #: element address the ones its accesses reach (`_elem_offsets`), made when
@@ -8101,14 +8107,19 @@ class Lifter:
                     return []
                 pre = self._clobber_call(st)
                 if kind == "throw":
+                    self.called.append(("throw", "stub", target))
                     return pre + [f"throw {exc.text};"]
                 if kind == "rethrow":
+                    self.called.append(("rethrow", "stub", target))
                     return pre + ["rethrow;"]
                 if kind == "throw_err":
+                    self.called.append((label, "stub", target))
                     return pre + [f"throw {label}();"]
                 if kind == "alloc":
+                    self.called.append((label, "alloc", target))
                     return pre + self._result(st, f"new {label}()", _T.ret_int)
                 terse = label.replace("stub ", "").replace("_iso_stub_", "")
+                self.called.append((terse, "stub", target))
                 # terse, without the stub prefix; a stub's result is an object
                 return pre + self._result(st, f"{terse}(...)", _T.ret_int)
             # A per-class allocation stub, which the snapshot names through the Code's
@@ -8131,8 +8142,10 @@ class Lifter:
             # call's invalidation rather than the register-preserving treatment a named
             # stub gets: the only thing that changes here is what the line says.
             if site is not None:
+                self.called.append((site.name, "alloc", target))
                 return pins + self._result(st, f"new {site.name}()", _T.ret_int,
                                            alloc=site)
+            self.called.append((call, "direct", target))
             # The receiver is NOT dropped from `pushed`, unlike the dispatch case. A `blr`
             # prints its receiver as the base of the call (`x.foo(...)`) so listing it
             # again would show it twice; a direct call has no base, so argument zero is
@@ -8162,6 +8175,8 @@ class Lifter:
                 pins += self._clobber_call(st)
                 if named and base and named.startswith(("get:", "set:")):
                     prop = named.split(":", 1)[1]       # an accessor, not a call, in source
+                    self.called.append((prop if named[0] == "g" else prop + "=",
+                                        "virtual", None))
                     return pins + (self._result(st, f"{base}.{prop}")
                                    if named.startswith("get:")
                                    else [f"{base}.{prop} = ...;"])
@@ -8169,6 +8184,7 @@ class Lifter:
                        else "dispatch" if off is None
                        else f"sel_0x{off:x}" if off >= 0 else f"sel_m0x{-off:x}")
                 shown = stack_args if stack_args is not None else "..."
+                self.called.append((sel, "virtual", None))
                 if base:
                     return pins + self._result(st, f"{base}.{sel}({shown})")
                 return pins + [ln + "   // virtual dispatch"
@@ -8180,7 +8196,10 @@ class Lifter:
             pins = self._pin_call(st)
             pins += self._clobber_call(st)
             if tgt_val and tgt_val.prec >= P_POST and "DISPATCH" not in tgt_val.text:
-                return pins + self._result(st, f"{_wrap(tgt_val, P_POST)}({shown})")
+                callee = _wrap(tgt_val, P_POST)
+                self.called.append((callee, "indirect", None))
+                return pins + self._result(st, f"{callee}({shown})")
+            self.called.append(("(dynamic call)", "indirect", None))
             return pins + self._result(st, f"(dynamic call)({shown})")
 
         # stores: object field (side effect) vs stack slot (tracked, no output)
@@ -8490,7 +8509,10 @@ class Lifter:
             if post:
                 disp = 0                     # post-index: the access is at the OLD base
             if note.startswith("  ; = ") or note.startswith("; = "):
-                st.set(dst, V(note.split("= ", 1)[1].strip(), P_ATOM))   # resolved pool const
+                lbl = note.split("= ", 1)[1].strip()
+                if here in self.pool_at:
+                    self.read_strs.append((self.pool_at[here], lbl))
+                st.set(dst, V(lbl, P_ATOM))   # resolved pool const
                 return []
             # A canonical object read straight out of the base register. arm64 reaches
             # true/false with an `add` off NULL and is handled there; arm32 has no null
@@ -8526,6 +8548,8 @@ class Lifter:
                 offs = [(r, st.poolbase[base] + d) for r, d in words]
                 for r, off in offs:
                     lbl = self.pool_map.get(off)
+                    if off in self.pool_strs:
+                        self.read_strs.append((off, lbl))
                     st.set(r, V(lbl if lbl else f"pool_0x{off:x}", P_ATOM))
                 return []
             frame = self._frame_base(base)
@@ -10624,6 +10648,8 @@ class Lifter:
                     for b, rows, past in rows_of:
                         label(b)
                         out.extend(flat_rows(rows, pad, self.show))
+                        _raw_reads(rows, self.called, self.read_strs, self.pool_at,
+                                   self.show)
                         if past >= 0:
                             out.append(pad + cut_goto(past, self.show))
                 falls = alive = False
@@ -10662,6 +10688,8 @@ class Lifter:
                     # explanation, or let the carried state run on into a block control
                     # never reaches from here. 997 sites on the clean fixture did exactly
                     # that.
+                    if s[1] >= 0:
+                        self.called.append((self._sub(s[1]), "tail", s[1]))
                     out.append(pad + (f"goto {self._sub(s[1])};" if s[1] >= 0
                                       else "goto <unresolved>;"))
                 else:
@@ -13211,14 +13239,81 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
             f"Tier 1 (`disasm`) does decode it, and the snapshot layer is unaffected.")
     with use_target(TARGETS[name] if name else ARM64):
         try:
-            return _lift_function(ann, pool_map, receiver, arity, indent, depth,
-                                  selectors, fields, show, cut_end, returns, allocs,
-                                  mono, casts, getattr(arch, "compressed", None))
+            rec = {}
+            out = _lift_function(ann, pool_map, receiver, arity, indent, depth,
+                                 selectors, fields, show, cut_end, returns, allocs,
+                                 mono, casts, getattr(arch, "compressed", None), rec)
+            lf = rec.get("lifter")
+            return (Body(out) if lf is None
+                    else Body(out, lf.called, lf.read_strs))
         except RecursionError:
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
             # own Lifter, so nothing a half-finished lift touched outlives it.
-            return flat(ann, indent, depth, show=show, cut_end=cut_end)
+            called, strs = [], []
+            _raw_reads(ann, called, strs, getattr(ann, "pool_at", {}), show)
+            return Body(flat(ann, indent, depth, show=show, cut_end=cut_end),
+                        called, strs)
+
+
+class Body(list):
+    """`lift_function`'s lines, and beside them what `lift -j` lists of them (#444).
+
+    `calls` is one (name, kind, target, count) per callee, in the order the body first
+    prints a call to it: the name as the body prints it, the kind (`direct`, `alloc`,
+    `stub`, `virtual`, `indirect`, or `tail` for a `goto` out of the function), the
+    pc_offset a `bl` or that `goto` goes to and None for any other call, and how many
+    calls to it the body prints. `strings` is one (pool offset, text) per pool slot
+    holding a String the body prints, the text as the body prints it.
+
+    Both are what the walk that printed the body resolved as it printed each call and
+    each load (`Lifter.called`, `Lifter.read_strs`), not read back out of the text. A
+    String loaded and not printed, passed to a call that prints `(...)` or held in a
+    declaration a later pass drops, is not one the body reads, so a String is listed
+    where its text is in the lines that ship. Every entry stands for text in the body,
+    so neither list is longer than the body is."""
+
+    calls: tuple = ()
+    strings: tuple = ()
+
+    def __init__(self, lines=(), called=(), read_strs=()):
+        super().__init__(lines)
+        counts: dict = {}
+        for c in called:
+            counts[c] = counts.get(c, 0) + 1
+        self.calls = tuple(k + (n,) for k, n in counts.items())
+        if read_strs:
+            text, seen, strs = "\n".join(self), set(), []
+            for off, lbl in read_strs:
+                if off not in seen and lbl and lbl in text:
+                    seen.add(off)
+                    strs.append((off, lbl))
+            self.strings = tuple(strs)
+
+
+def _raw_reads(rows, called, read_strs, pool_at, show):
+    """What rows printed as they are say they call and read, into `called` and
+    `read_strs` as `Lifter` keeps them: a `bl`'s callee by its note, or the range it
+    goes to, a `blr` by the register it calls through, and a String by its slot."""
+    for a, mn, op, note in rows:
+        off = pool_at.get(a)
+        if off is not None and "= " in note:
+            read_strs.append((off, note.split("= ", 1)[1].strip()))
+        if mn not in _CALLS:
+            continue
+        ops = _split_ops(op)
+        tgt = _imm(ops[0]) if ops and ops[0].startswith("#") else None
+        if tgt is None:
+            called.append((ops[0].strip() if ops else op, "indirect", None))
+            continue
+        if "-> " in note:
+            nm = note.split("-> ", 1)[1].strip()
+        else:
+            label = getattr(show, "label", None)
+            nm = label(tgt) if label is not None else f"sub_0x{tgt:x}"
+        stub = _stub_of(note)
+        called.append((nm, "direct" if stub is None
+                       else "alloc" if stub[0] == "alloc" else "stub", tgt))
 
 
 @contextlib.contextmanager
@@ -13471,7 +13566,8 @@ def _ends_again(blocks, stmts, placed, second=frozenset(), trapped=frozenset()) 
 
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None, cut_end=None, returns=None,
-                   allocs=None, mono=None, casts=None, compressed=None) -> list:
+                   allocs=None, mono=None, casts=None, compressed=None,
+                   rec=None) -> list:
     g = tier3_graph(ann, cut_end, mono)
     if g is None:
         return []
@@ -13536,6 +13632,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                                 slow=slow, raw=raw)
 
     data, elem_box = _data_offsets(compressed), {}
+    pool_at = getattr(ann, "pool_at", None) or {}
 
     def walk(keep, carry=None, join_phi=None, printed_prior=None, hoist=None,
              phi_shown=None):
@@ -13543,6 +13640,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                         dispatch=dispatch, selectors=selectors, entry=entry,
                         fields=fields, allocs=allocs, casts=cast_at)
         lifter.data_offsets, lifter._elem_box = data, elem_box
+        lifter.pool_at = pool_at
         lifter.show = show
         lifter.slow_paths = frozenset(slow)
         lifter.frame_meets = meets
@@ -13713,4 +13811,6 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     if missing:
         pad = indent * depth
         out = [f"{pad}var {n};" for n in sorted(missing, key=lambda n: int(n[1:]))] + out
+    if rec is not None:
+        rec["lifter"] = lifter
     return out

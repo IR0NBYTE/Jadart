@@ -27012,6 +27012,86 @@ def test_the_call_graph_reads_no_name_from_the_vm_snapshot():
     assert sum(len(v) for v in idx.may_call.values()) == 22509
     assert sum(len(v) for v in idx.callees.values()) == 24849
 
+def _lift_json(target):
+    """The one function `lift CLEAN <target> -j` prints."""
+    import contextlib
+    import io
+    import json
+    from jadart import cli
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.main(["lift", CLEAN, target, "-j"])
+    doc = json.loads(buf.getvalue())
+    assert rc == 0 and doc["ok"] is True, doc
+    fns = doc["functions"]
+    assert all("calls" in f and "strings" in f for f in fns), target
+    return fns[0]
+
+
+def test_lift_json_lists_each_callee_with_its_kind_address_and_count():
+    """An agent reading `lift -j` had to grep `body` for calls and strings, and could not
+    tell a call through a selector from one to an address. Each function now carries
+    `calls`, one entry per callee in order of first appearance, taken from what the
+    lifter resolved while printing: a direct call and an allocation with the range they
+    go to, a stub, a tail branch, a virtual call by its selector and no address, and a
+    call through a value by the expression it calls. A call printed `(...)` counts."""
+    _needs_capstone()
+    f = _lift_json("benchFetchToken")
+    assert [(c["name"], c["kind"]) for c in f["calls"]] == [
+        ("sub_0x15765c", "direct"), ("Future.delayed", "direct"),
+        ("sub_0x157418", "direct"), ("List", "alloc"),
+        ("_interpolate@0150898", "direct"), ("sub_0x157164", "tail")], f["calls"]
+    # one address, the one every command takes back, and a count only past one
+    assert f["calls"][1] == {"name": "Future.delayed", "kind": "direct",
+                             "va": 0x1c15ec}, f["calls"][1]
+    assert f["strings"] == [{"text": '"FLUBENCH{async_marker}:"', "pool": "0x96f8"}]
+    # a call printed with its arguments cut, `Positioned.directional(...)`
+    f = _lift_json("0x23e510")
+    assert "return Positioned.directional(...);" in f["body"]
+    assert ("Positioned.directional", "direct") in [(c["name"], c["kind"])
+                                                     for c in f["calls"]]
+    # a virtual call: the selector as printed and no address; a throw stub
+    f = _lift_json("0x280d70")
+    assert f["calls"] == [{"name": "build", "kind": "virtual"},
+                          {"name": "NullCastError", "kind": "stub",
+                           "va": 0x2d5d00}], f["calls"]
+    # a call through a value: the expression, no address
+    f = _lift_json("0x284a18")
+    assert f["calls"] == [{"name": "this.field_0x10.field_0x20",
+                           "kind": "indirect"}], f["calls"]
+    # a thrown error built by a direct call, and the String it reads
+    f = _lift_json("0x23e4dc")
+    assert [(c["name"], c["kind"]) for c in f["calls"]] == [
+        ("FlutterError.", "direct"), ("throw", "stub")], f["calls"]
+    [s] = f["strings"]
+    assert s["pool"] == "0xf470" and s["text"].startswith('"Widgets that mix ')
+    assert s["text"] in "\n".join(f["body"])
+    # neither: both fields are there, empty
+    f = _lift_json("benchWithdraw")
+    assert f["calls"] == [] and f["strings"] == []
+
+
+def test_lift_json_fields_are_kept_when_the_body_is_printed_flat():
+    """A body too deep to structure is printed as its rows (#405). Its calls are still
+    read, off the rows: a `bl` by its note and a `blr` by its register, so the fields
+    are never missing and never empty only because the lifter gave up."""
+    from jadart.disasm import body_reads
+    from jadart.expr import lift_function
+    n = 500
+    end = 8 * n
+    rows = []
+    for i in range(n):
+        rows += [(8 * i, "cmp", f"x{i % 7}, #{i}", ""),
+                 (8 * i + 4, "b.eq", f"#{end + 16}", "")]
+    rows += [(end, "bl", "#0x9000", "-> Foo"), (end + 4, "blr", "x5", ""),
+             (end + 8, "bl", "#0x9000", "-> Foo"), (end + 12, "ret", "", ""),
+             (end + 16, "ret", "", "")]
+    body = _at_default_limit(lambda: lift_function(rows))
+    assert body[0].strip().startswith("// "), body[:2]
+    got = body_reads(body, None, frozenset())
+    assert got == {"calls": [{"name": "Foo", "kind": "direct", "count": 2},
+                             {"name": "x5", "kind": "indirect"}],
+                   "strings": []}, got
 
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
@@ -27035,3 +27115,4 @@ if __name__ == "__main__":
 
 
 # ── field layout: the offset -> name map the snapshot still carries ───────────────
+
