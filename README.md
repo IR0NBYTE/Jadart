@@ -494,6 +494,7 @@ What to know before relying on it:
 | [docs/usage.md](docs/usage.md) | command walkthroughs |
 | [docs/support.md](docs/support.md) | platform and version support in detail |
 | [docs/whats-coming.md](docs/whats-coming.md) | three Dart SDK changes that alter what a binary holds, and how to tell each from its bytes |
+| [docs/x86_64-design.md](docs/x86_64-design.md) | a proposal for reading x86_64 code: registers, patterns, the decoder, three stages and their cost |
 | [DESIGN.md](DESIGN.md) | the annotated Dart AOT snapshot format, cited to dart-lang/sdk |
 | [EVAL.md](EVAL.md) | evaluation against existing tools, and the failure taxonomy |
 | [skills/](skills/flutter-reverse-engineering/SKILL.md) | a portable Flutter reverse-engineering skill for coding agents |
