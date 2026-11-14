@@ -775,6 +775,11 @@ class Instances(_ByRef):
     def add(self, start, count, cid, bitmap, shape, marks) -> None:
         self._put(start, count, (cid, bitmap, shape, marks))
 
+    def cid_of(self, ref):
+        """The class id of the instance `ref`, from its cluster, reading nothing."""
+        got = self._run(ref)
+        return got[1][0] if got is not None else None
+
     def _value(self, i, run):
         cid, bitmap, (hw, nf, per_word), marks = run
         key = (id(run), i)

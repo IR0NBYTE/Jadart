@@ -4463,6 +4463,8 @@ class Lifter:
         #: What each pool slot holds (held.Holdings, disasm.PoolMap.held), asked only
         #: of a slot the pool map gives no name.
         self.pool_held = getattr(pool_map, "held", None)
+        #: The texts `_pool_slot` gave a const instance, each an object reference.
+        self._held_refs = set()
         #: The displacements an element access is read at, `Target.data_offsets`'s pair
         #: for compressed pointers unless `lift_function` is told otherwise, and per
         #: element address the ones its accesses reach (`_elem_offsets`), made when
@@ -6092,13 +6094,25 @@ class Lifter:
         a double, and the double is printed, in a form `float()` reads back to the same
         64 bits; NaN payloads no literal gives stay as the offset. `canon` makes `s0`
         `d0`, and four bytes are not a double, so the spelling is read from `ops`, not
-        from `r`. Anything else prints the offset (#362)."""
+        from `r`.
+
+        An `x` register loaded from a slot that holds a const instance whose class the
+        snapshot states prints the instance: an enum value by the name it holds, any
+        other as its class and fields, bounded (held.Holdings.lift_object). Anything
+        else prints the offset (#362, #363)."""
         held = self.pool_held
         raw = [o.strip() for o in ops[:2] if canon(o) == r]
-        if (held is not None and raw and raw[0][:1] == "d" and raw[0][1:].isdigit()):
+        if held is None or not raw or not raw[0][1:].isdigit():
+            return V(f"pool_0x{off:x}", P_ATOM)
+        if raw[0][:1] == "d":
             text = held.lift_double(off)
             if text is not None:
                 return V(text, P_UNARY if text[:1] == "-" else P_ATOM)
+        elif raw[0][:1] == "x":
+            text = held.lift_object(off)
+            if text is not None and not _spells_own(text):
+                self._held_refs.add(text)
+                return V(text, P_ATOM)
         return V(f"pool_0x{off:x}", P_ATOM)
 
     def _known32(self, tok: str, v: V) -> str:
@@ -6121,7 +6135,7 @@ class Lifter:
         the value is known of only if both loaded it so (`_join_low32`)."""
         if (not v.calc and v.prec == P_ATOM
                 and (v.text in _T.consts.values() or v.text == _T.consts_base == "NULL"
-                     or v.text.startswith(('"', "pool_0x")))
+                     or v.text.startswith(('"', "pool_0x")) or v.text in self._held_refs)
                 or v.text.endswith(_BOOL_ARMS)):
             return "ref"
         return "u32" if self._low32.get(id(v)) is v else ""
@@ -13062,6 +13076,60 @@ def _hoist_lines(lines: list, names) -> list | None:
         out.append(ln)
     return None if left else out
 _TMP_RE = re.compile(r"\bt\d+\b")
+
+#: The words a body prints as its own syntax, beside the ones the targets' tables and
+#: `_NORETURN` already name: the statement heads cfg.py and this file print.
+_BODY_WORDS = frozenset({"var", "if", "else", "while", "break", "continue", "goto",
+                         "return", "new"})
+#: The prefixes of the names this file mints by offset or address: a pool slot, a pool
+#: base, a call target, a selector, a label. A field is `_FIELD_ANY` without its dot.
+_MINTED_PREFIXES = ("pool_", "sub_0x", "sel_", "L_0x")
+
+
+def _own_words():
+    """Every identifier this lifter spells as itself, as one matcher of a whole word,
+    made from its own tables and patterns: the registers (`_ANY_REG` and the register
+    names the targets' roles and aliases use), the temporaries (`_TMP_RE`), the
+    parameters EntryNames gives (`a0`), the roles and constants of every target, the
+    receiver, and what it mints by offset."""
+    words = {_RECEIVER, *_NORETURN, *_BODY_WORDS}
+    letters = set()
+    for t in (ARM64, ARM32):
+        words.update(t.roles.values())
+        words.update(t.consts.values())
+        words.add(t.consts_base)
+        words.add(t.zero)
+        words.update(t.aliases)
+        letters.update(re.match(r"[a-z]*", r).group() for r in t.roles)
+    pats = [_ANY_REG.pattern.replace(r"\b", ""), _TMP_RE.pattern.replace(r"\b", ""),
+            r"a\d+", rf"(?:{'|'.join(sorted(x for x in letters if x))})\d+",
+            _FIELD_ANY.pattern[2:] + r"\w*",
+            *(re.escape(p) + r"\w*" for p in _MINTED_PREFIXES),
+            *(re.escape(w) for w in sorted(words) if w)]
+    return re.compile("|".join(f"(?:{p})" for p in pats))
+
+
+_OWN_WORD = _own_words()
+_WORD_RE = re.compile(r"(?<![\w$])[A-Za-z_$][\w$]*")
+#: The label held.py gives a field the snapshot does not name, `{field_0x8: ?}`, and
+#: the null it prints for a field that holds the null object: its own spellings, not
+#: words from the binary. No rule here reads a field without the dot before it
+#: (`_FIELD_ANY`), and `null` is the null object wherever it prints.
+_HELD_LABEL = re.compile(r"(?<=[{ ])field_0x[0-9a-f]+(?=: )|(?<=: )null(?=[,}])")
+
+
+def _spells_own(text: str) -> bool:
+    """Whether a text read out of the binary holds a word this lifter spells itself.
+
+    A class or an enum value can be named anything in a crafted snapshot. Printed as a
+    value, `x1.field_0x8` reads as a field of x1 to the reader and to the rules here
+    that read printed text back (`_names_role`, `_TMP_RE`), so such a slot stays
+    `pool_0x...` (#363). String literals are left out, they print quoted, and so is
+    what held.py spells itself, a field with no name and a null (`_HELD_LABEL`)."""
+    if '"' in text:
+        text = _QUOTED_RE.sub('""', text)
+    text = _HELD_LABEL.sub("", text)
+    return any(_OWN_WORD.fullmatch(w) for w in _WORD_RE.findall(text))
 
 
 def _inline_single_use(lines: list, names: set, wrap=frozenset()) -> list:
