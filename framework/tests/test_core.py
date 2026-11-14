@@ -28514,6 +28514,313 @@ def _refusals_on_every_command_463(tmp_path, capsys, as_json):
         assert msg.startswith("this is " + words) and "docs/whats-coming.md" in msg, msg
 
 
+# graphs: the call graph and one function's blocks written out (#446)
+
+def _graph_cli(*argv, code=0):
+    """Run the CLI in this process; (stdout, stderr). Asserts the exit code."""
+    import io
+    import contextlib
+    from jadart import cli
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cli.main([*argv])
+    assert rc == code, (argv, rc, err.getvalue()[-400:])
+    return out.getvalue(), err.getvalue()
+
+
+def _graph_json(*argv):
+    import json
+    return json.loads(_graph_cli(*argv, "-j")[0])
+
+
+_DOT_TOKEN = re.compile(r'\s+|//[^\n]*|"(?:[^"\\\n]|\\.)*"|->|[{}\[\];,=]'
+                        r'|[A-Za-z_][A-Za-z0-9_]*|-?\d+(?:\.\d+)?')
+
+
+def _parse_dot(text):
+    """A strict parser for the DOT Jadart writes, and nothing more: `digraph "id" {`,
+    `node [a=v, ...];`, `"id" [a=v, ...];`, `"id" -> "id" [a=v, ...];`, `//` comments
+    and `}`. Anything else, a character outside a token, an attribute with no value, an
+    edge to an undeclared node or a node declared twice, fails. Returns [(title, nodes,
+    edges)], nodes {id: attrs} and edges [(from, to, attrs)], strings unescaped."""
+    toks, pos = [], 0
+    while pos < len(text):
+        m = _DOT_TOKEN.match(text, pos)
+        assert m and m.end() > pos, f"stray text at {pos}: {text[pos:pos + 40]!r}"
+        t = m.group()
+        pos = m.end()
+        if not t.isspace() and not t.startswith("//"):
+            toks.append(t)
+
+    def unq(t):
+        assert t.startswith('"') and t.endswith('"'), t
+        return re.sub(r'\\(.)', lambda m: m.group(1) if m.group(1) in '"\\'
+                      else "\\" + m.group(1), t[1:-1])
+
+    i, graphs = 0, []
+
+    def take(want=None):
+        nonlocal i
+        assert i < len(toks), "ran out of tokens"
+        t = toks[i]
+        i += 1
+        if want is not None:
+            assert t == want, (want, t, i)
+        return t
+
+    def attrs():
+        take("[")
+        out = {}
+        while True:
+            k = take()
+            assert re.fullmatch(r"[A-Za-z_]\w*", k), k
+            take("=")
+            v = take()
+            assert v not in "[]{};,=" and v != "->", v
+            assert k not in out, k
+            out[k] = unq(v) if v.startswith('"') else v
+            sep = take()
+            if sep == "]":
+                return out
+            assert sep == ",", sep
+
+    while i < len(toks):
+        take("digraph")
+        title = unq(take())
+        take("{")
+        nodes, edges = {}, []
+        while toks[i] != "}":
+            t = take()
+            if t == "node":
+                attrs()
+            else:
+                a = unq(t)
+                if toks[i] == "->":
+                    take("->")
+                    b = unq(take())
+                    edges.append((a, b, attrs()))
+                else:
+                    assert a not in nodes, a
+                    nodes[a] = attrs()
+            take(";")
+        take("}")
+        for a, b, _at in edges:
+            assert a in nodes and b in nodes, (a, b)
+        graphs.append((title, nodes, edges))
+    return graphs
+
+
+def test_dot_quote_keeps_any_name_one_string():
+    """A name from the binary is one quoted DOT string whatever it holds: a quote, a
+    backslash (last, too), a newline, `]`, `;`, `->`. Read back by a strict parser it is
+    the name and nothing else, so it cannot close the string, add an attribute or start
+    a statement."""
+    from jadart.graph import dot_quote
+    hostile = ['a"b', 'a\\', '\\"]; "x" -> "y', 'n\nm', 'x]; node [shape=none', 'a;b',
+               'f -> g', '"', '\\', 'tab\there', 'del\x7f']
+    for h in hostile:
+        q = dot_quote(h)
+        (_t, nodes, edges), = _parse_dot(f'digraph "t" {{\n  "0x1" [label={q}];\n}}\n')
+        assert list(nodes) == ["0x1"] and not edges, h
+        assert set(nodes["0x1"]) == {"label"}, h
+        want = h.replace("\n", "\\x0a").replace("\t", "\\x09").replace("\x7f", "\\x7f")
+        assert nodes["0x1"]["label"] == want, (h, nodes)
+        assert "\n" not in q
+
+
+def test_xrefs_graph_depth_one_lists_what_xrefs_and_functions_list():
+    """The depth 1 graph of benchFetchToken: its callers are exactly the ones `xrefs
+    function` lists and its callees as many as `functions` counts, every edge touches
+    it, and every other node is one call away."""
+    _needs_capstone()
+    g = _graph_json("xrefs", CLEAN, "function", "benchFetchToken", "--graph")
+    x = _graph_json("xrefs", CLEAN, "function", "benchFetchToken")
+    f = _graph_json("functions", CLEAN, "-f", "benchFetchToken")["functions"]
+    (fx,), (ff,) = x["functions"], [r for r in f if r["name"] == "benchFetchToken"]
+    root = fx["va"]
+    assert g["roots"] == [root] and g["depth"] == 1 and g["direction"] == "both"
+    callers = {c["va"] for c in fx["called_by"] + fx["may_be_called_by"]}
+    assert callers and {e["from"] for e in g["edges"] if e["to"] == root} == callers
+    out = [e for e in g["edges"] if e["from"] == root and e["kind"] != "virtual"]
+    assert len(out) == ff["callees"] == 6, out
+    assert all(root in (e["from"], e["to"]) for e in g["edges"])
+    depth = {n["va"]: n["depth"] for n in g["nodes"]}
+    assert depth.pop(root) == 0 and set(depth.values()) == {1}
+    assert g["node_count"] == len(g["nodes"]) == 8 and g["cut"] is None
+
+
+def test_xrefs_graph_depth_and_direction():
+    """Depth 2 of benchRunAll holds all of depth 1; callers and callees together are
+    `both`; a callers graph only ever walks into a node from farther out, a callees
+    graph only out of one; and --depth is bounded."""
+    _needs_capstone()
+    def edges(g):
+        return {(e["from"], e["to"], e["kind"]) for e in g["edges"]}
+    one = _graph_json("xrefs", CLEAN, "function", "benchRunAll", "--graph")
+    two = _graph_json("xrefs", CLEAN, "function", "benchRunAll", "--graph",
+                      "--depth", "2")
+    assert edges(one) < edges(two)
+    assert {n["va"] for n in one["nodes"]} < {n["va"] for n in two["nodes"]}
+    up = _graph_json("xrefs", CLEAN, "function", "benchRunAll", "--graph",
+                     "--depth", "2", "--direction", "callers")
+    down = _graph_json("xrefs", CLEAN, "function", "benchRunAll", "--graph",
+                       "--depth", "2", "--direction", "callees")
+    assert edges(up) | edges(down) == edges(two)
+    for g, back in ((up, True), (down, False)):
+        d = {n["va"]: n["depth"] for n in g["nodes"]}
+        assert g["edges"]
+        for e in g["edges"]:
+            a, b = (e["to"], e["from"]) if back else (e["from"], e["to"])
+            assert d[a] <= d[b], (back, e)
+    for bad in ("0", "7"):
+        _graph_cli("xrefs", CLEAN, "function", "benchRunAll", "--graph", "--depth", bad,
+                   code=2)
+
+
+def test_xrefs_graph_three_edge_kinds_agree_with_the_whole_graph():
+    """A `bl` is `direct`, a function torn off the object pool is `pool`, and a dispatch
+    site is `virtual`; the graph around one function, built for it alone, holds the
+    edges the whole graph holds for it, the virtual ones it calls included."""
+    _needs_capstone()
+    whole = _graph_json("xrefs", CLEAN, "function", "--graph", "--whole")
+    assert whole["graph"] == "whole" and whole["cut"] is None
+    kinds = {e["kind"] for e in whole["edges"]}
+    assert kinds == {"direct", "pool", "virtual"}, kinds
+    assert whole["virtual_edges"] == sum(e["kind"] == "virtual" for e in whole["edges"])
+    all_edges = {(e["from"], e["to"], e["kind"]) for e in whole["edges"]}
+    # build tears _run off the pool (0x1ee6a8); benchCheckSecret calls `skip` through the
+    # dispatch table.
+    for name, kind in (("0x1ee6a8", "pool"), ("benchCheckSecret", "virtual"),
+                       ("benchFetchToken", "direct")):
+        g = _graph_json("xrefs", CLEAN, "function", name, "--graph")
+        root, = g["roots"]
+        mine = {(e["from"], e["to"], e["kind"]) for e in g["edges"]}
+        assert mine == {e for e in all_edges if root in e[:2]}, name
+        assert kind in {e[2] for e in mine}, (name, kind)
+
+
+def test_xrefs_graph_dot_and_json_agree():
+    """`--dot` and `-j` are one graph: the same node addresses, the same edges with the
+    same kinds, a virtual edge dashed, and every label the node's name."""
+    _needs_capstone()
+    argv = ("xrefs", CLEAN, "function", "benchRunAll", "--graph", "--depth", "2")
+    g = _graph_json(*argv)
+    (title, nodes, edges), = _parse_dot(_graph_cli(*argv[:-3], "--dot", *argv[-2:])[0])
+    assert title == "benchRunAll"
+    assert set(nodes) == {f"0x{n['va']:x}" for n in g["nodes"]}
+    assert sorted((a, b, at["class"]) for a, b, at in edges) == sorted(
+        (f"0x{e['from']:x}", f"0x{e['to']:x}", e["kind"]) for e in g["edges"])
+    assert any(at["class"] == "virtual" for _a, _b, at in edges)
+    for _a, _b, at in edges:
+        assert (at.get("style") == "dashed") == (at["class"] == "virtual"), at
+    for n in g["nodes"]:
+        assert n["name"] in nodes[f"0x{n['va']:x}"]["label"] or not n["name"]
+
+
+def test_xrefs_graph_dot_survives_hostile_names():
+    """Every node of a graph whose names hold quotes, backslashes, newlines, `]`, `;`
+    and `->` still parses as one node with one label, under its address, and the edges
+    are the ones `-j` lists."""
+    _needs_capstone()
+    from unittest import mock
+    from jadart import graph
+    real = graph.range_names
+    evil = ['x"] ; "0x1" -> "0x2" [color=red', 'tail\\', 'line\nbreak', 'a;b->c',
+            '"]', '\\"', 'node [shape=none]']
+
+    def names(image, fr, matched=None):
+        out = real(image, fr, matched)
+        return {pc: (evil[pc % len(evil)] + nm, o) for pc, (nm, o) in out.items()}
+    argv = ("xrefs", CLEAN, "function", "benchRunAll", "--graph")
+    with mock.patch.object(graph, "range_names", names):
+        dot = _graph_cli(*argv[:-1], "--dot")[0]
+        g = _graph_json(*argv)
+    (_t, nodes, edges), = _parse_dot(dot)
+    assert set(nodes) == {f"0x{n['va']:x}" for n in g["nodes"]}
+    assert all(set(at) == {"label"} for at in nodes.values())
+    assert len(edges) == len(g["edges"])
+    for n in g["nodes"]:
+        if n["name"]:
+            assert n["name"].replace("\n", "\\x0a") in nodes[f"0x{n['va']:x}"]["label"]
+
+
+def test_xrefs_graph_is_bounded_and_says_what_it_cut():
+    """The callers of every `toString` are more than a screen: the graph keeps -n nodes
+    and five times as many edges, nearest first, and says how many it left out, in
+    `-j`, as a note and in the text; -n 0 lifts the bound."""
+    _needs_capstone()
+    g = _graph_json("xrefs", CLEAN, "function", "toString", "--graph", "-n", "10")
+    assert g["node_count"] <= 10 and g["edge_count"] <= 50
+    assert g["cut"] and g["cut"]["nodes"] + g["cut"]["edges"] > 0
+    assert any(n.startswith("cut at 10 nodes and 50 edges") for n in g["notes"])
+    ids = {n["va"] for n in g["nodes"]}
+    assert all(e["from"] in ids and e["to"] in ids for e in g["edges"])
+    text = _graph_cli("xrefs", CLEAN, "function", "toString", "--graph", "-n", "10")[0]
+    assert "// cut at 10 nodes and 50 edges" in text
+    full = _graph_json("xrefs", CLEAN, "function", "toString", "--graph", "-n", "0")
+    assert full["cut"] is None and full["edge_count"] > 50
+    dflt = _graph_json("xrefs", CLEAN, "function", "toString", "--graph")
+    assert dflt["node_count"] <= 200 and dflt["edge_count"] <= 1000 and dflt["cut"]
+
+
+def test_xrefs_graph_refuses_what_it_cannot_draw():
+    """Two formats at once, a graph option with no graph, a graph of strings, a name
+    with --whole and no name without it are usage errors, not a guess."""
+    for argv in (("function", "benchRunAll", "--dot", "-j"),
+                 ("function", "benchRunAll", "--depth", "2"),
+                 ("string", "flutter", "--graph"),
+                 ("function", "benchRunAll", "--graph", "--whole"),
+                 ("function", "--graph"),
+                 ("function", "--whole", "-n", "5")):
+        _graph_cli("xrefs", CLEAN, *argv, code=2)
+    _graph_cli("disasm", CLEAN, "benchRunAll", "--dot", "-j", code=2)
+
+
+def test_disasm_graph_is_the_lifters_block_graph():
+    """`disasm --graph` of benchComputeChecksum: one edge for every successor of every
+    block in the graph tier 3 builds, the blocks cover every instruction `disasm` lists
+    exactly once, the loop's back edge and the two arms of its conditionals are there,
+    and `--dot` is the same graph."""
+    _needs_capstone()
+    from jadart.branches import row_kinds
+    from jadart.disasm import (load_instructions, named_ranges, disassemble_range,
+                               annotate, build_pool_map, monomorphic_entry, cut_end,
+                               va_of)
+    from jadart.signatures import names_with_signatures
+    from jadart.expr import tier3_graph
+    g = _graph_json("disasm", CLEAN, "benchComputeChecksum", "--graph")
+    (fn,) = g["functions"]
+    image, fr, _h = load_instructions(CLEAN)
+    (_nm, cr), = named_ranges(image, fr, "benchComputeChecksum")
+    dis = disassemble_range(image, cr)
+    pc_to_name, _ = names_with_signatures(image, fr, None)
+    ann = annotate(dis, pc_to_name, build_pool_map(fr, image.arch),
+                   kinds=row_kinds(image, dis))
+    t3 = tier3_graph(ann, cut_end(cr, dis), monomorphic_entry(image, cr))
+    want = sorted((va_of(image, a), va_of(image, s)) for a, b in t3.blocks.items()
+                  for s in b.succ)
+    assert sorted((e["from"], e["to"]) for e in fn["edges"]) == want
+    assert len(fn["edges"]) == sum(len(b.succ) for b in t3.blocks.values())
+    rows = [i["va"] for i in _graph_json("disasm", CLEAN,
+                                          "benchComputeChecksum")["functions"][0][
+                                              "instructions"]]
+    covered = [a for b in fn["blocks"] for a in range(b["start"], b["end"], 4)]
+    assert sorted(covered) == rows and len(set(covered)) == len(covered)
+    assert sum(b["instructions"] for b in fn["blocks"]) == len(rows)
+    kinds = {e["kind"] for e in fn["edges"]}
+    assert {"taken", "fall", "jump"} <= kinds, kinds
+    assert any(e["kind"] == "jump" and e["to"] < e["from"] for e in fn["edges"])
+    assert fn["entry"] == fn["blocks"][0]["start"] == fn["va"]
+    (title, nodes, edges), = _parse_dot(
+        _graph_cli("disasm", CLEAN, "benchComputeChecksum", "--dot")[0])
+    assert title == "benchComputeChecksum"
+    assert set(nodes) == {f"0x{b['start']:x}" for b in fn["blocks"]}
+    assert sorted((a, b, at["class"]) for a, b, at in edges) == sorted(
+        (f"0x{e['from']:x}", f"0x{e['to']:x}", e["kind"]) for e in fn["edges"])
+    text = _graph_cli("disasm", CLEAN, "benchComputeChecksum", "--graph")[0]
+    assert f"{len(fn['blocks'])} blocks, {len(fn['edges'])} edges" in text
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188

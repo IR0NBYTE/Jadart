@@ -13,6 +13,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
+- **The call graph around a function, and one function's blocks, as a graph (#446).**
+  Reading the shape of the code meant chaining `xrefs` by hand. `xrefs ... function NAME
+  --graph` now writes the function, its callers and callees, `--depth N` levels out (1 to
+  6) in one `--direction`; `-j` gives `nodes` and `edges` with a `kind` of direct, pool
+  or virtual, and `--dot` writes Graphviz with addresses as node ids and every name
+  quoted, so a name with quotes, backslashes, newlines or `->` stays one label. A virtual
+  edge is a call that may land there and is drawn dashed. The graph stops at 200 nodes
+  and 1000 edges, keeps the nearest, and says what it cut; `--whole` writes every
+  function. `disasm NAME --graph` prints the blocks the lifter builds, with start, end,
+  instruction count and `fall`, `taken` and `jump` edges. On the clean fixture the depth
+  1 graph of `benchFetchToken` is the one caller `xrefs` lists and the 6 callees
+  `functions` counts; it takes 0.465 s against 0.461 s for `xrefs function`, best of 5,
+  because it builds the index only for the functions it reaches. The whole graph, 8194
+  nodes and 47358 edges, takes 0.78 s. Existing text and `-j` output is unchanged.
+
 - **`lift -j` lists what each body calls and which Strings it prints (#444).** An agent
   had to grep `body` for both, and could not tell a call through a selector from one to
   an address. Each function now has `calls`, one entry per callee in order of first use

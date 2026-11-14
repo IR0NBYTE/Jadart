@@ -33,6 +33,9 @@ _COMMANDS = ("info", "libraries", "classes", "disasm", "lift", "decompile",
              "signatures",
              "functions", "ffi", "symbols", "hook", "serve")
 
+#: The bounds of `xrefs --graph`, kept here for the help text; graph.py holds them.
+_GRAPH_MAX_DEPTH, _GRAPH_NODES, _GRAPH_EDGES = 6, 200, 5
+
 _EXAMPLES = """\
 examples:
   jadart info libapp.so                    header, epoch, target, object counts
@@ -412,6 +415,10 @@ def cmd_disasm(args) -> int:
         return _fail(e)
 
     as_json = getattr(args, "json", False)
+    graph = getattr(args, "graph", False) or getattr(args, "dot", False)
+    if as_json and getattr(args, "dot", False):
+        return _xrefs_usage(args, "--dot and -j are two spellings of one graph: "
+                                  "pass one of them")
     ranges = named_ranges(image, fr, args.symbol)
     if not ranges:
         if as_json:
@@ -423,9 +430,11 @@ def cmd_disasm(args) -> int:
         pc_to_name, signote = names_with_signatures(image, fr, getattr(args, "sigs", None))
     except JadartError as e:
         return _fail(e)
-    if signote and not as_json:
+    if signote and not as_json and not getattr(args, "dot", False):
         print(comment(f"// {signote}"))
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
+    if graph:
+        return _disasm_graph(args, image, ranges, pc_to_name, pool_map)
     printed, out = 0, []
     for nm, cr in ranges:
         dis = disassemble_range(image, cr)
@@ -460,6 +469,165 @@ def cmd_disasm(args) -> int:
     if not printed:
         error(f"{args.symbol} has no resolvable code range")
         return EXIT_MISS
+    return EXIT_OK
+
+
+def _disasm_graph(args, image, ranges, pc_to_name, pool_map) -> int:
+    """`disasm --graph`: each range's blocks and edges, from the CFG the lifter builds
+    (graph.block_graph), as an edge list, `-j` or DOT."""
+    from .branches import row_kinds
+    from .disasm import (disassemble_range, annotate, addr_label, va_of,
+                         monomorphic_entry)
+    from .expr import TooDeep
+    from .graph import block_graph, block_graph_dot, dot_quote
+    as_json, as_dot = getattr(args, "json", False), getattr(args, "dot", False)
+    out = []
+    for nm, cr in ranges:
+        dis = disassemble_range(image, cr)
+        if not dis:
+            continue
+        ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
+        try:
+            g, err = block_graph(image, cr, dis, ann, monomorphic_entry(image, cr)), None
+        except TooDeep as e:
+            g, err = None, str(e)
+        out.append((nm, cr, g, err))
+    if as_json:
+        fns = []
+        for nm, cr, g, err in out:
+            doc = {"name": nm, "pc_offset": cr.pc_offset,
+                   "va": va_of(image, cr.pc_offset), "size": cr.size}
+            if g is None:
+                doc.update(blocks=None, edges=None,
+                           error=err or "no instructions make a block")
+            else:
+                doc.update(entry=va_of(image, g["entry"]),
+                           blocks=[{"start": va_of(image, b["start"]),
+                                    "end": va_of(image, b["end"]),
+                                    "instructions": b["instructions"]}
+                                   for b in g["blocks"]],
+                           edges=[{"from": va_of(image, e["from"]),
+                                   "to": va_of(image, e["to"]), "kind": e["kind"]}
+                                  for e in g["edges"]])
+            fns.append(doc)
+        return emit({"ok": bool(fns), "symbol": args.symbol, "count": len(fns),
+                     "functions": fns}, EXIT_OK if fns else EXIT_MISS)
+    if not out:
+        error(f"{args.symbol} has no resolvable code range")
+        return EXIT_MISS
+    for nm, cr, g, err in out:
+        if g is None:
+            why = err or "no instructions make a block"
+            if as_dot:
+                print(f"// {addr_label(image, cr.pc_offset)}: {why}")
+            else:
+                print(comment(f"// {nm}  @ {addr_label(image, cr.pc_offset)}: {why}"))
+            continue
+        if as_dot:
+            print("\n".join(block_graph_dot(g, image, nm)))
+            continue
+        print(dim("// ") + bold(nm) + dim(f"  @ {addr_label(image, cr.pc_offset)}  "
+                                          f"{len(g['blocks'])} blocks, "
+                                          f"{len(g['edges'])} edges"))
+        succ = {}
+        for e in g["edges"]:
+            succ.setdefault(e["from"], []).append(e)
+        for b in g["blocks"]:
+            tail = "  ".join(f"{e['kind']} {addr_label(image, e['to'])}"
+                             for e in succ.get(b["start"], ()))
+            print(f"  {addr_label(image, b['start'])}..{addr_label(image, b['end'])}"
+                  f"  {b['instructions']:>4}" + (f"  -> {tail}" if tail else ""))
+        print()
+    return EXIT_OK
+
+
+def _xrefs_graph(args) -> int:
+    """`xrefs FILE function NAME --graph`: the call graph around NAME, or with --whole
+    every function's, as an edge list, `-j` or DOT (graph.call_graph)."""
+    from .disasm import load_instructions, named_ranges, addr_label, va_of
+    from .graph import call_graph, call_graph_dot, MAX_DEPTH, NODE_LIMIT
+    as_json, as_dot = getattr(args, "json", False), getattr(args, "dot", False)
+    whole = getattr(args, "whole", False)
+    depth, direction, limit = args.depth, args.direction, args.limit
+    if as_json and as_dot:
+        return _xrefs_usage(args, "--dot and -j are two spellings of one graph: "
+                                  "pass one of them")
+    if not (args.graph or as_dot or whole):
+        return _xrefs_usage(args, "--depth, --direction and -n shape a graph: "
+                                  "add --graph")
+    if args.kind_or_pattern != "function":
+        return _xrefs_usage(args, "--graph draws calls: "
+                                  "`xrefs FILE function NAME --graph`")
+    if args.exact or args.class_name:
+        return _xrefs_usage(args, "--exact and --class do not apply to --graph")
+    if whole:
+        if args.pattern is not None:
+            return _xrefs_usage(args, "--whole draws every function: leave out NAME")
+        if depth is not None or direction is not None or limit is not None:
+            return _xrefs_usage(args, "--whole has no depth, direction or bound")
+    elif args.pattern is None:
+        return _xrefs_usage(args, "--graph needs a function NAME, or --whole")
+    depth = 1 if depth is None else depth
+    if not 1 <= depth <= MAX_DEPTH:
+        return _xrefs_usage(args, f"--depth is 1 to {MAX_DEPTH}")
+    direction = direction or "both"
+    limit = NODE_LIMIT if limit is None else limit
+    if limit < 0:
+        return _xrefs_usage(args, "-n is 0 or more")
+    try:
+        image, fr, _hdr = load_instructions(args.libapp)
+    except JadartError as e:
+        return _fail(e)
+    roots = []
+    if not whole:
+        try:
+            roots = sorted({cr.pc_offset for _nm, cr in
+                            named_ranges(image, fr, args.pattern)})
+        except JadartError:
+            roots = []
+        if not roots:
+            return _xrefs_miss(args, args.pattern, "function",
+                               f"nothing matching {args.pattern!r}: "
+                               "no function goes by that name or address")
+    try:
+        g = call_graph(image, fr, roots, depth, direction, whole, limit,
+                       getattr(args, "sigs", None))
+    except JadartError as e:
+        return _fail(e)
+    virt = sum(e["kind"] == "virtual" for e in g["edges"])
+    if as_json:
+        return emit({"ok": True, "pattern": args.pattern, "kind": "function",
+                     "graph": "whole" if whole else "around",
+                     "depth": None if whole else depth,
+                     "direction": None if whole else direction,
+                     "roots": [va_of(image, r) for r in roots],
+                     "node_count": len(g["nodes"]), "edge_count": len(g["edges"]),
+                     "virtual_edges": virt, "cut": g["cut"], "notes": g["notes"],
+                     "nodes": [{"va": n["va"], "pc_offset": n["pc_offset"],
+                                "name": n["name"], "class": n["class"],
+                                "depth": n["depth"]} for n in g["nodes"]],
+                     "edges": [{"from": va_of(image, e["from"]),
+                                "to": va_of(image, e["to"]), "kind": e["kind"]}
+                               for e in g["edges"]]})
+    title = "callgraph" if whole else args.pattern
+    if as_dot:
+        lines = call_graph_dot(g, image, title)
+        # Notes are Jadart's own words and addresses, never a name from the binary.
+        print("\n".join([lines[0], *(f"  // {n}" for n in g["notes"]), *lines[1:]]))
+        return EXIT_OK
+    label = {n["pc_offset"]: n["label"] for n in g["nodes"]}
+    what = ("the whole call graph" if whole else
+            f"call graph around {args.pattern}  depth {depth}, "
+            + ("both directions" if direction == "both" else direction))
+    print(comment(f"// {what}: {len(g['nodes'])} functions, {len(g['edges'])} calls"))
+    if virt:
+        print(comment(f"// {virt} virtual: a dispatch site that may call the target, "
+                      "picked by its selector's name, not proven"))
+    for n in g["notes"]:
+        print(comment(f"// {n}"))
+    for e in g["edges"]:
+        print(f"{addr_label(image, e['from']):<10} -> {addr_label(image, e['to']):<10} "
+              f"{e['kind']:<8} {label.get(e['from'], '')} -> {label.get(e['to'], '')}")
     return EXIT_OK
 
 
@@ -1197,6 +1365,12 @@ def cmd_xrefs(args) -> int:
     exact = getattr(args, "exact", False)
     class_name = getattr(args, "class_name", None)
 
+    if (getattr(args, "graph", False) or getattr(args, "dot", False)
+            or getattr(args, "whole", False) or getattr(args, "depth", None) is not None
+            or getattr(args, "direction", None) is not None
+            or getattr(args, "limit", None) is not None):
+        return _xrefs_graph(args)
+
     if args.kind_or_pattern is None:
         return _xrefs_usage(args, "xrefs needs a PATTERN or KIND PATTERN")
 
@@ -1677,6 +1851,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol", metavar="SYMBOL",
                    help="a recovered function name, or an ELF .symtab name on "
                         "dwarf builds")
+    p.add_argument("--graph", action="store_true",
+                   help="write the function's basic blocks and the edges between them, "
+                        "from the graph the lifter structures, instead of its "
+                        "instructions")
+    p.add_argument("--dot", action="store_true",
+                   help="write that block graph as Graphviz DOT")
     _add_sigs(p)
     p.set_defaults(func=cmd_disasm)
 
@@ -1745,6 +1925,24 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="keep only references owned by this class",
     )
+    p.add_argument("--graph", action="store_true",
+                   help="with function NAME: write the call graph around it, its "
+                        "callers and callees to --depth, as an edge list (or nodes and "
+                        "edges with -j)")
+    p.add_argument("--depth", type=int, metavar="N",
+                   help=f"how many calls away from NAME the graph reaches (default 1, "
+                        f"at most {_GRAPH_MAX_DEPTH})")
+    p.add_argument("--direction", choices=("both", "callers", "callees"),
+                   help="follow what calls NAME, what NAME calls, or both (default)")
+    p.add_argument("--dot", action="store_true",
+                   help="write the graph as Graphviz DOT; virtual calls are dashed, "
+                        "because they are possible targets, not proven ones")
+    p.add_argument("--whole", action="store_true",
+                   help="the whole call graph instead of the part around NAME, with no "
+                        "bound on its size: `xrefs FILE function --graph --whole`")
+    p.add_argument("-n", "--limit", type=int, metavar="N",
+                   help=f"cut the graph around NAME at N functions and {_GRAPH_EDGES}N "
+                        f"calls, nearest first (default {_GRAPH_NODES}; 0 for no bound)")
     _add_sigs(p)
     p.set_defaults(func=cmd_xrefs)
 
