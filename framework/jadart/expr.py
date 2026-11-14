@@ -1269,7 +1269,7 @@ def _num(n: int) -> V:
 #: The root of an address off the frame, `FP`, `SP`, `(FP - 8)` (#341).
 _FRAME_ROOT = re.compile(r"\(*(?:FP|SP)(?: [-+] [^.()\[\]]+)*\)*\Z")
 #: A read of the frame inside a value's text, which a store to the heap does not write:
-#: `FP.field_0x21`, `(FP - 0x340).field_0x1`, and the `FP[` of a slot at an index, whose
+#: `FP.field_0x20`, `(FP - 0x340).field_0x0`, and the `FP[` of a slot at an index, whose
 #: index may itself read the heap and stays (#341).
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
@@ -1378,7 +1378,7 @@ _RECEIVER = "this"
 #: `field_0x` would stop seeing it, so exactly the fields we understand best would be
 #: the ones left stale across a call. A name is only ever attached to the receiver alias,
 #: which bounds the widening to that one base rather than every dotted expression.
-#: A text spelled off the frame itself, `(FP - 64).field_0x1`. It reads memory the
+#: A text spelled off the frame itself, `(FP - 64).field_0x0`. It reads memory the
 #: lifter tracks as slots rather than as fields, so a frame store writes it without
 #: anything marking a value that reads it stale; such a text is never recorded (#199).
 _FRAME_TEXT_RE = re.compile(r"\((?:FP|SP)\s*[-+]")
@@ -1665,7 +1665,7 @@ class State:
         instruction was FOLDED, so it printed no assignment and the text still reads what
         it read at the spill (#196).
 
-        A text spelled off the frame itself is refused. `(FP - 64).field_0x1` reads memory
+        A text spelled off the frame itself is refused. `(FP - 64).field_0x0` reads memory
         the lifter does not model as a slot, so nothing marks it stale when a frame store
         writes it (#199)."""
         if not _FRAME_TEXT_RE.search(v.text):
@@ -6361,18 +6361,19 @@ class Lifter:
         return got if got.text else V(canon(reg), P_ATOM)
 
     def _frame_read(self, base: str, disp: int, at=None, width: int = 8) -> V:
-        """A frame slot spelled as the read it is, `(FP - 8).field_0x1`.
+        """A frame slot spelled as the read it is, `(FP - 8).field_0x0`.
 
-        Spelled the way the lifter already spells the SAME address when it is held in a
-        register: `sub x0, x29, #0x40; ldur x3, [x0, #8]` prints `(FP - 64).field_0x9`,
-        and `mov x0, x15; ldur x3, [x0, #0x10]` prints `SP.field_0x11`. So the negative
-        part of the displacement goes into the base expression and the field offset
-        carries the tag bias, which is what `record_drop` and `_FRAME_TEXT_RE` both
-        document.
+        At the offset the instruction reads, as a slot of the thread is: the frame is no
+        tagged heap object, so its field offset carries no tag bias. It carried one, and
+        `ldr x0, [x29, #0x10]` printed `FP.field_0x11`, a byte the code never reads, in
+        8,631 lines of the clean fixture (#407). The negative part of the displacement
+        goes into the base expression, so a field offset is never negative, and the
+        lifter spells the SAME address held in a register the same way: `mov x0, x15;
+        ldur x3, [x0, #0x10]` prints `SP.field_0x10` (`_untagged`).
 
-        Not `_byte_off`: the frame registers are untagged, and taking its answer here
-        would print `.tags`, the object header, for a read at the base itself, and a
-        negative field offset for the frame slots that matter, which are all below FP.
+        Not `_byte_off` alone: a read at the base itself would print `.tags`, the object
+        header, and the frame slots that matter, which are all below FP, a negative
+        field offset.
         """
         # Off SP, spelled against the frame the function was ENTERED with wherever SP's
         # place there is known exactly. `SP` means SP at this line, so two reads of
@@ -6391,7 +6392,7 @@ class Lifter:
         addr, off = V(role, P_ATOM), disp
         if disp < 0:
             addr, off = _bin(addr, "-", _num(-disp), P_ADD), 0
-        return self._field(addr, off + 1, width)
+        return self._field(addr, off, width, header=False)
 
     def _name_blind(self, st: State, base: str, mn: str, blind: list, at=None) -> list:
         """Name what a DECLINED frame reload read, rather than keep the load's register.
@@ -6432,7 +6433,7 @@ class Lifter:
                 continue
             v = self._frame_read(base, disp, at, width)
             # The spelling says how many bytes were read now, so the unsigned mask said it
-            # twice: `(FP - 8).field2_0x1` and not `((FP - 8).field_0x1 & 0xffff)`. The
+            # twice: `(FP - 8).field2_0x0` and not `((FP - 8).field_0x0 & 0xffff)`. The
             # SIGN is a separate fact about the destination's 64 bits, and the shift pair
             # is still the only thing that says it (#221).
             if _reg_file(op) == "x" and signed and width < 8:
@@ -7249,7 +7250,7 @@ class Lifter:
         of any object (#341): a displacement folded into the base, or a base that may
         hold a computed address (`_computed`). Not off an untagged role's own address,
         DISPATCH or HEAP, which is no Dart object, as THR and PP are not (`_pin_mem`),
-        and not off the frame: SP, FP or a sum of one, `(FP - 8).field_0x1`, which no
+        and not off the frame: SP, FP or a sum of one, `(FP - 8).field_0x0`, which no
         heap store reaches. Or the rows to ask `_settle` about, where only the analysis
         of the whole body can say and it has not been made."""
         if self._frame_base(base_reg) or _FRAME_ROOT.match(spelled.text):
@@ -7278,9 +7279,9 @@ class Lifter:
         # two ways, the odd one no slot at all (#273). The value is the walk's must-fact:
         # a write, a call that clobbers the copy, a join that disagrees and a section no
         # edge leads into each leave the register something else, and an interior
-        # pointer, `add x25, x26, #0x10`, reads `THR + 16`, which is not the thread. Only
-        # THR follows its value: the null in x22 is a tagged object, and a copy of FP or
-        # SP is spelled with the bias, as the frame read itself is (`_frame_read`).
+        # pointer, `add x25, x26, #0x10`, reads `THR + 16`, which is not the thread. The
+        # null in x22 is a tagged object. A copy of FP or SP, or one plus a constant, is
+        # read with no bias, as the frame read itself is (`_frame_read`, #407).
         #
         # LR is untagged only while it holds a return address (`_holds_ra`). Keyed on the
         # name, `ldr x30, [x27, #0x13e0]; ldur x30, [x30, #7]` printed `.field_0x7` for
@@ -7330,7 +7331,14 @@ class Lifter:
         address and nowhere else (#280)."""
         if reg in _UNTAGGED and not (ROLE.get(reg) == "FP" and self._fp_lost()):
             return True
-        return v.text == _THR or (ROLE.get(reg) == "LR" and self._holds_ra())
+        # A copy of SP or FP, or one plus a constant by its own record, holds a frame
+        # address and is read as the frame register is (#407).
+        if v.text == _THR or (ROLE.get(reg) == "LR" and self._holds_ra()):
+            return True
+        # `_role_sum` of either, asked once: this is asked at every access.
+        b = v if v.at is None else v.at[0]
+        return (b.text in ("SP", "FP") and not v.smi and v.wide is None
+                and _role_address(b))
 
     def _rebase(self, base_reg: str, base_v: V, disp: int) -> tuple:
         """The (base expression, NON-NEGATIVE field offset, whether offset 0 there is an
@@ -7369,19 +7377,26 @@ class Lifter:
         member, and this does not either.
 
         The fold is exact for both representations BECAUSE it uses the displacement and
-        not the biased offset: the address is `base + disp` either way, and offset 1 is
-        the read at the base expression (a field offset carries the tag bias, which is
-        the convention `_frame_read`, `_FRAME_TEXT_RE` and docs/usage.md all state). Only
-        a displacement below the base can bias negative, so the two cases do not overlap:
-        `ldur x0, [x1, #-1]` on a tagged pointer is offset 0, the object header, and still
-        prints `.tags`. 11,184 of the clean image's 11,695 negative displacements are that
-        header read and are untouched.
+        not the biased offset: the address is `base + disp` either way, and the offset is
+        the read at the base expression, 1 off a tagged base, whose field offset carries
+        the tag bias, and 0 off an untagged one, the frame and the thread, which carry
+        none (#407). Only a displacement below the base can bias negative, so the two
+        cases do not overlap: `ldur x0, [x1, #-1]` on a tagged pointer is offset 0, the
+        object header, and still prints `.tags`. 11,184 of the clean image's 11,695
+        negative displacements are that header read and are untouched.
         """
         off = self._byte_off(base_reg, base_v, disp)
         if off > 0:
             return base_v, off, True
         if off < 0:
-            return _bin(base_v, "-", _num(-disp), P_ADD), 1, True
+            # Below an untagged base the read at the address is offset 0 there: no tag
+            # bias, and no header either, `(FP - 8).field_0x0` (#407).
+            bias = off - disp
+            if not bias and base_v.at is not None:
+                # A sum off it folds its constants: `add x0, x29, #8; ldur x3, [x0,
+                # #-8]` is `FP.field_0x0`, not `(FP + 8 - 8)`.
+                return self._at_address(base_v, disp)
+            return _bin(base_v, "-", _num(-disp), P_ADD), bias, bool(bias)
         if disp == 0:
             return base_v, 0, False             # an untagged base: no header at 0
         if not self._computed(base_reg, base_v):
@@ -7564,20 +7579,21 @@ class Lifter:
         The sum is `base + k` for the base `src` stands off, so a later access adds its
         displacement to one constant, and a chain that comes back to the base IS the
         base: `add x0, x1, #8; sub x0, x0, #8` holds x1, an object pointer if x1 is one,
-        and a store through it is a store through x1. An untagged base other than the
-        thread is not given back bare, because a copy of it is spelled with the tag
-        bias and the register is not (`_byte_off`); the sum keeps its text and its
-        base, and the access is made off that. Where the rows prove an inline
+        and a store through it is a store through x1. So is the thread, SP and FP,
+        whose copies are read as the register is (`_untagged`, #407). Another untagged
+        base is not given back bare, because a copy of it is spelled with the tag bias
+        and the register is not (`_byte_off`); the sum keeps its text and its base, and
+        the access is made off that. Where the rows prove an inline
         allocation the sum is the new object's pointer and not a computed address."""
         if src.smi or not _whole(ops[:2]):
             return total                    # a tagged Smi's word, or 32-bit arithmetic
         base, k0, untagged, at = src.at if src.at is not None else (
-            src, 0, _role_address(src) and src.text not in ("SP", "FP")
+            src, 0, _role_address(src)
             or self._untagged(reg, src) and not self._frame_base(reg), here)
         k += k0
         if self._fresh(here):
             return replace(total, calc=False, at=(base, k, untagged, None))
-        if k == 0 and (not untagged or base.text == _THR):
+        if k == 0 and (not untagged or base.text in (_THR, "SP", "FP")):
             return replace(base, at=None if at is None else (base, 0, untagged, at))
         if src.at is not None and _role_address(base) and base.text in ("SP", "FP"):
             # Off a frame register the constants are printed as one, the text a move
@@ -7657,6 +7673,9 @@ class Lifter:
         k += disp
         if untagged and k >= 0:
             return base, k, False
+        if untagged:
+            # Below an untagged base: the read at the address, with no bias (#407).
+            return _bin(base, "-", _num(-k), P_ADD), 0, False
         if not untagged and k >= 0:
             return base, k + 1, True
         if (k == -1 and not untagged and v.at is not None and not base.calc
@@ -7699,7 +7718,7 @@ class Lifter:
             out += [f"{base}.{n}" for n in sorted(self._named_at.get(off, ()))]
         return tuple(out)
 
-    def _overlapping(self, off: int, width: int) -> tuple:
+    def _overlapping(self, off: int, width: int, frame: bool = False) -> tuple:
         """The selector of every field this body read at ANOTHER offset that has a
         byte of the `width` bytes at `off` (#385). `_covers` spells the bytes a write
         lands on at its own offset, and a read that starts elsewhere shares none of
@@ -7721,14 +7740,19 @@ class Lifter:
         made are looked for (`span`, kept where each is made), so a body of aligned
         Dart fields, four bytes each or eight at multiples of eight, asks for
         nothing more than it did. Made again when a read or a name is added and not
-        at every store."""
+        at every store.
+
+        `frame` asks of the reads off the frame instead, which are kept apart: a frame
+        slot is spelled at the offset it is read at and a field with the tag bias, so
+        the two offsets are not one address space, and no object is in the frame
+        (#407)."""
         box = self._elem_box
-        span = box.get("span")
+        span = box.get("fspan" if frame else "span")
         if span is None:
             return ()
         wide, named = box.get("wide", ()), self._named_at
         now = (span[None], len(wide), self._named_n)
-        got = self._over_at.get((off, width))
+        got = self._over_at.get((off, width, frame))
         if got is not None and got[0] == now:
             return got[1]
         out = []
@@ -7748,7 +7772,7 @@ class Lifter:
             # A name is printed for a read of eight bytes or fewer at its offset.
             if (word or (2 if codes & 2 else codes & 1)) > gap:
                 out += ["." + n for n in sorted(named.get(o, ()))]
-        got = self._over_at[off, width] = (now, tuple(out))
+        got = self._over_at[off, width, frame] = (now, tuple(out))
         return got[1]
 
     def _field(self, base_v: V, byte_off: int, width: int = 8, cast=None,
@@ -8673,10 +8697,10 @@ class Lifter:
                     # in (`_at_computed`), the ones read off that base: a store through
                     # a pointer read out of one of them is into whatever object that
                     # is, and names them all.
-                    only = self._overlapping(off, w)
+                    froot = _FRAME_ROOT.match(bv.text) is not None
+                    only = self._overlapping(off, w, froot)
                     if only:
-                        if (bv.text in _NO_OBJECT or _role_address(bv)
-                                or _FRAME_ROOT.match(bv.text)):
+                        if bv.text in _NO_OBJECT or _role_address(bv) or froot:
                             only = tuple(bv.text + x for x in only)
                         else:
                             also, only = also + only, ()
@@ -8957,9 +8981,11 @@ class Lifter:
                     # Where each field was read and at which widths, for the store
                     # that writes some of its bytes from another offset
                     # (`_overlapping`, #385).
-                    span = self._elem_box.get("span")
+                    # A read off the frame is kept apart, at the offset it reads (#407).
+                    key = "fspan" if _FRAME_ROOT.match(bv.text) else "span"
+                    span = self._elem_box.get(key)
                     if span is None:
-                        span = self._elem_box["span"] = {}
+                        span = self._elem_box[key] = {}
                     had, code = span.get(off, 0), wk if wk in (1, 2, 16) else 4
                     if not had & code:
                         span[off] = had | code

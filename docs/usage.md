@@ -99,20 +99,22 @@ call prints where it cannot read its callee's list. A name is printed only while
 register still holds the entry value on every path to the line: after a write, a call, a
 join that disagreed or a loop that rewrites it the register reads as the lifter always
 read it, bare or by a fresh name, and a raw arm64 line reads the machine's register as
-it is. A stack argument stays a frame read, `var t0 = FP.field_0x11;`.
+it is. A stack argument stays a frame read, `var t0 = FP.field_0x10;`.
 
 **Reading a frame slot.** A load from the frame that the lifter cannot answer prints the
-read it is, under a name: `var t0 = (FP - 8).field_0x1;`. The address is the base
-expression, and `.field_0x1` is the read at it, because a field offset carries the
-heap-object tag bias. That is the same spelling you get when the address is held in a
-register first, `sub x0, x29, #0x40; ldur x3, [x0, #8]` printing `(FP - 64).field_0x9`,
-and it is not the untagged spelling used for the thread, where `THR.field_0x68` is offset
-0x68 exactly. A plain field read is eight bytes, the word this machine spills and loads,
-and any other width says itself: `(FP - 32).field16_0x1` for sixteen, `.field2_0x1` and
-`.field1_0x1` for a halfword and a byte. Four is the exception and keeps the plain
+read it is, under a name: `var t0 = (FP - 8).field_0x0;`. The address is the base
+expression, and `.field_0x0` is the read at it. The frame is no heap object, so its
+offsets carry no tag bias: `ldr x0, [x29, #0x10]` reads `FP.field_0x10`, offset 0x10
+exactly, as `THR.field_0x68` is offset 0x68 of the thread. That is the same spelling you
+get when the address is held in a register first, `sub x0, x29, #0x40; ldur x3, [x0,
+#8]` printing `(FP - 64).field_0x8`. A field of a heap object does carry the bias, so
+`x1.field_0x8` is the word at machine offset 7 off the tagged pointer. A plain field read
+is eight bytes, the word this machine spills and loads, and any other width says itself:
+`(FP - 32).field16_0x0` for sixteen, `.field2_0x0` and `.field1_0x0` for a halfword and a
+byte. Four is the exception and keeps the plain
 spelling, because this target compresses pointers, so a four-byte read is what a reference
 field read looks like and the lifter prints the pointer it becomes. A sign-extending load
-adds the shift pair that says so, `.field2_0x1 << 48 >> 48`, since the width alone does
+adds the shift pair that says so, `.field2_0x0 << 48 >> 48`, since the width alone does
 not. In the floating-point file an access narrower than eight declines rather than claim a
 width it cannot spell. `x1.tags` is offset 0 of the object `x1` points at, its header
 word, and it is printed only off a value that holds an object pointer: a register or a
@@ -138,7 +140,7 @@ begins another. Inside a frame one address has one spelling. An FFI call gives t
 call a frame of its own, `str x29, [x15, #-8]!; mov x29, x15` to `ldr x29, [x15], #8`,
 and what is read or built through x29 there is written off the FP of the function's
 frame: under 0x40 bytes of locals that frame is 72 bytes down, so `ldr x0, [x29, #8]`
-reads `(FP - 64).field_0x1` and `add x0, x29, #8` is `FP - 64`.
+reads `(FP - 64).field_0x0` and `add x0, x29, #8` is `FP - 64`.
 
 A value is printed only on lines where its text is right, so one that names a frame
 register does not cross a move of that register as it stands. Where the value is the
