@@ -107,6 +107,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A virtual call lifted with no arity resolver lists what it pushed, or `(...)`.**
+  With no resolver the list of a dispatch call is the words pushed, and where its
+  receiver is in a register the first of them was dropped as the receiver without
+  looking. A word pushed after the class id read, `str x3, [x15]`, was that first word,
+  and the call printed `x2.sel_m0xffe()`, an empty list that says there are no arguments
+  (#383). The first word is dropped now only where it is the receiver, the rule a call
+  with a resolver already kept, and the list is `(...)` otherwise. Over the clean
+  fixture, 25 calls lifted with no resolver printed a list shorter than what was pushed,
+  22 of them empty, and none do now: they print `(...)`. Three of them:
+  `t17.sel_m0xffe()` with `4` pushed, `this.invoke()` with `a2` pushed, and
+  `t5.findAnnotations(t5, t3, t6, true)` with `t4` pushed first; each now ends in
+  `(...)`. Every command passes a resolver, and no command's output changes: both
+  fixtures differ in 0 of their 8,194 and 8,188 ranges, and at the 3,333 virtual calls
+  of the clean fixture the receiver and the list printed are the same at each. Lifting
+  the clean fixture's 3,333 calls with no resolver takes 11.3 s of CPU against 11.2 on
+  main, and the dump 24.0 s against 27.0, one run each.
+
 - **Two adds of a double keep their order.** `fadd d0, d0, d1` twice across a loop edge
   printed `t0 += d1 + d1`, which regroups the adds: a double rounds after each one, and
   for t0 = 1e16 and d1 = 1.0 the machine's `(t0 + d1) + d1` is 1e16 where the printed
