@@ -12255,13 +12255,15 @@ def test_the_function_table_and_lifted_bodies_name_an_anonymous_range_alike():
     anon = [f for f in rows.values() if not f.name]
     assert all(_parse_addr(f.label, image) == f.pc_offset for f in anon)
     buf = io.StringIO()
-    # `forTap`, not `mapToString` or `putIfAbsent`: the only range mapToString called by
-    # label was its StringBuffer allocation, which the owner Class of the stub's Code
-    # object now names (#240), and the one putIfAbsent called has a name in the vm
-    # snapshot (#364). This test is about the LABEL of a range that has no name at all.
+    # `getHandle`, not `mapToString`, `putIfAbsent` or `forTap`: the only range
+    # mapToString called by label was its StringBuffer allocation, which the owner Class
+    # of the stub's Code object now names (#240), the one putIfAbsent called has a name
+    # in the vm snapshot (#364), and the one forTap called is the InitAsync stub, which
+    # the vm snapshot's own copy names (#462). This test is about the LABEL of a range
+    # that has no name at all, and getHandle calls a type check nothing names.
     with contextlib.redirect_stdout(buf):
-        assert cli.main(["lift", CLEAN, "forTap"]) == 0
-    called = re.search(r"\b(sub_0x[0-9a-f]+)\(\)", buf.getvalue()).group(1)
+        assert cli.main(["lift", CLEAN, "getHandle"]) == 0
+    called = re.search(r"\b(sub_0x[0-9a-f]+)\(\.\.\.\)", buf.getvalue()).group(1)
     assert rows[_parse_addr(called, image)].label == called, called
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -12534,9 +12536,15 @@ def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
 #: and 31 and 24 `; = value` on a pool load, and `-j` carries the same names. Checked
 #: line by line: both samples keep their line count, 14,085 and 15,675, and nothing else
 #: differs.
+#: Regenerated for #462, which names the stubs an async or sync* function calls: 2 rows
+#: of the clean text sample and 7 of the obf one gained `; -> _iso_stub_...Stub` on a
+#: `bl` or `b` to InitAsync, Await, ReturnAsync, ReturnAsyncNotFuture, InitSyncStar or
+#: a SuspendSyncStar stub, and `-j` carries the same 2 and 7 notes. Checked line by
+#: line and key by key: both samples keep their line count, 14,342 and 15,931, and
+#: nothing else differs.
 _ARM64_DISASM_SAMPLE_SHA = {
-    "clean": "330aef0c59d7527aa3f1d2f7f1c0fc78cf2cfd491eff9937af30fabaad424d5b",
-    "obf": "1d3a12ef825d3e1250db6a7da5d9c70e63983cf0340c74a0841ad3d868d0b5cf",
+    "clean": "984942e24c2257fac7f02f2ff2e295dda7337e2a4f44c23373516ebb41faebdf",
+    "obf": "ee8ed55c88741fabdd68acad5db61f6582cfb51db8a3cd29026b213299535da8",
 }
 
 
@@ -15551,7 +15559,7 @@ def test_a_dispatch_offset_other_selectors_share_is_not_named():
 
 
 def test_a_stub_that_returns_a_value_is_a_call_to_the_return_rule():
-    # `InitLate*`, `Await`, `InitAsync` and `CloneContext` hand a value back in x0, so the
+    # `InitLate*`, `InitAsync` and `CloneContext` hand a value back in x0, so the
     # return rule must not read a d0 written before one as what the `ret` after it hands
     # back (#127). They are also not dropped like the stubs that give every register back:
     # dropping them left the stale x0 standing in for the value they return, which is a
@@ -15563,9 +15571,12 @@ def test_a_stub_that_returns_a_value_is_a_call_to_the_return_rule():
                 ("bl", "#0x200", f"  ; -> stub _iso_stub_{stub}Stub"), ("ret", "", "")]
         return [ln.strip() for ln in lift_function(
             [(i * 4, mn, op, n) for i, (mn, op, n) in enumerate(rows)])]
-    for stub in ("InitLateStaticField", "InitLateFinalInstanceField", "Await",
-                 "InitAsync", "CloneContext"):
+    for stub in ("InitLateStaticField", "InitLateFinalInstanceField", "InitAsync",
+                 "CloneContext"):
         assert lift(stub) == [f"return {stub}(...);"], stub
+    # `Await` hands one back too, and reads as the `await` it is (#462). Nothing set x0
+    # before it here, so what it waits for is not said.
+    assert lift("Await") == ["var t0 = await ...;", "return t0;"]
     # A stub that does give every register back leaves the double where it was.
     assert lift("StackOverflowSharedWithoutFPURegs") == [
         "return x1.field_0x10 + x1.field_0x10;"]
@@ -26770,7 +26781,9 @@ def test_a_function_named_in_the_vm_snapshot_prints_by_its_name():
     assert fr.strings[894] == "==" and fr.smi_values[904] == 0
     assert (len(fr.strings), len(fr.own_strings())) == (9817, 9013)
     names = collections.Counter(function_name_by_pc(image, fr).values())
-    assert sum(names.values()) == 6926, sum(names.values())            # 6,017 before
+    # 6,017 before, and 6,926 until the nine stubs an async or sync* function calls
+    # took the names of the vm snapshot's copies (#462).
+    assert sum(names.values()) == 6935, sum(names.values())
     assert [names[n] for n in ("==", "[]=", "<anonymous closure>", "add")] == [
         176, 68, 461, 40]
     # A pool slot holding a base string is that string, where it was `pool_0x408`.
@@ -27120,10 +27133,11 @@ def test_lift_json_lists_each_callee_with_its_kind_address_and_count():
     call through a value by the expression it calls. A call printed `(...)` counts."""
     _needs_capstone()
     f = _lift_json("benchFetchToken")
+    # The stub that starts the async function prints as a call by name, a stub; the
+    # await and the return through its stub print as neither and are not calls (#462).
     assert [(c["name"], c["kind"]) for c in f["calls"]] == [
-        ("sub_0x15765c", "direct"), ("Future.delayed", "direct"),
-        ("sub_0x157418", "direct"), ("List", "alloc"),
-        ("_interpolate@0150898", "direct"), ("sub_0x157164", "tail")], f["calls"]
+        ("InitAsync", "stub"), ("Future.delayed", "direct"), ("List", "alloc"),
+        ("_interpolate@0150898", "direct")], f["calls"]
     # one address, the one every command takes back, and a count only past one
     assert f["calls"][1] == {"name": "Future.delayed", "kind": "direct",
                              "va": 0x1c15ec}, f["calls"][1]
@@ -27149,6 +27163,10 @@ def test_lift_json_lists_each_callee_with_its_kind_address_and_count():
     [s] = f["strings"]
     assert s["pool"] == "0xf470" and s["text"].startswith('"Widgets that mix ')
     assert s["text"] in "\n".join(f["body"])
+    # a tail branch to another range
+    f = _lift_json("0x137250")
+    assert f["calls"] == [{"name": "sub_0x2d43e4", "kind": "tail",
+                           "va": 0x2d43e4}], f["calls"]
     # neither: both fields are there, empty
     f = _lift_json("benchWithdraw")
     assert f["calls"] == [] and f["strings"] == []
@@ -28025,6 +28043,356 @@ def test_the_clean_fixture_closures_name_their_function_and_context():
     assert inner.startswith("// <anonymous closure>("), m.group(1)
     assert re.search(r"setState\(this, new Closure\(sub_0x[0-9a-f]+, t\d+\)\);",
                      run("lift", CLEAN, "_run")), run("lift", CLEAN, "_run")
+
+
+# The stubs an async function calls, named by the vm snapshot's copy (#462).
+
+#: The release the made-up images below say they are, and stubs of its list that the
+#: isolate roots never name.
+_VM_RELEASE = "3.12.2"
+_ASYNC_STUBS = ("InitAsync", "Await", "ReturnAsync")
+
+
+def _stub_words(i: int, off: int = 0x80) -> bytes:
+    """Forty bytes no other stub has: a load of the pool slot at `off`, then nine
+    instructions that carry `i`."""
+    return struct.pack("<10I", 0xF9400360 | (off // 8 << 10) | 5,
+                       *(0xD2800000 | (i << 5) | k for k in range(9)))
+
+
+def _stub_image(anchors: int = 40):
+    """(image, rooted, at, put): an image whose vm snapshot has one stub for each name
+    of the release's list, whose isolate roots name the first `anchors` of them, and
+    which holds a copy of each of _ASYNC_STUBS that the roots do not name, at `at[name]`.
+    `put(code, owner)` adds a range and returns where it is."""
+    from types import SimpleNamespace
+    from jadart.disasm import CodeRange
+    from jadart.vmstubs import NULL_REF, VM_STUBS
+    names = VM_STUBS[_VM_RELEASE]
+    code = [_stub_words(i) for i in range(len(names))]
+    text, ranges, rooted, at = bytearray(), [], {}, {}
+
+    def put(body, owner=NULL_REF):
+        ranges.append(CodeRange(len(text), len(body), owner))
+        text.extend(body)
+        return ranges[-1].pc_offset
+    for i in range(anchors):
+        rooted[put(code[i])] = f"_iso_stub_{names[i]}Stub"
+    put(b"\x1f\x20\x03\xd5" * 10, owner=700)            # a function of the program
+    for nm in _ASYNC_STUBS:
+        assert names.index(nm) >= anchors
+        at[nm] = put(code[names.index(nm)])
+    image = SimpleNamespace(text=text, all_ranges=ranges, vm_stubs=tuple(code),
+                            epoch=SimpleNamespace(dart=_VM_RELEASE),
+                            arch=SimpleNamespace(name="arm64"))
+    return image, rooted, at, put
+
+
+def test_a_stub_the_roots_leave_out_takes_the_name_of_the_vm_snapshots_copy():
+    """The isolate roots stop naming stubs at `slow_tts_stub`, and the ones an async
+    function calls come after it, so `bl 0x157418` was a call to nothing (#462). The vm
+    snapshot holds the same stubs in the order of the release's VM_STUB_CODE_LIST. An
+    isolate stub is given a name only where its bytes are those of one stub of that
+    list, and only after the stubs the roots do name are found at their positions in
+    it; anything short of that names nothing."""
+    from types import SimpleNamespace
+    from jadart.vmstubs import MIN_ANCHORS, VM_STUBS, vm_stub_names
+    names = VM_STUBS[_VM_RELEASE]
+    image, rooted, at, put = _stub_image()
+    want = {at[nm]: f"_iso_stub_{nm}Stub" for nm in _ASYNC_STUBS}
+    assert vm_stub_names(image, rooted) == want
+    # A root that names a stub the list does not have is no anchor and no refusal.
+    rooted[put(_stub_words(900))] = "_iso_stub_NotInTheListStub"
+    assert vm_stub_names(image, rooted) == want
+
+    # The same stub against another object pool: one `ldr xN, [x27, #off]` whose
+    # offset differs. Named on arm64, where that is the whole difference, and left
+    # alone on arm32, whose pool load is not looked for.
+    yield_ = names.index("YieldAsyncStar")
+    pc = put(_stub_words(yield_, off=0x1238))
+    assert vm_stub_names(image, rooted) == {**want, pc: "_iso_stub_YieldAsyncStarStub"}
+    image.arch = SimpleNamespace(name="arm")
+    assert vm_stub_names(image, rooted) == want
+
+    def left_out(change):
+        """What is named after `change(image, rooted, at, put)`."""
+        made = _stub_image()
+        change(*made)
+        return vm_stub_names(made[0], made[1])
+
+    # One byte of the copy differs somewhere that is not a pool offset.
+    def one_byte(image, rooted, at, put):
+        image.text[at["Await"] + 9] ^= 1
+    got = left_out(one_byte)
+    assert sorted(got.values()) == [
+        "_iso_stub_InitAsyncStub", "_iso_stub_ReturnAsyncStub"]
+    # A Code a function owns is not a stub, whatever its bytes are.
+    def owned(image, rooted, at, put):
+        put(_stub_words(yield_), owner=700)
+    assert left_out(owned) == want
+    # Two ranges with one stub's bytes: neither is named.
+    def twice(image, rooted, at, put):
+        put(_stub_words(names.index("Await")))
+    assert sorted(left_out(twice).values()) == [
+        "_iso_stub_InitAsyncStub", "_iso_stub_ReturnAsyncStub"]
+    # Two stubs of the list with the same bytes: a copy of them is neither's.
+    def alike(image, rooted, at, put):
+        code = list(image.vm_stubs)
+        code[names.index("ReturnAsyncNotFuture")] = code[names.index("ReturnAsync")]
+        image.vm_stubs = tuple(code)
+    assert sorted(left_out(alike).values()) == [
+        "_iso_stub_AwaitStub", "_iso_stub_InitAsyncStub"]
+    # A stub of a few instructions is too short to be told from its like.
+    def short(image, rooted, at, put):
+        code = list(image.vm_stubs)
+        code[yield_] = code[yield_][:28]
+        image.vm_stubs = tuple(code)
+        put(code[yield_])
+    assert left_out(short) == want
+
+    # The refusals: each leaves every stub as it was.
+    def fewer(image, rooted, at, put):
+        image.vm_stubs = image.vm_stubs[:-1]
+    def other_release(image, rooted, at, put):
+        image.epoch = SimpleNamespace(dart="3.8.1")
+    def no_vm_snapshot(image, rooted, at, put):
+        image.vm_stubs = ()
+    def no_roots(image, rooted, at, put):
+        rooted.clear()
+    def anchor_differs(image, rooted, at, put):
+        image.text[sorted(rooted)[7] + 12] ^= 1
+    def anchor_longer(image, rooted, at, put):
+        i = next(i for i, cr in enumerate(image.all_ranges) if cr.pc_offset in rooted)
+        cr = image.all_ranges[i]
+        image.all_ranges[i] = type(cr)(cr.pc_offset, cr.size + 4, cr.owner_ref)
+    def list_one_out(image, rooted, at, put):
+        for pc, i in zip(sorted(rooted), range(len(rooted))):
+            rooted[pc] = f"_iso_stub_{names[i + 1]}Stub"
+    for change in (fewer, other_release, no_vm_snapshot, no_roots, anchor_differs,
+                   anchor_longer, list_one_out):
+        assert left_out(change) == {}, change.__name__
+    assert "3.8.1" not in VM_STUBS and "3.13.0" not in VM_STUBS
+    # Too few of the rooted stubs found is not a build.
+    for n, named in ((MIN_ANCHORS - 1, False), (MIN_ANCHORS, True)):
+        image, rooted, at, put = _stub_image(anchors=n)
+        assert bool(vm_stub_names(image, rooted)) is named, n
+
+
+def test_naming_a_stub_by_its_bytes_reads_each_candidate_once(monkeypatch):
+    """The ranges come from the file, so what is done to them is counted. A range is
+    copied only where it is as long as a stub that still wants a name, and its pool
+    loads are blanked once: a file of ownerless ranges costs their number, and those of
+    any other length cost nothing."""
+    import jadart.vmstubs as vmstubs
+    real, calls = vmstubs._pool_blind, []
+    monkeypatch.setattr(vmstubs, "_pool_blind", lambda c: calls.append(len(c)) or real(c))
+
+    def cost(alike, others):
+        image, rooted, at, put = _stub_image()
+        for k in range(alike):
+            put(_stub_words(1000 + k))
+        for k in range(others):
+            put(_stub_words(1000 + k) + b"\x1f\x20\x03\xd5")
+        put(b"\x00" * (vmstubs.MAX_SIZE + 4))
+        del calls[:]
+        assert len(vmstubs.vm_stub_names(image, rooted)) == len(_ASYNC_STUBS)
+        return len(calls), max(calls)
+    base, longest = cost(0, 0)
+    assert longest == 40
+    assert cost(1000, 0) == (base + 1000, 40)
+    assert cost(2000, 0) == (base + 2000, 40)
+    assert cost(1000, 5000) == (base + 1000, 40)
+
+
+def test_the_vm_snapshots_stub_code_is_read_whole_or_not_at_all(monkeypatch):
+    """`read_stub_code` hands back the instructions of every stub the vm snapshot's
+    roots list, in their order, or nothing: where the release's list is not as long as
+    the roots, a stub has no instructions of its own, or the instructions are not all
+    there. None of it is fatal, and the base objects read as they did."""
+    from types import SimpleNamespace
+    import jadart.baseobjects as baseobjects
+    import jadart.vmstubs as vmstubs
+    from jadart.errors import MissingSymbol
+    from jadart.macho import open_container
+    from jadart.snapshot import parse_blob
+    with open(CLEAN, "rb") as f:
+        c = open_container(f.read())
+    hdr = parse_blob(c.symbol_bytes("_kDartIsolateSnapshotData"), "isolate")
+    seen = []
+
+    def spy(*args):
+        seen.append(args)
+        return vmstubs.read_stub_code(*args)
+    monkeypatch.setattr(baseobjects, "read_stub_code", spy)
+    whole = baseobjects.read_base_objects(c, hdr)
+    names = vmstubs.VM_STUBS[hdr.epoch.dart]
+    assert len(whole.stub_code) == len(names) == 173
+    assert all(len(code) % 4 == 0 and code for code in whole.stub_code)
+    text = c.symbol_bytes(vmstubs.VM_INSTRUCTIONS)
+    assert sum(map(len, whole.stub_code)) <= len(text)
+
+    def with_text(get):
+        there = SimpleNamespace(symbol_bytes=lambda name: (
+            get() if name == vmstubs.VM_INSTRUCTIONS else c.symbol_bytes(name)))
+        got = baseobjects.read_base_objects(there, hdr)
+        assert got == whole
+        return got.stub_code
+
+    def missing():
+        raise MissingSymbol(vmstubs.VM_INSTRUCTIONS)
+    assert with_text(lambda: text) == whole.stub_code
+    assert with_text(missing) == ()
+    assert with_text(lambda: text[:len(text) // 2]) == ()
+    # The arguments of the real call, one of them changed at a time.
+    container, blob, end, vm, codes, refs = seen[0]
+    read = vmstubs.read_stub_code
+    assert read(container, blob, end, vm, codes, refs) == whole.stub_code
+    refs = list(refs)
+    for bad in (refs[:-1], refs + [refs[0]], refs[:-1] + [refs[0]],
+                refs[:-1] + [1 << 40]):
+        assert read(container, blob, end, vm, codes, bad) == (), bad[-2:]
+    far = [(ref, owner, (1 << 40) if ref == refs[5] else ci) for ref, owner, ci in codes]
+    assert read(container, blob, end, vm, far, refs) == ()
+    monkeypatch.setitem(vmstubs.VM_STUBS, hdr.epoch.dart, names[:-1])
+    assert read(container, blob, end, vm, codes, refs) == ()
+    monkeypatch.delitem(vmstubs.VM_STUBS, hdr.epoch.dart)
+    assert read(container, blob, end, vm, codes, refs) == ()
+
+
+def test_the_fixtures_name_the_stubs_their_async_functions_call():
+    """On both fixtures, what the vm snapshot adds to the 76 stubs the roots name: the
+    nine a build of this app has past `slow_tts_stub`. `functions` and the call graph
+    take them as they take a rooted stub's name."""
+    import dataclasses
+    from jadart.callgraph import range_names
+    from jadart.disasm import function_name_by_pc, load_instructions
+    from jadart.objstore import stub_names
+    nine = ["Await", "AwaitWithTypeCheck", "CloneSuspendState", "InitAsync",
+            "InitSyncStar", "ReturnAsync", "ReturnAsyncNotFuture",
+            "SuspendSyncStarAtStart", "SuspendSyncStarAtYield"]
+    for lib in (CLEAN, OBF):
+        image, fr, hdr = load_instructions(lib)
+        rooted = stub_names(image, fr, hdr.epoch)
+        by_pc, ranges = function_name_by_pc(image, fr), range_names(image, fr)
+        found = {pc: nm for pc, nm in by_pc.items()
+                 if nm.startswith("_iso_stub_") and pc not in rooted}
+        assert sorted(nm[len("_iso_stub_"):-len("Stub")] for nm in found.values()) == (
+            nine), lib
+        assert len(rooted) == 76 and not set(found.values()) & set(rooted.values())
+        for pc, nm in found.items():
+            assert ranges[pc] == (nm, "roots"), (lib, hex(pc), nm)
+        # With no vm snapshot read, the roots' names and no more.
+        bare = dataclasses.replace(image, vm_stubs=())
+        assert not set(found) & set(function_name_by_pc(bare, fr))
+
+
+# `await` and the async return (#462).
+
+_AWAIT = "  ; -> _iso_stub_AwaitStub"
+_RETURN_ASYNC = "  ; -> _iso_stub_ReturnAsyncStub"
+
+
+def _async_lift(rows, **kw):
+    """Tier 3 of `rows`, each (mnemonic, operands) or (mnemonic, operands, note)."""
+    from jadart.expr import lift_function
+    ann = [(i * 4, *(tuple(r) + ("",))[:3]) for i, r in enumerate(rows)]
+    return [ln.strip() for ln in lift_function(ann, **kw)]
+
+
+def test_an_await_prints_what_it_waits_for_and_names_what_it_hands_back():
+    # `sub_0x157418();` said neither that the function waits there nor for what (#462).
+    # The stub takes the awaited value in x0 and hands back in x0 what it completed
+    # with, which gets a name where a later row reads it.
+    field = ("ldur", "x0, [x1, #0xf]")
+    done = [("mov", "x0, x22"), ("b", "#0x400", _RETURN_ASYNC)]
+    assert _async_lift([field, ("bl", "#0x200", _AWAIT)] + done) == [
+        "await x1.field_0x10;", "return NULL;"]
+    assert _async_lift([field, ("bl", "#0x200", _AWAIT), ("ldur", "x0, [x0, #0xf]"),
+                        ("b", "#0x400", _RETURN_ASYNC)]) == [
+        "var t0 = await x1.field_0x10;", "return t0.field_0x10;"]
+    assert _async_lift([field, ("bl", "#0x200", _AWAIT), ("mov", "x1, x0"),
+                        ("bl", "#0x500"), ("b", "#0x400", _RETURN_ASYNC)],
+                       arity=lambda pc: 1) == [
+        "var t0 = await x1.field_0x10;", "return sub_0x500(t0);"]
+    # The result is never folded into the row that reads it, as a call's is: `await`
+    # binds looser than the `.field` after it, and `await f().x` waits for another
+    # thing. The call it waits for is folded into it, which binds tighter.
+    assert _async_lift([("bl", "#0x300"), ("bl", "#0x200", _AWAIT)] + done) == [
+        "await sub_0x300(...);", "return NULL;"]
+    assert _async_lift([("bl", "#0x300"), ("bl", "#0x200", _AWAIT),
+                        ("add", "x0, x0, #2"), ("b", "#0x400", _RETURN_ASYNC)]) == [
+        "var t0 = sub_0x300(...);", "var t1 = await t0;", "return t1 + 2;"]
+    # An operand that binds looser than `await` is bracketed.
+    assert _async_lift([("add", "x0, x1, x2"), ("bl", "#0x200", _AWAIT),
+                        ("ret", "")]) == ["var t0 = await (x1 + x2);", "return t0;"]
+    assert _async_lift([("mov", "x0, x22"), ("bl", "#0x200", _AWAIT), ("ret", "")]) == [
+        "var t0 = await NULL;", "return t0;"]
+    # A register the walk holds no value for is not printed as what is awaited.
+    assert _async_lift([("bl", "#0x200", _AWAIT), ("ret", "")]) == [
+        "var t0 = await ...;", "return t0;"]
+    # The other await stub takes the value in the same register.
+    checked = "  ; -> _iso_stub_AwaitWithTypeCheckStub"
+    assert _async_lift([field, ("bl", "#0x200", checked), ("ret", "")]) == [
+        "var t0 = await x1.field_0x10;", "return t0;"]
+    # And a stub that is not one of the two is the call it was.
+    assert _async_lift([field, ("bl", "#0x200", "  ; -> _iso_stub_YieldAsyncStarStub"),
+                        ("ret", "")]) == ["return YieldAsyncStar(...);"]
+
+
+def test_an_async_function_returns_what_it_hands_its_return_stub():
+    # An async function does not `ret`: it jumps to a stub with the value in x0, and
+    # that printed as `goto sub_0x157164;` with the value computed for nothing (#462).
+    for stub in ("ReturnAsync", "ReturnAsyncNotFuture", "ReturnAsyncStar"):
+        note = f"  ; -> _iso_stub_{stub}Stub"
+        assert _async_lift([("mov", "x0, x22"), ("b", "#0x400", note)]) == [
+            "return NULL;"], stub
+    # The jump reads x0 as a `ret` does, so what a call left there is the call's
+    # value and not a statement followed by a bare register.
+    assert _async_lift([("bl", "#0x300"), ("b", "#0x400", _RETURN_ASYNC)]) == [
+        "return sub_0x300(...);"]
+    assert _async_lift([("bl", "#0x300"), ("add", "x0, x0, #2"),
+                        ("b", "#0x400", _RETURN_ASYNC)]) == ["return sub_0x300(...) + 2;"]
+    # Each arm that leaves through the stub returns its own value.
+    assert _async_lift([("cbz", "x1, #0x10"), ("mov", "x0, x22"),
+                        ("b", "#0x400", _RETURN_ASYNC), ("brk", "#0"),
+                        ("mov", "x0, #4"), ("b", "#0x400", _RETURN_ASYNC)])[:5] == [
+        "if (x1 != 0) {", "return NULL;", "} else {", "return 4;", "}"]
+    # A jump out of the function to anything else is the jump it was.
+    assert _async_lift([("mov", "x0, x22"), ("b", "#0x400")]) == ["goto sub_0x400;"]
+    assert _async_lift([("mov", "x0, x22"),
+                        ("b", "#0x400", "  ; -> _iso_stub_AllocateArrayStub")]) == [
+        "goto sub_0x400;"]
+    # And only a jump is a return: a call to the stub comes back.
+    assert _async_lift([("mov", "x0, x22"), ("bl", "#0x400", _RETURN_ASYNC),
+                        ("ret", "")]) == ["return ReturnAsync(...);"]
+
+
+def test_the_clean_fixture_awaits_and_returns_in_its_async_functions():
+    """`benchFetchToken` is `await Future.delayed(...)` and a return of an interpolated
+    string, and `_run` awaits it and returns null. Both printed three calls to
+    `sub_0x...` and a `goto` (#462)."""
+    _needs_capstone()
+    import io
+    import contextlib
+    from jadart import cli
+
+    def run(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            assert cli.main([*argv]) == 0, argv
+        return out.getvalue()
+    body = run("lift", CLEAN, "benchFetchToken")
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    assert "InitAsync(...);" in lines, body
+    assert any(re.fullmatch(r"await Future\.delayed\(.*\);", ln) for ln in lines), body
+    assert re.fullmatch(r"return _interpolate@\d+\(t\d+\);", lines[-1]), body
+    assert "sub_0x" not in body and "goto" not in body, body
+    body = run("lift", CLEAN, "_run")
+    mine = body[body.index("benchRunAll"):]
+    m = re.search(r"var (t\d+) = benchFetchToken\(t\d+\);\n\s*var (t\d+) = await \1;\n"
+                  r"\s*t\d+\.field_0x18 = \2;\n", mine)
+    assert m, body
+    assert "return NULL;" in mine[m.end():].split("\n\n")[0], body
 
 
 if __name__ == "__main__":

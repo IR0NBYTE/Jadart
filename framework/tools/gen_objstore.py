@@ -29,6 +29,7 @@ jadart/ imports this.
     python3 tools/gen_objstore.py --tag 3.12.2            # what the release declares
     python3 tools/gen_objstore.py --tag 3.12.2 --emit     # the Python literal
     python3 tools/gen_objstore.py --check            # bundled layouts vs their source
+    python3 tools/gen_objstore.py --emit-vm-stubs    # jadart/vmstubs.py's lists
 """
 from __future__ import annotations
 
@@ -376,6 +377,67 @@ def emit_all() -> str:
             f"LAYOUTS: dict[str, RootLayout] = {{\n{rows}\n}}")
 
 
+#: The releases whose VM_STUB_CODE_LIST jadart/vmstubs.py holds, newest first. A release
+#: is here only where a real build of it was read: the list has to be as long as the vm
+#: snapshot has Code objects, and on a build that keeps a symbol table the stub at each
+#: list position has to carry that name. 26 corpus builds, arm64 and arm32, 159 to 172
+#: symbols each, none differing; the 3.12.2 builds keep no symbol and are held to the
+#: 3.12.0 list, which is the same list. The four registered releases with no build to
+#: read (2.19.0-444.2.beta, 3.0.1, 3.3.0-174.2.beta, 3.8.1) are left out on purpose:
+#: a list nobody checked would name a stub after its neighbour. 3.13 has one snapshot
+#: and names every stub from its roots (GROUPS).
+VM_STUB_TAGS = ("3.12.2", "3.12.0", "3.11.5", "3.10.9", "3.9.2", "3.7.2", "3.6.2",
+                "3.5.4", "3.4.4", "3.3.4", "3.2.6", "3.1.5", "3.0.6", "2.19.6")
+
+
+def emit_vm_stubs() -> str:
+    """The generated section of jadart/vmstubs.py: one tuple for each distinct list."""
+    lists = {}
+    for tag in VM_STUB_TAGS:
+        lists.setdefault(tuple(_stub_list(tag)), []).append(tag)
+    parts, index = [], []
+    for names, tags in lists.items():
+        label = "_VM_" + re.sub(r"\W", "_", tags[0])
+        parts.append("\n".join(
+            [f"#: Dart {_releases(tags)}. {len(names)} stubs.", f'{label} = tuple("""']
+            + textwrap.wrap(" ".join(names), 88) + ['""".split())']))
+        index += [(t, label) for t in tags]
+    rows = "\n".join(f"    {t!r}: {label}," for t, label in sorted(index))
+    return ("\n\n".join(parts) + "\n\n"
+            "#: SDK release -> its VM_STUB_CODE_LIST, in order.\n"
+            f"VM_STUBS: dict[str, tuple] = {{\n{rows}\n}}")
+
+
+def check_vm_stubs() -> int:
+    """How many bundled VM stub lists differ from their release's own header."""
+    from jadart.vmstubs import VM_STUBS
+    bad = 0
+    for tag in sorted(set(VM_STUBS) | set(VM_STUB_TAGS)):
+        have = VM_STUBS.get(tag)
+        if have is None or tag not in VM_STUB_TAGS:
+            print(f"{tag}: vm stubs: bundled and VM_STUB_TAGS disagree about it")
+            bad += 1
+            continue
+        try:
+            got = tuple(_stub_list(tag))
+        except FetchError as exc:
+            print(f"{tag}: vm stubs: FETCH FAILED: {exc}")
+            bad += 1
+            continue
+        if have == got:
+            print(f"{tag}: vm stubs ok ({len(got)})")
+            continue
+        bad += 1
+        print(f"{tag}: vm stubs DIFFER: bundled {len(have)}, source {len(got)}")
+        for i in range(max(len(have), len(got))):
+            a = have[i] if i < len(have) else None
+            b = got[i] if i < len(got) else None
+            if a != b:
+                print(f"  first difference at {i}: bundled {a!r}, source {b!r}")
+                break
+    return bad
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -383,12 +445,18 @@ def main(argv=None) -> int:
     ap.add_argument("--emit", action="store_true", help="print the Python literal")
     ap.add_argument("--emit-all", action="store_true",
                     help="print the whole generated section of jadart/objstore.py")
+    ap.add_argument("--emit-vm-stubs", action="store_true",
+                    help="print the whole generated section of jadart/vmstubs.py")
     ap.add_argument("--check", action="store_true",
                     help="re-derive every bundled layout from its SDK tag and diff")
     args = ap.parse_args(argv)
 
     if args.emit_all:
         print(emit_all())
+        return 0
+
+    if args.emit_vm_stubs:
+        print(emit_vm_stubs())
         return 0
 
     if args.check:
@@ -425,6 +493,7 @@ def main(argv=None) -> int:
                 print(f"  class table: bundled {len(have.class_cids)} from root "
                       f"{have.class_base}, source {len(got['class_cids'])} from root "
                       f"{got['class_base']}")
+        bad += check_vm_stubs()
         return 1 if bad else 0
 
     if not args.tag:

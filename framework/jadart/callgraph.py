@@ -46,6 +46,7 @@ from .disasm import (CodeRange, MissingDisassembler, UnsupportedArch, disassembl
                      MAX_INSNS, A64Words, A64_BL, A64_BLR, A64_DISPATCH, _PP, _word_load,
                      _word_add_pp, _word_loadstore, _word_loads_x)
 from .objstore import stub_names
+from .vmstubs import vm_stub_names
 
 
 @dataclass
@@ -536,7 +537,9 @@ class Func:
 #: binary; `symtab` was backfilled from the ELF symbol table on a dwarf_stack_traces_mode
 #: build; `roots` is a runtime stub placed by its index in the snapshot's object-store
 #: root run, which is read out of this binary but means something only through a table
-#: generated per release (objstore.py, #234); `signature` was matched against a
+#: generated per release (objstore.py, #234), or by its index in the vm snapshot's
+#: root run and the bytes it shares with the isolate's copy, through a table of the
+#: same kind (vmstubs.py, #462); `signature` was matched against a
 #: reference binary and is an inference, not a reading. Keeping them apart is the whole
 #: point of showing an origin column.
 ORIGINS = ("snapshot", "symtab", "roots", "signature", "anonymous")
@@ -560,6 +563,7 @@ def range_names(image, fr, matched: dict = None) -> dict:
             snapshot_names.add(cr.pc_offset)
     symtab = image.symbol_names or {}
     roots = stub_names(image, fr, getattr(image, "epoch", None))
+    roots.update(vm_stub_names(image, roots))
     names = function_name_by_pc(image, fr)
     matched = matched or {}
     out = {}

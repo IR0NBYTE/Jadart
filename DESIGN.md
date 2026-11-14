@@ -865,6 +865,54 @@ for the graph while `_arrive`'s write-back still lands after it. And blocks whos
 statement is an assignment nothing reads went 1,398 to 1,575, one shape: a type-test
 stub is dropped and the class-id load in front of it is left with no reader.
 
+### The stubs the root run stops short of, and the copy that names them
+
+The roots name a stub by its slot, and the AOT root run ends at `slow_tts_stub`. The
+stubs an async or a sync* function calls come after that in object_store.h, so through
+Dart 3.12 no root holds one: `benchFetchToken` printed `sub_0x15765c();` where it
+starts, `sub_0x157418();` where it awaits and `goto sub_0x157164;` where it returns
+(#462). Dart 3.13 put every stub in the roots and needs none of this.
+
+WHERE THE NAME IS. The file has each of those stubs a second time. The vm snapshot
+holds the VM isolate's, one Code for each entry of VM_STUB_CODE_LIST, and its roots end
+with one ref for each of them in that list's order. Both copies come out of one
+generator, so an isolate stub is the bytes of the vm stub it copies, give or take the
+pool slot a `ldr xN, [x27, #off]` names where the two pools number an object
+differently. A range that is the code of exactly one vm stub takes that stub's name
+(`vmstubs.vm_stub_names`).
+
+WHAT HAS TO HOLD ON THE BINARY IN HAND, each of them a refusal that leaves every such
+stub as `sub_0x...`. The release has a list (`VM_STUBS`, generated from
+stub_code_list.h by `gen_objstore.py --emit-vm-stubs`) and the vm snapshot has exactly
+as many stub Codes as the list has names, each with instructions of its own. Every stub
+the isolate roots DO name, and the list names too, is the same length and the same code
+as the vm stub at that name's position, and there are at least 32 of them: the roots
+and the list are written by different code from different files, so a list one entry
+out anywhere in front of the last of them fails here. The range is a Code nothing
+owns, 32 to 4,096 bytes, as long as a vm stub no root accounts for, and its bytes are
+those of one such stub and of no other, and no other range's are. A table of names for
+a release is not that proof, so a release is listed only where a real build of it was
+read: 26 corpus builds that keep a symbol table, 13 releases from 2.19.6 to 3.12.0, on
+which the vm stubs carry the list's names at 159 to 172 positions a build and differ
+at none. 3.12.2 keeps no symbol and is held to 3.12.0's list, which its
+stub_code_list.h is, and passes the checks. 2.19.0-444.2.beta, 3.0.1,
+3.3.0-174.2.beta and 3.8.1 have no build here and no list: their stubs print as
+before. arm32 compares whole bytes only.
+
+WHAT IS PRINTED. `Await` takes the awaited value in x0 and hands the result back in
+x0, so the call is `await v`, and `var tN = await v` where the result is read; `v` is
+what the walk holds for x0 on every path into the call and `...` where the paths
+disagree. An async body does not `ret`: it branches to `ReturnAsync`,
+`ReturnAsyncNotFuture` or `ReturnAsyncStar` with the value in x0, which is the body's
+`return v;` and printed as `goto sub_0x157164;`. `_call_reads` gives that branch its
+read of x0, or the value's last write is dead and the return has nothing to print.
+
+WHAT IS LEFT A NAMED CALL. `InitAsync`, `InitAsyncStar` and `InitSyncStar` are the
+function's prologue and print `InitAsync(...)`. `YieldAsyncStar`,
+`SuspendSyncStarAtStart`, `SuspendSyncStarAtYield`, `CloneSuspendState` and
+`FfiAsyncCallbackSend` print by name and are not a `yield`: what a sync* body hands
+its suspend stub is not the value it yields, which it stored in the iterator first.
+
 ### The edge a call that cannot return used to have
 
 Naming the stubs made the second half of #234 visible, and it is the one the issue is
