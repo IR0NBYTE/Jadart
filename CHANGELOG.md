@@ -232,6 +232,45 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **What a loop leaves in a register has a name the code after it reads (#468).** `1: and
+  x2, x4, #1; sub x7, x7, #1; cbnz x7, 1b; cbnz x2, 2f; mov x4, #5; 2: mov x0, x4`
+  printed `return x4;` under no branch at all and returned the wrong value from 16 of 40
+  entry states. Nothing in the loop reads x2, so the loop had no line for it, and after
+  the loop the register read bare, as the value the function came in with, and the
+  branch on it was dropped. The walk now notes each register a loop wrote that the code
+  after it reads, and the loop sets a name for it on a second walk: `var t0 = x2;` above
+  the loop, `t0 = x4 & 1;` on the way out and `if (t0 == 0) {` after it. A copy of such a
+  register that outlives a write to it is followed too (`mov x1, x2; mov x2, x5; str x1,
+  [x10, #8]`). Where no name can be set, in a loop that stores to memory while a stack
+  slot holds a read of memory, the branch is printed `if (? == 0) {` and a call
+  `f(...)`: a gap, and no claim. Of fifteen forms (a branch on an `and` and on an `add`,
+  a compare, a return, a call, a store's address and its value, two registers, nested
+  loops, a test at the top, a break in the middle, a raw line in the loop, a copy
+  stored, added to in place and branched on) twelve disagreed with the CPU, in 1 to 40
+  of 40 entry states each, and all fifteen agree in every state the CPU runs. Of the
+  unicorn oracle's 20,420 generated programs 17,082 agree where 16,540 did, and of 10,600
+  more 8,847 where 8,135 did; no program that agreed is wrong now. The oracle counts 5
+  wrong where it counted 3: the two new ones were gaps before, and each reads memory
+  after an `x13[i] = v` store the oracle cannot place and leaves out; with that store at
+  an offset it can place, the same two programs print the same names and neither is
+  wrong. A row of loops that each leave a register the next lines read is walked twice
+  where it was walked once and printed the register bare: 2,000 of them take 1.0 s
+  against 0.45 s, the four such shapes timed 1.8 to 2.2 times what they took, and the
+  time still grows with the length alone. The fifteen other shapes are within 1.1 times
+  what they took, and the clean fixture lifts in 23.2 s against 23.2 s, its 184 changed
+  ranges in 4.7 s against 4.2 s. 125 ranges change on each fixture, 8,763 lines replaced
+  by 9,523 on the clean one and 8,712 by 9,470 on the obfuscated one, all but 519 of the
+  lines out a temporary's number moving up: `return x1;` to `return t2;` under `var t2 =
+  false;` and `t2 = true;`, `x0.field_0x44 = t1;` to `t1.field_0x44 = t2;` under `var t1
+  = this;`, and `_createSemanticsConfigForTextInfo@162149678(...)` to the same call with
+  `(this, t7, 0)`. 36 fewer lines print `(...)` on each fixture, and two more conditions
+  read `?`, both where a bare register stood. With #461, 3,530 of the 273,863 ranges of
+  the two fixtures and seven apps change, 255,793 lines replaced by 286,502 (14,954 by
+  45,663 with the numbers of temporaries left out); 508 fewer lines print `(...)`, and
+  121 conditions newly read `?`, 116 where a bare register stood and 5 where no branch
+  was printed. Twelve changed ranges of the clean fixture were read against the
+  disassembly and the change is right in all twelve.
+
 - **A join an `if` falls into is named on the way in from each arm (#461).** `umulh x3,
   x5, x6; cbz x1, 1f; mov x3, #7; cbz x2, 2f; mov x3, #8; cbz x5, 1f; mov x3, #9; 1: add
   x4, x4, #1; 2: mov x0, x3` printed `t1 = x3;` under the label `1:`, which three ways
