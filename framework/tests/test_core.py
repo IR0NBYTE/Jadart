@@ -24853,7 +24853,8 @@ def test_every_dispatch_offset_on_the_clean_build_is_the_one_in_the_word():
     """Each dispatch site whose row is made by an add or a subtract of an immediate, read
     again off the instruction word: twelve bits, the shift bit, the sign. 312 of the
     clean build's are shifted and each printed the unshifted number (#376); the body of
-    `_syncAll` holds one."""
+    `_syncAll` holds one. 609 more are read off a class id moved before the add (#404),
+    69 of them shifted."""
     _needs_capstone()
     import struct
     import jadart
@@ -24874,7 +24875,7 @@ def test_every_dispatch_offset_on_the_clean_build_is_the_one_in_the_word():
             if off != (-imm if w >> 30 & 1 else imm):
                 wrong.append((hex(addr), off))
     assert not wrong, (len(wrong), wrong[:5])
-    assert (seen, shifted) == (1685, 312), (seen, shifted)
+    assert (seen, shifted) == (2294, 381), (seen, shifted)
     body = [ln for f in jadart.decompile(CLEAN, "_syncAll") for ln in f["body"]]
     assert any(".sel_m0x1000(" in ln for ln in body), body
     assert not any(".sel_m0x1(" in ln for ln in body), body
@@ -25059,7 +25060,8 @@ def test_every_dispatch_receiver_on_the_clean_build_is_where_the_pass_says():
     the stack. 440 of the calls printed another value: the register the class id is in
     for those on the stack, and what was loaded over the receiver for 13 of those in a
     register (#377). The six with none are in bodies that jump through a register. The
-    named bodies are the issue's."""
+    named bodies are the issue's. 751 more have an offset off a class id moved before
+    the add (#404)."""
     _needs_capstone()
     import jadart
     from jadart.disasm import disassemble_range, load_instructions
@@ -25086,7 +25088,7 @@ def test_every_dispatch_receiver_on_the_clean_build_is_where_the_pass_says():
                                  or dis[wrote[0]][1] == "mov"), hex(addr)
             where["x1" if recv == "x1" else "other" if isinstance(recv, str)
                   else "none" if recv is None else "stack"] += 1
-    assert where == {"x1": 1761, "other": 368, "stack": 445, "none": 6}, where
+    assert where == {"x1": 2142, "other": 523, "stack": 660, "none": 6}, where
     for name, want, wrong in (
             ("_deactivateRecursively", "a0.sel_m0xfd8(", "pool_0x2a00."),
             ("markNeedsBuild", "sel_0x498d(pool_0x2ab8, ", "pool_0x818.")):
@@ -25155,6 +25157,37 @@ def test_a_dispatch_call_drops_only_a_first_word_that_is_its_receiver():
     assert lift(("str", "x2, [x15, #8]"), ("str", "x3, [x15]")) == listed
     assert _lift_rows([("str", "x2, [x15, #8]"), *read, ("str", "x3, [x15]"),
                        ("mov", "x1, x2"), *call]) == listed
+
+
+def test_a_class_id_moved_before_the_add_still_names_the_call():
+    """`get:locale` reads the class id into x1, swaps it with the object through x16
+    and adds the selector offset to the copy in x0, and the call printed
+    `dispatch(...)`: only an add to the register the `ubfx` wrote was a selector
+    (#404). A whole copy of the class id is the class id, in one move or two. One
+    added to first, or moved through memory, is not followed."""
+    from jadart.expr import detect_dispatch
+
+    def site(*mid):
+        rows = [("ldur", "x1, [x0, #-1]"), ("ubfx", "x1, x1, #0xc, #0x14"), *mid,
+                *_TABLE_CALL]
+        got = detect_dispatch([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
+        assert len(got) == 1, got
+        return next(iter(got.values())), _lift_rows(rows)
+    add = [("mov", "x17, #0x48e9"), ("add", "x30, x0, x17")]
+    swap = [("mov", "x16, x0"), ("mov", "x0, x1"), ("mov", "x1, x16")]
+    assert site(*swap, *add) == (("x1", 0x48e9), ["return x0.sel_0x48e9(...);"])
+    assert site(("mov", "x16, x0"), ("mov", "x2, x1"), ("mov", "x0, x2"),
+                ("mov", "x1, x16"), *add) == (("x1", 0x48e9),
+                                              ["return x0.sel_0x48e9(...);"])
+    assert site(*swap, ("sub", "x30, x0, #0xfd8"))[0] == ("x1", -0xfd8)
+    # a sum of two adds is still not read, as it was not without the move
+    assert site(("add", "x0, x1, #5"), ("sub", "x30, x0, #3"))[0] == (None, None)
+    declined = ["var t0 = dispatch(...);   // virtual dispatch", "return t0;"]
+    for mid in ([("mov", "x16, x0"), ("mov", "x2, x1"), ("stur", "x2, [x29, #-8]"),
+                 ("ldur", "x0, [x29, #-8]"), ("mov", "x1, x16"), *add],
+                [*swap[:2], ("ldr", "x0, [x27, #8]"), swap[2], *add],
+                [*swap[:2], ("add", "w0, w0, #1"), swap[2], *add]):
+        assert site(*mid) == ((None, None), declined), mid
 
 
 def _flags_371(setter, a, b):
