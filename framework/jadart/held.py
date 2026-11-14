@@ -75,9 +75,12 @@ class Holdings:
         # its strings, Smis and Arrays (baseobjects.py); only those below it are made
         # by the VM and stated nowhere.
         self._vm_made = getattr(fr, "base_first_ref", 0) or self._first
+        #: A FillResult made by hand, as a test makes one, may carry no instances.
+        self._insts = getattr(fr, "instances", None) or {}
         self._memo = {}
         self._texts = {}
         self._tables = None
+        self._groups = None
 
     # -- the slot ---------------------------------------------------------------------
 
@@ -156,9 +159,33 @@ class Holdings:
         if idx is None:
             return None
         kind, val = self.fr.pool[idx]
-        if kind != "ref" or val not in self.fr.instances:
+        if kind != "ref" or val not in self._insts:
             return None
-        return self._inst_text(val, 0)
+        got = self._inst_text(val, 0)
+        # Two objects can spell alike (an unboxed field prints `?`); a lift that met both
+        # would join them as one value, so a text that names more than one stays a slot.
+        return got if got is not None and not self._alike(val, got) else None
+
+    def _alike(self, ref: int, text: str) -> bool:
+        """Whether another instance a slot names spells as `ref` does. Only an instance
+        of a class with the same name can, so those are the only ones spelled; which
+        class each slot's instance has is its cluster's, known without reading it."""
+        if self._groups is None:
+            t = self._tab()
+            cid_of = getattr(self._insts, "cid_of", None)
+            groups: dict = {}
+            for kind, val in self.fr.pool:
+                if kind != "ref" or val not in self._insts:
+                    continue
+                cid = cid_of(val) if cid_of is not None else self._insts[val][0]
+                cls = t["by_cid"].get(cid)
+                if cls is not None:
+                    groups.setdefault(t["cname"].get(cls) or "", set()).add(val)
+            self._groups = groups
+        t = self._tab()
+        cname = t["cname"].get(t["by_cid"].get(self._insts[ref][0]), "")
+        return any(other != ref and self._inst_text(other, 0) == text
+                   for other in sorted(self._groups.get(cname, ())))
 
     # -- objects ----------------------------------------------------------------------
 
@@ -197,7 +224,7 @@ class Holdings:
             if d is not None:
                 out["value"] = d
             return out
-        inst = getattr(fr, "instances", {}).get(ref)
+        inst = self._insts.get(ref)
         if inst is not None:
             return self._instance(ref, inst)
         elems = (getattr(fr, "arrays", None) or {}).get(ref)
@@ -289,7 +316,7 @@ class Holdings:
         return got
 
     def _spell(self, ref: int, depth: int):
-        cid, bitmap, fields = self.fr.instances[ref]
+        cid, bitmap, fields = self._insts[ref]
         t = self._tab()
         cls = t["by_cid"].get(cid)
         if cls is None:
@@ -319,7 +346,7 @@ class Holdings:
     def _value_text(self, ref: int, depth: int) -> str:
         """A field's value inside an instance: short, and `?` for what is not known."""
         fr = self.fr
-        if ref in getattr(fr, "instances", {}):
+        if ref in self._insts:
             got = self._inst_text(ref, depth)
             return got if got is not None else "?"
         if ref in fr.strings:
