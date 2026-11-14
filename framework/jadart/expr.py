@@ -4995,8 +4995,9 @@ class Lifter:
                  words the call's own block stored (the middle of the plan);
           all    the same, before 3.4, for a callee that reads no argument: what was
                  pushed is every argument there, and an empty list where nothing was;
-          pushed what was pushed, with nothing asked of it: the first word pushed is
-                 taken for the receiver of a dispatch call that has one in a register.
+          pushed what was pushed, with nothing asked of it, but for a dispatch call
+                 that has its receiver in a register: the first word pushed has to be
+                 that object, or the list is not known (#383).
 
         A list is every argument or it is `...`, so each of the others declines
         where the rows show an argument it would leave out. A callee that reads x4 with
@@ -7805,15 +7806,16 @@ class Lifter:
                     vals = None
         elif recv:
             base = self._leaf(recv, st)
-            if not asked:
-                at = 0 if vals is not None else None
-            else:
-                leads = (0, 1) if plan is not None and plan[2] == "cached" else (lead,)
-                at = next((i for i in leads if vals is not None and len(vals) > i
-                           and not (names and names[i])
-                           and (vals[i] is base or vals[i].text == base.text)), None)
-                if at is None:
-                    vals = None
+            # Unasked, the first word pushed is the receiver only where it is seen to
+            # be: `str x3, [x15]` after the class id read is an argument, and dropping
+            # it printed `x2.sel_m0xffe()`, a list that says there is none (#383).
+            leads = ((0, 1) if plan is not None and plan[2] == "cached"
+                     else (lead,) if asked else (0,))
+            at = next((i for i in leads if vals is not None and len(vals) > i
+                       and not (names and names[i])
+                       and (vals[i] is base or vals[i].text == base.text)), None)
+            if at is None:
+                vals = None
         if vals is not None and at is not None:
             vals = vals[:at] + vals[at + 1:]
             names = names and names[:at] + names[at + 1:]

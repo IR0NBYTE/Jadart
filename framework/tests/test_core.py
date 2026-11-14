@@ -25131,6 +25131,32 @@ def test_following_a_dispatch_receiver_costs_the_same_per_row_guard():
     assert large <= getattr(expr, "_RECV_WINDOW", 64), large
 
 
+def test_a_dispatch_call_drops_only_a_first_word_that_is_its_receiver():
+    """Lifted with no arity resolver, a dispatch call with its receiver in a register
+    took the first word pushed for the receiver and left it out of the list. Where an
+    argument is the only word pushed after the class id read, `str x3, [x15]`, the
+    call printed `x2.sel_m0xffe()`, a list that says there is none (#383). The first
+    word pushed is dropped only where it is the receiver; otherwise the list is not
+    known and prints `(...)`."""
+    read = [("ldur", "x0, [x2, #-1]"), ("ubfx", "x0, x0, #0xc, #0x14")]
+    call = [("sub", "x30, x0, #0xffe"), *_TABLE_CALL]
+
+    def lift(*mid):
+        return _lift_rows([*read, *mid, ("mov", "x1, x2"), *call])
+    unknown = ["return x2.sel_m0xffe(...);"]
+    assert lift(("str", "x3, [x15]")) == unknown
+    # argument zero is something else, or nothing pushed is the receiver
+    assert lift(("stp", "x2, x3, [x15]")) == unknown
+    assert lift(("stp", "x3, x4, [x15]")) == unknown
+    assert lift() == unknown
+    # the receiver is argument zero, pushed with it, before it or before the read
+    listed = ["return x2.sel_m0xffe(x3);"]
+    assert lift(("stp", "x3, x2, [x15]")) == listed
+    assert lift(("str", "x2, [x15, #8]"), ("str", "x3, [x15]")) == listed
+    assert _lift_rows([("str", "x2, [x15, #8]"), *read, ("str", "x3, [x15]"),
+                       ("mov", "x1, x2"), *call]) == listed
+
+
 def _flags_371(setter, a, b):
     """N, Z, C and V as an arm64 CPU leaves them after `cmp a, b` (or `subs`) and
     after `cmn a, b` (or `adds`), for two 64-bit values."""
