@@ -4830,6 +4830,12 @@ class Lifter:
         #: address -> where SP sits there against the frame the function was entered
         #: with, exact only (None where unknown or merely bounded by an alignment) (#207).
         self.sp_at: dict = {}
+        #: offset from FP -> the name of the stack argument there (program.EntryNames.
+        #: stack, #420), and the names the walk printed one of.
+        self.stack_names: dict = {}
+        self.stack_read: set = set()
+        #: The rows a catch entry reaches, where no stack argument is named (#420).
+        self.stack_skip: frozenset = frozenset()
         #: address -> how far FP is from where its frame started, where that is not 0;
         #: None where `_frame_plan` did not follow FP through the function (#340).
         self.fp_at = None
@@ -6389,6 +6395,11 @@ class Lifter:
         sits = got[0] if got and not got[1] else None
         if sits is not None:
             role, disp = "FP", sits + disp
+        name = (self.stack_names.get(disp) if role == "FP" and width == 8
+                and self._here not in self.stack_skip else None)
+        if name is not None:
+            self.stack_read.add(name)
+            return V(name, P_ATOM)
         addr, off = V(role, P_ATOM), disp
         if disp < 0:
             addr, off = _bin(addr, "-", _num(-disp), P_ADD), 0
@@ -8996,6 +9007,12 @@ class Lifter:
                     # may write it, and its spelling is no field of that base (#329,
                     # #341).
                     self._at_read(v.text, self._at_computed(base, at_base, bv))
+                    # A stack argument, by the name its parameter has (#420).
+                    name = (self.stack_names.get(off) if wk == 8 and bv.text == "FP"
+                            and self._here not in self.stack_skip else None)
+                    if name is not None:
+                        self.stack_read.add(name)
+                        v = V(name, P_ATOM)
                     if sign and wk < 8 and _reg_file(ops[k]) == "x":
                         v = _extended(v, 8 * wk, True)
                         if ops[k].strip()[:1] == "w":
@@ -14003,7 +14020,7 @@ REJOIN = ("the names past that label were worked out for the ways in above it, n
 def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
                   indent="  ", depth=1, selectors=None, arch=None, fields=None,
                   show=None, cut_end=None, returns=None, allocs=None,
-                  mono=None, casts=None) -> list:
+                  mono=None, casts=None, stack=None) -> list:
     """Annotated disasm -> pseudo-Dart body lines (Tier 3). `receiver` is an optional
     register-alias map, e.g. {"x1": "this"} for an instance method; `arity` is an optional
     `pc -> int` resolver (see make_arity_resolver) enabling call-argument reconstruction;
@@ -14024,6 +14041,9 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
     function's own code. `mono` is the address of the code's monomorphic entry where
     the snapshot says it has one (disasm.monomorphic_entry): the section placed there
     says so, and is lifted as a body from that entry; see MONOMORPHIC_ENTRY.
+    `stack` maps an offset from FP to the name of the stack argument there
+    (program.EntryNames.stack): a read of that slot prints the name, and the Body's
+    `stack_read` lists the ones printed (#420).
 
     `arch` is the resolved target. Passing one whose roles are not modelled refuses; see
     LIFTABLE_ARCHS. Omitting it keeps the arm64 assumption every caller had before the
@@ -14041,10 +14061,16 @@ def lift_function(ann: list, pool_map=None, receiver=None, arity=None,
             rec = {}
             out = _lift_function(ann, pool_map, receiver, arity, indent, depth,
                                  selectors, fields, show, cut_end, returns, allocs,
-                                 mono, casts, getattr(arch, "compressed", None), rec)
+                                 mono, casts, getattr(arch, "compressed", None), rec,
+                                 stack)
             lf = rec.get("lifter")
-            return (Body(out) if lf is None
-                    else Body(out, lf.called, lf.read_strs))
+            if lf is None:
+                return Body(out)
+            body = Body(out, lf.called, lf.read_strs)
+            body.stack_params = tuple(n for _o, n in sorted(lf.stack_names.items(),
+                                                            reverse=True))
+            body.stack_read = tuple(n for n in body.stack_params if n in lf.stack_read)
+            return body
         except RecursionError:
             # The structurer and the walk recurse once per level of nesting (#81); see
             # cfg.render_function. The caches hold parses only, and each lift builds its
@@ -14074,6 +14100,10 @@ class Body(list):
 
     calls: tuple = ()
     strings: tuple = ()
+    #: The stack arguments the body reads by name, first parameter first (#420).
+    stack_read: tuple = ()
+    #: Every parameter the stack names stand for, where the lift named them (#420).
+    stack_params: tuple = ()
 
     def __init__(self, lines=(), called=(), read_strs=()):
         super().__init__(lines)
@@ -14363,10 +14393,112 @@ def _ends_again(blocks, stmts, placed, second=frozenset(), trapped=frozenset()) 
     return out
 
 
+def _args_kept(blocks, raw, stack) -> bool:
+    """Whether every slot above FP keeps what the caller pushed there wherever a read of
+    one is named, so that a read of one is the argument (#420).
+
+    The frame must be the prologue's, `stp x29, x30, [x15, #-0x10]!; mov x29, x15`
+    and a `sub x15, x15, #S` the first rows that touch either register, in address
+    order, past the class check a monomorphic entry makes, and FP is not written
+    again. SP is written only there, by the epilogue (`mov x15, x29`, the pop of FP and
+    LR) and by `sub x15, x29, #S` at a catch entry, so it is S below FP wherever the
+    code uses it. Neither is otherwise a value but in a compare, the stack overflow
+    check's: `mov x0, x29` or `add x0, x29, #0x10` makes an address a store could write
+    an argument through and the store would not say so, and Dart writes a parameter it
+    assigns to where it was passed. A store through either, of
+    any width, ends below 0x10 off FP. Once the frame is torn down, in the rest of that
+    block and every block it leads to, neither is read or written through. A read at
+    or past 0x10 covers whole slots that `stack` names: one past them means the count
+    is not the function's."""
+    sp, fp = _frame_regs()
+    pairs = ("ldp", "stp", "ldpsw", "ldnp", "stnp")
+
+    def rows(blk):
+        for (a, mn, op, _n) in blk.insns:
+            yield (a,) + tuple(raw.get(a, (mn, op)))
+
+    def regs_of(ops):
+        return {canon(o) for o in ops if "[" not in o and not o.startswith("#")}
+
+    head = sorted(r for blk in blocks.values() for r in rows(blk) if r[1] != "nop")
+    k = next((i for i, (_a, _m, op) in enumerate(head)
+              if fp in {canon(o.strip("[]!").split(",")[0]) for o in _split_ops(op)}
+              or sp in {canon(o.strip("[]!").split(",")[0]) for o in _split_ops(op)}),
+             None)
+    if k is None or k + 1 >= len(head):
+        return False
+    push, setfp = head[k], head[k + 1]
+    pops = _split_ops(push[2])
+    m = _mem(pops[-1]) if pops and "[" in pops[-1] else None
+    if (push[1] != "stp" or len(pops) != 3 or canon(pops[0]) != fp or m is None
+            or m[0] != sp or m[1] != -0x10 or not m[4]):
+        return False
+    if setfp[1] != "mov" or [canon(o) for o in _split_ops(setfp[2])] != [fp, sp]:
+        return False
+    frame, size = {push[0], setfp[0]}, 0
+    if k + 2 < len(head) and head[k + 2][1] == "sub":
+        ops = _split_ops(head[k + 2][2])
+        if len(ops) == 3 and canon(ops[0]) == sp and canon(ops[1]) == sp:
+            size = _imm(ops[2])
+            if size is None:
+                return False
+            frame.add(head[k + 2][0])
+    # The blocks a teardown leads to: every row in them runs after it.
+    downs = {b for b, blk in blocks.items()
+             if any(mn == "mov" and [canon(o) for o in _split_ops(op)] == [sp, fp]
+                    for _a, mn, op in rows(blk))}
+    after, todo = set(), [t for b in downs for t in blocks[b].succ]
+    while todo:
+        b = todo.pop()
+        if b in after or b not in blocks:
+            continue
+        after.add(b)
+        todo.extend(blocks[b].succ)
+    for b, blk in blocks.items():
+        torn = b in after
+        for a, mn, op in rows(blk):
+            if a in frame or mn == "nop":
+                continue
+            ops = _split_ops(op)
+            mi = next((i for i, o in enumerate(ops) if "[" in o), None)
+            m = _mem(ops[mi]) if mi is not None else None
+            data = regs_of(ops)
+            if m is not None and (m[0] in (sp, fp) or m[2] in (sp, fp)):
+                post = (_imm(ops[mi + 1]) if mi + 1 < len(ops) else 0)
+                if (mn == "ldp" and m[0] == sp and canon(ops[0]) == fp
+                        and post == 0x10 and not m[4] and m[1] == 0 and torn):
+                    continue        # the epilogue's pop of FP and LR
+                if (torn or m[2] is not None or m[4] or post or data & {sp, fp}
+                        or mn not in _LOADS and mn not in _STORES):
+                    return False
+                off = m[1] if m[0] == fp else m[1] - size
+                w = _access_width(mn, ops[0]) * (2 if mn in pairs else 1)
+                if off + w <= 0x10:
+                    continue
+                if mn in _STORES or off < 0x10:
+                    return False
+                if not all(o in stack for o in range(off - off % 8, off + w, 8)):
+                    return False
+                continue
+            if not data & {sp, fp}:
+                continue
+            got = [canon(o) for o in ops]
+            if mn in ("cmp", "cmn"):
+                continue            # the stack overflow check: it writes nothing
+            if mn == "mov" and got == [sp, fp]:
+                torn = True
+                continue
+            if (mn == "sub" and len(got) == 3 and got[:2] == [sp, fp]
+                    and _imm(ops[2]) == size):
+                continue            # a catch entry puts SP back where the body had it
+            return False
+    return True
+
+
 def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                    fields=None, show=None, cut_end=None, returns=None,
                    allocs=None, mono=None, casts=None, compressed=None,
-                   rec=None) -> list:
+                   rec=None, stack=None) -> list:
     g = tier3_graph(ann, cut_end, mono)
     if g is None:
         return []
@@ -14419,6 +14551,19 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     fp_lost = _fp_lost_at(blocks, raw)
     meets, moves, joins, cross, spat, fpat, wrote = _frame_plan(blocks, entry, raw,
                                                                 fp_lost)
+    if stack and (fp_lost or not _args_kept(blocks, raw, stack)):
+        stack = None
+    # The runtime writes a parameter's slot back when it unwinds to a catch entry, so a
+    # read of one in code a catch entry reaches is the frame slot, as it was (#420).
+    skip = set()
+    if stack:
+        todo = list(dead - cut_off(blocks, unreached, g.cut))
+        while todo:
+            b = todo.pop()
+            if b in skip or b not in blocks:
+                continue
+            skip.add(b)
+            todo.extend(blocks[b].succ)
     # Every row a value naming a frame register is looked at before: the ones that
     # write one, and the ones `_frame_plan` starts a frame at.
     shift_rows = {a: (False, 0) for a in moves.keys() - wrote.keys()}
@@ -14569,6 +14714,8 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.frame_joins = joins
         lifter.frame_cross = cross
         lifter.sp_at = spat
+        lifter.stack_names = stack or {}
+        lifter.stack_skip = frozenset(a for b in skip for a, *_r in blocks[b].insns)
         lifter.fp_at = fpat
         lifter.shift_rows = shift_rows
         lifter._fp_leaf = None if fpat is None else lifter._fp_reg

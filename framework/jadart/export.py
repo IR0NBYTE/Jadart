@@ -349,22 +349,26 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
             cr = image.code_ranges[ref]
             cut = truncated_by(cr, dis)
             note = f", TRUNCATED: {len(dis)} of {len(dis) + cut} instructions" if cut else ""
-            # As program.decompile_class: the tier 3 body's own names, else empty.
-            params = entry.params(cr) if entry is not None else ""
-            out.append(f"  {disp}({params}) {{  // {addr_label(image, cr.pc_offset)}, "
-                       f"{cr.size} bytes{note}")
+            body = None
             if tier >= 3:
                 ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
-                out.extend(lift_function(ann, pool_map,
-                                         receiver=entry.names(cr),
-                                         arity=arity, indent="  ", depth=2,
-                                         selectors=selectors,
-                                         arch=getattr(image, "arch", None),
-                                         fields=layout.for_function(ref),
-                                         allocs=allocs, casts=casts,
-                                         show=rebaser(image), cut_end=cut_end(cr, dis),
-                                         returns=returns,
-                                         mono=monomorphic_entry(image, cr)))
+                body = lift_function(ann, pool_map,
+                                     receiver=entry.names(cr),
+                                     arity=arity, indent="  ", depth=2,
+                                     selectors=selectors,
+                                     arch=getattr(image, "arch", None),
+                                     fields=layout.for_function(ref),
+                                     allocs=allocs, casts=casts,
+                                     show=rebaser(image), cut_end=cut_end(cr, dis),
+                                     returns=returns,
+                                     mono=monomorphic_entry(image, cr),
+                                     stack=entry.stack(cr))
+            # As program.decompile_class: the tier 3 body's own names, else empty.
+            params = entry.params(cr, body) if entry is not None else ""
+            out.append(f"  {disp}({params}) {{  // {addr_label(image, cr.pc_offset)}, "
+                       f"{cr.size} bytes{note}")
+            if body is not None:
+                out.extend(body)
             elif tier == 2:
                 ann = annotate(dis, pc_to_name, pool_map, kinds=row_kinds(image, dis))
                 out.extend(render_function(ann, exits=exits(image, dis),

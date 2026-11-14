@@ -232,6 +232,24 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A stack argument reads as its parameter (#420).** An argument the caller pushed
+  printed as a bare frame slot, `FP.field_0x10`, though the snapshot states how many
+  parameters the function takes. Where it does, with no optional or type parameters and
+  no arguments descriptor, each slot read prints its name in the order of the list, the
+  first at the highest slot, and the signature lists every parameter, `a0` to the last:
+  `_ffi_resolver_function@9050071(a0, a1, a2)` at 0x138f54 reads `var t2 = a0;` where it
+  read `var t2 = FP.field_0x20;`. The receiver of an instance method is `this`, and a
+  closure's implicit parameter stays `a0`. `lift`, `export` and the Python API all pass
+  the names. The slots stay bare, and the signature as it was, where the function has
+  no prologue, stores over a slot through FP or SP at any width, lets either go into
+  another register, reads one after its frame is torn down, or reads past the slots the
+  count names, and a read in code a catch entry reaches stays bare too. On the clean
+  fixture the ranges that read a bare argument slot go from 1,498 to 784, and the lines
+  from 4,413 to 2,967; 714 ranges and 1,446 lines change on clean and 78 and 174 on
+  obf, each line replaced by one. A forwarder's `var t0 = FP.field_0x10;` is `var t0 =
+  a1;` and its `var t2 = FP.field_0x18;` is `var t2 = this;`. Lifting the clean fixture
+  takes 23.3 s of CPU against 22.8 s before.
+
 - **A frame or stack slot is spelled at the offset the instruction reads (#407).** `ldr
   x0, [x29, #0x10]` printed `FP.field_0x11` and `ldur x0, [x29, #-24]` printed `(FP -
   24).field_0x1`: the frame took the tag bias of a heap object, which it is not, so the

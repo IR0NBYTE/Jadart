@@ -99,7 +99,15 @@ call prints where it cannot read its callee's list. A name is printed only while
 register still holds the entry value on every path to the line: after a write, a call, a
 join that disagreed or a loop that rewrites it the register reads as the lifter always
 read it, bare or by a fresh name, and a raw arm64 line reads the machine's register as
-it is. A stack argument stays a frame read, `var t0 = FP.field_0x10;`.
+it is. An argument the caller pushed on the stack is named the same way where the
+snapshot states how many parameters the function takes: the first at the highest slot,
+so `ldr x0, [x29, #0x10]` in a function of three reads `a2`, and the signature then
+lists every parameter, `f(a0, a1, a2)`, whichever the body reads. `lift`, `export` and
+the Python API all name them. Where the count is missing, or the list has optional or
+type parameters, or the function has no frame of its own, writes the slots, lets FP or
+SP go into another register, or reads past the slots the count names, the read stays a
+frame read, `var t0 = FP.field_0x10;`, and the signature is what it was. So does a read
+in code a catch entry reaches, since the runtime writes the slots back as it unwinds.
 
 **Reading a frame slot.** A load from the frame that the lifter cannot answer prints the
 read it is, under a name: `var t0 = (FP - 8).field_0x0;`. The address is the base
