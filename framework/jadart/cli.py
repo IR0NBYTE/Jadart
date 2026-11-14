@@ -1094,7 +1094,11 @@ def _xrefs_pool_matches(pool, kind, needle, exact=False):
             addr = int(needle, 0)
         except (TypeError, ValueError):
             raise ValueError(f"invalid pool offset: {needle!r}")
-        return {off: lab for off, lab in pool.items() if off == addr}, addr
+        # Any slot answers, with what it holds: only a labelled one did, and a slot the
+        # lifter prints as `pool_0x2d0` was said to be in no entry (#443).
+        held = getattr(pool, "held", None)
+        text = held.text(addr, pool.get(addr)) if held is not None else pool.get(addr)
+        return ({addr: text} if text is not None else {}), addr
 
     if kind == "string":
         # A label is the string as printed (fill.quoted), so a pattern matches as typed
@@ -1161,7 +1165,7 @@ def _xrefs_filter_class(fr, hdr, refs, class_name):
     return filtered, unattributed
 
 
-def _xrefs_entries(matches, refs, image, fr=None, sigs=None):
+def _xrefs_entries(matches, refs, image, fr=None, sigs=None, held=None):
     from .disasm import va_of
     matched = None
     if sigs:
@@ -1172,6 +1176,7 @@ def _xrefs_entries(matches, refs, image, fr=None, sigs=None):
         {
             "pool_offset": off,
             "entry": matches[off],
+            **({"holds": held.slot(off)} if held is not None else {}),
             "referenced_by": [
                 {"pc_offset": cr.pc_offset, "va": va_of(image, cr.pc_offset),
                  "size": cr.size, **who(cr.pc_offset)}
@@ -1271,7 +1276,11 @@ def cmd_xrefs(args) -> int:
     # built at runtime, can reach it without a load this scan sees. The listing keeps to
     # the entries with loads, and these are said, not dropped: on the clean fixture `e`
     # matches 1,444 entries and 331 of them have no direct load (#62).
-    unloaded = [{"pool_offset": off, "entry": matches[off]}
+    # `xrefs pool` says what the slot holds in `-j` as well (#443); the other kinds
+    # answer as they did.
+    held = getattr(pool, "held", None) if resolved_kind == "pool" and not legacy else None
+    unloaded = [{"pool_offset": off, "entry": matches[off],
+                 **({"holds": held.slot(off)} if held is not None else {})}
                 for off in sorted(matches) if not refs.get(off)]
 
     if legacy:
@@ -1291,7 +1300,8 @@ def cmd_xrefs(args) -> int:
                 exact=_xrefs_exact(args, resolved_kind, legacy),
             )
 
-    entries = _xrefs_entries(matches, refs, image, fr, getattr(args, "sigs", None))
+    entries = _xrefs_entries(matches, refs, image, fr, getattr(args, "sigs", None),
+                             held)
 
     if not entries and unloaded and not class_name:
         if getattr(args, "json", False):

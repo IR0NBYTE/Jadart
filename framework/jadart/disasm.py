@@ -880,6 +880,8 @@ def build_pool_map(fr, arch=None) -> dict:
     m, done, quotes = PoolMap(), {}, {}
     m.descs = descs = {}
     m.strs = strs = set()
+    from .held import Holdings
+    m.held = Holdings(fr, arch)
     smis, seen, at = None, {}, []
     # Where the vm snapshot was read, its own objects are stated and are not the VM's
     # cached descriptors: only the refs below them are objects no file holds.
@@ -924,10 +926,12 @@ class PoolMap(dict):
     offset -> the arguments descriptor in that slot as `_args_desc` reads it, or
     CACHED_DESC for a slot naming a base object no file states. A slot has a label or
     a descriptor, never both, and most have neither. `strs` holds the offsets whose
-    label is a String's, the slots `lift -j` lists under `strings`."""
+    label is a String's, the slots `lift -j` lists under `strings`. `held` says what
+    any slot holds (held.py), asked only where a slot has no label."""
 
     descs: dict = {}
     strs: set = frozenset()
+    held = None
 
 
 #: What `PoolMap.descs` holds for a slot naming a base object that is in no snapshot:

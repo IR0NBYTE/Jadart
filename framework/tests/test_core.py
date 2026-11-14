@@ -3113,7 +3113,9 @@ def test_xrefs_says_which_matching_entries_no_code_loads():
     assert "and 1453 matching entries no code loads directly" in out, out[-400:]
     rc, out, _ = run("pool", "0x568", "-j")
     doc = json.loads(out)
-    assert rc == 0 and doc["unloaded"] == [{"pool_offset": 0x568, "entry": '"ifAbsent"'}]
+    assert rc == 0 and doc["unloaded"] == [{"pool_offset": 0x568, "entry": '"ifAbsent"',
+                                            "holds": {"kind": "string",
+                                                      "value": '"ifAbsent"'}}]
     rc, _out, err = run("string", "zzqqxx")
     assert rc == 1 and "no ObjectPool entry holds it" in err, err
     assert "function" not in err, err
@@ -27426,6 +27428,173 @@ def test_a_run_of_joins_that_each_lose_the_next_is_not_walked_try_by_try():
     # No join a goto reaches kept a name: the labels read what the `if`s named.
     assert not [ln for ln in large if ln.strip() == "t2 = x3;"], large[:30]
     assert len(small) == 97 and len(large) == 617, (len(small), len(large))
+
+
+# -- what a pool slot holds (held.py) -------------------------------------------------
+
+
+def _xrefs_pool(off, json_out):
+    import io
+    import contextlib
+    from jadart import cli
+    buf, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+        rc = cli.main((["-j"] if json_out else []) + ["xrefs", CLEAN, "pool", off])
+    return rc, buf.getvalue(), err.getvalue()
+
+
+def test_xrefs_pool_says_what_any_slot_holds():
+    """`lift benchFetchToken` prints `Future.delayed(pool_0x2d0, pool_0x96f0)`, and
+    `xrefs pool 0x2d0` said no ObjectPool entry held it: only a slot holding a string
+    answered. Every slot answers now with the kind of object it holds, one header line
+    over the list it printed before, and `-j` adds a `holds` field (#443)."""
+    _needs_capstone()
+    import json
+    rc, out, _ = _xrefs_pool("0x2d0", False)
+    lines = out.splitlines()
+    assert rc == 0 and lines[0] == "// pool_0x2d0  TypeArguments object"
+    assert all(not ln.startswith("//") for ln in lines[1:-1])
+    rc, out, _ = _xrefs_pool("0x96f0", False)
+    # Duration keeps an int unboxed: on arm64 with compressed pointers that is two four
+    # byte slots, each written as its own 32 bits, and it is one field, not two halves.
+    head = "// pool_0x96f0  const Duration{field_0x8: ?}"
+    assert rc == 0 and out.splitlines()[0] == head
+    assert "benchFetchToken" in out.splitlines()[1]
+    rc, out, _ = _xrefs_pool("0x96f0", True)
+    got = json.loads(out)["entries"][0]["holds"]["fields"]
+    assert got == [{"offset": 8, "raw": "0x3e8"}]
+    rc, out, _ = _xrefs_pool("0x2138", True)
+    doc = json.loads(out)
+    held = doc["entries"][0]["holds"]
+    assert rc == 0 and doc["entries"][0]["entry"] == "DiagnosticLevel.info"
+    assert held["kind"] == "instance" and held["class"] == "DiagnosticLevel"
+    assert {"offset": 16, "name": "_name@0150898", "value": '"info"'} in held["fields"]
+    rc, out, _ = _xrefs_pool("0x3aa8", True)
+    held = json.loads(out)["entries"][0]["holds"]
+    assert held == {"kind": "immediate", "value": "0x406fe00000000000", "double": "255.0"}
+    # A string slot answers as it did, with the kind beside it in -j.
+    rc, out, _ = _xrefs_pool("0x96f8", True)
+    ent = json.loads(out)["entries"][0]
+    assert ent["entry"] == '"FLUBENCH{async_marker}:"'
+    assert ent["holds"] == {"kind": "string", "value": '"FLUBENCH{async_marker}:"'}
+
+
+def test_xrefs_pool_keeps_the_miss_for_an_offset_that_is_no_slot():
+    """Guard: an offset off the pool's grid, or past its end, is still a miss."""
+    _needs_capstone()
+    for off in ("0x2d4", "0x8", "0x7fffffff"):
+        rc, out, err = _xrefs_pool(off, False)
+        assert rc == 1 and out == ""
+        assert "no ObjectPool entry holds it" in err
+
+
+def _held_fr(pool, instances=None, strings=None, classes=(), doubles=None):
+    from jadart.fillwalk import FillResult
+    fr = FillResult(strings=dict(strings or {}), functions=[], fields=[],
+                    classes=list(classes), types={}, codes=[], pool=list(pool),
+                    end_pos=0, first_ref=10)
+    fr.instances = dict(instances or {})
+    fr.doubles = dict(doubles or {})
+    fr.spans = [(10, 10_000, 600, "LoopCid")]
+    return fr
+
+
+def test_a_slot_holding_a_crafted_instance_prints_bounded_and_escaped():
+    """Everything here comes out of the binary. An instance that names itself, one that
+    holds a long string with control characters in it, and a chain of a thousand
+    instances each print within the bound, escaped, and spell at most _DEPTH + 1 of the
+    instances they reach, whatever the chain's length (#443, #363)."""
+    from jadart import held as H
+    from jadart.versions import Arch
+    arch = Arch(name="arm64", word_size=8, compressed=True)
+    s = "a\x1b[2J\n\u202e" + "x" * 5000
+    chain = {200 + k: (600, 0, (200 + k + 1, 11)) for k in range(1000)}
+    inst = {100: (600, 0, (100, 11, 100)), **chain}
+    fr = _held_fr([("ref", 100), ("ref", 200), ("imm", 0x3ff0000000000000)],
+                  instances=inst, strings={11: s, 12: "Lo\x07op"},
+                  classes=[(50, 12, 600, 0)])
+    h = H.Holdings(fr, arch)
+    text = h.lift_object(0x10)
+    assert text.startswith("const Lo\\u0007op{field_0x8: const Lo\\u0007op{")
+    assert len(text) <= H._CUT and text.isprintable() and "\x1b" not in text
+    spelled = []
+    real = H.Holdings._spell
+
+    def count(self, ref, depth):
+        spelled.append(ref)
+        return real(self, ref, depth)
+    H.Holdings._spell = count
+    try:
+        text = H.Holdings(fr, arch).lift_object(0x18)
+    finally:
+        H.Holdings._spell = real
+    assert len(spelled) <= H._DEPTH + 1 and len(text) <= H._CUT
+    assert h.slot(0x20) == {"kind": "immediate", "value": "0x3ff0000000000000",
+                            "double": "1.0"}
+    assert h.slot(0x28) is None and h.slot(0x14) is None
+
+
+def test_the_fill_keeps_no_entry_for_each_object_a_cluster_declares():
+    """A crafted instance cluster declares 200,000 objects with no fields, which cost
+    the stream nothing. The fill kept a tuple for each, 40 MB here and 781 MB at four
+    million; it keeps their shape and reads one back when asked (#443)."""
+    import tracemalloc
+    import types
+    from jadart import fillwalk as F
+    from jadart.stream import ReadStream
+    cl = types.SimpleNamespace(count=200_000, next_field_offset=2, cid=5000,
+                               start_ref=1_000_000)
+    st = ReadStream(bytes([0x80]) + b"\x00" * 16)       # bitmap 0, nothing else
+    store = F.Instances(st.data) if hasattr(F, "Instances") else {}
+    tracemalloc.start()
+    try:
+        F._fill_instance(st, cl, None, store)
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert st.pos == 1 and len(store) == 200_000
+    assert peak < 64 * 1024, peak
+    assert store[1_000_005] == (5000, 0, ()) and 1_200_000 not in store
+
+
+def test_a_slot_naming_a_base_object_the_vm_snapshot_states_says_what_it_is():
+    """Where the vm snapshot was read (#460), a base object from its first ref on is a
+    string, a Smi or an Array it states, and says so; one the VM makes before any
+    snapshot, below that ref, is a vm object, and so is a base object it states as
+    something else, since what is kept of it is no more than its ref."""
+    from jadart import held as H
+    from jadart.versions import Arch
+    fr = _held_fr([("ref", 50), ("ref", 120), ("ref", 121), ("ref", 130)],
+                  strings={120: "add"})
+    fr.first_ref, fr.spans = 200, [(200, 10_000, 600, "LoopCid")]
+    fr.base_first_ref = 100
+    fr.smi_values = {121: 2}
+    h = H.Holdings(fr, Arch(name="arm64", word_size=8, compressed=True))
+    assert [h.object(r)["kind"] for r in (50, 120, 121, 130)] == [
+        "vm object", "string", "int", "vm object"]
+    assert h.object(120)["value"] == '"add"'
+    fr.base_first_ref = 0
+    h = H.Holdings(fr, Arch(name="arm64", word_size=8, compressed=True))
+    assert h.object(120)["kind"] == "vm object"
+
+
+def test_an_instance_read_back_from_the_stream_is_the_one_the_fill_read():
+    """Each object of a cluster with fields reads back as the fill read it, wherever it
+    sits between two of the positions the fill keeps: a ref, and an unboxed word made
+    of two 32-bit reads, low half first (#443)."""
+    from jadart import fillwalk as F
+    from jadart.stream import ReadStream
+    import types
+    n = 40
+    body = b"".join(bytes([0x80 | (i + 1), 0xC0 + i, 0xC0 + (i % 3)]) for i in range(n))
+    st = ReadStream(bytes([0x88]) + body + b"\x00")   # slot 3 of 2 + 2 is unboxed
+    cl = types.SimpleNamespace(count=n, next_field_offset=4, cid=600, start_ref=50)
+    store = F.Instances(st.data)
+    F._fill_instance(st, cl, None, store)
+    assert st.pos == 1 + 3 * n and len(store) == n and 50 + n not in store
+    for i in (39, 0, 15, 16, 21, 17):
+        assert store[50 + i] == (600, 8, (i + 1, i | (i % 3) << 32)), i
+    assert store.get(49) is None and sorted(store)[:2] == [50, 51]
 
 
 if __name__ == "__main__":

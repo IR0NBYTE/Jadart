@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from .errors import JadartError
 
+import bisect
+from array import array
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -160,6 +162,19 @@ class FillResult:
     func_signature: dict = field(default_factory=dict)
     ftype_params: dict = field(default_factory=dict)
     smi_values: dict = field(default_factory=dict)        # Mint/Smi ref -> the int it holds
+    #: For each Double ref, the 64 bits it holds as an unsigned int. The fill read them
+    #: to stay in step and kept none, so a pool slot naming a Double had no value (#443).
+    #: Kept as one array of words per cluster, eight bytes a Double.
+    doubles: Mapping = field(default_factory=dict)
+    #: For each Instance ref, (class id, unboxed-fields bitmap as written, fields).
+    #: `fields` holds one entry per slot from the header to next_field_offset: a ref, or
+    #: for a slot the bitmap marks unboxed, the word the stream wrote for it. What a
+    #: const instance in the pool holds is these (#363). Decoded from the stream when
+    #: asked (Instances), so the fill keeps a few bytes a cluster and no entry an object.
+    instances: Mapping = field(default_factory=dict)
+    #: (first ref, ref past the last, class id, cluster name) for every cluster in ref
+    #: order, which says what kind of object any ref this snapshot allocates is (#443).
+    spans: list = field(default_factory=list)
     # A const list's ELEMENTS, which the fill pass was already reading and throwing away.
     # Dart puts every const data table in one of these, a keystream, an S-box, a lookup
     # of magic constants, and without them a decompiled loop shows the arithmetic over
@@ -261,6 +276,8 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     strings: dict = dict(base.strings) if base is not None else {}
     string_lengths: dict = {}
     arrays: dict = dict(base.arrays) if base is not None else {}
+    doubles = Doubles()
+    instances = Instances(st.data)
     functions: list = []
     fields: list = []
     classes: list = []
@@ -310,8 +327,9 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
         elif name in _NONE:
             pass
         elif name == "DoubleCid":
-            for _ in range(n):
-                st.read_int()          # Read<double> = Read64 varint
+            # Read<double> = Read64 varint, the double's bits as an int64
+            doubles.add(cl.start_ref, array("Q", [st.read_int() & 0xFFFFFFFFFFFFFFFF
+                                                  for _ in range(n)]))
         elif name == "CodeCid":
             pair = _fill_code(st, cl, codes, instr_index, code_payload_info,
                               epoch.code_stub_refs)
@@ -395,7 +413,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
         elif cl.name == "TypeCid":
             _fill_type(st, cl, types, epoch.type_class_id_shift)
         elif cl.cid >= boundary or cl.name == "InstanceCid":
-            _fill_instance(st, cl, arch)
+            _fill_instance(st, cl, arch, instances)
         elif name in _refs:
             _fill_refs(st, cl, _refs[name], functions, fields, func_code_index,
                        libraries, meta)
@@ -431,7 +449,9 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       code_payload_info=code_payload_info,
                       func_data=meta["fdata"],
                       func_signature=meta["fsig"], ftype_params=meta["ftparams"],
-                      arrays=arrays,
+                      arrays=arrays, doubles=doubles, instances=instances,
+                      spans=[(cl.start_ref, cl.start_ref + cl.count, cl.cid, cl.name)
+                             for cl in clusters],
                       base_first_ref=base.first_ref if base is not None else 0,
                       smi_values=smi_values)
 
@@ -642,7 +662,7 @@ def _fill_type(st, cl, types, shift: int = 3):
         types[cl.start_ref + i] = (flags >> shift) & 0xFFFFF
 
 
-def _fill_instance(st, cl, arch=None):
+def _fill_instance(st, cl, arch=None, instances=None):
     bitmap = st.read_unsigned()
     nfo = cl.next_field_offset
     header_words = arch.instance_header_words if arch else 2
@@ -650,14 +670,125 @@ def _fill_instance(st, cl, arch=None):
     # two 32-bit reads on a 64-bit target and one on a 32-bit one.
     per_word = arch.read32_per_word if arch else 2
     num_fields = max(0, nfo - header_words)
-    for _ in range(cl.count):
-        for j in range(num_fields):
-            if (bitmap >> (header_words + j)) & 1:
-                for _ in range(per_word):
-                    st.read_int()
-            else:
-                st.read_ref_id()
+    marks = array("Q")
+    if num_fields:
+        # Where every _MARK-th object starts, so Instances can read any one of them back
+        # by skipping at most _MARK - 1 others: 8 bytes per _MARK objects, and an object
+        # with a field costs the stream a byte or more, so this stays under the file size.
+        for i in range(0, cl.count, _MARK):
+            marks.append(st.pos)
+            for _ in range(min(_MARK, cl.count - i)):
+                for j in range(num_fields):
+                    if (bitmap >> (header_words + j)) & 1:
+                        for _ in range(per_word):
+                            st.read_int()
+                    else:
+                        st.read_ref_id()
+    if instances is not None:
+        instances.add(cl.start_ref, cl.count, cl.cid, bitmap,
+                      (header_words, num_fields, per_word), marks)
 
+
+#: Instances keeps the stream position of one object in this many.
+_MARK = 16
+
+
+def _read_fields(st, bitmap, header_words, num_fields, per_word, got):
+    """One object's fields off `st`, appended to `got` where it is a list."""
+    for j in range(num_fields):
+        if (bitmap >> (header_words + j)) & 1:
+            # The low half first (datastream.h); the slot keeps the word that makes.
+            w = 0
+            for k in range(per_word):
+                w |= (st.read_int() & 0xFFFFFFFF) << (32 * k)
+            if got is not None:
+                got.append(w)
+        else:
+            r = st.read_ref_id()
+            if got is not None:
+                got.append(r)
+
+
+class _ByRef(Mapping):
+    """A read-only map over runs of refs, one run a cluster, found by bisection."""
+
+    def __init__(self):
+        self._starts: list = []
+        self._runs: list = []
+        self._len = 0
+
+    def _put(self, start: int, count: int, run) -> None:
+        if count <= 0:
+            return
+        k = bisect.bisect_right(self._starts, start)
+        self._starts.insert(k, start)
+        self._runs.insert(k, (start, count, run))
+        self._len += count
+
+    def _run(self, ref):
+        if not isinstance(ref, int):
+            return None
+        k = bisect.bisect_right(self._starts, ref) - 1
+        if k < 0:
+            return None
+        start, count, run = self._runs[k]
+        return (ref - start, run) if ref < start + count else None
+
+    def __contains__(self, ref) -> bool:
+        return self._run(ref) is not None
+
+    def __getitem__(self, ref):
+        got = self._run(ref)
+        if got is None:
+            raise KeyError(ref)
+        return self._value(*got)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __iter__(self):
+        for start, count, _run in self._runs:
+            yield from range(start, start + count)
+
+
+class Doubles(_ByRef):
+    """Each Double ref to its 64 bits, from one array of words a cluster."""
+
+    def add(self, start: int, words) -> None:
+        self._put(start, len(words), words)
+
+    def _value(self, i, words):
+        return words[i]
+
+
+class Instances(_ByRef):
+    """Each Instance ref to (class id, bitmap, fields), read back from the snapshot's
+    bytes when asked. The fill keeps a cluster's shape and where one object in _MARK
+    starts, and no entry per object: a cluster can declare millions of objects that
+    cost the stream a byte each, or none at all where they have no fields."""
+
+    def __init__(self, data=b""):
+        super().__init__()
+        self._data = data
+        self._memo: dict = {}
+
+    def add(self, start, count, cid, bitmap, shape, marks) -> None:
+        self._put(start, count, (cid, bitmap, shape, marks))
+
+    def _value(self, i, run):
+        cid, bitmap, (hw, nf, per_word), marks = run
+        key = (id(run), i)
+        got = self._memo.get(key)
+        if got is not None:
+            return got
+        fields: list = []
+        if nf:
+            st = ReadStream(self._data, marks[i // _MARK])
+            for _ in range(i % _MARK):
+                _read_fields(st, bitmap, hw, nf, per_word, None)
+            _read_fields(st, bitmap, hw, nf, per_word, fields)
+        got = self._memo[key] = (cid, bitmap, tuple(fields))
+        return got
 
 def _fill_sized(st, cl, spec):
     """A cluster whose objects each state a length that sizes a run of their refs.
