@@ -1003,6 +1003,38 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   an interrupt `130`, so an agent branching on `2` read a miss as success. The skill,
   the README and the `--help` epilog now carry the same sentence, naming `0`, `1`, `2`,
   `3` and `130`; what the command line returns is unchanged.
+- **A closure allocation names the function it runs and the context it captured
+  (#442).** `benchMakeAdder` returns `(int x) => base + x` and printed
+  `return new Closure();`, which says neither what the closure runs nor what it closed
+  over, and so did all 942 closure allocations of each fixture. The allocation stub
+  takes the Function in its first argument register, loaded from the object pool in
+  front of the call, and the context in the second; the four 3.13 stubs take a length
+  there and the context in the third, read off what each stub stores on 14 corpus
+  releases and six apps. The function prints where the block loads a pool slot that
+  holds a Function and the walk holds that same slot in the register: by its name, or as
+  `sub_0x...`, the address of its code, where its name is the `<anonymous closure>`
+  every one of them has. The context prints where the walk holds a value for its
+  register and not the bare register. Each prints `...` where the rows do not say it,
+  and `new Closure(...)` where they say neither. On the clean fixture all 942 print the
+  function, 350 by name and 592 by address, and 913 the context: 283 `NULL`, 259 `this`,
+  358 a value the body named, such as the `new Context()` it built, and 13 another
+  value. The other 29 print `...`, 28 of them a tear-off getter that reads its receiver
+  off the caller's stack; the obf fixture has 33. Read by hand against the rows and the
+  Dart source at 20 sites, every 47th: 20 functions right, 19 contexts right and one
+  `...`. `benchMakeAdder` now reads `var t0 = new Context();`,
+  `t0.field_0x10 = a0 << 1;`, `return new Closure(sub_0x1eec70, t0);`, and
+  `lift sub_0x1eec70` is the `<anonymous closure>` that adds its argument to that field.
+  617 of 8,194 ranges change on the clean fixture and 617 of 8,188 on the obf one, 1,039
+  lines for 1,136 on each. 942 are the allocations, and the 97 added are a context that
+  is read twice now and so has a name: `new Context().field_0x10 = this;` is
+  `var t0 = new Context();` and `t0.field_0x10 = this;`. The 13 sites that printed
+  `new ClosureTA()` or `new ClosureGeneric()`, a class no program has, print
+  `new Closure(...)` as the rest do. Typical lines: `return new Closure();` is
+  `return new Closure(_localeClosure@35065589, t1);`, `var t0 = new Closure();` is
+  `var t0 = new Closure(_computeDryLayout@26392247, this);`, and
+  `setState(this, new Closure());` is `setState(this, new Closure(sub_0x1eee7c, t0));`.
+  Lifting every range takes what it did: 21.7 s of CPU before and 21.7 after on the
+  clean fixture, 21.4 and 21.5 on the obf one.
 
 ## 1.4.0 - 2026-11-12
 
