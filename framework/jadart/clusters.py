@@ -237,6 +237,23 @@ def walk_alloc(st: ReadStream, num_base_objects: int, num_objects: int,
     r = routing(epoch)
     _names = r.names
 
+    # Each object counted here is a turn of some loop, in this pass or in the fill, and
+    # nearly every turn is paid for: it reads a length, a ref or a byte, so a stream
+    # that is short ends the loop. An instance with no field pays nothing in either
+    # pass (_fill_instance reads per field), and its count is a varint the file
+    # chooses: 215 bytes that count 16,000,000 of them took 0.43 s to walk, and at 2^40
+    # the same bytes would not have finished (#451). The header's own count is the
+    # same file's word. The bytes are not, so the count is held to them, before any
+    # loop: of 71 snapshots measured, vm and isolate, the fixtures, seven apps and 27
+    # corpus builds, the most objects any holds for each byte left here is 0.30, and
+    # none has a cluster of more than one such instance.
+    own, left = num_objects - num_base_objects, len(st.data) - st.pos
+    if own > left:
+        raise AllocError(
+            f"the header counts {own} objects, and {left} bytes are left to describe "
+            f"them. An object that takes no byte is an instance with no field, and a "
+            f"snapshot that counts more of those than it has bytes is not walked.")
+
     next_ref = num_base_objects + 1     # kFirstReference=1; base objs fill [1..num_base]
     clusters: list[Cluster] = []
 
