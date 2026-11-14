@@ -19,6 +19,13 @@ one app all carry the same version hash, and one of them needs a different gramm
 | iOS / macOS arm64 | Mach-O 64 | uncompressed | supported, every applicable Tier-A gate (9 to 11 of the 12, by target) |
 | Android arm32 (`armeabi-v7a`) | ELF32 | uncompressed | supported, every applicable Tier-A gate (9 to 11 of the 12, by target). Tiers 1 and 2 decode; Tier 3 refuses: see below |
 | riscv32, riscv64, ia32 | n/a | n/a | recognised in the features string, refused by name |
+| arm64e (iOS, macOS) | Mach-O 64 | n/a | features token or cpusubtype, refused by name |
+| Windows x64 (`app.so`) | PE | n/a | `MZ` at offset 0, refused by name |
+| module snapshot (modular AOT) | Mach-O 64 | n/a | its header, refused by name |
+| Dart bytecode (dynamic modules) | own | n/a | its magic, refused by name |
+
+The last four are the inputs [whats-coming.md](whats-coming.md) describes. Each is refused
+with `NotReadYet`, which says what the file is and points at that page.
 
 x64 shares a grammar key with arm64, which is why the snapshot layer parsed x86_64 with no
 changes. That makes architecture-independence a demonstration rather than a claim.

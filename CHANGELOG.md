@@ -100,6 +100,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Changed
 
+- **Four kinds of file Jadart does not read are refused by name (#463).** A module
+  snapshot from the modular AOT compiler, an arm64e build, a Dart bytecode file and a
+  Windows PE file were refused with a message about something else: an unknown format
+  epoch, a features string with no architecture, an unrecognised container. A lenient
+  parse took the module header's format version and CPU name as a version hash and
+  went on. Each now raises `NotReadYet`, an `InputError` and a `ContainerError`, whose
+  one line says what the file is, that Jadart does not read it yet, and points at
+  docs/whats-coming.md; `-j` gives `"type": "NotReadYet"` with the same four fields as
+  before and exit 2. The tests are the page's and read a few header bytes: kind 3 with
+  `81`, a CPU name and a NUL at offset 20 (kind 3 alone is kFullAOT through 3.12); the
+  features token `arm64e` or Mach-O cpusubtype `0x80000002`; `33 43 42 44`; `MZ`. `info`
+  and `info -j` print the same bytes before and after on 36 binaries, the two fixtures,
+  27 corpus builds and seven apps. `info` on the clean fixture, best of 5, is 49.8 ms
+  before and 49.0 ms after.
+
 - **A pool slot loaded into a `d` register prints its double (#362).** `linearized`
   printed `return a0.toDouble() / pool_0x3aa8 / pool_0x79b8 * pool_0x7978;`, where the
   three slots hold the bits of 255.0, 12.92 and 100.0 and the `d` register they are

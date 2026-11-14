@@ -2053,8 +2053,10 @@ def test_container_dispatch_is_fail_loud():
     except ContainerError as e:
         assert "fat" in str(e).lower()
 
+    # MZ is named now, as a Windows PE file (test_four_kinds_jadart_does_not_read_...);
+    # bytes that name nothing are still an unrecognised container.
     try:
-        open_container(b"MZ\x90\x00" + b"\x00" * 60)
+        open_container(b"\x00\x01\x02\x03" + b"\x00" * 60)
         assert False, "an unknown container should be rejected"
     except ContainerError as e:
         assert "unrecognised container" in str(e)
@@ -28393,6 +28395,123 @@ def test_the_clean_fixture_awaits_and_returns_in_its_async_functions():
                   r"\s*t\d+\.field_0x18 = \2;\n", mine)
     assert m, body
     assert "return NULL;" in mine[m.end():].split("\n\n")[0], body
+
+
+# -- four kinds of input refused by name (docs/whats-coming.md) ----------------------
+
+def _header_463(kind: int, rest: bytes) -> bytes:
+    """A snapshot header: magic, length, `kind`, then `rest` at offset 20, padded."""
+    body = (struct.pack("<I", 0xDCDCF5F5) + bytes(16) + rest).ljust(96, b"\x00")
+    return body[:4] + struct.pack("<qq", len(body), kind) + body[20:]
+
+
+#: A module snapshot header (module_snapshot.cc:2162-2190): kind 3, then the varint 0x81
+#: for format version 1 where an AOT header has its hash, then the CPU name and a NUL.
+_MODULE_463 = _header_463(3, b"\x81arm64\x00\x01\x02\x03")
+
+
+def _arm64e_macho_463() -> bytes:
+    """The minimal merged Mach-O with its cpusubtype patched to arm64e."""
+    out = bytearray(_merged_macho(_header_463(3, b"\x01arm64\x00")))
+    struct.pack_into("<I", out, 8, 0x80000002)
+    return bytes(out)
+
+
+def _inputs_463(tmp_path):
+    """name -> (path, the words its refusal must carry), one crafted file per kind."""
+    feat = _header_463(3, b"ace654289f5abc240509fc941453ebc5"
+                       b"product arm64e ios no-compressed-pointers\x00" + b"\x81" * 5)
+    made = {
+        "module": (_merged_macho(_MODULE_463), "a Dart module snapshot"),
+        "arm64e-features": (_merged_elf(feat), "an arm64e build"),
+        "arm64e-macho": (_arm64e_macho_463(), "an arm64e build"),
+        "bytecode": (b"3CBD" + struct.pack("<I", 4) + bytes(24), "a Dart bytecode file"),
+        "windows": (b"MZ\x90\x00" + bytes(60), "a Windows PE file"),
+    }
+    out = {}
+    for name, (data, words) in made.items():
+        p = tmp_path / f"{name}.bin"
+        p.write_bytes(data)
+        out[name] = (str(p), words)
+    return out
+
+
+def test_four_kinds_jadart_does_not_read_are_refused_by_name(tmp_path):
+    """Each was refused before with a message about something else: an unknown format
+    epoch whose hash was stream bytes, a features string that names no architecture, and
+    an unrecognised container. Each now says what the file is and where to read more."""
+    from jadart.errors import NotReadYet
+    for name, (path, words) in _inputs_463(tmp_path).items():
+        with pytest.raises(NotReadYet) as caught:
+            jadart.header(path)
+        msg = str(caught.value)
+        assert msg.startswith("this is " + words), (name, msg)
+        assert "does not read" in msg and "docs/whats-coming.md" in msg, (name, msg)
+        assert "\n" not in msg, (name, msg)
+        # Still an InputError, and a ContainerError as the two container cases were.
+        assert isinstance(caught.value, (jadart.InputError, jadart.ContainerError))
+
+
+def test_a_module_header_is_refused_before_a_lenient_parse_reads_it():
+    """A parse that is not strict took the module's format version and CPU name as a
+    version hash and returned a header. The refusal comes first, either way."""
+    from jadart.errors import NotReadYet
+    for strict in (True, False):
+        with pytest.raises(NotReadYet, match="module snapshot"):
+            parse_blob(_MODULE_463, "isolate", strict=strict)
+    with pytest.raises(NotReadYet, match="arm64e"):
+        parse_blob(_header_463(3, b"x" * 32 + b"product arm64e ios\x00" + b"\x81" * 5),
+                   "isolate", strict=False)
+
+
+def test_a_kind_3_snapshot_through_3_12_is_still_read_and_only_the_module_bytes_refuse():
+    """Kind 3 is kFullAOT through Dart 3.12, so kind alone must not refuse: the clean
+    fixture, 3.12.2 with kind 3, reads as before. Its own header with byte 20 made 0x81
+    and an architecture word after it is the module test, and only that refuses."""
+    from jadart.errors import NotReadYet
+    from jadart.snapshot import images
+    from jadart.macho import open_container
+    hdr = parse_libapp(CLEAN)["isolate"]
+    assert hdr.kind == 3 and hdr.kind_name == "kFullAOT" and hdr.epoch is not None
+    blob = bytearray(open_container(open(CLEAN, "rb").read()).symbol_bytes(
+        "_kDartIsolateSnapshotData"))
+    blob[20:28] = b"\x81arm64\x00\x00"
+    with pytest.raises(NotReadYet, match="module snapshot"):
+        parse_blob(bytes(blob), "isolate", strict=False)
+    blob[21:27] = b"zzzzz\x00"                 # 0x81 without a CPU name: not a module
+    with pytest.raises(UnknownEpoch):
+        parse_blob(bytes(blob), "isolate")
+
+
+def test_the_refusals_by_name_read_the_same_on_every_command(tmp_path, capsys):
+    for as_json in (False, True):
+        _refusals_on_every_command_463(tmp_path, capsys, as_json)
+
+
+def _refusals_on_every_command_463(tmp_path, capsys, as_json):
+    import json
+    from jadart import cli
+    commands = [["info"], ["libraries"], ["classes"], ["functions"], ["strings"],
+                ["lift", "f"], ["disasm", "f"], ["decompile", "C"], ["xrefs", "f"],
+                ["verify"]]
+    for name, (path, words) in _inputs_463(tmp_path).items():
+        said = set()
+        for cmd in commands:
+            rc = cli.main([cmd[0], *(["-j"] if as_json else []), path, *cmd[1:]])
+            out, err = capsys.readouterr()
+            assert rc == 2, (name, cmd, rc, out, err)
+            if as_json:
+                doc = json.loads(out)
+                assert set(doc) == {"ok", "error", "type", "exit"}, doc
+                assert (doc["ok"], doc["type"], doc["exit"]) == (False, "NotReadYet", 2)
+                said.add(doc["error"])
+            else:
+                assert out == "" and err.count("\n") == 1, (name, cmd, err)
+                assert "Traceback" not in err
+                said.add(err.split("jadart: ", 1)[1].strip())
+        assert len(said) == 1, (name, said)
+        msg = said.pop()
+        assert msg.startswith("this is " + words) and "docs/whats-coming.md" in msg, msg
 
 
 if __name__ == "__main__":

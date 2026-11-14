@@ -29,7 +29,7 @@ import struct
 
 # container.py imports errors.py and the stdlib and nothing else, so this is a
 # downward edge: no cycle, and the container vocabulary stays in one place.
-from .errors import ContainerError, MissingSymbol
+from .errors import ContainerError, MissingSymbol, NotReadYet
 from dataclasses import dataclass
 
 from .elf import ReadBudget, Symbol, find_magic
@@ -38,6 +38,13 @@ MH_MAGIC_64 = 0xFEEDFACF
 MH_CIGAM_64 = 0xCFFAEDFE          # big-endian 64 (not supported; arm64/x64 are LE)
 FAT_MAGIC = 0xCAFEBABE
 FAT_CIGAM = 0xBEBAFECA
+CPU_TYPE_ARM64 = 0x0100000C
+#: arm64e with the pointer authentication ABI bit (runtime/platform/mach_o.h:49 at the
+#: SDK commit docs/whats-coming.md pins).
+CPU_SUBTYPE_ARM64E = 0x80000002
+#: The first four bytes of a Dart bytecode file, 0x44424333 little endian
+#: (runtime/vm/constants_kbc.h:274-277).
+BYTECODE_MAGIC = b"3CBD"
 LC_SEGMENT_64 = 0x19
 LC_SYMTAB = 0x02
 N_TYPE = 0x0E
@@ -204,6 +211,33 @@ class MachO64:
         return find_magic(self.data, limit)
 
 
+def _refuse_by_name(data: bytes) -> None:
+    """Raise NotReadYet for the three kinds of file the leading bytes name and jadart
+    does not read: a Windows PE file, a Dart bytecode file and an arm64e Mach-O.
+
+    Each test is the one docs/whats-coming.md gives, and reads at most twelve bytes. None
+    of them can hold for a file jadart reads: an ELF starts 7f 45 4c 46, and only an
+    arm64e build carries cpusubtype 0x80000002."""
+    if data[:2] == b"MZ":
+        raise NotReadYet("windows", "a Windows PE file (MZ), the format of the app.so in "
+                         "a Flutter Windows build", "Windows builds")
+    if data[:4] == BYTECODE_MAGIC and len(data) >= 8:
+        version, = struct.unpack_from("<I", data, 4)
+        raise NotReadYet("bytecode", f"a Dart bytecode file (dynamic modules, format "
+                         f"version {version}), code loaded at run time from outside "
+                         f"libapp", "bytecode")
+    if len(data) >= 12 and data[:4] == MH_MAGIC_64.to_bytes(4, "little"):
+        cputype, subtype = struct.unpack_from("<II", data, 4)
+        if cputype == CPU_TYPE_ARM64 and subtype == CPU_SUBTYPE_ARM64E:
+            raise_arm64e("Mach-O cpusubtype 0x80000002")
+
+
+def raise_arm64e(seen: str):
+    """The one arm64e refusal, from the Mach-O header or from the features string."""
+    raise NotReadYet("arm64e", f"an arm64e build, Apple arm64 with pointer "
+                     f"authentication ({seen})", "arm64e builds")
+
+
 def open_container(data: bytes):
     """Return an ELF (32- or 64-bit) or MachO64 reader for `data`, whichever it is.
 
@@ -218,6 +252,7 @@ def open_container(data: bytes):
     libapp.so used to escape all the way to a caller as `struct.error` from elf.py, which
     no documented `except` clause mentions."""
     from .elf import Elf
+    _refuse_by_name(data)
     try:
         if data[:4] == b"\x7fELF":
             return Elf(data)

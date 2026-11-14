@@ -1,8 +1,8 @@
 # What is coming in the Dart SDK
 
 Three lines of work in dart-lang/sdk change what a Dart binary can hold. This page says
-what each is at one commit, what Jadart does with it today, and what a refusal by name
-would test.
+what each is at one commit, what Jadart does with it today, and the test its refusal by
+name makes.
 
 SDK paths are at commit `f3f72dd63911938effc75feacc86f52022216c67` of `main`
 (2026-11-13, version 3.15.0, `tools/VERSION:26-29`). Flutter paths are at flutter/flutter
@@ -40,8 +40,8 @@ A module is:
   (`pkg/native_compiler/lib/back_end/arm64/code_generator.dart:691-782`).
 
 In Jadart, `snapshot._layout` takes the dylib for a 3.13 app, then `snapshot.parse_blob`
-reads a hash at offset 20 and features at 52. A made-up module header is refused as an
-"unknown format epoch" whose hash is stream bytes.
+tests the header against the bytes below before it reads a hash at offset 20, and refuses
+a module snapshot by name (`NotReadYet`), lenient parse or not.
 
 Refusal test: kind is 3, byte 20 is `81`, the varint for 1, and an architecture word
 and a NUL follow. Kind 3 alone is `kFullAOT` through 3.12 (`snapshot.KIND`).
@@ -75,8 +75,8 @@ What it adds:
   under the define (`runtime/vm/app_snapshot.cc:3147-3176`).
 
 Jadart parses the host as before. What fails is the assumption that libapp is the whole
-program. Given the bytecode file, `macho.open_container` says "unrecognised container
-(leading bytes 33434244)".
+program. Given the bytecode file, `macho.open_container` refuses it by name as a Dart
+bytecode file (`NotReadYet`), with the format version it carries.
 
 Refusal test: bytes `33 43 42 44` at offset 0, then a uint32 version. The host has no
 header test; a live `InterpretCall` stub body is a candidate, not established.
@@ -104,8 +104,9 @@ What changes:
   `runtime/vm` found no other signed instruction.
 - `runtime/vm/app_snapshot.cc` does not branch on it.
 
-In Jadart, `versions._ARCH_WORDS` has no `arm64e`, so a known release is refused with
-"the features string names no architecture". `macho.MachO64._parse` drops the subtype.
+In Jadart, `versions._ARCH_WORDS` has no `arm64e`. `snapshot.parse_blob` refuses the
+features token and `macho.open_container` the Mach-O subtype, both by name as an arm64e
+build (`NotReadYet`).
 
 Refusal test: the token `arm64e`, or cputype arm64 with that subtype.
 
@@ -122,7 +123,8 @@ gate on a real build.
   DLL and a PDB (`runtime/vm/coff.h:27-33`). Flutter tools pass it for Windows x64 and
   link `app.so` as that DLL
   (`packages/flutter_tools/lib/src/base/build.dart:200-204`, `287-296`). Jadart opens
-  ELF and Mach-O only. Refusal test: `MZ` at offset 0.
+  ELF and Mach-O only, and refuses a file that starts `MZ` by name as a Windows PE file
+  (`NotReadYet`).
 
 ## Which to read first
 

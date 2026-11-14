@@ -59,6 +59,7 @@ from .errors import JadartError
 from .snapshot import parse_libapp, parse_blob, SnapshotHeader, UnknownEpoch
 from .versions import UnsupportedTarget
 from .errors import InputError
+from .errors import NotReadYet
 # The rest of the taxonomy, reachable by name. Five of these used to exist only inside the
 # modules that raise them, so a caller following the docstring below could not name what it
 # was catching and fell back to matching on messages.
@@ -91,6 +92,7 @@ __all__ = [
     "constants",
     "parse_libapp", "parse_blob", "SnapshotHeader",
     "JadartError", "UnknownEpoch", "UnsupportedTarget", "InputError", "ContainerError",
+    "NotReadYet",
     "TruncatedSnapshot", "AllocError", "FillError", "UnsupportedArch",
     "MissingDisassembler",
     "__version__",
