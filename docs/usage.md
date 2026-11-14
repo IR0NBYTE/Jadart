@@ -354,6 +354,37 @@ when a closure or a value built at runtime reaches it. Those are not listed with
 others, and not dropped either: the text output ends with how many there are, `-j` lists
 them under `"unloaded"`, and a pattern that matches only such entries says so and exits 0.
 
+### The call graph around a function, and one function's blocks
+
+`--graph` turns `xrefs ... function` into a graph: the function, what calls it and what it
+calls, `--depth N` levels out (1 to 6, default 1), `--direction callers|callees|both`.
+`-j` gives `nodes` and `edges` with a `kind` of `direct`, `pool` or `virtual`; `--dot`
+writes Graphviz, with node ids that are addresses and names only in quoted labels. A
+virtual edge is a call that may land there, drawn dashed. The graph stops at 200 nodes
+(`-n` changes it, `-n 0` for all) and says what it left out; `--whole` writes every
+function, 8194 nodes and 47358 edges on the clean fixture, in 0.8 s.
+
+```
+$ jadart xrefs libapp.so function benchFetchToken --graph
+// call graph around benchFetchToken  depth 1, both directions: 8 functions, 7 calls
+0x1ee7b8   -> 0x157418   direct   benchFetchToken -> sub_0x157418
+0x1ee7b8   -> 0x1c15ec   direct   benchFetchToken -> Future.delayed
+...
+$ jadart xrefs libapp.so function benchRunAll --depth 2 --dot | dot -Tsvg > calls.svg
+```
+
+`disasm --graph` (or `--dot`) prints the blocks the lifter builds for one function, each
+with its start, end and instruction count, and the edges between them: `fall`, `taken`
+for the arm a conditional branches to, `jump`:
+
+```
+$ jadart disasm libapp.so benchComputeChecksum --graph
+// benchComputeChecksum  @ 0x1eecc0  9 blocks, 10 edges
+  0x1eecc0..0x1eece4     9  -> fall 0x1eece4
+  0x1eecf0..0x1eecf8     2  -> taken 0x1eed40  fall 0x1eecf8
+  ...
+```
+
 ### ffi: where the Dart stops being the answer
 
 Some apps put nothing interesting in Dart at all. BrunnerCTF 2025's "Brod and Co." is one:

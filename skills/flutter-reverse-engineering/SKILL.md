@@ -195,6 +195,16 @@ A matching string that no code loads directly is reported under `"unloaded"` in 
 listed with the loads. No direct load is not proof nothing uses it: a closure or a value
 built at runtime can still reach it.
 
+For the shape of the code around a function, ask for a graph instead of chaining xrefs:
+
+```text
+jadart xrefs <path> function <name> --graph -j --depth 2   # nodes, edges, kinds
+jadart xrefs <path> function <name> --dot                  # Graphviz, ids are addresses
+jadart disasm <path> <name> --graph -j                     # the lifter's blocks and edges
+```
+
+An edge of kind `virtual` is a call that may land there, not one that does.
+
 `jadart` takes an APK, an IPA, a directory or a bare `libapp.so` / `App.framework/App`.
 You do not need to unzip anything first.
 

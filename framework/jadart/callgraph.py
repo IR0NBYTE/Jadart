@@ -75,6 +75,10 @@ class CallIndex:
     virtual_sites: int = 0                         # blr sites attributed to a selector
     opaque_sites: int = 0                          # register calls nothing attributed
     undecodable: list = field(default_factory=list)  # pcs of ranges that would not decode
+    #: The (caller pc, target pc) pairs in callers/callees that a pool load made rather
+    #: than a `bl`: a function torn off the pool is called later through a register, so
+    #: a graph that draws it keeps it apart from a direct call (graph.py).
+    pool: set = field(default_factory=set)
 
 
 @kept
@@ -328,6 +332,7 @@ def build_index(image, fr=None, virtual: bool = True,
                     if keep is None or t in keep:
                         idx.callees.setdefault(src, []).append(t)
                         idx.callers.setdefault(t, []).append(src)
+                        idx.pool.add((src, t))
 
             fb = _add_imm_from_pp(op) if mn == "add" else None
             if fb is not None:
