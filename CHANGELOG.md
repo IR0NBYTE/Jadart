@@ -79,6 +79,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   string is said to name no architecture, and a bytecode file is an unrecognised
   container.
 
+- `xrefs pool OFFSET` says what the slot holds, for every slot (#443). `lift
+  benchFetchToken` prints `Future.delayed(pool_0x2d0, pool_0x96f0)`, and asked about
+  either slot `xrefs pool` said no ObjectPool entry held it: only a slot the pool map
+  already names answered. The clean fixture's tier 3 prints 1,666 distinct `pool_0x...`
+  slots; `xrefs pool` answered none of them with a kind and answers all 1,666 now: 616
+  const instances, 574 other objects by class, 210 runtime entries, 136 immediates, 46
+  strings only the vm snapshot holds (#460), 37 lists, 26 doubles, 19 VM objects and 2
+  ints. A VM object is one the VM makes before it loads a snapshot, or one of the vm
+  snapshot's that is not a string, a Smi or an Array, which is all of it that is read.
+  The text form prints one header line over the list it printed before, `// pool_0x2d0
+  TypeArguments object`, `// pool_0x2138 DiagnosticLevel.info`, `// pool_0x3aa8
+  immediate 0x406fe00000000000 (255.0 as a double)`, and `-j` adds a `holds` field to
+  each entry: the kind, the class and value where the snapshot has them, an instance's
+  fields by offset and name. What it reads out of the binary is escaped and cut as a
+  string literal is, and an instance inside an instance is spelled two deep at most, so
+  one that holds itself prints bounded. An offset that is no slot, off the grid or past
+  the pool's end, is still a miss. `lift` prints the same bytes: both fixtures, every
+  range, compared against the commit before.
+
 ### Changed
 
 - **`follow` finds a join one way, off the dominator tree, and the scan is gone.** It had
