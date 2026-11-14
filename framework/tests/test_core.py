@@ -27597,6 +27597,81 @@ def test_an_instance_read_back_from_the_stream_is_the_one_the_fill_read():
     assert store.get(49) is None and sorted(store)[:2] == [50, 51]
 
 
+def _bits(x):
+    import struct
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def _held_pool_map(fr):
+    from jadart import held as H
+    from jadart.versions import Arch
+
+    class PoolMap(dict):
+        held = H.Holdings(fr, Arch(name="arm64", word_size=8, compressed=True))
+    return PoolMap()
+
+
+def test_a_double_reads_back_to_the_bits_the_slot_holds():
+    """The text is for a reader to take as the number: `float()` of it gives back the
+    same 64 bits, -0.0 and the smallest subnormal among them, NaN prints as the one NaN
+    Dart spells and any other payload prints nothing, since no literal gives it (#362)."""
+    import math
+    import random
+    import struct
+    from jadart.held import double_text
+    rnd = random.Random(362)
+    cases = [0.0, -0.0, 1.0, 255.0, -2.5, 1e16, 1e-7, 5e-324, 1.7976931348623157e308,
+             0.1, 0.040449936, float("inf"), float("-inf")]
+    cases += [struct.unpack("<d", struct.pack("<Q", rnd.getrandbits(64)))[0]
+              for _ in range(2000)]
+    for x in cases:
+        if math.isnan(x):
+            continue
+        text = double_text(_bits(x))
+        if math.isinf(x):
+            assert text == ("-double.infinity" if x < 0 else "double.infinity")
+            continue
+        assert _bits(float(text)) == _bits(x), (x, text)
+    assert double_text(_bits(-0.0)) == "-0.0" and double_text(_bits(1e16)) == "1e+16"
+    assert double_text(0x7FF8000000000000) == "double.nan"
+    assert double_text(0x7FF0000000000001) is None
+    assert double_text(0xFFF8000000000000) is None
+    assert double_text(0x7FF0000000000000) == "double.infinity"
+
+
+def test_a_pool_slot_loaded_into_a_d_register_prints_its_double():
+    """`return a0.toDouble() / pool_0x3aa8 / pool_0x79b8 * pool_0x7978;` was the clean
+    fixture's `linearized`: the slots hold the bits of 255.0, 12.92 and 100.0, and the
+    `d` register they are loaded into says so. A slot loaded into an `s` register, which
+    `canon` names d too, or into an x register, or holding a NaN no literal spells,
+    prints as it did; a negative double binds as a unary minus (#362)."""
+    fr = _held_fr([("imm", _bits(-0.0)), ("imm", _bits(1e16)), ("imm", _bits(255.0)),
+                   ("imm", 0x7FF0000000000001), ("imm", _bits(-2.5))])
+    rows = [("ldr", "d0, [x27, #0x10]"), ("ldr", "d1, [x27, #0x18]"),
+            ("fadd", "d0, d0, d1"), ("stur", "d0, [x1, #0xf]"),
+            ("ldr", "s2, [x27, #0x20]"), ("stur", "s2, [x1, #0x17]"),
+            ("ldr", "d3, [x27, #0x28]"), ("stur", "d3, [x1, #0x1f]"),
+            ("ldr", "d4, [x27, #0x30]"), ("fmul", "d4, d4, d4"),
+            ("stur", "d4, [x1, #0x27]"), ("ldp", "d5, d6, [x27, #0x10]"),
+            ("fsub", "d5, d6, d5"), ("stur", "d5, [x1, #0x2f]"),
+            ("ldr", "x0, [x27, #0x20]"), ("ret", "")]
+    assert _lift_rows(rows, pool_map=_held_pool_map(fr)) == [
+        "x1.field_0x10 = -0.0 + 1e+16;", "x1.field_0x18 = pool_0x20;",
+        "x1.field_0x20 = pool_0x28;", "x1.field_0x28 = -2.5 * -2.5;",
+        "x1.field_0x30 = 1e+16 - -0.0;", "return pool_0x20;"]
+    # With no reader, as a pool map from before #362 has, the offset as before.
+    assert _lift_rows(rows[:4] + rows[-1:], pool_map={}) == [
+        "x1.field_0x10 = pool_0x10 + pool_0x18;", "return pool_0x10 + pool_0x18;"]
+    _needs_capstone()
+    from jadart.cli import main
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["lift", CLEAN, "0x4c2bc"]) == 0
+    assert "    return a0.toDouble() / 255.0 / 12.92 * 100.0;" in buf.getvalue()
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
