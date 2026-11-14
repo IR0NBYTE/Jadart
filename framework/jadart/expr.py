@@ -391,9 +391,32 @@ _CLOSURE_CTX = {"AllocateClosure": "x2", "AllocateClosureGeneric": "x2",
 _ANONYMOUS = "<anonymous closure>"
 
 
+#: The stubs an `await` is a call to. The awaited value is in R0 (SuspendStubABI::
+#: kArgumentReg, R0 in constants_arm64.h and constants_arm.h at every release from
+#: 2.19.6 to 3.13.0; AwaitWithTypeCheck takes a type-argument vector in R1 beside it),
+#: and what the future completed with is in R0 when the function runs again.
+_AWAIT_STUBS = frozenset({"Await", "AwaitWithTypeCheck"})
+#: The stubs an async or async* function returns through. It does not `ret`: it jumps
+#: to one with the value in R0, and the stub pushes that and the frame's suspend state
+#: and calls the library function that completes the future (stub_code_compiler.cc,
+#: GenerateReturnStub, `PushRegistersInOrder({kSuspendState, kReturnReg})`).
+_ASYNC_RETURN_STUBS = frozenset({"ReturnAsync", "ReturnAsyncNotFuture",
+                                 "ReturnAsyncStar"})
+
+
+def _async_return(mn: str, note: str) -> bool:
+    """Whether the row is an async function's return: a jump to one of the stubs it
+    returns through, which reads the result register as a `ret` does (#462)."""
+    if mn != "b" or "_iso_stub_" not in note:
+        return False
+    m = _STUB_RE.search(note)
+    return bool(m) and m.group(1) in _ASYNC_RETURN_STUBS
+
+
 def _returns_x0(base: str) -> bool:
-    """The stubs that hand a value back in x0: `InitLate*` the field's, `Await` the
-    awaited one, `InitAsync` and `CloneContext` an object.
+    """The stubs that hand a value back in x0 and print as the calls they are:
+    `InitLate*` the field's, `InitAsync` and `CloneContext` an object. An `await`
+    hands one back as well, and has a kind of its own (`_AWAIT_STUBS`).
 
     They are not register-preserving machinery like the stack-check, write-barrier and
     type-test stubs, so they are rendered as the calls they are rather than dropped.
@@ -401,12 +424,12 @@ def _returns_x0(base: str) -> bool:
     lazy-init getters on the clean fixture to `return x0;` the moment stub naming started
     working (#234): a whole body replaced by a bare register, where the unnamed call at
     least printed the branch it came from."""
-    return base.startswith("InitLate") or base in ("InitAsync", "Await", "CloneContext")
+    return base.startswith("InitLate") or base in ("InitAsync", "CloneContext")
 
 
 def _classify_stub(name: str):
     """(kind, label) for a runtime-stub call target. kind in
-    throw|rethrow|throw_err|alloc|suppress|keep."""
+    throw|rethrow|throw_err|alloc|suppress|await|keep."""
     m = _STUB_RE.search(name)
     if not m:
         return ("keep", name)
@@ -417,6 +440,8 @@ def _classify_stub(name: str):
         return ("rethrow", None)
     if "WriteBarrier" in base or "TypeTest" in base or base.startswith("StackOverflow"):
         return ("suppress", None)
+    if base in _AWAIT_STUBS:
+        return ("await", None)
     if _returns_x0(base):
         return ("keep", base)        # hands a value back: a call, not machinery to drop
     if base.endswith("Error"):
@@ -4536,6 +4561,10 @@ class Lifter:
         #: pool byte offset -> (name, pc offset or None) of the Function in that slot
         #: (fields.closure_functions): what a closure allocation was handed.
         self.closures = getattr(allocs, "closures", None) or {}
+        #: The addresses an async function returns by jumping to (`_async_return`).
+        self._async_returns = frozenset(
+            blk.exit_target for blk in blocks.values()
+            if blk.insns and blk.exit_target >= 0 and _async_return(*blk.insns[-1][1::2]))
         #: The names this body minted for such a result, name -> AllocSite. Keyed by TEXT,
         #: which is sound because `_mint` hands each name out once per lift and the only
         #: line that assigns one is the `new` that produced it, so `t7` means that object
@@ -5046,10 +5075,15 @@ class Lifter:
         out, sites = {}, None
         for i, (a, mn, op, note) in enumerate(insns):
             if mn not in _CALLS:
+                # An async function's return prints the result register as a `ret`
+                # does, and the jump itself reads nothing (#462).
+                if mn == "b" and "_iso_stub_" in note and _async_return(mn, note):
+                    out[i] = _reg_mask((_T.ret_int,))
                 continue
             name = note.split("-> ", 1)[1].strip() if "-> " in note else None
             if mn == "bl" and name and "_iso_stub_" in name:
-                if _classify_stub(name)[0] == "throw":
+                # A throw prints what it throws and an await what it waits for.
+                if _classify_stub(name)[0] in ("throw", "await"):
                     out[i] = _reg_mask((_T.ret_int,))
                 continue
             if sites is None:
@@ -7857,6 +7891,25 @@ class Lifter:
             hi <<= shift
         return hi + disp
 
+    def _await(self, st: State, future: V) -> list:
+        """`await <future>`, with what it completed with named where anything reads it.
+
+        `future` is what the walk held in the result register before the call, which
+        is where the stub takes the awaited value. It prints where it is a value and
+        not a register (`_closure_args`), and as `...` where it is not. The name is
+        not one `_inline_single_use` may fold into the line after it: `await` binds
+        looser than the `.field` or the call that line may apply to it, and `var t1 =
+        await t0;` is how the source reads as well."""
+        shown = "..."
+        if not _REG_RE.fullmatch(future.text) and self._exact(st, [future]):
+            shown = _wrap(future, P_UNARY)
+        if self._live_after & _reg_mask((_T.ret_int,)):
+            name, decl = self._mint(st, f"await {shown}")
+            st.set(_T.ret_int, V(name, P_ATOM))
+            return [decl]
+        st.set(_T.ret_int, V(_T.ret_int, P_ATOM))
+        return [f"await {shown};"]
+
     def _closure_args(self, st: State, stub: str) -> str:
         """What a closure allocation was handed, `function, context`, each where the
         rows prove it and `...` where they do not; `...` alone where neither is (#442).
@@ -8318,6 +8371,8 @@ class Lifter:
                 if kind == "alloc":
                     self.called.append((label, "alloc", target))
                     return pre + self._result(st, f"new {label}({made})", _T.ret_int)
+                if kind == "await":
+                    return pre + self._await(st, exc)
                 terse = label.replace("stub ", "").replace("_iso_stub_", "")
                 self.called.append((terse, "stub", target))
                 # terse, without the stub prefix; a stub's result is an object
@@ -11223,10 +11278,15 @@ class Lifter:
                     # explanation, or let the carried state run on into a block control
                     # never reaches from here. 997 sites on the clean fixture did exactly
                     # that.
-                    if s[1] >= 0:
-                        self.called.append((self._sub(s[1]), "tail", s[1]))
-                    out.append(pad + (f"goto {self._sub(s[1])};" if s[1] >= 0
-                                      else "goto <unresolved>;"))
+                    if s[1] in self._async_returns:
+                        # An async function's return, through the stub that completes
+                        # its future with the result register (#462).
+                        out.append(pad + f"return {st.get(_T.ret_int).text};")
+                    else:
+                        if s[1] >= 0:
+                            self.called.append((self._sub(s[1]), "tail", s[1]))
+                        out.append(pad + (f"goto {self._sub(s[1])};" if s[1] >= 0
+                                          else "goto <unresolved>;"))
                 else:
                     out.append(pad + cut_goto(s[1], self.show))  # inside this function
                 falls = alive = False
