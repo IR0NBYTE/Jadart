@@ -12524,6 +12524,13 @@ def _arm64_disasm_sample_sha(key):
     import hashlib
     import contextlib
     from jadart import cli, disasm, signatures
+    # Before anything below is replaced. `disasm` by address imports jadart.callgraph
+    # on demand (#406), and callgraph takes `build_pool_map` from disasm by name:
+    # imported for the first time while the replacement stood, it kept the
+    # replacement, and this fixture's pool map in it, for every call graph built
+    # later in the process. 301 direct edges of the clean fixture went missing in a
+    # test that ran after the obf listing (#466).
+    from jadart import callgraph  # noqa: F401
     lib = os.path.join(ROOT, f"flubench/artifacts/{key}/lib/arm64-v8a/libapp.so")
     loaded = disasm.load_instructions(lib)
     image = loaded[0]
@@ -12539,6 +12546,8 @@ def _arm64_disasm_sample_sha(key):
     signatures.names_with_signatures = \
         lambda im, f, s: once("nws", lambda: real_nws(im, f, s))
     disasm.build_pool_map = lambda f, arch=None: once("pool", lambda: real_pool(f, arch))
+    stand_ins = (disasm.load_instructions, signatures.names_with_signatures,
+                 disasm.build_pool_map)
     try:
         h = hashlib.sha256()
         for cr in image.all_ranges[::32]:
@@ -12552,6 +12561,11 @@ def _arm64_disasm_sample_sha(key):
     finally:
         disasm.load_instructions = real_load
         signatures.names_with_signatures, disasm.build_pool_map = real_nws, real_pool
+        # Whatever was imported while they stood must not have kept one (#466).
+        kept = [f"{m}.{a}" for m, mod in list(sys.modules.items())
+                if m.startswith("jadart") and mod is not None
+                for a, v in list(vars(mod).items()) if any(v is f for f in stand_ins)]
+        assert not kept, kept
 
 
 def test_arm64_disasm_listing_unchanged_clean():
@@ -12566,6 +12580,25 @@ def test_arm64_disasm_listing_unchanged_obf():
     if not _capstone_available():
         _skip("  SKIP test_arm64_disasm_listing_unchanged_obf (no capstone)")
     assert _arm64_disasm_sample_sha("obf") == _ARM64_DISASM_SAMPLE_SHA["obf"]
+
+
+def test_the_listing_helper_leaves_no_stand_in_behind():
+    """The listing helper stands three functions in for the real ones while it runs
+    and puts the real ones back. A module imported for the first time in between, and
+    taking one of them by name, kept the stand-in: jadart.callgraph did, since `disasm`
+    by address imports it on demand (#406), and every call graph built later in that
+    process used the obf fixture's pool map (#466). In a process of its own, where
+    nothing has imported callgraph first, as a worker under xdist may not have."""
+    if not _capstone_available():
+        _skip("  SKIP test_the_listing_helper_leaves_no_stand_in_behind (no capstone)")
+    import subprocess
+    prog = ("import sys; sys.path.insert(0, 'tests'); import test_core as T; "
+            "T._arm64_disasm_sample_sha('obf'); "
+            "from jadart import callgraph, disasm; "
+            "assert callgraph.build_pool_map is disasm.build_pool_map")
+    out = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True,
+                         cwd=os.path.join(ROOT, "framework"))
+    assert out.returncode == 0, out.stderr[-600:]
 
 
 def test_overlapping_tables_cannot_make_a_container_cost_more_than_its_size(tmp_path):

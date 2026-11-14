@@ -129,6 +129,13 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The suite's listing helper leaves nothing behind (#466).** While it runs it stands
+  a remembering function in for `disasm.build_pool_map`, and `jadart.callgraph`, imported
+  for the first time in that window since #406, kept it: a test that built a call graph
+  later in the same process got the obf fixture's pool map and lost 301 direct edges of
+  the clean one. No command was affected, only the order tests may run in. The helper
+  imports the module first and checks that no module kept a stand-in.
+
 - **A count the stream cannot pay for is refused before it is walked (#451).** A cluster
   of instances with no field reads nothing for each object, in the alloc pass or in the
   fill, so its count cost time and no bytes: 215 bytes that declare 16,000,000 such
