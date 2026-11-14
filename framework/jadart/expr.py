@@ -1454,7 +1454,7 @@ def _slot_regs(text: str) -> frozenset:
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
                  "src", "via", "views", "lost", "lost_slot", "slot_by_reg", "dropped",
-                 "opaque", "spilled", "hoist", "hoisted")
+                 "opaque", "stale", "spilled", "hoist", "hoisted")
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
@@ -1523,6 +1523,13 @@ class State:
         # a store's BASE, where a bare name claims the object the function came in with
         # (#208).
         self.opaque: set = set()
+        # The ones of `opaque` written again since, with something other than their
+        # own name: the register is known now, and a copy made before the write still
+        # spells the bare name, in another register or a slot. `mov x1, x2; mov x2,
+        # x4` after a loop that wrote x2 leaves x1 printing `x2` under no mark, the
+        # write having cleared it. Until the register is its own name again, that
+        # name in a line is the value the loop left and not the register (#468).
+        self.stale: set = set()
         # frame slot key -> the lost register whose value it holds, so the slot can be
         # dropped when that register is reassigned and its spelling means something else
         # (#140). Only lost values are tracked; a stable value in a slot stays.
@@ -1547,6 +1554,7 @@ class State:
         s.views = {n: set(v) for n, v in self.views.items()}
         s.lost = set(self.lost)
         s.opaque = set(self.opaque)
+        s.stale = set(self.stale)
         s.lost_slot = dict(self.lost_slot)
         s.slot_by_reg = {r: set(ks) for r, ks in self.slot_by_reg.items()}
         s.dropped = dict(self.dropped)
@@ -1591,6 +1599,7 @@ class State:
         self._stale_lost(reg)
         self.lost.discard(reg)
         self.opaque.discard(reg)
+        self.stale.discard(reg)
 
     def forget(self, reg: str):
         """Drop what is known about `reg` WITHOUT touching `result`.
@@ -1607,6 +1616,7 @@ class State:
         self._other_views(reg)
         self._stale_lost(reg)
         self.lost.discard(reg)
+        self.stale.discard(reg)
 
     def _stale_lost(self, reg: str):
         """Drop the slots holding `reg` as a lost value, now `reg` is reassigned and its
@@ -1755,7 +1765,12 @@ class State:
         self._other_views(reg)
         self._stale_lost(reg)
         self.lost.discard(reg)
-        self.opaque.discard(reg)
+        if reg in self.opaque:
+            self.opaque.discard(reg)
+            if v.text != reg:
+                self.stale.add(reg)
+        elif self.stale and v.text == reg:
+            self.stale.discard(reg)
         if reg in (_T.ret_int, _T.ret_fp):
             self.result = reg
 
@@ -2603,6 +2618,7 @@ def _merge(dst: State, a: State, b: State):
         dst.result = a.result
     dst.lost = dropped | (a.lost & b.lost)
     dst.opaque = a.opaque | b.opaque
+    dst.stale = a.stale | b.stale
 
 
 # ── boilerplate stripping (frame + thread stack-overflow check) ─────────────
@@ -4904,6 +4920,15 @@ class Lifter:
         #: got; see _render_loop and _lift_function.
         self.carry_more: dict = {}
         self.exit_hazards: dict = {}
+        #: Registers a loop wrote and its exit dropped (`State.opaque`) that the code
+        #: after it read: spelled as themselves in a line (`_lost_spelled`), or where
+        #: the walk prints no register, in a condition (`_lost_in`), as the base of a
+        #: store and in a call's arguments. `_lift_function` has their loops carry them.
+        self.lost_reads: set = set()
+        #: The loops a slot comes into holding a read of memory where a trip stores to
+        #: memory: what a reload of it prints there is not what a later trip loads, so
+        #: no name is set from one on `lost_reads` alone. See `_render_loop`.
+        self.exit_unsure: set = set()
         #: loop header -> {register: the value _render_loop forgot it to at the header},
         #: for each register the loop writes and does not carry; see _note_goto.
         self._unset: dict = {}
@@ -8043,18 +8068,28 @@ class Lifter:
         x2, ...)` passed the incoming x2 and then another value under the same name,
         and `var t0; g(...); f(t0)` read a temporary nothing assigns. An argument list
         with one such value in it is not the call's list."""
-        bad = st.lost | st.opaque if st.lost or st.opaque else self.unknown
+        # The name of one written again since is as bad (`State.stale`): `mov x1, x2;
+        # mov x2, x4; bl f` passed `x2` as the first argument. And the whole list is
+        # looked at, so each register it reads is on record for the next walk and none
+        # first shows in a list that walk prints (#468).
+        lost = st.opaque | st.stale if st.stale else st.opaque
+        bad = st.lost | lost if st.lost or lost else self.unknown
         if not bad:
             return True
         if bad is not self.unknown:
             bad = bad | self.unknown
+        exact = True
         for v in vals:
             t = v.text
             if '"' in t:
                 t = _QUOTED_RE.sub("", t)
-            if not bad.isdisjoint(_WORD_RE.findall(t)):
-                return False
-        return True
+            words = _WORD_RE.findall(t)
+            if not bad.isdisjoint(words):
+                if not lost:
+                    return False
+                self.lost_reads.update(lost.intersection(words))
+                exact = False
+        return exact
 
     def _indirect_args(self, st: State, pushed, plan, recv):
         """(the receiver an indirect call prints as its base or None, its argument list
@@ -8530,6 +8565,8 @@ class Lifter:
             basedecl = []
             if ((base in st.lost or base in st.opaque) and _T.roles.get(base) is None
                     and base not in self.alias):
+                if base in st.opaque:
+                    self.lost_reads.add(base)
                 tmp, decl = self._mint(st)
                 if decl:
                     basedecl.append(decl)
@@ -10745,35 +10782,44 @@ class Lifter:
                 return None
         return cont
 
-    def _reads_lost(self, text: str, st: State) -> bool:
-        """Whether `text` spells as itself a register a loop wrote and its exit dropped
-        (`State.opaque`), where no printed line shows the write. Read there it says
-        the value the function came in with, which it is not."""
-        for m in _REG_RE.findall(text):
-            r = canon(m)
-            if (r in st.opaque and r not in self._printed_regs
-                    and st.get(r).text == r):
-                return True
-        return False
+    def _lost_spelled(self, out: list, pad: str, at: int, lost: frozenset) -> None:
+        """Record in `lost_reads` each register of `lost`, the ones a loop wrote and
+        its exit dropped as the statement began, that the statement's own lines spell.
+        Its own: the lines at this depth, as a deeper one is a nested walk's and was
+        looked at there, so a line is read once however deep it sits."""
+        own = len(pad)
+        for ln in out[at:]:
+            if ln.startswith(pad) and ln[own:own + 1] != " ":
+                for r in _REG_RE.findall(ln):
+                    r = canon(r)
+                    if r in lost:
+                        self.lost_reads.add(r)
 
-    def _phi_was_bare(self, a: State, b: State, live) -> bool:
-        """Whether every register the arms of an `if` disagree about is a join of two
-        plain values, the kind `_phi` left bare before #409, so that the `if` printed
-        nothing for them."""
-        for r in a.reg.keys() | b.reg.keys():
-            va, vb = a.reg.get(r) or V(r, P_ATOM), b.reg.get(r) or V(r, P_ATOM)
-            if _joined(va, vb) is not None or not (live & _reg_mask((r,))):
-                continue
-            if (va.prec < P_POST or vb.prec < P_POST
-                    or _MINTED_RE.fullmatch(va.text) or _MINTED_RE.fullmatch(vb.text)
-                    or (_FLIT_RE.fullmatch(va.text) and vb.text != r)
-                    or (_FLIT_RE.fullmatch(vb.text) and va.text != r)
-                    or r in self._printed_regs or r in self.phi_shown):
-                return False
-        return True
+    def _lost_in(self, text: str, st: State) -> str:
+        """`text`, a condition, with `?` where it spells as itself a register a loop
+        wrote and its exit dropped (`State.opaque`) and no printed line shows the
+        write. Read there the register says the value the function came in with,
+        which it is not: after `and x2, x4, #1` in a loop, `cbnz x2, 1f; mov x4, #5;
+        1:` printed `if (x2 == 0)` on the entry x2, and then, the `if` left out
+        where its arms printed nothing, `return x4;` on every path (#468). The branch
+        is there and what it tests has no name here, which `?` says, as it does for
+        a flag nothing set. `_lift_function` walks again with the register carried
+        by its loop where it can, and the condition then reads that name. So too a
+        copy of one made before the register was written again (`State.stale`)."""
+        if not st.opaque and not st.stale:
+            return text
+
+        def one(m):
+            r = canon(m.group(1))
+            if r not in self._printed_regs and (
+                    r in st.stale or (r in st.opaque and st.get(r).text == r)):
+                self.lost_reads.add(r)
+                return "?"
+            return m.group(0)
+        return _REG_RE.sub(one, text)
 
     def _phi(self, st: State, a: State, b: State, tlines, elines, live, pad, indent,
-             stmts, shy=False):
+             stmts):
         """Write out the registers the two arms disagree about, and NAME the result.
 
         `_merge` keeps what both arms agree on and drops the rest, so a register each arm
@@ -10835,13 +10881,6 @@ class Lifter:
                 return False
             return v.text == r or any(canon(m) in writes(k)
                                       for m in _REG_RE.findall(v.text))
-        # `shy`: the arms printed nothing and the condition reads a register that was
-        # lost. Naming a join of two plain values is then all that would print this
-        # `if`, with a condition that reads as the value on entry: after
-        # `add x2, x4, #8` in a loop, `cbnz x2, 1f; mov x4, #5; 1:` printed
-        # `if (x2 == 0)` on the x2 the function came in with. Such an `if` stays
-        # unprinted, as it was before #409, unless a register here was named then too.
-        shy = shy and self._phi_was_bare(a, b, live)
         for r in sorted(a.reg.keys() | b.reg.keys()):
             # A register only one arm tracks holds, on the other path, whatever it came in
             # with, which is the register itself, since anything the map knew before the
@@ -10879,8 +10918,8 @@ class Lifter:
             if (va.prec >= P_POST and vb.prec >= P_POST
                     and not _MINTED_RE.fullmatch(va.text)
                     and not _MINTED_RE.fullmatch(vb.text)
-                    and (shy or any(v.text == r and (pre.text != r or r in writes(k))
-                                    for k, v in enumerate((va, vb))))):
+                    and any(v.text == r and (pre.text != r or r in writes(k))
+                            for k, v in enumerate((va, vb)))):
                 if r not in self._printed_regs and r not in self.phi_shown:
                     self.phi_skipped.add(r)
                     continue
@@ -11025,8 +11064,13 @@ class Lifter:
         # a trap tier 3 does not print, loses its note at the next one: a note over
         # nothing says nothing, and it read as being about the section after it (#266).
         note = None
+        lost_at = None
         for i, s in enumerate(stmts):
             kind = s[0]
+            if lost_at is not None:
+                self._lost_spelled(out, pad, *lost_at)
+            lost_at = ((len(out), frozenset(st.opaque | st.stale))
+                       if st.opaque or st.stale else None)
             if note is not None and (kind in ("note", "rest")
                                      or (kind == "label" and note[1])):
                 self._drop_note(out, note[0])
@@ -11153,11 +11197,11 @@ class Lifter:
                 _, cond, then, els = s
                 head = self._last_block if self._last_block is not None else self.entry
                 cc = self._branch_cc(head, cond)
-                cond_txt = self._cond(cond, st, cc)
+                cond_txt = self._lost_in(self._cond(cond, st, cc), st)
                 # The negation of an ordering of doubles is not the reversed operator,
                 # and once the registers are substituted cfg no longer sees that they
                 # were doubles: negated here, from the registers (#402).
-                neg_txt = (self._cond(negate_cond(cond), st, cc)
+                neg_txt = (self._lost_in(self._cond(negate_cond(cond), st, cc), st)
                            if _FP_REG.search(cond) else None)
                 a, b = st.copy(), st.copy()
                 tlines, tfalls = self.walk(then, a, indent, depth + 1, joins[i])
@@ -11165,10 +11209,9 @@ class Lifter:
                 named = {}
                 if tfalls and efalls:
                     first = st.tmpc[0]
-                    shy = not tlines and not elines and self._reads_lost(cond_txt, st)
                     named, decls, entered = self._phi(
                         st, a, b, tlines, elines, self._livein.get(joins[i], 0), pad,
-                        indent, (then, els), shy)
+                        indent, (then, els))
                     self.phi_names.update(named.values())
                     self.phi_minted.update(named.values())
                     out.extend(decls)
@@ -11315,6 +11358,8 @@ class Lifter:
                 falls = alive = False
         if note is not None:
             self._drop_note(out, note[0])
+        if lost_at is not None:
+            self._lost_spelled(out, pad, *lost_at)
         return out, falls
 
     def _render_if(self, cond, tlines, elines, pad, indent, neg=None):
@@ -11436,6 +11481,19 @@ class Lifter:
             carried |= self.carry_more.get(header, frozenset())     # see below
             self.carried[header] = carried
         written = self._written(nodes) - (_SPECIAL - {_lr()})
+        # A slot holding a read of memory keeps its text into the loop, and a trip that
+        # stores to memory after reloading it comes round to a slot that still holds
+        # the first value while the text reads the new one. Where the loop itself reads
+        # the reload that is printed as it was; a name set from it on the way out, for
+        # the code after the loop alone, would print it where the bare register stood,
+        # so such a loop sets none (#468).
+        if header not in self.exit_unsure and self._writes_heap(self._trip_body(header)):
+            self._slot_crossings()
+            bit, live_in = self._slot_live
+            live = live_in.get(header, (0, 0))[0]
+            if live and any(bit.get(k, 0) & live and self._reads_mem(v.text)
+                            for k, v in st.slot.items()):
+                self.exit_unsure.add(header)
         pre = self._pin_loop(st, header, carried)
         # A loop-carried register is a phi, and a phi reaching exactly one join has a name
         # in the source: bind it before the loop with the entry value, read that name in
@@ -11623,6 +11681,20 @@ class Lifter:
                         for out_h, _names, _copied in self._carrying:
                             if s not in self._back_loop(out_h):
                                 self.exit_hazards.setdefault(out_h, set()).add(r)
+        # A loop around this one that had forgotten such a register at its own header
+        # holds, from here on, what this loop left in it: as little a value of this
+        # trip as the one its header forgot, so its mark moves to the register as it
+        # is now and a break of the outer loop that still holds it is a hazard there
+        # too. Without it only this loop carried the register, the outer one forgot
+        # the name at its exit, and the code after both read it bare (#468).
+        hit = self.exit_hazards.get(header)
+        if hit and self._carrying:
+            for out_h, _names, _copied in self._carrying:
+                outer = self._unset.get(out_h)
+                if outer:
+                    for r in sorted(hit & outer.keys()):
+                        if st.get(r).text == r:
+                            outer[r] = st.reg[r]
         # ...except the ones that got a name, whose value after the loop is that variable.
         # That is the second half of naming it: forgetting it here would put the machine
         # register back into every line that reads the result of the loop. A register whose
@@ -14574,8 +14646,16 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         return moved
 
     hoist = wants_hoist(lifter, lines) or None
-    carry = {h: frozenset(r & printed) for h, r in lifter.exit_hazards.items()
-             if r & printed}
+    # ...and one no printed line writes, where the code after the loop goes on to
+    # read it (`Lifter.lost_reads`). It has no line in the loop only because nothing
+    # in the loop reads it, and bare after the loop it reads as the value the
+    # function came in with (#468). Asked only where a loop has one: most have none.
+    shown = printed
+    if any(r - printed for r in lifter.exit_hazards.values()):
+        shown = printed | lifter.lost_reads
+    carry = {h: frozenset(r & (printed if h in lifter.exit_unsure else shown))
+             for h, r in lifter.exit_hazards.items()}
+    carry = {h: r for h, r in carry.items() if r}
     # ...and which registers a goto-reached join needs a phi for (#123): each one the
     # ways in disagree about and the code after it reads, where the walk prints every
     # edge into the join, so that every way in writes the name (#414). See _join_write.
@@ -14597,7 +14677,11 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                              facts)
         # A name the code after the loop does not print, its only reader a call that
         # prints `(...)`, says nothing, and the walk goes back to the bare register.
-        unread = {h: frozenset(names[n] for n in _never_read(lines, names))
+        # Asked of the lines once for every loop's names, not once a loop: a row of
+        # loops that each carry one read them all again for each (#468).
+        dead = _never_read(lines, {n for names in lifter.carry_names.values()
+                                   for n in names})
+        unread = {h: frozenset(r for n, r in names.items() if n in dead)
                   for h, names in lifter.carry_names.items()}
         if any(unread.values()):
             carry = {h: r - unread.get(h, frozenset()) for h, r in carry.items()}
