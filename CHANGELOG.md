@@ -385,6 +385,115 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   programs wrong on both). On the two fixtures and the seven app-sweep libraries 602 of
   273,863 ranges change, 52,903 lines out and 59,852 in, none with an error; 98,344 of
   those 112,755 lines differ only in a temporary's number.
+- **A name the vm snapshot holds is read from it (#364).** Through Dart 3.12 a library
+  holds two snapshots. The isolate one numbers its objects after the vm one's and writes
+  an object of the vm one as that number and nothing else, and nothing read the vm
+  snapshot. So `==`, `[]=`, `add`, `call` and `<anonymous closure>` were no name at all:
+  on the clean fixture 1,073 of 7,892 functions, 412 of 2,350 classes and 19 of 420
+  fields are named by a string only the vm snapshot holds, and 1,291 call sites printed
+  `sub_0x...` for a function the file names. The vm snapshot is now read with the
+  isolate snapshot's grammar, alloc pass and fill pass, and its ref N is base ref N:
+  the strings, the Smis and the Arrays. The one difference is in the alloc pass, where
+  the vm snapshot's String cluster has no canonical-set layout behind it, and it is the
+  same line of `app_snapshot.cc` in all 15 registered releases from 2.19.6 to 3.12.2.
+  Read on 35 real builds, the two fixtures, six app-sweep libraries and 27 corpus
+  builds: 14 releases from 2.19.6 to 3.12.2 on arm64 and 13 of them on arm32. On each
+  the fill and the roots behind it end on the last byte the header counts. Dart 3.13
+  writes one snapshot with seven fixed base objects, so there is nothing to read there.
+  Not read anywhere: the vm snapshot's own base objects, refs 1 to 99 on 3.12.2 (null,
+  true, false, the cached arguments descriptors), which the VM makes before it loads a
+  snapshot and no file states, and the names of its stubs.
+
+  The vm snapshot is used whole or not at all. It has to carry the isolate snapshot's
+  version and target, hold exactly the objects the isolate header counts as base, walk
+  to the last byte its header counts, and end on the roots the VM reads there, held to
+  what the 35 builds have: every Code object of the vm snapshot once, last, in any
+  order; before them a WeakArray or an Array, or null as on every arm32 build; and
+  before that no ref, as before 3.9, or strings that between them name every string
+  the vm snapshot holds, 806 roots for 804 strings on 3.12.2. Which release writes the
+  symbols, how many it has and their order are not looked up, so roots with no symbol
+  pass on a 3.12 build and so do the symbols in another order; the strings are read by
+  the fill either way, and the roots add no name and move none. Short of that it is
+  refused (`BaseObjectsError`, or the typed error of the walk) and the file reads as it
+  did before: base refs blank.
+
+  A refusal is said, since a listing with a fifth of its names missing looks like any
+  other. A command that read the snapshot says it once on stderr, `// the vm snapshot
+  is not read, so what only it names is left unnamed:` and the reason; a `-j` document
+  that is an object carries the same line in `notes`; and `verify` fails G13 with the
+  reason, where it passed on two counts that agree and printed "Grammar consistent"
+  over a vm snapshot that does not walk. G13 is Tier B, so the exit code is as it was.
+
+  A clean vm snapshot is 15 KB and costs 1 ms. A crafted one costs its length: 0.34 s
+  for 3.2 MB of roots, each root one bisection over the clusters, and a count of
+  objects the bytes cannot pay for is refused before it is walked (#451), so the 215
+  bytes that count 2^40 instances with no field are a typed error at once.
+
+  Printed output changes on every build that has a vm snapshot. On the clean fixture
+  `functions` names 6,849 ranges where it named 5,940, and `classes` lists 2,231 classes
+  and 6,730 members where it listed 1,843 and 5,779: 323 of the new ones are the
+  top-level class of a library, which a 3.13 build already lists. In tier 3, 1,316 of
+  its 8,194 ranges change, 2,837 lines, none with an error. Paired line for line that is
+  2,833 changes: 1,291 calls print the function's name where they printed `sub_0x...`,
+  457 calls of an allocation stub print `new Class()`, 592 dispatches print the
+  selector's name where they printed `sel_0x...` and 83 where they printed `sel_m0x...`,
+  352 lines print a string where they printed `pool_0x...`, 57 print a field's name
+  where they printed `field_0x...`, and one call prints its arguments. `sub_0x...(` is
+  on 655 lines where it was on 2,403. A pool slot holding a base object is mentioned 420
+  times in 241 ranges where it was 770 in 401, and the 420 are 405 stubs of the VM and
+  15 of its own base objects, which no file names. The obf fixture, whose vm snapshot
+  holds the same 804 strings: 870 of 8,188 ranges, 1,712 lines.
+  Three of the lines: `return sub_0x136c08(t2, t3);` is now `return -(t2, t3);`,
+  `var t6 = sub_0x137ac4();` is now `var t6 = new ArgumentError();`, and
+  `t6.field_0x30 = pool_0x408;` is now `t6.field_0x30 = ".";`.
+
+  An arguments descriptor names its numbers by ref, and the vm snapshot of the 3.3.4,
+  3.5.4 and 3.6.2 builds holds the Smis 0, 1 and 2, so nearly every descriptor there
+  had two base refs and was not read. Of the loads of a descriptor from the pool, 571
+  of 8,398 named one read in full on a Dart 3.5.4 app and 6,501 do now; on a 3.6.2 app
+  554 of 9,595 and 7,661.
+  Where the vm snapshot was read nothing about a descriptor is worked out any more: a
+  number that is still not a Smi is not one, and only an object older than the vm
+  snapshot is taken for one of the VM's cached descriptors.
+  `sub_0x...(` is on 3,143 lines of the 3.5.4 app where it was on 7,597, and a call
+  printed as `(...)` on 19,305 where it was on 25,731; on the 3.6.2 app 3,688 for 9,921
+  and 21,085 for 28,564. Over the two fixtures and the seven app-sweep libraries 35,511
+  of 273,863 ranges change, 129,924 lines for 138,421, none with an error, and none on
+  FluffyChat, a 3.13 build.
+
+  Three things read as before, on purpose. `strings` lists the isolate snapshot's own
+  strings, 9,013 on the clean fixture, not the 804 symbols of the VM. The call graph
+  (`callers`, `callees`, `functions`' counts) reads no name from the vm snapshot: it
+  settles a virtual site by the name most rows near its offset carry, and with 461
+  functions named `<anonymous closure>` the same 2,580 sites came to 95,352 virtual
+  edges where they had 15,536, no more right than before. And a library is printed by
+  its url where the snapshot has one, so `dart.core` is now `dart:core`, a string of the
+  vm snapshot; `export` writes the same paths. `xrefs string` matches the entries that
+  have text now, 573 closures by `<anonymous closure>` among them, and `verify` counts
+  19 more fields under G12, 66,342 checks on the clean fixture where it counted 66,323.
+
+  The same names reach every other reader of them. `xrefs` prints a top-level function
+  with its class, `::.benchRunAll` where it printed `benchRunAll`, as it does on a 3.13
+  build. `disasm` changes 101 lines of every 32nd range of the clean fixture and 30 of
+  the obf one: 28 and 1 headers print the range's name, 42 and 5 calls and 31 and 24
+  pool loads gain a note. `selectors` names `==`, `[]` and `[]=`, 136 offsets for 133,
+  and `==` on the obf fixture, 2 for 1. `symbols` names 6,925 of the clean fixture's
+  8,194 ranges where it named 6,016, in all four formats: the radare2 script is 38,540
+  lines where it was 36,722. `hook` embeds 2,406 class names where it embedded 2,018,
+  and one of its three byte checks is taken at another range. `constants` prints a
+  const list whose elements are objects of the vm snapshot: 7 lists on the clean
+  fixture where it printed 4, and 15 for 4 on a 3.5.4 build. `libraries` counts 323
+  libraries on the clean fixture where it counted 322, and 308 for 306 on the obf one,
+  where `libraries -a` no longer lists 13 `dart:` libraries under an obfuscated name,
+  284 for 297. One more closed class of the clean fixture has a name to be cast by, and
+  two of the obf one. The implicit-accessor channel, which named six slots of the clean
+  fixture whose Field's name is a vm string, finds them named and adds none.
+
+  Cost, best of three, before and after. On FluffyChat, a 3.13 build with nothing to
+  read: `info` 0.05 and 0.05 s, `classes` 0.72 and 0.72, `functions` 5.45 and 5.48,
+  `lift` of one function 1.37 and 1.39. On Kazumi, a 3.11.5 build whose vm snapshot is
+  read: 0.05 and 0.06, 0.37 and 0.37, 2.51 and 2.51, 0.66 and 0.65.
+
 - **A signed load into a `w` register is extended to 32 bits.** `ldursh w0, [x13, #7]`
   printed `x13.field2_0x8 << 48 >> 48`, the field sign-extended to 64 bits, where the
   register holds it extended to 32 with the top half clear: 0xffff8000 for a field of

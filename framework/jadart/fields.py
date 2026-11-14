@@ -549,7 +549,10 @@ def recover_accessors(image, fr, layout: FieldLayout) -> AccessorNames:
     name is a string the VM snapshot holds, a base object the isolate snapshot refers to
     and never writes (`end`, `start`, `state`, `r`, `g`, `b`), while the accessor's name
     `get:g` is written into the isolate snapshot. All 19 such Fields on the clean fixture
-    are that case, and that is the whole of this channel's reach.
+    are that case, and that is the whole of this channel's reach. Where the vm snapshot
+    is read (baseobjects.py) those Fields name themselves too and this adds nothing, 0
+    names on the clean fixture for 164 agreements: it is what names them in a file whose
+    vm snapshot is refused or not exported.
 
     WHAT IT USED TO DO, AND WHY THAT WAS A GUESS (#258). This read every `get:` and `set:`
     Function whatever its kind, and took the one offset its body touched. A HAND-WRITTEN

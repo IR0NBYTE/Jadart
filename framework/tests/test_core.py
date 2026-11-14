@@ -368,6 +368,15 @@ def _needs_capstone():
         _skip(f"  SKIP {sys._getframe(1).f_code.co_name} (no capstone)")
 
 
+def _without_vm_snapshot():
+    """A context in which a file is read as it was before its vm snapshot was (#364):
+    its base refs blank. For a test of what is read where there is none to read, and for
+    comparing a fixture with a copy of itself that exports no vm snapshot."""
+    from unittest import mock
+    from jadart import baseobjects
+    return mock.patch.object(baseobjects, "read_base_objects", lambda *a, **k: None)
+
+
 def test_tier1_disassembles_benchwithdraw():
     if not _capstone_available():
         _skip("  SKIP test_tier1_disassembles_benchwithdraw (no capstone)")
@@ -3065,7 +3074,13 @@ def test_xrefs_says_which_matching_entries_no_code_loads():
     loaded directly, answered "nothing matching 'ifAbsent' was referenced" and exited 1.
     No direct load is not no reference: a closure or a value built at runtime can reach
     the entry (#62). And a miss on an explicit kind no longer says it looked for a
-    function, which only the 1.1.0 form does."""
+    function, which only the 1.1.0 form does.
+
+    The counts for `e` were 1,113 and 331 until the vm snapshot was read (#364), and
+    1,709 more entries match now. 1,136 are a string of the vm snapshot, or a list
+    holding one, and had no text to match by. 573 name a closure, and an entry naming
+    a function matches by its name: `<anonymous closure>`, a string of the vm snapshot
+    as well."""
     import io
     import json
     import contextlib
@@ -3087,9 +3102,9 @@ def test_xrefs_says_which_matching_entries_no_code_loads():
     assert "// pool_0x568  \"ifAbsent\"" in out, out
     rc, out, _ = run("string", "e", "-j")
     doc = json.loads(out)
-    assert (doc["count"], len(doc["unloaded"])) == (1113, 331), (doc["count"],)
+    assert (doc["count"], len(doc["unloaded"])) == (1700, 1453), (doc["count"],)
     rc, out, _ = run("string", "e")
-    assert "and 331 matching entries no code loads directly" in out, out[-400:]
+    assert "and 1453 matching entries no code loads directly" in out, out[-400:]
     rc, out, _ = run("pool", "0x568", "-j")
     doc = json.loads(out)
     assert rc == 0 and doc["unloaded"] == [{"pool_offset": 0x568, "entry": '"ifAbsent"'}]
@@ -7973,7 +7988,8 @@ def test_this_is_not_bound_where_no_function_owns_the_code():
     clean = [f["body"] for f in jadart.decompile(CLEAN, "benchCheckSecret")]
     # The same instructions, so the same body, whatever name the argument is given.
     assert obf == clean and len(obf) == 1, (obf, clean)
-    assert obf[0][-1].endswith('.sel_0x0("FLUBENCH{str_literal_compare}");'), obf
+    # `==` is a string of the vm snapshot, so selector 0 has its name on both (#364).
+    assert obf[0][-1].endswith('.==("FLUBENCH{str_literal_compare}");'), obf
     assert not any(re.search(r"\bthis\b", ln) for ln in obf[0]), obf
     # An instance method keeps its receiver, which is what the rule is for.
     body = jadart.decompile(CLEAN, "benchWithdraw")[0]["body"]
@@ -8594,7 +8610,10 @@ def test_xrefs_names_each_reference_the_way_functions_does():
     text = run("xrefs", CLEAN, "string", "Bench")
     line = next(ln for ln in text.splitlines() if f"{build['size']} bytes" in ln)
     assert line.rstrip().endswith("  FluBenchApp.build"), line
-    assert "  benchRunAll" in run("xrefs", CLEAN, "function", "benchWithdraw")
+    # A top-level function is owned by its library's top-level class, whose name, `::`,
+    # is a string of the vm snapshot: no class was printed here until that was read
+    # (#364). A Dart 3.13 build, which holds the string itself, always printed it.
+    assert "  ::.benchRunAll\n" in run("xrefs", CLEAN, "function", "benchWithdraw")
 
     anon = next(pc for pc, nm in label.items() if not nm)
     assert cli._ref_line(image, {"pc_offset": anon, "size": 4, "name": "",
@@ -9203,7 +9222,9 @@ def test_the_implemented_bit_agrees_with_every_interface_the_table_names():
     _needs_capstone()                   # load_instructions reads the specialised stubs
     from jadart.disasm import load_instructions
     from jadart.fields import recover_casts, recover_fields
-    for path, stubs in ((CLEAN, 237), (OBF, 235)):
+    # 237 and 235 before the vm snapshot was read (#364): a class is cast to by name,
+    # and one more closed class on clean and two on obf have theirs from it.
+    for path, stubs in ((CLEAN, 238), (OBF, 237)):
         image, fr, hdr = load_instructions(path)
         c = recover_casts(image, fr, recover_fields(fr, hdr.arch))
         assert c.refused == "" and c.contradicted == 0, (c.refused, c.contradicted)
@@ -11342,7 +11363,8 @@ def test_tier3_shows_the_fixture_forwarder_and_catch_entry():
     miss = "br x16   // x16 holds THR.field_0x258"
     # the check is a guard over its miss handler, and the body follows it (#278)
     assert body[0] == miss and body[4:6] == [miss, "}"], body
-    assert any(ln.startswith("return sub_") for ln in body[6:]), body
+    # the call it forwards to: `-`, a name the vm snapshot holds (#364)
+    assert body[-1] == "return -(t2, t3);", body
     from jadart.expr import MONOMORPHIC_ENTRY
     assert body[1] == "// " + MONOMORPHIC_ENTRY, body
 
@@ -12212,11 +12234,12 @@ def test_the_function_table_and_lifted_bodies_name_an_anonymous_range_alike():
     anon = [f for f in rows.values() if not f.name]
     assert all(_parse_addr(f.label, image) == f.pc_offset for f in anon)
     buf = io.StringIO()
-    # `putIfAbsent`, not `mapToString`: the only range mapToString called by label was
-    # its StringBuffer allocation, which the owner Class of the stub's Code object now
-    # names (#240). This test is about the LABEL of a range that has no name at all.
+    # `forTap`, not `mapToString` or `putIfAbsent`: the only range mapToString called by
+    # label was its StringBuffer allocation, which the owner Class of the stub's Code
+    # object now names (#240), and the one putIfAbsent called has a name in the vm
+    # snapshot (#364). This test is about the LABEL of a range that has no name at all.
     with contextlib.redirect_stdout(buf):
-        assert cli.main(["lift", CLEAN, "putIfAbsent"]) == 0
+        assert cli.main(["lift", CLEAN, "forTap"]) == 0
     called = re.search(r"\b(sub_0x[0-9a-f]+)\(\)", buf.getvalue()).group(1)
     assert rows[_parse_addr(called, image)].label == called, called
     buf = io.StringIO()
@@ -12484,9 +12507,15 @@ def test_arm32_corpus_decompile_tier1_labels_conditional_branches():
 #: Regenerated for #406, which names a range asked for by address as `functions` does:
 #: 181 headers and 181 `-j` names of the clean sample and 8 and 8 of the obf one went from
 #: `sub_0x...` to that name. Checked line by line: same line count, nothing else differs.
+#: Regenerated for #364, which reads the base objects out of the vm snapshot: 101 lines
+#: of the clean text sample and 30 of the obf one change. 28 and 1 are a header that went
+#: from `sub_0x...` to the name the range now has, 42 and 5 gained `; -> name` on a call
+#: and 31 and 24 `; = value` on a pool load, and `-j` carries the same names. Checked
+#: line by line: both samples keep their line count, 14,085 and 15,675, and nothing else
+#: differs.
 _ARM64_DISASM_SAMPLE_SHA = {
-    "clean": "52590ac75a3ed9cc5d7f7f230f109e1e3262f23dd3fadddc8e03228847b307f7",
-    "obf": "be4bb5e064d598877e7da1ed554ad95bb185a2f1919cefa7a1e47ac13c2d9e5c",
+    "clean": "330aef0c59d7527aa3f1d2f7f1c0fc78cf2cfd491eff9937af30fabaad424d5b",
+    "obf": "1d3a12ef825d3e1250db6a7da5d9c70e63983cf0340c74a0841ad3d868d0b5cf",
 }
 
 
@@ -15375,7 +15404,9 @@ def test_a_dispatch_offset_other_selectors_share_is_not_named():
     from jadart import dispatch as D
     image, fr, hdr = load_instructions(CLEAN)
     sel = D.recover_selectors(image, fr, hdr)
-    assert len(sel) == 133 and "build" in sel.values()
+    # 133 before the vm snapshot was read (#364): `==`, `[]` and `[]=` are its strings.
+    assert len(sel) == 136 and "build" in sel.values()
+    assert (sel[0], sel[-0xfc2], sel[-0xdc5]) == ("==", "[]", "[]=")
     # `renderObject` shares -0xff2 with `handleTapUp`, `encodeMethodCall` and
     # `get:notify`, each defined in a class whose only row is there; `controller.stream`
     # printed `.maximumSize`, as `_StreamController.stream`, defined in an abstract class,
@@ -19303,7 +19334,10 @@ def test_a_hand_written_setter_does_not_name_the_slot_it_stores_to():
     from jadart.disasm import load_instructions
     from jadart.fields import recover_accessors, recover_fields
     from jadart.program import _FUNCTION_KINDS
-    image, fr, hdr = load_instructions(CLEAN)
+    # Read without the vm snapshot: with it every such Field names itself and the
+    # channel has no name left to give on this fixture (#364).
+    with _without_vm_snapshot():
+        image, fr, hdr = load_instructions(CLEAN)
     layout = recover_fields(fr, hdr.arch)
     acc = recover_accessors(image, fr, layout)
     assert not acc.refused, acc.refused
@@ -19340,7 +19374,8 @@ def test_an_implicit_accessor_names_its_own_fields_slot():
     _needs_capstone()
     from jadart.disasm import load_instructions
     from jadart.fields import recover_accessors, recover_fields
-    image, fr, hdr = load_instructions(CLEAN)
+    with _without_vm_snapshot():
+        image, fr, hdr = load_instructions(CLEAN)
     layout = recover_fields(fr, hdr.arch)
     acc = recover_accessors(image, fr, layout)
     by_name = {layout.class_name[c]: offs for c, offs in acc.by_class.items()}
@@ -19351,6 +19386,15 @@ def test_an_implicit_accessor_names_its_own_fields_slot():
     stream = next(v for k, v in by_name.items()
                   if k.startswith("_AsyncStarStreamController@"))
     assert stream == {0xc: "controller", 0x10: "asyncStarBody"}, stream
+    # With the vm snapshot read those Fields name themselves (#364): the layout holds
+    # the same names before the channel is asked, and the channel has none to add.
+    image, fr, hdr = load_instructions(CLEAN)
+    layout = recover_fields(fr, hdr.arch)
+    color = next(c for c, n in layout.class_name.items() if n == "Color")
+    own = {off: fi.name for off, fi in layout.by_class[color].items()}
+    assert {off: own.get(off) for off in (0x10, 0x18, 0x20)} == by_name["Color"], own
+    acc = recover_accessors(image, fr, layout)
+    assert (acc.added, acc.agreed, acc.refused) == (0, 164, ""), acc
 
 
 def test_the_accessor_names_agree_with_every_field_object_that_speaks():
@@ -19521,11 +19565,15 @@ def test_a_merged_layout_library_is_read_through_the_merged_pair(tmp_path):
     assert got["isolate"] == real["isolate"]
     assert anchor == dict(real_anchor, symbol="_kDartSnapshotText")
 
-    was = recover_program(CLEAN)
+    # The copy exports no vm snapshot, as a 3.13 library does not, so the fixture it
+    # is compared with is read without its own (#364).
+    with _without_vm_snapshot():
+        was = recover_program(CLEAN)
     now = recover_program(str(path))
     assert now.classes == was.classes and now.strings == was.strings
 
-    old_image, old_fr, _hdr = load_instructions(CLEAN)
+    with _without_vm_snapshot():
+        old_image, old_fr, _hdr = load_instructions(CLEAN)
     image, fr, hdr = load_instructions(str(path))
     assert image.anchor_symbol == "_kDartSnapshotText"
     assert old_image.anchor_symbol == "_kDartIsolateSnapshotInstructions"
@@ -19622,7 +19670,8 @@ def test_one_contradicted_accessor_refuses_the_whole_channel():
     from jadart.disasm import load_instructions
     from jadart.fields import recover_accessors, recover_fields
     from jadart.program import _FUNCTION_KINDS
-    image, fr, hdr = load_instructions(CLEAN)
+    with _without_vm_snapshot():        # with it the channel adds no name here (#364)
+        image, fr, hdr = load_instructions(CLEAN)
     layout = recover_fields(fr, hdr.arch)
     assert recover_accessors(image, fr, layout).added > 0
     getter = next(ref for ref, nr, ow, kt in fr.functions
@@ -20585,7 +20634,7 @@ def test_an_incoming_argument_is_named_by_the_register_it_arrived_in():
     # a static function's first register argument is a0, not `this`
     f = jadart.decompile(CLEAN, "benchCheckSecret")[0]       # (String input)
     assert f["params"] == "a0" and f["body"] == [
-        'return a0.sel_0x0("FLUBENCH{str_literal_compare}");'], f
+        'return a0.==("FLUBENCH{str_literal_compare}");'], f
     f = jadart.decompile(CLEAN, "benchMakePair")[0]          # (int id, String name)
     assert f["params"] == "a0, a1", f
     # a generic function takes its arguments on the stack: no register is named and the
@@ -23995,7 +24044,7 @@ def test_a_session_does_the_setup_once(monkeypatch):
     timed."""
     _needs_capstone()
     import importlib
-    from jadart import callgraph, disasm, dispatch, fields, fillwalk
+    from jadart import baseobjects, callgraph, disasm, dispatch, fields, fillwalk
     program = importlib.import_module("jadart.program")    # jadart.program is a function
     monkeypatch.delenv("JADART_SERVER", raising=False)
     calls = {}
@@ -24010,6 +24059,7 @@ def test_a_session_does_the_setup_once(monkeypatch):
 
     counted(fillwalk, "walk_fill")                 # the snapshot walk
     counted(program, "walk_fill")                  # and where `classes` reaches it
+    counted(baseobjects, "read_base_objects")      # the vm snapshot, a walk of its own
     counted(dispatch, "build_selector_map")        # selector recovery
     counted(fields, "recover_casts")               # cast recovery
     counted(disasm, "_pool_label")                 # the pool map, per entry
@@ -24035,14 +24085,17 @@ def test_a_session_does_the_setup_once(monkeypatch):
         served.close()
     # Three walks: the one the code is read from, the one `classes` and `libraries`
     # read, and the one `strings` reads. Two cast tables: with accessor names, without.
-    assert first["walk_fill"] == 3 and first["recover_casts"] == 2, first
+    # The first two walks each read the vm snapshot for their base objects (#364), 905
+    # objects on this fixture, which is a walk more apiece and once per session.
+    assert first["read_base_objects"] == 2, first
+    assert first["walk_fill"] == 3 + 2 and first["recover_casts"] == 2, first
     assert first["_pool_loads"] == 1, first
     assert first["_read_words"] > 8000 and first["_pool_label"] > 1000, first
     # No session, no keeping: a process of its own builds what it always built.
     calls.clear()
     for argv in lines[:2]:
         assert _fresh(argv)[0] == 0
-    assert calls["walk_fill"] == 2, calls
+    assert calls["read_base_objects"] == 2 and calls["walk_fill"] == 2 + 2, calls
 
 
 def test_a_session_keeps_the_whole_call_graph_and_never_a_part(monkeypatch):
@@ -24708,7 +24761,10 @@ def test_a_session_keeps_a_layout_for_each_way_it_is_finished():
     src = open_source(CLEAN)
     keep.open_session(src.data)
     try:
-        image, fr, hdr = load_instructions(src)
+        # Without the vm snapshot, whose names leave the accessors none to add on the
+        # fixtures (#364): the two layouts would be the same size and tell nothing.
+        with _without_vm_snapshot():
+            image, fr, hdr = load_instructions(src)
         named = lift_tables(image, fr, True)[0]        # what `lift` builds, first
         plain = lift_tables(image, fr, False)[0]       # what `decompile` then reads
         fresh = recover_fields(fr, getattr(image, "arch", None))
@@ -26553,6 +26609,408 @@ def test_a_count_the_stream_cannot_pay_for_is_refused_before_any_loop():
         with pytest.raises(AllocError, match="bytes are left to describe"):
             walk(n)
     assert len(stream(16_000_000)[0]) < 256
+
+
+# Base objects, read out of the vm snapshot (#364).
+
+def _vm_snapshot_of(d: bytes):
+    """(isolate header, the vm snapshot up to the last byte its header counts) of the
+    library `d`."""
+    from jadart.macho import open_container
+    from jadart.snapshot import parse_blob
+    c = open_container(d)
+    blob = c.symbol_bytes("_kDartVmSnapshotData")
+    return (parse_blob(c.symbol_bytes("_kDartIsolateSnapshotData"), "isolate"),
+            blob[:struct.unpack_from("<q", blob, 4)[0] + 4])
+
+
+def _with_vm_snapshot(tmp_path, d: bytes, blob: bytes) -> str:
+    """The path of a copy of the library `d` whose vm snapshot starts with `blob`."""
+    from jadart.elf import Elf
+    elf = Elf(d)
+    at = elf.va_to_offset(elf.symbols["_kDartVmSnapshotData"].value)
+    path = tmp_path / "libapp.so"
+    path.write_bytes(d[:at] + bytes(blob) + d[at + len(blob):])
+    return str(path)
+
+
+def _read_base(blob, hdr):
+    """`read_base_objects` for the isolate header `hdr` beside the vm snapshot `blob`."""
+    from types import SimpleNamespace
+    from jadart.baseobjects import read_base_objects
+    return read_base_objects(SimpleNamespace(symbol_bytes=lambda _name: bytes(blob)), hdr)
+
+
+def test_a_base_ref_reads_what_the_vm_snapshot_states():
+    """An isolate snapshot numbers its objects after the vm snapshot's, and an object
+    the vm snapshot holds is written in it as that number and nothing else. Nothing read
+    the vm snapshot, so `==`, `[]=`, `add` and `<anonymous closure>` were no name at
+    all: 1,073 functions of the clean fixture printed as `sub_0x...` and 388 of its
+    classes were left out of `classes`, each for a name the file states (#364).
+
+    The vm snapshot is read with the isolate snapshot's grammar and its ref N is base
+    ref N. Its own base objects, refs 1 to 99 here, are in no file and stay unread."""
+    from jadart.program import recover_program
+    p = recover_program(CLEAN)
+    assert len(p.user_classes()) == 2231, len(p.user_classes())       # 1,843 before
+    # A library is known by its url where the snapshot has it, and `dart:core` is a
+    # string of the vm snapshot: its name, `dart.core`, was all there was to print.
+    assert "dart:core" in p.libraries() and "dart.core" not in p.libraries()
+    # `strings` lists what the isolate snapshot holds, which is what it listed.
+    assert len(p.strings) == 9013 and min(p.strings) == 1082
+    for lib in (CLEAN, OBF):
+        with open(lib, "rb") as f:
+            hdr, blob = _vm_snapshot_of(f.read())
+        b = _read_base(blob, hdr)
+        assert (b.first_ref, b.stop_ref) == (100, 1082) == (
+            b.first_ref, hdr.num_base_objects + 1)
+        assert (len(b.strings), min(b.strings), max(b.strings)) == (804, 100, 903)
+        assert [b.strings[r] for r in (328, 407, 411, 653, 894)] == [
+            "dart:core", "[]=", "<anonymous closure>", "add", "=="]
+        # The Smis a vm snapshot holds differ by release. Here they are 0 and the size
+        # of its symbol table, and an arguments descriptor's 0 is the first of them.
+        assert (b.smi_values, b.arrays) == ({904: 0, 905: 804}, {})
+
+
+def test_a_function_named_in_the_vm_snapshot_prints_by_its_name():
+    """The same through the code: a call to a function whose name is a base string
+    printed as its address, 1,291 call sites of the clean fixture, and prints the name
+    the vm snapshot gives it (#364). `lift addGlobalRoute` printed `sub_0x2cb2c4(...);`
+    where it prints `[]=(...);`, and no `sub_0x` is left in that body."""
+    _needs_capstone()
+    import collections
+    from jadart.disasm import build_pool_map, function_name_by_pc, load_instructions
+    body = _lift("addGlobalRoute")
+    assert "  []=(...);" in body.split("\n") and "sub_0x" not in body, body
+    image, fr, _ = load_instructions(CLEAN)
+    assert (fr.base_first_ref, fr.first_ref) == (100, 1082)
+    assert fr.strings[894] == "==" and fr.smi_values[904] == 0
+    assert (len(fr.strings), len(fr.own_strings())) == (9817, 9013)
+    names = collections.Counter(function_name_by_pc(image, fr).values())
+    assert sum(names.values()) == 6926, sum(names.values())            # 6,017 before
+    assert [names[n] for n in ("==", "[]=", "<anonymous closure>", "add")] == [
+        176, 68, 461, 40]
+    # A pool slot holding a base string is that string, where it was `pool_0x408`.
+    assert build_pool_map(fr)[0x408] == '"."'
+
+
+def test_a_vm_snapshot_that_does_not_hold_together_is_refused(tmp_path):
+    """A wrong table of base objects puts a neighbour's name on every function that
+    has one, so the vm snapshot is used whole or not at all (#364). It has to be the
+    one the isolate snapshot was written against, walk to the last byte its header
+    counts, and end on the roots the VM reads there: every string as a predefined
+    symbol or none of them, the symbol table or null, then every stub once. Anything
+    else is a BaseObjectsError out of
+    `read_base_objects`, or the typed error of the walk that met it, and the commands
+    read the file as they did before the vm snapshot was read: its base refs blank."""
+    import dataclasses
+    from types import SimpleNamespace
+    from jadart.baseobjects import BaseObjectsError, base_objects, read_base_objects
+    from jadart.clusters import AllocError, walk_alloc
+    from jadart.errors import JadartError, MissingSymbol
+    from jadart.fillwalk import walk_fill
+    from jadart.program import recover_program
+    from jadart.snapshot import parse_blob
+    from jadart.stream import ReadStream
+    from jadart.versions import known_epochs, known_hashes, resolve
+    with open(CLEAN, "rb") as f:
+        d = f.read()
+    hdr, blob = _vm_snapshot_of(d)
+    end = len(blob)
+    whole = _read_base(blob, hdr)
+
+    def refused(b, says, h=hdr):
+        with pytest.raises(BaseObjectsError) as err:
+            _read_base(b, h)
+        assert says in str(err.value), str(err.value)
+        there = SimpleNamespace(symbol_bytes=lambda _name: bytes(b))
+        assert base_objects(there, h) is None
+
+    # The isolate snapshot counts one base object more or fewer than the vm one holds.
+    for n in (hdr.num_base_objects - 1, hdr.num_base_objects + 1, 0, 1 << 40):
+        refused(blob, "holds 1081 objects",
+                dataclasses.replace(hdr, num_base_objects=n))
+    # The vm snapshot of another release.
+    b = bytearray(blob)
+    b[20:52] = next(h for h in known_hashes() if h != hdr.version_hash
+                    and not resolve(h, hdr.features).epoch.merged).encode()
+    refused(b, "The base objects of one are not the objects of the other.")
+    # The last stub named twice, and a string where the symbol table is. A stub's ref
+    # is two bytes here, and there are 173 of them behind the table's.
+    b = bytearray(blob)
+    b[end - 2:end] = b[end - 4:end - 2]
+    refused(b, "the roots are not predefined symbols")
+    twice = bytes(b)
+    b = bytearray(blob)
+    b[end - 2 * 173 - 2:end - 2 * 173] = bytes([0x07, 0x87])           # ref 903
+    refused(b, "the roots are not predefined symbols")
+
+    # The roots, set out again. What a real build has is read: null where the symbol
+    # table is (every arm32 build), no symbol at all (before 3.9), the stubs in any
+    # order (no build has them rising). The symbols in another order are read too,
+    # since their order is not looked up.
+    vm = parse_blob(blob, "vm")
+    st = ReadStream(blob, 52)
+    feats_end = len(st.read_cstring()) + 53
+    for _ in range(5):
+        st.read_unsigned()
+    walk_fill(st, walk_alloc(st, vm.num_base_objects, vm.num_objects, vm.num_clusters,
+                             epoch=vm.epoch, arch=vm.arch, vm=True), vm.epoch,
+              arch=vm.arch)
+    fill_end, roots = st.pos, []
+    while st.pos < end:
+        roots.append(st.read_ref_id())
+    sym, table, stubs = roots[:-174], roots[-174], roots[-173:]
+    assert (len(sym), len(set(sym)), table) == (806, 804, 1081)
+
+    def ref(v):                        # WriteRefId: 7 bits a byte from the top, last +128
+        out = [(v & 127) | 128]
+        while v > 127:
+            v >>= 7
+            out.insert(0, v & 127)
+        return bytes(out)
+
+    def ending(*rs):
+        b = bytearray(blob[:fill_end]) + b"".join(ref(r) for r in rs)
+        struct.pack_into("<q", b, 4, len(b) - 4)
+        return b
+    assert ending(*roots) == blob
+    for rs in ((*sym, 1, *stubs), (table, *stubs), (*sym, table, *stubs[::-1]),
+               (*sym[::-1], table, *stubs)):
+        got = _read_base(ending(*rs), hdr)
+        assert (got.strings, got.smi_values) == (whole.strings, whole.smi_values)
+    # What no build has is refused: five of the 806 symbols, one symbol 806 times, a
+    # stub short, a stub twice, a Smi or ref 0 where the table is.
+    for rs in ((*sym[:5], table, *stubs), (*[sym[0]] * 806, table, *stubs),
+               (*sym, table, *stubs[:-1]), (*sym, table, *stubs, stubs[0]),
+               (*sym, 904, *stubs), (*sym, 0, *stubs)):
+        refused(ending(*rs), "the roots are not predefined symbols")
+
+    # A vm snapshot of one cluster, instances with no field, and both headers counting
+    # them: about 215 bytes that had the walk loop once for each, 0.55 s for 16,000,000
+    # and no end for 2^40. The walk refuses the count before it loops (#451), so a
+    # crafted vm snapshot costs its length here as well.
+    def uv(v):                         # WriteUnsigned: 7 bits a byte, the last one +128
+        out = bytearray()
+        while v > 127:
+            out.append(v & 127)
+            v >>= 7
+        return bytes(out + bytes([v + 128]))
+    cid = (hdr.epoch.num_predefined_cids << 12) | 0xc0          # the tag, as an int32
+    for n in (16_000_000, 1 << 40):
+        base = vm.num_base_objects
+        b = bytearray(blob[:feats_end]) + uv(base) + uv(base + n) + uv(1) + uv(0) + uv(0)
+        b += uv(cid)[:-1] + bytes([uv(cid)[-1] + 64]) + uv(n) + b"\xc0\xc0\x80\x81"
+        struct.pack_into("<q", b, 4, len(b) - 4)
+        assert len(b) < 256
+        counts = dataclasses.replace(hdr, num_base_objects=base + n)
+        with pytest.raises(AllocError, match="bytes are left to describe"):
+            _read_base(b, counts)
+        there = SimpleNamespace(symbol_bytes=lambda _name, b=b: bytes(b))
+        assert base_objects(there, counts) is None
+
+    # A header that counts fewer bytes than the roots take, or more than there are.
+    for delta in (-1, -2, -2 * 174, 1, 2, 1 << 20):
+        b = bytearray(blob) + bytes(4)
+        struct.pack_into("<q", b, 4, end - 4 + delta)
+        with pytest.raises(JadartError):
+            _read_base(b, hdr)
+    # Cut anywhere, it is a typed error, never an IndexError out of a reader.
+    for cut in range(0, end, 97):
+        with pytest.raises(JadartError):
+            _read_base(blob[:cut], hdr)
+    # One byte changed anywhere. A changed character of a string is a snapshot that
+    # states another string, and is read; a changed count is not. Either way the refs
+    # are the ones the two headers agree on, or nothing is returned.
+    read = 0
+    for i in range(52, end, 13):
+        b = bytearray(blob)
+        b[i] ^= 0x55
+        try:
+            got = _read_base(b, hdr)
+        except JadartError:
+            continue
+        read += 1
+        assert (got.first_ref, got.stop_ref) == (100, 1082)
+        assert set(got.strings) == set(whole.strings), i
+    assert 0 < read < len(range(52, end, 13))
+
+    # No vm snapshot to read is no error: a library that names none, and Dart 3.13,
+    # whose one snapshot has seven fixed base objects and whose container is not asked.
+    def gone(name):
+        raise MissingSymbol(name)
+    assert read_base_objects(SimpleNamespace(symbol_bytes=gone), hdr) is None
+    merged = next(e for e in known_epochs() if e.merged)
+    assert read_base_objects(None, dataclasses.replace(hdr, epoch=merged)) is None
+
+    # Through a file: the refused vm snapshot costs the names it held and no more.
+    path = _with_vm_snapshot(tmp_path, d, twice)
+    p = recover_program(path)
+    assert len(p.user_classes()) == 1843 and "dart.core" in p.libraries()
+    assert len(p.strings) == 9013
+
+
+def test_a_refused_vm_snapshot_is_said_and_fails_g13(tmp_path):
+    """A file whose vm snapshot is refused is read without it, and nothing said so:
+    `classes` listed 1,843 classes where the file names 2,231, and `verify` printed
+    "Grammar consistent" with G13 passing on two counts that agree (#364). Every
+    command that read the snapshot says it once on stderr, a `-j` document carries it
+    in `notes`, and G13 fails with the reason. A file that is read says nothing."""
+    import json
+    with open(CLEAN, "rb") as f:
+        d = f.read()
+    _, blob = _vm_snapshot_of(d)
+    b = bytearray(blob)
+    b[-2:] = b[-4:-2]                                  # the last stub named twice
+    bad = _with_vm_snapshot(tmp_path, d, b)
+    said = "the vm snapshot is not read, so what only it names is left unnamed: vm: "
+
+    def notices(err):
+        return [ln for ln in err.split("\n") if "vm snapshot is not read" in ln]
+
+    rc, out, err = _fresh(["classes", bad])
+    assert rc == 0 and len(notices(err)) == 1, err
+    assert notices(err)[0].startswith("// " + said) and "roots" in notices(err)[0]
+    assert "vm snapshot" not in out
+    rc, out, err = _fresh(["info", bad])               # reads neither snapshot's objects
+    assert rc == 0 and not notices(err), err
+
+    rc, out, err = _fresh(["-j", "verify", bad])
+    doc = json.loads(out)
+    assert rc == 0 and doc["ok"] is True and len(notices(err)) == 1, (rc, err)
+    assert doc["failed"] == ["G13 base objects vs vm snapshot"]
+    assert len(doc["notes"]) == 1 and doc["notes"][0].startswith(said)
+    g13 = next(g for g in doc["gates"] if g["gate"].startswith("G13"))
+    assert g13["checks"] == 1 and not g13["passed"]
+    assert g13["detail"].startswith("isolate base_objects 1081 == vm objects 1081; "
+                                    "the vm snapshot is not read: vm: the roots")
+    rc, out, err = _fresh(["verify", bad])
+    assert rc == 0 and "Tier B" in out and len(notices(err)) == 1, (out, err)
+
+    # A server holds one read of the file, and says it with every answer.
+    served = _Served(bad)
+    try:
+        for _ in range(2):
+            rc, out, err = served.ask(["classes", bad, "-f", "Bench"])
+            assert rc == 0 and len(notices(err)) == 1, err
+    finally:
+        served.close()
+
+    for argv in (["classes", CLEAN], ["-j", "verify", CLEAN]):
+        rc, out, err = _fresh(argv)
+        assert rc == 0 and "vm snapshot" not in err, err
+    doc = json.loads(out)
+    assert doc["failed"] == [] and "notes" not in doc
+    g13 = next(g for g in doc["gates"] if g["gate"].startswith("G13"))
+    assert g13["passed"] and g13["detail"] == (
+        "isolate base_objects 1081 == vm objects 1081")
+
+
+def test_the_roots_of_a_vm_snapshot_cost_one_lookup_each():
+    """Reading the vm snapshot adds its roots to what a file can make a command do, and
+    a root is checked against the clusters: which one allocated the ref it names. Many
+    roots over many clusters must not cost their product (#364). The work is counted: a
+    vm snapshot with n more predefined symbols costs n more refs read and n more
+    lookups, each a bisection, and nothing else."""
+    from unittest import mock
+    from jadart import baseobjects
+    from jadart.clusters import walk_alloc
+    from jadart.fillwalk import walk_fill
+    from jadart.snapshot import parse_blob
+    from jadart.stream import ReadStream
+    with open(CLEAN, "rb") as f:
+        hdr, blob = _vm_snapshot_of(f.read())
+    vm = parse_blob(blob, "vm")
+    st = ReadStream(blob, 52)
+    st.read_cstring()
+    for _ in range(5):
+        st.read_unsigned()
+    walk_fill(st, walk_alloc(st, vm.num_base_objects, vm.num_objects, vm.num_clusters,
+                             epoch=vm.epoch, arch=vm.arch, vm=True), vm.epoch,
+              arch=vm.arch)
+    roots = st.pos
+    assert (roots, len(blob)) == (13551, 15483)
+    whole = _read_base(blob, hdr)
+
+    def work(n):
+        b = bytearray(blob[:roots]) + bytes([0x07, 0x87]) * n + blob[roots:]
+        struct.pack_into("<q", b, 4, len(b) - 4)
+        refs, looks = [], []
+        read_ref_id, bisect_right = ReadStream.read_ref_id, baseobjects.bisect_right
+
+        def counted_ref(self):
+            refs.append(1)
+            return read_ref_id(self)
+
+        def counted_bisect(a, x):
+            looks.append(1)
+            return bisect_right(a, x)
+
+        with mock.patch.object(ReadStream, "read_ref_id", counted_ref), \
+                mock.patch.object(baseobjects, "bisect_right", counted_bisect):
+            assert _read_base(b, hdr) == whole
+        return len(refs), len(looks)
+
+    none = work(0)
+    assert none[1] == 980, none         # 806 symbols, the table and 173 stubs
+    for n in (1000, 2000, 4000, 8000):
+        assert work(n) == (none[0] + n, none[1] + n), n
+
+    # And the lookup is right about clusters that hold nothing, which a crafted
+    # snapshot can have any number of.
+    spans = baseobjects._Spans()
+    for i in range(0, 4000, 4):
+        spans.add(i, i + 2)
+        spans.add(i + 2, i + 2)
+    assert (spans.refs, len(spans.starts)) == (2000, 1000)
+    assert all((r in spans) == (r % 4 < 2) for r in range(4000))
+    assert -1 not in spans and 4000 not in spans and 1 << 40 not in spans
+
+
+def test_a_descriptor_is_not_worked_out_where_the_vm_snapshot_was_read():
+    """An arguments descriptor names its numbers by ref, and without the vm snapshot a
+    base ref among them was worked out from the rest of the descriptor, and any other
+    base object in a pool slot was taken for one of the VM's cached descriptors. Both
+    are for a snapshot read alone. Where the vm snapshot was read its Smis and Arrays
+    are stated, so a number that is still no Smi is not one, and only an object older
+    than the vm snapshot can be a cached descriptor (#364)."""
+    from types import SimpleNamespace
+    from jadart.disasm import CACHED_DESC, build_pool_map
+
+    def descs(base_first_ref):
+        # 0x10: a base object the vm snapshot holds. 0x18: one it does not. 0x20: a
+        # descriptor whose type_args_len is the base ref 50. 0x28: one read in full.
+        fr = SimpleNamespace(
+            pool=[("ref", 50), ("ref", 30), ("ref", 120), ("ref", 60)],
+            arrays={120: (50, 61, 61, 61, 1), 60: (70, 61, 61, 61, 1)},
+            smi_values={61: 2, 70: 1}, strings={}, functions=[], names={},
+            first_ref=100, base_first_ref=base_first_ref)
+        return build_pool_map(fr).descs
+
+    whole = (1, 2, 2, (None, None))
+    assert descs(0) == {0x10: CACHED_DESC, 0x18: CACHED_DESC,
+                        0x20: (None, 2, 2, (None, None)), 0x28: whole}
+    assert descs(40) == {0x18: CACHED_DESC, 0x28: whole}
+
+
+def test_the_call_graph_reads_no_name_from_the_vm_snapshot():
+    """A guard, and it passes without the fix. The call graph finds a virtual site's
+    targets by the name most rows near its offset carry, and a pool slot's function by
+    the first function of that name. With the vm snapshot's names, which 1,073
+    functions share among a few strings, the 2,580 sites the clean fixture had when
+    this was measured came to 95,352 virtual edges where they had 15,536 (it has 3,331
+    sites and 22,509 edges since #404). The vote is not better for
+    more names, so the graph keeps reading the isolate snapshot's own until its edges
+    come from the table's rows (#364)."""
+    _needs_capstone()
+    from jadart.callgraph import build_index
+    from jadart.disasm import load_instructions
+    image, fr, _ = load_instructions(CLEAN)
+    idx = build_index(image, fr)
+    assert sum(len(s) for s in idx.sites.values()) == 3331
+    assert len(idx.sel_targets) == 331
+    assert sum(len(v) for v in idx.may_call.values()) == 22509
+    assert sum(len(v) for v in idx.callees.values()) == 24849
 
 
 if __name__ == "__main__":

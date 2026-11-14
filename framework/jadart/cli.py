@@ -68,7 +68,13 @@ def emit(obj, code: int = EXIT_OK) -> int:
 
     The exit code has to be passed in rather than assumed successful. `-j` used to report 0
     on every path that printed `"ok": false` (including a failed acceptance gate) so a
-    script branching on `$?` saw success where the same command without `-j` said 1."""
+    script branching on `$?` saw success where the same command without `-j` said 1.
+
+    A document that is an object carries the notice of a refused vm snapshot in its
+    `notes`, beside whatever the command put there (`_vm_note`)."""
+    note = _vm_note()
+    if note and isinstance(obj, dict):
+        obj = {**obj, "notes": [*obj.get("notes", ()), note]}
     _write_json(obj)
     return code
 
@@ -104,6 +110,21 @@ def _json_error(exc, code: int) -> int:
 
 
 _JSON = [False]          # set once from argv, so _fail can honour it without threading
+_SOURCE = [None]         # the Source the running command reads, set by _run
+
+
+def _vm_note() -> str:
+    """What a command says about a vm snapshot it could not read, or "".
+
+    The file is still read, as every file was before the vm snapshot was: a name only
+    the vm snapshot states (`==`, `add`, `<anonymous closure>`, a fifth of the classes
+    of the clean fixture) is left out, and nothing in a listing shows that. So it is
+    said once a command, on stderr as the other notices are, and in the `notes` of a
+    `-j` document."""
+    from .baseobjects import refusal
+    why = refusal(getattr(_SOURCE[0], "data", None))
+    return why and ("the vm snapshot is not read, so what only it names is left "
+                    f"unnamed: {why}")
 
 
 def _fail(exc) -> int:
@@ -1916,9 +1937,11 @@ def _run(args, src=None) -> int:
             args.container = src.origin
         args.libapp = src
 
+    _SOURCE[0] = src
     try:
         return args.func(args)
     except (BrokenPipeError, KeyboardInterrupt):
+        _SOURCE[0] = None             # nothing more is said to a reader that left
         raise                         # main's to handle, and a server's to stop on
     except Exception as e:
         from .disasm import UnsupportedArch, MissingDisassembler
@@ -1951,6 +1974,10 @@ def _run(args, src=None) -> int:
               "  Re-run with JADART_DEBUG=1 for the traceback, and please report it:\n"
               "  https://github.com/IR0NBYTE/Jadart/issues", file=sys.stderr)
         return EXIT_INTERNAL
+    finally:
+        note = _vm_note()
+        if note:
+            print(comment(f"// {note}"), file=sys.stderr)
 
 
 if __name__ == "__main__":

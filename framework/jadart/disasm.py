@@ -279,6 +279,7 @@ def load_instructions(path):
     from .snapshot import images, parse_blob
     from .clusters import walk_alloc
     from .fillwalk import walk_fill
+    from .baseobjects import base_objects
     from .source import read_binary
 
     src = read_binary(path)
@@ -302,7 +303,8 @@ def load_instructions(path):
         st.read_unsigned()
     clusters = walk_alloc(st, hdr.num_base_objects, hdr.num_objects, hdr.num_clusters,
                           epoch=hdr.epoch, is_root_unit=True, arch=hdr.arch)
-    fr = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch)
+    fr = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch,
+                   base=base_objects(elf, hdr, raw))
 
     pcs, first_code = parse_instructions_table(data, header_length,
                                                hdr.instr_table_rodata_offset, hdr.arch,
@@ -853,7 +855,9 @@ def build_pool_map(fr, arch=None) -> dict:
     m, done, quotes = PoolMap(), {}, {}
     m.descs = descs = {}
     smis, seen, at = None, {}, []
-    first = getattr(fr, "first_ref", 0)
+    # Where the vm snapshot was read, its own objects are stated and are not the VM's
+    # cached descriptors: only the refs below them are objects no file holds.
+    first = getattr(fr, "base_first_ref", 0) or getattr(fr, "first_ref", 0)
     for idx, (kind, val) in enumerate(fr.pool):
         if kind != "ref":
             continue
@@ -890,15 +894,16 @@ def build_pool_map(fr, arch=None) -> dict:
 class PoolMap(dict):
     """What `build_pool_map` returns: the labels, and beside them `descs`, pool byte
     offset -> the arguments descriptor in that slot as `_args_desc` reads it, or
-    CACHED_DESC for a slot naming a base object. A slot has a label or a descriptor,
-    never both, and most have neither."""
+    CACHED_DESC for a slot naming a base object no file states. A slot has a label or
+    a descriptor, never both, and most have neither."""
 
     descs: dict = {}
 
 
-#: What `PoolMap.descs` holds for a slot naming a base object: nothing of it is in the
-#: snapshot. One loaded as a call's arguments descriptor is one of the VM's cached ones
-#: (expr.Lifter._plan_desc), and what else a base object can be is not asked here.
+#: What `PoolMap.descs` holds for a slot naming a base object that is in no snapshot:
+#: any base object where the vm snapshot was not read, and where it was, one the VM
+#: made before it (baseobjects). One loaded as a call's arguments descriptor is one of
+#: the VM's cached ones (expr.Lifter._plan_desc), and what else it can be is not asked.
 CACHED_DESC = (None, None, None, ())
 
 
@@ -934,6 +939,11 @@ def _args_desc(fr, ref: int, smis, known=None):
     type_args_len that is the only base ref stays None, not known, unless `known`
     gives the value another descriptor left for the same ref.
 
+    That is for a snapshot read without its vm snapshot. Where the vm snapshot was read
+    (`fr.base_first_ref`) its Smis are in `fr.smi_values` with every other, a descriptor
+    it holds is in `fr.arrays`, and nothing is worked out: a number that is still not a
+    Smi is no Smi at all, and the Array is not read.
+
     `smis` is every Smi and Mint value the snapshot holds."""
     elems = (getattr(fr, "arrays", None) or {}).get(ref)
     if not elems or not 5 <= len(elems) <= 5 + 2 * _ARGS_MAX or not len(elems) % 2:
@@ -941,11 +951,12 @@ def _args_desc(fr, ref: int, smis, known=None):
     if elems[-1] != 1:
         return None
     vals, first = fr.smi_values, getattr(fr, "first_ref", 0)
+    stated = getattr(fr, "base_first_ref", 0)
     nums, base = [], None
     for e in elems[:4] + elems[5:-1:2]:
         v = vals.get(e)
         if v is None:
-            if not 1 < e < first or base not in (None, e):
+            if stated or not 1 < e < first or base not in (None, e):
                 return None
             base = e
         nums.append(v)

@@ -33,7 +33,7 @@ genuinely unresolvable is a closure call through a captured context.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 from .branches import indirect_call, row_kinds
@@ -74,6 +74,34 @@ class CallIndex:
     virtual_sites: int = 0                         # blr sites attributed to a selector
     opaque_sites: int = 0                          # register calls nothing attributed
     undecodable: list = field(default_factory=list)  # pcs of ranges that would not decode
+
+
+@kept
+def own_names(fr):
+    """`fr` as the call graph reads names out of it: with this snapshot's own strings
+    and without its base objects' (baseobjects.py).
+
+    The graph finds two kinds of edge by name, and neither holds up once the names
+    most functions share are known. A pool slot that names a function is an edge to
+    the first function of that name (build_index), and a virtual site's targets are
+    the functions of whichever name most rows in reach of its offset carry
+    (selector_targets). `==`, `[]`, `[]=`, `get:length` and `<anonymous closure>` are
+    base strings on every release that has a vm snapshot, 581 functions of the clean
+    fixture have the last one alone, and with them the vote names 7,873 targets on
+    that fixture where it named 2,883, for the same 2,580 sites. Measured against the
+    rows themselves (dispatch._placements), 267 of the 286 offsets it settled had no
+    target the table places there before those names were read, and 286 of 296 with
+    them: the vote is not made better or worse by more names, only larger. So the
+    graph keeps the names it had until its edges come from the table's rows, which is
+    its own change, and every other reader of `fr` gets the base names. The pool map
+    the graph reads is built over this as well: a range is decoded where it loads a
+    slot that names a function, and with the closures named that was 8,164 ranges of
+    one 3.11.5 app for 6,356, 0.37 s more in `functions`, for edges it then drops."""
+    if not getattr(fr, "base_first_ref", 0):
+        return fr
+    first = fr.first_ref
+    return replace(fr, strings={ref: s for ref, s in fr.strings.items() if ref >= first},
+                   _names=None)
 
 
 def selector_targets(image, fr, offsets, extra_names: dict = None,
@@ -120,7 +148,7 @@ def selector_targets(image, fr, offsets, extra_names: dict = None,
     if not found:
         return {}
     _pos, entries, _end = found
-    slot_name = _slot_names(fr, image)
+    slot_name = _slot_names(own_names(fr), image)
     cids = sorted({cid & 0xFFFFFFFF for _r, _n, cid, _s in fr.classes})
     npc, nrows = len(image.pcs), len(entries)
     rows = None
@@ -202,13 +230,14 @@ def build_index(image, fr=None, virtual: bool = True,
     # decoded must not come back as a graph of only its direct calls.
     arch_name = require_decoder(image) if ranges else None
     starts = {cr.pc_offset for cr in ranges}
-    pool = build_pool_map(fr, getattr(image, "arch", None)) if fr is not None else {}
+    own = own_names(fr) if fr is not None else None
+    pool = build_pool_map(own, getattr(image, "arch", None)) if fr is not None else {}
     # A pool entry that names a function: `&name` is build_pool_map's spelling.
     fn_by_pool = {off: lbl[1:] for off, lbl in pool.items() if lbl.startswith("&")}
     name_to_pc = {}
     if fr is not None:
         from .disasm import function_name_by_pc
-        for pc, nm in function_name_by_pc(image, fr).items():
+        for pc, nm in function_name_by_pc(image, own).items():
             name_to_pc.setdefault(nm, pc)
 
     want_virtual = virtual and fr is not None

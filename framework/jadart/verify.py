@@ -180,7 +180,7 @@ def getter_field_load(dis, recv0="x1", frame=("x15", "x29")):
     return None
 
 
-def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
+def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None, refused="") -> list:
     """Evaluate every gate we can from an already-completed walk."""
     import collections
     from . import cids as C
@@ -567,11 +567,16 @@ def run_gates(clusters, fr, hdr, image=None, dispatch=None, vm=None) -> list:
         gates.append(_g("G13 base objects vs vm snapshot", "B", False, 0,
                         skipped="no vm snapshot in this container"))
     else:
-        ok = (hdr.num_base_objects == vm.num_objects)
-        rel = "==" if ok else "!="
+        # `refused` is why the vm snapshot was not read where it was not (baseobjects.
+        # refusal): the counts can agree over a vm snapshot that does not walk, and
+        # then every name only it states is missing from every listing.
+        rel = "==" if hdr.num_base_objects == vm.num_objects else "!="
+        ok = rel == "==" and not refused
         gates.append(_g("G13 base objects vs vm snapshot", "B", ok, 1,
                         f"isolate base_objects {hdr.num_base_objects} {rel} "
-                        f"vm objects {vm.num_objects}"))
+                        f"vm objects {vm.num_objects}"
+                        + (f"; the vm snapshot is not read: {refused}" if refused
+                           else "")))
 
     # G2: no unknown bits set in cluster tags.
     stray = [cl.cid for cl in clusters if cl.cid < 0]
@@ -627,5 +632,7 @@ def verify_file(path) -> VerifyReport:
     rep = VerifyReport(path=src.label, which="isolate",
                        epoch=hdr.epoch.name if hdr.epoch else "?",
                        arch=str(hdr.arch) if hdr.arch else "?")
-    rep.gates = run_gates(clusters, fr, hdr, image=image, dispatch=dispatch, vm=vm)
+    from .baseobjects import refusal
+    rep.gates = run_gates(clusters, fr, hdr, image=image, dispatch=dispatch, vm=vm,
+                          refused=refusal(src.data))
     return rep

@@ -124,8 +124,9 @@ def strings(path: str) -> list:
     printing: Dart literals contain newlines and NULs, and raw output stops being
     line-oriented."""
     from .disasm import load_instructions
+    from .fillwalk import own_strings
     _image, fr, _hdr = load_instructions(_resolve(path))
-    return sorted(set(fr.strings.values()))
+    return sorted(set(own_strings(fr)))
 
 
 def selectors(path: str) -> dict:

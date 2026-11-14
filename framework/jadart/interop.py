@@ -517,10 +517,10 @@ def ghidra_name(sym: CodeSymbol) -> str:
     """Ghidra holds the Dart name as written, so it keeps the punctuation the reduced
     names lose; the address is still appended to make it unique.
 
-    Without it 548 of the clean fixture's 5940 named ranges share a name with another
-    (`toString` names 18), so the Symbol Tree cannot tell them apart and a crafted name
-    can be made identical to a real one. The exact name as written is in the plate
-    comment either way."""
+    Without it 904 of the clean fixture's 6925 named ranges share a name with another
+    (`MaterialDynamicColors.<anonymous closure>` names 67), so the Symbol Tree cannot
+    tell them apart and a crafted name can be made identical to a real one. The exact
+    name as written is in the plate comment either way."""
     return f"{_shown_name(sym)}_{sym.va:x}" if sym.name else \
         f"anon_{sym.va:x}"
 
