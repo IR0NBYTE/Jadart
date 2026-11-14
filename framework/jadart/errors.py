@@ -62,3 +62,24 @@ class MissingSymbol(ContainerError):
     scan when neither is present, and it must not confuse that with a symbol that IS
     present but points outside the file.
     """
+
+
+class NotReadYet(InputError, ContainerError):
+    """A kind of file jadart recognises from its first bytes and does not read yet.
+
+    Four are named, each from the bytes docs/whats-coming.md gives for it: a module
+    snapshot from the modular AOT compiler, an arm64e build, a Dart bytecode file and a
+    Windows PE file. Each was refused before as something else, an unknown Dart version,
+    a features string with no architecture or an unrecognised container, which sent a
+    reader looking for a release or a corruption that is not there.
+
+    `what` is the short name of the kind ("module snapshot", "arm64e", "bytecode",
+    "windows"). The class is an InputError, and a ContainerError too because two of the
+    four were refused as one before and an `except ContainerError` that skipped them
+    still does.
+    """
+
+    def __init__(self, what: str, said: str, plural: str):
+        self.what = what
+        super().__init__(f"this is {said}. Jadart does not read {plural} yet; see "
+                         f"docs/whats-coming.md")

@@ -14,14 +14,14 @@ header, version epoch (fail-loud), counts, and the first cluster's cid.
 """
 from __future__ import annotations
 
-from .errors import ContainerError, InputError, JadartError, MissingSymbol
+from .errors import ContainerError, InputError, JadartError, MissingSymbol, NotReadYet
 
 import struct
 from dataclasses import dataclass
 
 from . import versions
 from .keep import kept
-from .macho import open_container
+from .macho import open_container, raise_arm64e
 
 #: The symbols a library names its snapshot images with: two layouts, and the release
 #: decides which. Through Dart 3.12 a library holds two snapshots, the vm one and the
@@ -170,6 +170,24 @@ def images(container, label: str = "this file") -> Images:
         f"library.")
 
 
+#: The architecture words a module header can carry as its features string: the ones
+#: dart.cc names (versions._ARCH_WORDS) and arm64e.
+_MODULE_CPUS = frozenset((*versions._ARCH_WORDS, "arm64e"))
+
+
+def _is_module_header(blob: bytes) -> bool:
+    """Whether the header past magic, length and kind is a module snapshot's: the varint
+    0x81, format version 1, at offset 20, then a CPU name alone and a NUL
+    (runtime/vm/module_snapshot.cc:2162-2190 at the commit docs/whats-coming.md pins).
+
+    An AOT snapshot has its version hash there, 32 ASCII hex digits, so its byte 20 is
+    never 0x81. Kind 3 alone does not say module: it is kFullAOT through Dart 3.12."""
+    if blob[20:21] != b"\x81":
+        return False
+    end = blob.find(b"\x00", 21, 21 + 16)
+    return end > 21 and blob[21:end].decode("ascii", "replace") in _MODULE_CPUS
+
+
 def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeader:
     if len(blob) < _MIN_HEADER:
         raise InputError(
@@ -184,6 +202,11 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
             f"This is not a Dart AOT snapshot.")
     length, = struct.unpack_from("<q", blob, 4)
     kind, = struct.unpack_from("<q", blob, 12)
+    if kind == _AOT and _is_module_header(blob):
+        # Before anything reads offset 20 as a version hash: a lenient parse would
+        # otherwise take the module's format version and CPU name as a hash and carry on.
+        raise NotReadYet("module snapshot", "a Dart module snapshot, written by the "
+                         "experimental modular AOT compiler", "module snapshots")
     # Both come straight off disk and are trusted downstream: `length` locates the RO data
     # image on uncompressed targets, so a corrupt one silently mislocates every string.
     if not 0 < length <= len(blob):
@@ -204,6 +227,8 @@ def parse_blob(blob: bytes, which: str, *, strict: bool = True) -> SnapshotHeade
 
     st = ReadStream(blob, 52)
     features = st.read_cstring()
+    if "arm64e" in features.split():
+        raise_arm64e("features token arm64e")
     num_base_objects = st.read_unsigned()
     num_objects = st.read_unsigned()
     num_clusters = st.read_unsigned()
