@@ -156,12 +156,14 @@ def decompile(path: str, symbol: str) -> list:
     `_onPressed@19445826`, whose suffix nobody can guess), or an address (`0xfea30`),
     AOT emits closures anonymously and they are regularly the interesting function.
 
-    Returns [{"name", "pc_offset", "size", "params", "body": [str, ...]}, ...].
+    Returns [{"name", "pc_offset", "size", "params", "body": [str, ...], "calls",
+    "strings"}, ...], `calls` and `strings` as `lift -j` gives them (disasm.body_reads).
     `params` is the list a signature prints for the function, the names its body reads
     its register arguments by (program.EntryNames.params): `"a1, a2"`, `""` where it
     reads none, `"..."` where the list is not read."""
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
-                         function_name_by_pc, build_pool_map, monomorphic_entry)
+                         function_name_by_pc, build_pool_map, monomorphic_entry,
+                         body_reads)
     from .branches import row_kinds
     from .disasm import rebaser, cut_end
     from .expr import lift_function, make_arity_resolver, make_return_resolver
@@ -186,6 +188,7 @@ def decompile(path: str, symbol: str) -> list:
     allocs = recover_allocations(image, fr, layout)
     casts = recover_casts(image, fr, layout)
     out = []
+    starts = None
     for nm, cr in ranges:
         dis = disassemble_range(image, cr)
         if not dis:
@@ -208,9 +211,12 @@ def decompile(path: str, symbol: str) -> list:
                              allocs=allocs, casts=casts,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
                              returns=returns, mono=monomorphic_entry(image, cr))
+        if starts is None:
+            starts = frozenset(c.pc_offset for c in image.all_ranges)
         out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
                     "params": entry.params(cr),
-                    "body": [ln.strip() for ln in body]})
+                    "body": [ln.strip() for ln in body],
+                    **body_reads(body, image, starts)})
     return out
 
 

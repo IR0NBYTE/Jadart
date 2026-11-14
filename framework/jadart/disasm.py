@@ -574,6 +574,31 @@ def va_of(image: InstrImage, pc_offset: int):
     return None if image.anchor_va is None else image.anchor_va + pc_offset
 
 
+def body_reads(body, image: InstrImage, starts) -> dict:
+    """`calls` and `strings` for one function's record in `lift -j` (#444), from what
+    `expr.lift_function` kept beside the lines it printed (`expr.Body`). A callee gets
+    its `va`, the address every command takes back, where the call goes to the start of
+    a range of this binary (`starts`), and its `pc_offset` only where the binary gives
+    no virtual address; `count` only where the body calls it more than once. An agent
+    pays for each byte, and these are in every record. A String gets its pool offset as
+    `xrefs pool` takes it back. A body without them, a caller's own list, has none."""
+    calls = []
+    for name, kind, tgt, n in getattr(body, "calls", ()):
+        c = {"name": name, "kind": kind}
+        if n > 1:
+            c["count"] = n
+        if tgt is not None and tgt in starts:
+            va = va_of(image, tgt)
+            if va is not None:
+                c["va"] = va
+            else:
+                c["pc_offset"] = tgt
+        calls.append(c)
+    return {"calls": calls,
+            "strings": [{"text": t, "pool": f"0x{o:x}"}
+                        for o, t in getattr(body, "strings", ())]}
+
+
 def addr_label(image: InstrImage, pc_offset: int) -> str:
     """The address to print for a code range.
 
@@ -854,6 +879,7 @@ def build_pool_map(fr, arch=None) -> dict:
     fname = {ref: fr.names.get(nr, "") for ref, nr, ow, kt in fr.functions}
     m, done, quotes = PoolMap(), {}, {}
     m.descs = descs = {}
+    m.strs = strs = set()
     smis, seen, at = None, {}, []
     # Where the vm snapshot was read, its own objects are stated and are not the VM's
     # cached descriptors: only the refs below them are objects no file holds.
@@ -870,6 +896,8 @@ def build_pool_map(fr, arch=None) -> dict:
         if done[val] is not None:
             off = pool_byte_offset(idx, arch)
             m[off] = _at(done[val], off)
+            if val in fr.strings:
+                strs.add(off)
         elif seen[val] is not None:
             at.append((pool_byte_offset(idx, arch), val))
         elif 1 < val < first:
@@ -895,9 +923,11 @@ class PoolMap(dict):
     """What `build_pool_map` returns: the labels, and beside them `descs`, pool byte
     offset -> the arguments descriptor in that slot as `_args_desc` reads it, or
     CACHED_DESC for a slot naming a base object no file states. A slot has a label or
-    a descriptor, never both, and most have neither."""
+    a descriptor, never both, and most have neither. `strs` holds the offsets whose
+    label is a String's, the slots `lift -j` lists under `strings`."""
 
     descs: dict = {}
+    strs: set = frozenset()
 
 
 #: What `PoolMap.descs` holds for a slot naming a base object that is in no snapshot:
@@ -1263,6 +1293,14 @@ def _mem_base_disp(op: str):
     return m.group(1), (_parse_imm(m.group(2)) or 0)
 
 
+class Annotated(list):
+    """What `annotate` returns: the rows, and `pool_at` beside them."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.pool_at = {}
+
+
 def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> list:
     """Annotate direct BL/B call targets with the callee name, and PP-relative pool
     loads with the referenced string/function. Handles both direct loads
@@ -1274,8 +1312,13 @@ def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> l
     stack-overflow stub and `bleq` to the null-error stubs, 9,554 of them over every range
     of arm32-2.19.6 that the mnemonic test it replaced (`bl` and `b` only) passed over.
     That test stayed as a fallback for a caller that left `kinds` out, and tier 2 did, so
-    `export -t 2` named none of them (#42)."""
-    ann = []
+    `export -t 2` named none of them (#42).
+
+    The list carries `pool_at`, row address -> the pool offset of the String its note
+    names, which is where `lift -j` takes a string's offset from: the note says the text
+    and not the slot, and several slots can name one object."""
+    ann = Annotated()
+    strs = getattr(pool_map, "strs", None) or ()
     far_base = {}   # reg -> pp-relative byte offset established by `add reg, x27, #hi`
     for i, (addr, mn, op) in enumerate(dis):
         note = ""
@@ -1295,6 +1338,8 @@ def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> l
                     off = far_base[md[0]] + md[1]
             if off is not None and off in pool_map:
                 note = f"  ; = {pool_map[off]}"
+                if off in strs:
+                    ann.pool_at[addr] = off
 
         # maintain far-load base registers: `add xD, x27, #hi` establishes xD; any
         # later instruction that overwrites a tracked reg invalidates it (the far load

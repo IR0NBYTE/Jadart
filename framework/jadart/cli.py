@@ -332,7 +332,7 @@ def cmd_lift(args) -> int:
     from .disasm import (load_instructions, named_ranges, disassemble_range, annotate,
                          build_pool_map, addr_label, va_of, monomorphic_entry)
     from .branches import row_kinds
-    from .disasm import rebaser, cut_end
+    from .disasm import rebaser, cut_end, body_reads
     from .signatures import names_with_signatures
     from .expr import lift_function, make_arity_resolver, make_return_resolver
     from .dispatch import recover_selectors
@@ -363,6 +363,7 @@ def cmd_lift(args) -> int:
     selectors = recover_selectors(image, fr, hdr)
     layout, allocs, casts = lift_tables(image, fr, True)
     out = []
+    starts = None
     for nm, cr in ranges:
         dis = disassemble_range(image, cr)
         if not dis:
@@ -379,10 +380,13 @@ def cmd_lift(args) -> int:
         # The names the body reads its arguments by, so no `a1` in it goes undeclared.
         params = entry.params(cr)
         if getattr(args, "json", False):
+            if starts is None:
+                starts = frozenset(c.pc_offset for c in image.all_ranges)
             out.append({"name": nm, "pc_offset": cr.pc_offset,
                         "va": va_of(image, cr.pc_offset), "size": cr.size,
                         "instructions": len(dis), "params": params,
-                        "body": [ln.strip() for ln in body]})
+                        "body": [ln.strip() for ln in body],
+                        **body_reads(body, image, starts)})
             continue
         print(comment(f"// {nm}({params})  {addr_label(image, cr.pc_offset)}  "
                       f"({cr.size} bytes)"))

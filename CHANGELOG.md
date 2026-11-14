@@ -13,6 +13,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Added
 
+- **`lift -j` lists what each body calls and which Strings it prints (#444).** An agent
+  had to grep `body` for both, and could not tell a call through a selector from one to
+  an address. Each function now has `calls`, one entry per callee in order of first use
+  with its `kind` (direct, alloc, stub, tail, virtual, indirect), its `va` where the
+  callee is a range in the binary and a `count` where the body calls it more than once,
+  and `strings`, one entry per pool slot with the text as printed and the offset `xrefs
+  pool` takes. Both are recorded by the lifter while it prints, so a call printed
+  `(...)` counts and a body printed flat has them too; `jadart.decompile()` carries them
+  as well. Checked against the text of 30 functions per fixture: clean 107 calls and 22
+  strings, obf 119 and 9, every one accounted for. Text output is unchanged byte for
+  byte. Lifting all 8194 ranges of the clean fixture, best of 5, is 21.39 s before and
+  21.64 s after; `lift -j` of `benchFetchToken` grows from 403 to 797 bytes.
+
 - **`jadart serve` keeps one binary loaded, and `--server` asks it (#352).** Every
   command is a process of its own, and it spent nearly all of its time on work that does
   not depend on the question: `lift` of a 200 byte function out of FluffyChat's 26 MB

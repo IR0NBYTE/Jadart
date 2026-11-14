@@ -206,6 +206,19 @@ and the name is not in it. With `-j` the error is JSON too, so you never have to
 stderr. Read through a pipe, as
 you do, `-j` is one compact line with no indentation; only a terminal gets it indented.
 
+`lift -j` gives each function `calls` and `strings` beside `body`, so do not grep the body
+for them. `calls` is one entry per callee in order of first use: `name` as printed, `kind`
+(`direct`, `alloc`, `stub`, `tail`, `virtual`, `indirect`), `va` where the callee is a
+range in this binary, and `count` where it is called more than once. `strings` is one
+entry per pool slot: `text` as printed and `pool`, which `xrefs <path> pool` takes. Part
+of what `benchFetchToken` gives:
+
+```
+"calls":[{"name":"Future.delayed","kind":"direct","va":1840620},
+{"name":"List","kind":"alloc","va":2970980}],
+"strings":[{"text":"\"FLUBENCH{async_marker}:\"","pool":"0x96f8"}]
+```
+
 ---
 
 ## Workflows
