@@ -27836,6 +27836,197 @@ def test_a_const_instance_slot_spells_only_its_own_class_siblings():
     assert sorted(set(asked)) == [100, 101], asked
 
 
+# --- a closure names its function and its context (#442) -------------------------------
+
+_CLOSURE_STUB = "  ; -> _iso_stub_AllocateClosureStub"
+#: Pool slots that hold a Function, as fields.closure_functions hands them to the lifter:
+#: a named one, an anonymous one behind a far load, one with no code, one with no name.
+_CLOSURE_SLOTS = {0x20: ("_onTap@77", 0x400), 0x9758: ("<anonymous closure>", 0x500),
+                  0x30: ("<anonymous closure>", None), 0x38: ("", 0x600)}
+
+
+def _closure_slots():
+    """An AllocLayout that knows those slots and nothing else."""
+    from jadart.fields import AllocLayout
+    allocs = AllocLayout()
+    allocs.closures = dict(_CLOSURE_SLOTS)
+    return allocs
+
+
+def _closure_lift(rows, pool=None, stub=_CLOSURE_STUB):
+    """Tier 3 of `rows` and then a `bl` to a closure allocation stub and a `ret`."""
+    from jadart.expr import lift_function
+    rows = [(*r, "")[:3] for r in rows] + [("bl", "#0x200", stub), ("ret", "", "")]
+    ann = [(i * 4, mn, op, note) for i, (mn, op, note) in enumerate(rows)]
+    return [ln.strip() for ln in lift_function(ann, pool, allocs=_closure_slots())]
+
+
+def test_a_closure_prints_the_function_its_pool_slot_holds_and_its_context():
+    # `return new Closure();` named neither the code the closure runs nor what it
+    # captured (#442). The stub takes the Function in x1, loaded from the pool, and the
+    # context in x2. By name where the Function has one of its own.
+    null = ("mov", "x2, x22")
+    assert _closure_lift([null, ("ldr", "x1, [x27, #0x20]")]) == [
+        "return new Closure(_onTap@77, NULL);"]
+    # An anonymous closure is named by where its code is, and so is one with no name.
+    # The far load is the form past 0x7ff8, which is where a closure's slot usually is.
+    far = [("add", "x1, x27, #9, lsl #12"), ("ldr", "x1, [x1, #0x758]")]
+    assert _closure_lift([null] + far) == ["return new Closure(sub_0x500, NULL);"]
+    assert _closure_lift([null, ("ldr", "x1, [x27, #0x38]")]) == [
+        "return new Closure(sub_0x600, NULL);"]
+    # The label a pool map gives the slot is what the walk holds, and is the same slot.
+    assert _closure_lift([null] + far, pool={0x9758: "&<anonymous closure>"}) == [
+        "return new Closure(sub_0x500, NULL);"]
+    # The context the body built, which is what a closure that captures has, and one
+    # read out of an object.
+    assert _closure_lift([("bl", "#0x100", "  ; -> _iso_stub_AllocateContextStub"),
+                          ("mov", "x2, x0"), ("ldr", "x1, [x27, #0x20]")]) == [
+        "var t0 = new Context();", "return new Closure(_onTap@77, t0);"]
+    assert _closure_lift([("ldur", "w2, [x5, #0xf]"), ("ldr", "x1, [x27, #0x20]")]) == [
+        "return new Closure(_onTap@77, x5.field_0x10);"]
+    # Each half on its own. A context that prints as a register is not printed: nothing
+    # in the body set it, or it came off a slot the walk does not follow, and a register
+    # names nothing. Neither is a function with no name and no code.
+    for ctx in ([], [("mov", "x2, x5")], [("ldr", "x2, [x29, #0x10]")],
+                [("ldur", "x2, [x29, #-8]")]):
+        assert _closure_lift(ctx + [("ldr", "x1, [x27, #0x20]")]) == [
+            "return new Closure(_onTap@77, ...);"], ctx
+    assert _closure_lift([null, ("ldr", "x1, [x27, #0x30]")]) == [
+        "return new Closure(..., NULL);"]
+    assert _closure_lift([]) == ["return new Closure(...);"]
+
+
+def test_a_closure_function_is_printed_only_where_the_block_loads_it():
+    # The function is proven by one row: the last write of x1 in the call's own block,
+    # a whole load of a pool slot that holds a Function. Anything else is `...`.
+    def fn(rows, **kw):
+        out = _closure_lift(rows, **kw)
+        assert len(out) >= 1 and "new Closure(" in out[-1], out
+        return out[-1].split("new Closure(", 1)[1].rstrip(");").split(", ")[0]
+    load = ("ldr", "x1, [x27, #0x20]")
+    assert fn([load]) == "_onTap@77"
+    for rows in (
+            [load, ("mov", "x1, x3")],                      # written since
+            [load, ("add", "x1, x1, #8")],
+            [("ldr", "w1, [x27, #0x20]")],                  # half of the slot
+            [("ldr", "x1, [x27], #0x20")],                  # the base moves
+            [("ldr", "x1, [x27, x3]")],                     # no slot named
+            [("ldr", "x1, [x27, #0x28]")],                  # a slot with no Function
+            [("ldr", "x1, [x3, #0x20]")],                   # not the pool
+            [("add", "x1, x3, #9, lsl #12"), ("ldr", "x1, [x1, #0x758]")],
+            [("add", "x1, x27, #9, lsl #12"), ("mov", "x1, x3"),
+             ("ldr", "x1, [x1, #0x758]")],
+            [("ldr", "x2, [x27, #0x20]")],                  # another register
+            [load, ("bl", "#0x300")],                       # a call destroys x1
+    ):
+        assert fn(rows) == "...", rows
+    # A load in another block proves nothing here, on one way in or on both of them.
+    from jadart.expr import lift_function
+    rows = [("ldr", "x1, [x27, #0x20]", ""), ("cbz", "x3, #0xc", ""),
+            ("ldr", "x1, [x27, #0x20]", ""), ("bl", "#0x200", _CLOSURE_STUB),
+            ("ret", "", "")]
+    out = "\n".join(lift_function([(i * 4, *r) for i, r in enumerate(rows)],
+                                  allocs=_closure_slots()))
+    assert "new Closure(...)" in out and "_onTap" not in out, out
+
+
+def test_a_closure_context_is_read_from_the_register_its_stub_takes_it_in():
+    # Through 3.12 the context is in x2 for all four stubs. 3.13 passes the closure's
+    # length and flags there and the context in x3, and has a stub for each size
+    # (AllocateClosureABI, constants_arm64.h). The stub's name says which.
+    rows = [("mov", "x2, x22"), ("ldur", "w3, [x5, #0xf]"), ("ldr", "x1, [x27, #0x20]")]
+    for name in ("AllocateClosure", "AllocateClosureGeneric", "AllocateClosureTA",
+                 "AllocateClosureTAGeneric"):
+        assert _closure_lift(rows, stub=f"  ; -> _iso_stub_{name}Stub") == [
+            "return new Closure(_onTap@77, NULL);"], name
+    for n in range(1, 5):
+        assert _closure_lift(rows, stub=f"  ; -> _iso_stub_AllocateClosure{n}Stub") == [
+            "return new Closure(_onTap@77, x5.field_0x10);"], n
+    # A symbol table spells the stub with a prefix, and it is the same stub.
+    assert _closure_lift(rows, stub="  ; -> stub _iso_stub_AllocateClosureStub") == [
+        "return new Closure(_onTap@77, NULL);"]
+    # A register a call left unknown is not the context.
+    assert _closure_lift([("bl", "#0x300"), ("mov", "x2, x1"),
+                          ("ldr", "x1, [x27, #0x20]")])[-1] == (
+        "return new Closure(_onTap@77, ...);")
+
+
+def test_closure_functions_reads_each_function_slot_and_bounds_its_code_index():
+    # pool offset -> (name, pc): the Function a slot holds and the instructions-table
+    # entry its own code_index names, slot code_index - 1, none for 0 (no code) and
+    # none for an index the table does not have, which is the file's to claim.
+    from types import SimpleNamespace
+    from jadart.fields import closure_functions
+    fr = SimpleNamespace(
+        functions=[(50, 7, 0, 0), (51, 8, 0, 0), (52, 9, 0, 0), (53, 7, 0, 0)],
+        names={7: "<anonymous closure>", 8: "tap\\n(x)"},
+        pool=[("ref", 50), ("imm", 51), ("ref", 51), ("ref", 99), ("ref", 52),
+              ("ref", 53)],
+        func_code_index={50: 2, 51: 1, 52: 0, 53: 4})
+    image = SimpleNamespace(pcs=[0x10, 0x40, 0x80], arch=None)
+    from jadart.disasm import pool_byte_offset as at
+    assert closure_functions(image, fr) == {
+        at(0): ("<anonymous closure>", 0x40), at(2): ("tap\\n(x)", 0x10),
+        at(4): ("", None), at(5): ("<anonymous closure>", None)}
+
+
+def test_a_block_of_closures_scans_each_row_once():
+    # The scan for the row that loaded x1 stops at a call, and each allocation is one,
+    # so a block of n of them reads its rows once and not n times. Counted, not timed.
+    from jadart import expr
+
+    def work(n):
+        rows = []
+        for _ in range(n):
+            rows += [("mov", "x4, x5"), ("ldr", "x1, [x27, #0x20]")]
+        calls = [0]
+        real = expr.Lifter._last_def
+
+        def counted(self, reg, before):
+            got = real(self, reg, before)
+            calls[0] += before - (got if got is not None else -1)
+            return got
+        expr.Lifter._last_def = counted
+        try:
+            from jadart.expr import lift_function
+            ann = []
+            for mn, op in rows:
+                ann.append((len(ann) * 4, mn, op, ""))
+                if mn == "ldr":
+                    ann.append((len(ann) * 4, "bl", "#0x200", _CLOSURE_STUB))
+            ann.append((len(ann) * 4, "ret", "", ""))
+            out = lift_function(ann, allocs=_closure_slots())
+        finally:
+            expr.Lifter._last_def = real
+        assert sum("new Closure(_onTap@77" in ln for ln in out) == n, out[:4]
+        return calls[0]
+    a, b = work(200), work(400)
+    assert a <= 4 * 200 and b <= 2 * a + 8, (a, b)
+
+
+def test_the_clean_fixture_closures_name_their_function_and_context():
+    # benchMakeAdder returns `(int x) => base + x`: an anonymous closure, the range
+    # right after it, over the context that holds `base`. `_run` hands setState one.
+    _needs_capstone()
+    import io
+    import contextlib
+    from jadart import cli
+
+    def run(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            assert cli.main([*argv]) == 0, argv
+        return out.getvalue()
+    body = run("lift", CLEAN, "benchMakeAdder")
+    m = re.search(r"return new Closure\((sub_0x[0-9a-f]+), (t\d+)\);", body)
+    assert m, body
+    assert f"var {m.group(2)} = new Context();" in body, body
+    inner = run("lift", CLEAN, m.group(1))
+    assert inner.startswith("// <anonymous closure>("), m.group(1)
+    assert re.search(r"setState\(this, new Closure\(sub_0x[0-9a-f]+, t\d+\)\);",
+                     run("lift", CLEAN, "_run")), run("lift", CLEAN, "_run")
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
