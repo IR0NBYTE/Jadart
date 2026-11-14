@@ -232,6 +232,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A frame or stack slot is spelled at the offset the instruction reads (#407).** `ldr
+  x0, [x29, #0x10]` printed `FP.field_0x11` and `ldur x0, [x29, #-24]` printed `(FP -
+  24).field_0x1`: the frame took the tag bias of a heap object, which it is not, so the
+  offset named a byte the code never reads. A slot of the thread was already spelled at
+  its offset, and the frame and the stack are spelled the same way now, also through a
+  copy of FP or SP and a sum off one, `add x0, x29, #8; ldur x3, [x0, #-8]` reading
+  `FP.field_0x0`. A read off the frame is kept apart from the heap reads a store through
+  another base may cover, so a heap store no longer names a frame slot. 2,217 ranges
+  and 9,165 lines change on the clean fixture and 2,215 and 9,167 on obf, each line
+  replaced by one; the 8,770 lines at a biased word offset on clean are 0. `var t0 =
+  FP.field_0x11;` is `var t0 = FP.field_0x10;`, `var t2 = (FP - 24).field_0x1;` is
+  `var t2 = (FP - 24).field_0x0;` and `var t0 = SP.field_0x1;` is `var t0 =
+  SP.field_0x0;`.
+  tools/pbfuzz.py reads the new spelling.
+
 - **What a loop leaves in a register has a name the code after it reads (#468).** `1: and
   x2, x4, #1; sub x7, x7, #1; cbnz x7, 1b; cbnz x2, 2f; mov x4, #5; 2: mov x0, x4`
   printed `return x4;` under no branch at all and returned the wrong value from 16 of 40
