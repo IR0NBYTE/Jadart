@@ -94,6 +94,16 @@ _NONE = frozenset({"MintCid", "SentinelCid", "InstructionsTableCid"})
 _TD_ELEMENT_SIZES = [1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 16, 16, 16]  # by typed-data type index
 
 
+def own_strings(fr) -> list:
+    """`FillResult.own_strings` of anything that holds `strings`. The export is handed
+    a bare namespace by its arm32 callers, which states no base objects and so owns
+    every string it holds."""
+    if not getattr(fr, "base_first_ref", 0):
+        return list(fr.strings.values())
+    first = fr.first_ref
+    return [s for ref, s in fr.strings.items() if ref >= first]
+
+
 @dataclass
 class FillResult:
     strings: dict          # ref_id -> str (from all String clusters)
@@ -111,6 +121,12 @@ class FillResult:
     #: object, one the VM snapshot holds and this one only names (Serializer::
     #: AddBaseObject), so nothing here says what it is. 0 where that is not known.
     first_ref: int = 0
+    #: The first ref the vm snapshot's own clusters allocate, where the vm snapshot was
+    #: read (baseobjects.py) and `strings`, `smi_values` and `arrays` hold what it
+    #: states for the refs from here to `first_ref`. A ref below this one is an object
+    #: the VM makes before it loads any snapshot, which no file states. 0 where nothing
+    #: was read.
+    base_first_ref: int = 0
     # Redundantly-encoded values kept for the acceptance gates (verify.py). Each is read by
     # the fill pass anyway and is cross-checkable against a value the ALLOC pass read, which
     # ties the two passes together without needing an external oracle.
@@ -190,6 +206,12 @@ class FillResult:
             self._names = _Names(self.strings)
         return self._names
 
+    def own_strings(self) -> list:
+        """The strings this snapshot's own clusters hold, each ref's once: `strings`
+        less the base objects'. What `strings` and the export list, so the list of a
+        program's strings is the same list whether the vm snapshot was read or not."""
+        return own_strings(self)
+
 
 class _Names(Mapping):
     """A read-only view of a strings dict, with each value escaped once, on first use.
@@ -226,14 +248,19 @@ def _td_element_size(cid: int, epoch) -> int:
 
 
 def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
-              oracle: dict | None = None, arch=None) -> FillResult:
+              oracle: dict | None = None, arch=None, base=None) -> FillResult:
     """Consume the whole fill pass. `st` positioned at the fill-section start (right
     after the alloc walk). Returns recovered strings + Function/Class name links.
     If `oracle` {cluster_index: end_offset} is given, asserts each cluster's end
-    position matches (byte-exact validation)."""
-    strings: dict = {}
+    position matches (byte-exact validation).
+
+    `base` is what the vm snapshot states for this snapshot's base objects
+    (baseobjects.BaseObjects), or None. Its strings, Smis and Arrays are in the result
+    under their refs before a cluster of this snapshot is read, so a name, a library
+    url or a descriptor's number that is a base object resolves like any other."""
+    strings: dict = dict(base.strings) if base is not None else {}
     string_lengths: dict = {}
-    arrays: dict = {}
+    arrays: dict = dict(base.arrays) if base is not None else {}
     functions: list = []
     fields: list = []
     classes: list = []
@@ -384,6 +411,10 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                     f"ended 0x{st.pos:x}, oracle 0x{exp:x} (delta {st.pos - exp})")
 
     code_first = next((cl.start_ref for cl in clusters if cl.name == "CodeCid"), -1)
+    smi_values = dict(base.smi_values) if base is not None else {}
+    for cl in clusters:
+        if cl.mint_values:
+            smi_values.update(zip(range(cl.start_ref, cl.stop_ref), cl.mint_values))
     return FillResult(strings=strings, functions=functions, fields=fields,
                       classes=classes, types=types, codes=codes, pool=pool, end_pos=st.pos,
                       code_first_ref=code_first, func_code_index=func_code_index,
@@ -401,9 +432,8 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       func_data=meta["fdata"],
                       func_signature=meta["fsig"], ftype_params=meta["ftparams"],
                       arrays=arrays,
-                      smi_values={cl.start_ref + i: v
-                                  for cl in clusters if cl.mint_values
-                                  for i, v in enumerate(cl.mint_values)})
+                      base_first_ref=base.first_ref if base is not None else 0,
+                      smi_values=smi_values)
 
 
 class FillError(JadartError):

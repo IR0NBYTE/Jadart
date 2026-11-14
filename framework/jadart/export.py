@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from .errors import InputError, JadartError
 from .fill import visible
+from .fillwalk import own_strings
 
 import contextlib
 import os
@@ -440,7 +441,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
         # Escaped, so one recovered string is one line. Literals contain newlines and NULs,
         # and writing them raw makes the dump binary as far as grep is concerned.
         # The literals as read, not the names view `S` is: printable() escapes them.
-        for s in sorted(set(fr.strings.values())):
+        for s in sorted(set(own_strings(fr))):
             fh.write(printable(s) + "\n")
     with _writing(outdir, os.path.join(outdir, "pool.txt")) as fh:
         for off, entry in sorted(pool_map.items()):
@@ -466,7 +467,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     stats["classes_anonymous"] = anonymous
     stats["classes_total"] = len(prog.classes)
     stats["orphans"] = len(orphans)
-    stats["strings"] = len(set(fr.strings.values()))
+    stats["strings"] = len(set(own_strings(fr)))
     stats["selectors"] = len(selectors or {})
 
     from .container import unpack
