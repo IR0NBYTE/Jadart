@@ -161,6 +161,10 @@ class FillResult:
     #: PatchClass owner against something that is not the PatchClass (#240).
     func_signature: dict = field(default_factory=dict)
     ftype_params: dict = field(default_factory=dict)
+    #: FunctionType ref -> (packed_parameter_counts, packed_type_parameter_counts), the
+    #: two counts its fill writes after its refs and that were read only to stay in step
+    #: (#420). Decoded by program.stack_params.
+    ftype_counts: dict = field(default_factory=dict)
     smi_values: dict = field(default_factory=dict)        # Mint/Smi ref -> the int it holds
     #: For each Double ref, the 64 bits it holds as an unsigned int. The fill read them
     #: to stay in step and kept none, so a pool slot naming a Double had no value (#443).
@@ -293,7 +297,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
     class_library: dict = {}
     libraries: list = []
     meta = {"field": {}, "patch": {}, "fdata": {}, "fsig": {}, "ftparams": {},
-            "epoch": epoch}
+            "fcount": {}, "epoch": epoch}
     code_stub_refs: list = []
     sized_lengths: dict = {}
     instr_index = [0]      # running instructions-table index across Code clusters
@@ -449,6 +453,7 @@ def walk_fill(st: ReadStream, clusters: list[Cluster], epoch, *,
                       code_payload_info=code_payload_info,
                       func_data=meta["fdata"],
                       func_signature=meta["fsig"], ftype_params=meta["ftparams"],
+                      ftype_counts=meta["fcount"],
                       arrays=arrays, doubles=doubles, instances=instances,
                       spans=[(cl.start_ref, cl.start_ref + cl.count, cl.cid, cl.name)
                              for cl in clusters],
@@ -574,8 +579,11 @@ def _fill_refs(st, cl, spec, functions, fields, func_code_index=None,
         code_index = -1
         kind_bits = 0
         value_ref = -1
+        got = []
         for op in scalars:
             v = _scalar(st, op)
+            if params_at >= 0:
+                got.append(v)
             if is_func and op == T:
                 kind_tag = v            # Function's last T scalar is kind_tag
             elif is_func and op == U:
@@ -587,6 +595,11 @@ def _fill_refs(st, cl, spec, functions, fields, func_code_index=None,
                 # either the static field's table id or the instance field's offset in
                 # compressed words. Which one is selected by StaticBit.
                 value_ref = v
+        if len(got) == 3:
+            # [flags, packed_parameter_counts, packed_type_parameter_counts]: the order
+            # FunctionType's ReadFill reads them in, unchanged across the registered
+            # releases (the spec above).
+            meta["fcount"][cl.start_ref + i] = (got[1], got[2])
         if libraries is not None and cl.name == "LibraryCid":
             # name and url both. Internal libraries (the patch libraries that hold private
             # VM classes like _RegExp) carry a name but no url, and dropping those loses

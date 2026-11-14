@@ -379,9 +379,10 @@ def cmd_lift(args) -> int:
                              fields=layout.for_function(cr.owner_ref),
                              allocs=allocs, casts=casts,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
-                             returns=returns, mono=monomorphic_entry(image, cr))
+                             returns=returns, mono=monomorphic_entry(image, cr),
+                             stack=entry.stack(cr))
         # The names the body reads its arguments by, so no `a1` in it goes undeclared.
-        params = entry.params(cr)
+        params = entry.params(cr, body)
         if getattr(args, "json", False):
             if starts is None:
                 starts = frozenset(c.pc_offset for c in image.all_ranges)
@@ -1171,7 +1172,8 @@ def cmd_ffi(args) -> int:
                                      fields=layout.for_function(cr.owner_ref),
                                      allocs=allocs, casts=casts,
                                      show=rebaser(image), returns=returns,
-                                     mono=monomorphic_entry(image, cr))
+                                     mono=monomorphic_entry(image, cr),
+                                     stack=entry.stack(cr))
             except JadartError:
                 # Tier 3 declines on a target it has no register model for (UnsupportedArch
                 # is a JadartError). The pool and xref halves still hold, so the library is

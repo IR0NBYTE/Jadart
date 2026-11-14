@@ -212,11 +212,12 @@ def decompile(path: str, symbol: str) -> list:
                              fields=layout.for_function(cr.owner_ref),
                              allocs=allocs, casts=casts,
                              show=rebaser(image), cut_end=cut_end(cr, dis),
-                             returns=returns, mono=monomorphic_entry(image, cr))
+                             returns=returns, mono=monomorphic_entry(image, cr),
+                             stack=entry.stack(cr))
         if starts is None:
             starts = frozenset(c.pc_offset for c in image.all_ranges)
         out.append({"name": nm, "pc_offset": cr.pc_offset, "size": cr.size,
-                    "params": entry.params(cr),
+                    "params": entry.params(cr, body),
                     "body": [ln.strip() for ln in body],
                     **body_reads(body, image, starts)})
     return out
