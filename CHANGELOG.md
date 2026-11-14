@@ -1035,6 +1035,72 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   `setState(this, new Closure());` is `setState(this, new Closure(sub_0x1eee7c, t0));`.
   Lifting every range takes what it did: 21.7 s of CPU before and 21.7 after on the
   clean fixture, 21.4 and 21.5 on the obf one.
+- **An `await` prints as one and an async function returns its value (#462).**
+  `benchFetchToken` awaits a `Future.delayed` and returns a string, and printed
+  `sub_0x15765c();`, `sub_0x157418();` and `goto sub_0x157164;`: three addresses, for
+  the stubs that start an async function, suspend it and complete its future. The
+  isolate snapshot's roots stop naming stubs at `slow_tts_stub`, in front of every one
+  an async or a sync* function calls. Through Dart 3.12 the vm snapshot beside it holds
+  each of those stubs a second time, one for each entry of the release's
+  `VM_STUB_CODE_LIST` in that order and made by the same generator. A stub the roots
+  leave out now takes the name of the vm snapshot's stub it is the same code as, byte
+  for byte or but for the pool slot a load names, and only where the binary in hand
+  proves the list is its own: the vm snapshot has exactly as many stubs as the list has
+  names, every stub the roots do name is the code of the vm stub at its name's position
+  (69 to 76 of them a build, and no fewer than 32 is accepted), and the range is the
+  code of one stub and no other. Where any of that fails the stubs stay `sub_0x...`.
+  There is a list for 2.19.6, 3.0.6, 3.1.5, 3.2.6, 3.3.4, 3.4.4, 3.5.4, 3.6.2, 3.7.2,
+  3.9.2, 3.10.9, 3.11.5, 3.12.0 and 3.12.2, each read on a real build: on the 26 corpus
+  builds that keep a symbol table the names agree with the symbols wherever there is
+  one. 3.13 names every stub from its roots already. 2.19.0-444.2.beta, 3.0.1,
+  3.3.0-174.2.beta and 3.8.1 have no build to check a list on, so they have none and
+  print as before, and so does a stub on arm32 whose pool slot differs. `Await` takes
+  the awaited value in x0 and hands the result back in x0: the call prints `await v;`,
+  or `var tN = await v;` where the result is read, and `await ...;` where the paths into
+  it do not agree on the value. An async body ends in a branch to `ReturnAsync`,
+  `ReturnAsyncNotFuture` or `ReturnAsyncStar` with its value in x0, which prints
+  `return v;`. `benchFetchToken` now reads `InitAsync(...);`,
+  `await Future.delayed(pool_0x2d0, pool_0x96f0);`, the three lines that build the
+  string's parts and `return _interpolate@0150898(t1);`, and `_run` reads
+  `var t4 = benchFetchToken(t2);`, `var t5 = await t4;` and ends `return NULL;`. On the
+  clean fixture 181 lines printed one of nine such stubs by its address and none does
+  now: the 40 calls to `Await` and `AwaitWithTypeCheck` print `await`, 23 of them naming
+  the result and none `...`; the 78 branches to a return stub print `return` with the
+  value, where two arms set it the one named where they meet; 50 print
+  `InitAsync(...)` and 13 `InitSyncStar(...)`, `SuspendSyncStarAtStart(...)`,
+  `SuspendSyncStarAtYield(...)` or
+  `CloneSuspendState(...)`. Kazumi (3.11.5) had 4,398 such lines by address and prints
+  1,616 `await`, none of them `await ...;`; FluffyChat (3.13) printed `Await(...)` or
+  `AwaitWithTypeCheck(...)` 3,096 times and `goto sub_0x...` 2,933 and prints `await`,
+  one of them `await ...;`, and `return`. Read by hand against the rows at 20 of the
+  clean fixture's 40 `await` lines, every second one: all 20 print the value x0 holds at
+  the call. The init and suspend stubs stay calls by name and no `yield` is printed:
+  what a sync* body hands its suspend stub is not the value it yields. In `lift -j` an
+  `await` and a return through a stub are not calls and are not listed in `calls`; a
+  stub that still prints as a call by name, `InitAsync` and the like, is listed with
+  kind `stub`. `benchFetchToken` listed `sub_0x15765c` and `sub_0x157418` as `direct`
+  and `sub_0x157164` as `tail`, and lists `InitAsync` as `stub`, `Future.delayed`,
+  `List` and `_interpolate@0150898`. Naming nine more stubs moves what other commands
+  print on the clean fixture as well: the `functions` header reads `roots 85` and
+  `anonymous 1260` where it read `roots 76` and `anonymous 1269`; `symbols` names 6,934
+  of the 8,194 ranges where it named 6,925; `functions -f Async` matches 20 where it
+  matched 17; `disasm` notes a branch to one of them as it notes any stub,
+  `bl 0x157418  ; -> _iso_stub_AwaitStub`, three more rows in `benchFetchToken`; and
+  the second of the three code byte checks `hook` and `symbols --format r2` make before
+  they apply anything, the middle named range, is at 0xeb4f8 where it was at 0xeb5d0.
+  55 of 8,194 ranges change on the clean fixture and 55 of 8,188 on the obf one, 304
+  lines for 305 on each. Measured together with the closure change above, against the
+  tree before both, 27,639 of the nine binaries' 273,863 ranges change, 85,931 lines for
+  87,499, and no range has an error on either side: 664 ranges and 1,343 lines for 1,441
+  on each fixture, 6,115 ranges and 20,503 lines for 20,322 on FluffyChat, 4,723 and
+  15,372 for 15,515 on Kazumi, and 5,427, 3,365, 3,388, 1,728 and 1,565 ranges on apps
+  built with 3.11.5, 3.6.2, 3.5.4, 3.3.4 and 2.19.6, each of which has its stubs named
+  by the vm snapshot's copy. Typical lines: `sub_0x15765c();` is `InitAsync(...);`,
+  `var t5 = sub_0x157418();` is `var t5 = await t4;`, and
+  `play(SystemSoundType.click);` with
+  `goto sub_0x174524;` under it is `return play(SystemSoundType.click);`. Lifting every
+  range takes what it did: 21.7 s of CPU before and 21.9 after on the clean fixture,
+  21.5 and 21.6 on the obf one.
 
 ## 1.4.0 - 2026-11-12
 

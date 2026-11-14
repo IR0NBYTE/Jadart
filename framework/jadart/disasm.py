@@ -40,6 +40,7 @@ except Exception as exc:                       # noqa: BLE001 - reported, not sw
 from .macho import open_container
 from .branches import code_target, printed_number
 from .objstore import stub_names
+from .vmstubs import vm_stub_names
 from .fill import quoted
 from .stream import ReadStream, TruncatedSnapshot
 from . import versions
@@ -236,6 +237,10 @@ class InstrImage:
     # pc_offset -> bytes from the range start to the entry calls actually land on, for the
     # Code objects with a monomorphic entry only. See AOT_ENTRY_OFFSET.
     entry_offsets: dict = None
+    #: The instructions of each stub of the vm snapshot beside this one, in the order
+    #: of the release's VM_STUB_CODE_LIST, or () (baseobjects.BaseObjects.stub_code).
+    #: What names the stubs the isolate roots stop short of (vmstubs.py).
+    vm_stubs: tuple = ()
 
 
 def check_image_size(text: bytes, pcs: list, arch, symbol: str) -> None:
@@ -303,8 +308,8 @@ def load_instructions(path):
         st.read_unsigned()
     clusters = walk_alloc(st, hdr.num_base_objects, hdr.num_objects, hdr.num_clusters,
                           epoch=hdr.epoch, is_root_unit=True, arch=hdr.arch)
-    fr = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch,
-                   base=base_objects(elf, hdr, raw))
+    base = base_objects(elf, hdr, raw)
+    fr = walk_fill(st, clusters, hdr.epoch, arch=hdr.arch, base=base)
 
     pcs, first_code = parse_instructions_table(data, header_length,
                                                hdr.instr_table_rodata_offset, hdr.arch,
@@ -375,7 +380,8 @@ def load_instructions(path):
                       epoch=hdr.epoch, anchor_symbol=names.instructions,
                       anchor_va=anchor_va, anchor_file_offset=anchor_off,
                       container="macho" if type(elf).__name__ == "MachO64" else "elf",
-                      entry_offsets=entry_offsets), fr, hdr
+                      entry_offsets=entry_offsets,
+                      vm_stubs=getattr(base, "stub_code", ())), fr, hdr
 
 
 # One cap for every path into the disassembler. `decompile` and `export` used to pass a
@@ -778,6 +784,10 @@ def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
         pc_to_name.update(merged_stub_names(image.symbol_names or {}, roots))
     else:
         for pc, nm in roots.items():
+            pc_to_name.setdefault(pc, nm)
+        # The stubs the roots stop short of, the async and sync* ones among them,
+        # named after the vm snapshot's copy of the same code (vmstubs.py, #462).
+        for pc, nm in vm_stub_names(image, roots).items():
             pc_to_name.setdefault(pc, nm)
     for owner_ref, cr in image.code_ranges.items():
         nm = fname.get(owner_ref)

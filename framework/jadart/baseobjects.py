@@ -39,10 +39,11 @@ from __future__ import annotations
 
 import struct
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .errors import InputError, JadartError, MissingSymbol
 from .stream import ReadStream
+from .vmstubs import read_stub_code
 
 _STRINGS = frozenset({"StringCid", "OneByteStringCid", "TwoByteStringCid"})
 #: What the symbol-table root may be: a WeakArray (3.3.4 and later builds), an Array
@@ -65,6 +66,21 @@ class BaseObjects:
     strings: dict        # ref -> str
     smi_values: dict     # ref -> int
     arrays: dict         # ref -> tuple of element refs
+    #: What `read_stub_code` reads the stubs' instructions from, or (). They are read
+    #: on first use: only the commands that match stub code need them, and reading
+    #: them imports the disassembler, which `classes` and `info` never load.
+    stub_source: tuple = field(default=(), repr=False, compare=False)
+    _stub_code: tuple = field(default=None, init=False, repr=False, compare=False)
+
+    @property
+    def stub_code(self) -> tuple:
+        """The instructions of each of its stubs, in the order its roots list them,
+        where that is the order of the release's VM_STUB_CODE_LIST
+        (vmstubs.read_stub_code), or ()."""
+        if self._stub_code is None:
+            self._stub_code = (read_stub_code(*self.stub_source) if self.stub_source
+                               else ())
+        return self._stub_code
 
 
 def read_base_objects(container, hdr):
@@ -107,21 +123,25 @@ def read_base_objects(container, hdr):
     clusters = walk_alloc(st, vm.num_base_objects, vm.num_objects, vm.num_clusters,
                           epoch=vm.epoch, is_root_unit=True, arch=vm.arch, vm=True)
     fr = walk_fill(st, clusters, vm.epoch, arch=vm.arch)
-    _check_roots(st, clusters, struct.unpack_from("<q", blob, 4)[0] + _MAGIC_SIZE)
+    end = struct.unpack_from("<q", blob, 4)[0] + _MAGIC_SIZE
+    stubs = _check_roots(st, clusters, end)
     return BaseObjects(first_ref=vm.num_base_objects + 1, stop_ref=vm.num_objects + 1,
-                       strings=fr.strings, smi_values=fr.smi_values, arrays=fr.arrays)
+                       strings=fr.strings, smi_values=fr.smi_values, arrays=fr.arrays,
+                       stub_source=(container, blob, end, vm, fr.codes, stubs))
 
 
-def _check_roots(st: ReadStream, clusters, end: int) -> None:
+def _check_roots(st: ReadStream, clusters, end: int) -> list:
     """Read the vm snapshot's roots, which have to end where the header says the
-    snapshot does, and be the roots the VM reads.
+    snapshot does, and be the roots the VM reads. Returns the stubs' refs, in the
+    order the roots hold them.
 
     VMDeserializationRoots::ReadRoots: from 3.9 a ref for each predefined symbol, then
     in every release the symbol table and a ref for each stub (StubCode::EntryAtPut).
     What is held to is what the 35 real builds have:
 
       the stubs come last and are the vm snapshot's Code objects, each of them once.
-        Not in rising order on any build, so the order is not held to.
+        Not in rising order on any build, so the order is not held to here; it is
+        the order of VM_STUB_CODE_LIST, which vmstubs.py holds a build to.
       the one ref before them is a WeakArray or an Array of the vm snapshot, or null,
         which is what every arm32 build writes.
       the refs before that are strings, and between them they name every string the vm
@@ -168,6 +188,7 @@ def _check_roots(st: ReadStream, clusters, end: int) -> None:
         raise BaseObjectsError(
             "vm: the roots are not predefined symbols, the symbol table and one ref "
             "for each Code object, which is what the VM reads there.")
+    return stubs
 
 
 class _Spans:
