@@ -1453,7 +1453,7 @@ def _slot_regs(text: str) -> frozenset:
 
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
-                 "src", "views", "lost", "lost_slot", "slot_by_reg", "dropped",
+                 "src", "via", "views", "lost", "lost_slot", "slot_by_reg", "dropped",
                  "opaque", "spilled", "hoist", "hoisted")
 
     def __init__(self):
@@ -1505,6 +1505,10 @@ class State:
         # broke out of it. `Lifter._arrive` reads it to tell a goto straight from its
         # block from one that follows a `break`.
         self.src = None
+        # The blocks whose way out this state is, where that is not `src` alone: past an
+        # `if`, the last block of each arm that runs on, which `src`, the block that
+        # decided it, does not say. None where `src` says it. See `ways`.
+        self.via = None
         # FP/SIMD register number -> the spellings other than dN it is held under (q0,
         # v0.16b), so a write under one need not search the whole map for the others.
         self.views: dict = {}
@@ -1548,8 +1552,17 @@ class State:
         s.dropped = dict(self.dropped)
         s.tmpc = self.tmpc
         s.spilled, s.hoist, s.hoisted = self.spilled, self.hoist, self.hoisted
-        s.src = self.src
+        s.src, s.via = self.src, self.via
         return s
+
+    def ways(self):
+        """The block or blocks control leaves to reach whatever is lifted next: the
+        edges a goto-join's record is about (`Lifter._join_pairs`). `src` after a block
+        or a loop. After an `if` the arms that run on each bring one, and `src` named
+        the block that decided the `if` for all of them, so a join the arm fell into
+        never saw that way in, was left without a name, and read the register bare
+        under its label for every way in (#461)."""
+        return self.src if self.via is None else self.via
 
     def _unpair(self, reg: str):
         """Writing either half ends the pairing. Both directions: overwriting the low
@@ -2530,6 +2543,13 @@ def _joined(a: V, b: V):
         return replace(a, smi=0, at=None,
                        calc=a.calc or b.calc or _SMI_TAG in (a.smi, b.smi))
     return None
+
+
+def _ways(st: State) -> frozenset:
+    """`State.ways` as a set of blocks: none where the state came from no one block."""
+    got = st.ways()
+    return (got if isinstance(got, frozenset)
+            else frozenset((got,)) if isinstance(got, int) else frozenset())
 
 
 def _merge(dst: State, a: State, b: State):
@@ -10093,7 +10113,7 @@ class Lifter:
     def _join_pairs(self, addr, st: State, src=None) -> list:
         """(name, value, register) for each phi register of goto-join `addr`, from
         `st`, and the record that this edge has written them: see `_join_write`."""
-        src = st.src if src is None else src
+        src = st.ways() if src is None else src
         srcs = ((src,) if isinstance(src, int)
                 else src if isinstance(src, frozenset) else ())
         self._join_srcs.setdefault(addr, set()).update(srcs)
@@ -10353,7 +10373,7 @@ class Lifter:
         # The comparison the block leaves live, for the one successor that can justify
         # taking it (`_flags_in`).
         self._flags_out[addr] = self._flags
-        st.src = addr
+        st.src, st.via = addr, None
         return lines, falls
 
     def _reenter(self, addr, st: State):
@@ -10413,7 +10433,7 @@ class Lifter:
         # Not `addr`: the state did not come out of the block it is being handed to, and
         # the one caller that needs the ARRIVING edge is handed it directly, because that
         # edge is what a goto-join's phi record is about (`_join_write`).
-        st.src = preds[0] if carry is not None else None
+        st.src, st.via = (preds[0] if carry is not None else None), None
 
     def _flags_in(self, addr, st: State):
         """The comparison `addr` may read on arrival, or None.
@@ -11020,7 +11040,7 @@ class Lifter:
                 # a state none of them justifies (`_unjustified`, #237). A loop header is
                 # excluded for the reason the meet below excludes it: `_render_loop` has
                 # already bound its carried registers in this state.
-                came = st.src
+                came = st.ways()
                 # A proven entry the walk falls into starts from bare registers all the
                 # same: the normal entry is where the callers come in too (#278).
                 if (alive and s[1] not in self.carried
@@ -11175,14 +11195,17 @@ class Lifter:
                         st.lost.discard(r)      # a named phi is a stable name, not lost
                     if self._join_tag and not self.join_phi:
                         self._join_retag(st, a, b)
+                    st.via = _ways(a) | _ways(b)
                 elif tfalls:
                     st.reg, st.slot, st.elem, st.result = a.reg, a.slot, a.elem, a.result
                     st.lost, st.lost_slot = a.lost, a.lost_slot
                     st.slot_by_reg = a.slot_by_reg
+                    st.via = _ways(a)
                 elif efalls:
                     st.reg, st.slot, st.elem, st.result = b.reg, b.slot, b.elem, b.result
                     st.lost, st.lost_slot = b.lost, b.lost_slot
                     st.slot_by_reg = b.slot_by_reg
+                    st.via = _ways(b)
                 else:
                     falls = False
                 alive = tfalls or efalls
@@ -11215,7 +11238,7 @@ class Lifter:
                         st.elem.clear()
                     _forget_temps(st, lambda k: self._unset_at(k, s[1]))
                 self._arm_hand(out, self._render_loop(s[1], s[2], st, indent, depth))
-                st.src = frozenset(self._breakers.get(s[1], ()))
+                st.src, st.via = frozenset(self._breakers.get(s[1], ())), None
                 alive = True
             elif kind in ("break", "continue"):
                 if kind == "break" and self._carrying:

@@ -14192,8 +14192,11 @@ def test_a_join_reads_no_name_only_some_of_its_paths_set():
                  ("add", "x17, x14, #31"), ("swp", "x8, x4, [x17]"), ("ret", "")])
     # The note says what the register the line STORES holds, which is the value the
     # block before the loop put there: the loop does not write x8, so it is not
-    # forgotten at the exit any more and the note has something to say (#228).
-    assert body[-2] == "swp x8, x4, [x17]   // x8 holds x4 + 49", body
+    # forgotten at the exit any more and the note has something to say (#228). And
+    # x17: both ways into the label bring `x14 + 31`, the goto out of the loop and the
+    # block that falls in past the `if`, an edge the join never saw before #461.
+    assert body[-2] == "swp x8, x4, [x17]   // x17 holds t0, x8 holds x4 + 49", body
+    assert body.count("t0 = x14 + 31;") == 2, body
     # What a block that dominates the join names is set on every path, so it is kept:
     # a call's result, a phi bound above an `if` and a loop's name, each made before the
     # branches start.
@@ -27411,11 +27414,99 @@ def test_an_if_only_a_plain_join_would_print_reads_no_lost_condition():
 
 def test_a_run_of_joins_that_each_lose_the_next_is_not_walked_try_by_try():
     # The cost, counted and not timed: each join here reads the name of the one before
-    # through an `if`, the first has a way in that lost x3, and so every walk made
+    # through an `if`, the first has a way in that lost d0, and so every walk made
     # without the lost one finds the next lost. Three tries end with only what a loop
     # carries named. They were three walks of the whole function and a fourth for the
     # answer; the walk that names every join says which ones lean on which, so the
     # second and third are counted and three walks are made, at any length (#414).
+    #
+    # The way in that loses d0 pops it after a stub's call. The first join here was
+    # one an `if` falls into, which lost x3 only because the join never saw that way
+    # in; it has a name now (#461, the test below), and nothing leans on a lost one.
+    import jadart.expr as expr
+    from jadart.expr import lift_function
+    init, made = expr.Lifter.__init__, [0]
+    stub = "  ; -> _iso_stub_AllocateDoubleStub"
+
+    def counted_init(self, *args, **kw):
+        made[0] += 1
+        return init(self, *args, **kw)
+
+    def cliff(n):
+        rows = [("ldur", "d0, [x0, #7]", ""), ("cbz", "x1, #0x18", ""),
+                ("str", "q0, [x15, #-0x10]!", ""), ("bl", "#0x100000", stub),
+                ("ldr", "q0, [x15], #0x10", ""), ("cbz", "x2, #0x1c", ""),
+                ("add", "x4, x4, #1", "")]
+        for i in range(n):
+            at = len(rows)
+            rows += [("cbz", f"x1, #{(at + 3) * 4:#x}", ""),
+                     ("ldur", f"d0, [x5, #{7 + 8 * (i % 50)}]", ""),
+                     ("cbz", f"x2, #{(at + 4) * 4:#x}", ""), ("add", "x4, x4, #1", "")]
+        return rows + [("stur", "d0, [x11, #23]", ""), ("stur", "x4, [x11, #31]", ""),
+                       ("ret", "", "")]
+
+    def walks(n):
+        made[0] = 0
+        got = lift_function([(i * 4, mn, op, note)
+                             for i, (mn, op, note) in enumerate(cliff(n))])
+        return made[0], got
+    expr.Lifter.__init__ = counted_init
+    try:
+        (few, small), (many, large) = walks(8), walks(60)
+    finally:
+        expr.Lifter.__init__ = init
+    assert few == many == 3, (few, many)
+    # No join a goto reaches kept a name for d0: the store at the end reads it bare.
+    assert not [ln for ln in large if re.fullmatch(r"\s*t\d+ = d0;", ln)], large[:30]
+    assert re.fullmatch(r"t\d+\.field_0x18 = d0;", large[-3].strip()), large[-4:]
+    assert len(small) == 108 and len(large) == 628, (len(small), len(large))
+
+
+def test_a_join_an_if_falls_into_is_named_on_the_way_in_from_each_arm():
+    """`umulh x3, x5, x6; cbz x1, 1f; mov x3, #7; cbz x2, 2f; mov x3, #8; cbz x5, 1f;
+    mov x3, #9; 1: add x4, x4, #1; 2: mov x0, x3` printed `t1 = x3;` under `1:`, which
+    three ways reach: one with the `umulh` in x3, one with 8 and one with 9, and the
+    name set to 8 or 9 above it was read by nothing (#461). The walk records a way
+    into a join against the block it leaves, and past an `if` that was the block that
+    decided the `if`, for both arms: the block holding `mov x3, #9` was never seen
+    to reach the label, a join is named only when every way in is printed, and so
+    this one was dropped and read the register bare. The state now says which
+    blocks it leaves (`State.ways`), one for each arm that runs on."""
+    head = [("cbz", "x1, #0x1c"), ("mov", "x3, #7"), ("cbz", "x2, #0x20"),
+            ("mov", "x3, #8"), ("cbz", "x5, #0x1c"), ("mov", "x3, #9")]
+    tail = [("add", "x4, x4, #1"), ("mov", "x0, x3"), ("ret", "")]
+    named = ["if (x1 != 0) {", "t2 = 7;", "if (x2 != 0) {", "var t0 = 8;",
+             "if (x5 != 0) {", "t0 = 9;", "}", "t1 = t0;", "L_0x1c:", "t2 = t1;", "}",
+             "} else {", "t1 = x3;", "goto L_0x1c;", "}", "return t2;"]
+    assert _lift_rows([("umulh", "x3, x5, x6")] + head + tail) == [
+        "var t1;", "var t2;", "umulh x3, x5, x6"] + named
+    # With no raw line it printed `return x3;` under no branch at all.
+    assert _lift_rows(head + tail, base=4) == ["var t1;", "var t2;"] + named
+    # Four ways in: two gotos and an `if` inside an `if` that falls into the label.
+    assert _lift_rows([("cbz", "x1, #0x20"), ("mov", "x3, #7"), ("cbz", "x2, #0x24"),
+                       ("mov", "x3, #8"), ("cbz", "x5, #0x20"), ("mov", "x3, #9"),
+                       ("cbz", "x6, #0x20"), ("mov", "x3, #10")] + tail) == [
+        "var t2;", "var t3;", "if (x1 != 0) {", "t3 = 7;", "if (x2 != 0) {",
+        "var t1 = 8;", "if (x5 != 0) {", "var t0 = 9;", "if (x6 != 0) {", "t0 = 10;",
+        "}", "t1 = t0;", "}", "t2 = t1;", "L_0x20:", "t3 = t2;", "}", "} else {",
+        "t2 = x3;", "goto L_0x20;", "}", "return t3;"]
+    # The value the join brings, stored and compared: both read the name.
+    stored = _lift_rows([("umulh", "x3, x5, x6")] + head + [
+        ("stur", "x3, [x11, #15]"), ("mov", "x0, x3"), ("ret", "")])
+    assert "x11.field_0x10 = t1;" in stored and "x11.field_0x10 = x3;" not in stored, \
+        stored
+    past = [("cbz", "x2, #0x28") if row == ("cbz", "x2, #0x20") else row for row in head]
+    compared = _lift_rows([("umulh", "x3, x5, x6")] + past + [
+        ("cmp", "x3, x4"), ("b.lt", "#0x28"), ("mov", "x3, #1"), ("mov", "x0, x3"),
+        ("ret", "")])
+    assert "if (t1 >= x4) {" in compared, compared
+
+
+def test_naming_a_join_an_if_falls_into_takes_two_walks_at_any_length():
+    # The cost, counted and not timed: the join above and a run of joins a goto
+    # reaches after it, each reading the name of the one before. It was three walks,
+    # the first join dropped and each one after it found lost in turn; every join has
+    # a name now and the function is walked twice, at any length (#461).
     import jadart.expr as expr
     from jadart.expr import lift_function
     init, made = expr.Lifter.__init__, [0]
@@ -27424,7 +27515,7 @@ def test_a_run_of_joins_that_each_lose_the_next_is_not_walked_try_by_try():
         made[0] += 1
         return init(self, *args, **kw)
 
-    def cliff(n):
+    def run(n):
         rows = [("cbz", "x1, #0x18"), ("mov", "x3, #7"), ("cbz", "x2, #0x1c"),
                 ("mov", "x3, #8"), ("cbz", "x5, #0x18"), ("mov", "x3, #9"),
                 ("add", "x4, x4, #1")]
@@ -27437,17 +27528,17 @@ def test_a_run_of_joins_that_each_lose_the_next_is_not_walked_try_by_try():
 
     def walks(n):
         made[0] = 0
-        got = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(cliff(n))])
+        got = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(run(n))])
         return made[0], got
     expr.Lifter.__init__ = counted_init
     try:
         (few, small), (many, large) = walks(8), walks(60)
     finally:
         expr.Lifter.__init__ = init
-    assert few == many == 3, (few, many)
-    # No join a goto reaches kept a name: the labels read what the `if`s named.
-    assert not [ln for ln in large if ln.strip() == "t2 = x3;"], large[:30]
-    assert len(small) == 97 and len(large) == 617, (len(small), len(large))
+    assert few == many == 2, (few, many)
+    assert re.fullmatch(r"x11\.field_0x18 = t\d+;", large[-3].strip()), large[-4:]
+    # Lines for each join added, the same at both lengths.
+    assert len(large) - len(small) == 16 * 52, (len(small), len(large))
 
 
 # -- what a pool slot holds (held.py) -------------------------------------------------
