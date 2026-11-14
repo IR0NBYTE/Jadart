@@ -107,6 +107,19 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A count the stream cannot pay for is refused before it is walked (#451).** A cluster
+  of instances with no field reads nothing for each object, in the alloc pass or in the
+  fill, so its count cost time and no bytes: 215 bytes that declare 16,000,000 such
+  instances took 0.55 s to walk, and at 2^40 the same bytes would not have finished.
+  Every command that walks the clusters ran that loop. The alloc walk now refuses a
+  snapshot whose header counts more objects than it has bytes left, before it reads a
+  cluster and in time that does not depend on the count (`AllocError`). Of 71 snapshots
+  measured, vm and isolate, from the two fixtures, the seven app-sweep libraries and 27
+  corpus builds of Dart 2.19.6 to 3.13, the most any holds is 0.30 objects for each
+  byte left and none has a cluster of more than one such instance. All of them read as
+  before: the same classes, strings and `verify` checks on each, and tier 3 prints the
+  same lines on both fixtures.
+
 - **A virtual call whose class id is moved before the add names its selector.**
   Most calls give the class id to the add in another register, `mov x0, x1` then
   `sub x30, x0, #0xfc2`, and only a class id added to where it was read was followed,

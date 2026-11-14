@@ -26487,6 +26487,74 @@ def test_an_element_at_a_constant_index_below_zero_is_at_a_computed_address():
     assert lift(ld, ("mov", "w9, #-0x10"), ("add", "x16, x13, w9, uxtw"), st, ret) == [
         "x13[0xfffffff0] = x1;", "return x13.field_0x8;"]
 
+
+def test_a_count_the_stream_cannot_pay_for_is_refused_before_any_loop():
+    """A cluster of instances with no field reads nothing for each object, in the alloc
+    pass or in the fill, so its count cost time and no bytes: about 215 bytes that
+    declare 16,000,000 of them took 0.43 s to walk, and the count is a varint the file
+    chooses (#451). The walk now holds what the header counts to the bytes left, before
+    it reads a cluster. Not timed: on the tree before this the first refusal below is a
+    walk that returns, and the counts after it are ones no loop comes back from."""
+    from jadart.clusters import AllocError, walk_alloc
+    from jadart.fillwalk import walk_fill
+    from jadart.macho import open_container
+    from jadart.snapshot import parse_blob
+    from jadart.stream import ReadStream
+
+    def uv(v):                         # WriteUnsigned: 7 bits a byte, the last one +128
+        out = bytearray()
+        while v > 127:
+            out.append(v & 127)
+            v >>= 7
+        return bytes(out + bytes([v + 128]))
+
+    def sv(v):                         # Write<int32_t>: the last byte +192
+        out = bytearray()
+        while v > 63:
+            out.append(v & 127)
+            v >>= 7
+        return bytes(out + bytes([v + 192]))
+
+    iso = open_container(open(CLEAN, "rb").read()).symbol_bytes(
+        "_kDartIsolateSnapshotData")
+    real = parse_blob(iso, "isolate")
+    st = ReadStream(iso, 52)
+    st.read_cstring()
+    head, base = iso[:st.pos], real.num_base_objects
+    cid = real.epoch.num_predefined_cids          # the first class a program declares
+
+    def stream(n):
+        b = bytearray(head) + uv(base) + uv(base + n) + uv(1) + uv(0) + uv(0)
+        at = len(b)
+        b += sv(cid << 12) + uv(n) + sv(0) + sv(0)    # one cluster: n, no field, size 0
+        b += uv(0) + b"\x81"                          # its fill, one bitmap, and a root
+        struct.pack_into("<q", b, 4, len(b) - 4)
+        return bytes(b), at
+
+    def walk(n):
+        b, at = stream(n)
+        h = parse_blob(b, "isolate")
+        st = ReadStream(b, at)
+        try:
+            clusters = walk_alloc(st, h.num_base_objects, h.num_objects, h.num_clusters,
+                                  epoch=h.epoch, arch=h.arch)
+        except AllocError:
+            assert st.pos == at, "refused before a byte of the first cluster was read"
+            raise
+        walk_fill(st, clusters, h.epoch, arch=h.arch)
+        return clusters, len(b) - at
+
+    # As many objects as bytes is the most that is walked, and one more is refused.
+    most = next(n for n in range(1, 64) if len(stream(n)[0]) - stream(n)[1] == n)
+    clusters, left = walk(most)
+    assert [(cl.name, cl.count, cl.next_field_offset) for cl in clusters] == [
+        ("cid%d" % cid, most, 0)] and left == most, (clusters, left)
+    for n in (most + 1, 1 << 20, 16_000_000, 1 << 40, 1 << 62):
+        with pytest.raises(AllocError, match="bytes are left to describe"):
+            walk(n)
+    assert len(stream(16_000_000)[0]) < 256
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
