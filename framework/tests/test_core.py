@@ -27525,7 +27525,9 @@ def test_a_slot_holding_a_crafted_instance_prints_bounded_and_escaped():
         return real(self, ref, depth)
     H.Holdings._spell = count
     try:
-        text = H.Holdings(fr, arch).lift_object(0x18)
+        alone = _held_fr([("ref", 200)], instances=inst, strings={11: s, 12: "Lo\x07op"},
+                         classes=[(50, 12, 600, 0)])
+        text = H.Holdings(alone, arch).lift_object(0x10)
     finally:
         H.Holdings._spell = real
     assert len(spelled) <= H._DEPTH + 1 and len(text) <= H._CUT
@@ -27670,6 +27672,168 @@ def test_a_pool_slot_loaded_into_a_d_register_prints_its_double():
     with contextlib.redirect_stdout(buf):
         assert main(["lift", CLEAN, "0x4c2bc"]) == 0
     assert "    return a0.toDouble() / 255.0 / 12.92 * 100.0;" in buf.getvalue()
+
+
+def test_a_pool_slot_that_holds_a_const_instance_prints_it():
+    """`DiagnosticsNode.message` stored `pool_0x2318` and `pool_0x2138`, an instance of
+    `_NoDefaultValue` and the `DiagnosticLevel` enum's `info`, both stated by the
+    snapshot. A slot loaded into an x register prints the instance now: an enum value by
+    the `_name` it holds, any other instance as its class and its fields (#363)."""
+    _needs_capstone()
+    from jadart.cli import main
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["lift", CLEAN, "DiagnosticsNode.message"]) == 0
+    assert buf.getvalue().splitlines()[1:7] == [
+        "  var t0 = new DiagnosticsProperty();",
+        "  t0.field_0x24 = const _NoDefaultValue@19198569{};",
+        "  t0.field_0x14 = false;",
+        "  t0.field_0x1c = true;",
+        "  t0.field_0x28 = DiagnosticLevel.info;",
+        "  return t0;"]
+
+
+def test_a_const_instance_slot_prints_bounded_and_as_an_object():
+    """An instance that holds itself prints bounded, one the snapshot does not hold
+    prints as its offset, a 4-byte load of the slot is no object and prints as before,
+    and the instance compares as a reference does: whole, with no `.toUnsigned(32)`
+    on it (#363)."""
+    from jadart.expr import lift_function
+    from jadart.held import _CUT
+    fr = _held_fr([("ref", 100), ("ref", 101), ("ref", 102)],
+                  instances={100: (600, 0, (100, 11)), 101: (600, 0, (11, 1))},
+                  strings={11: "hi", 12: "Loop"}, classes=[(50, 12, 600, 0)])
+    pm = _held_pool_map(fr)
+    rows = [("ldr", "x1, [x27, #0x18]"), ("stur", "w1, [x0, #0xf]"),
+            ("ldr", "x2, [x27, #0x20]"), ("stur", "w2, [x0, #0x13]"),
+            ("ldr", "w3, [x27, #0x18]"), ("stur", "w3, [x0, #0x17]"),
+            ("ldr", "x4, [x27, #0x10]"), ("stur", "w4, [x0, #0x1b]"), ("ret", "")]
+    got = _lift_rows(rows, pool_map=pm)
+    assert got[:3] == ['x0.field_0x10 = const Loop{field_0x8: "hi", field_0xc: null};',
+                       "x0.field_0x14 = pool_0x20;", "x0.field_0x18 = pool_0x18;"]
+    assert got[3] == ("x0.field_0x1c = const Loop{field_0x8: const Loop{field_0x8: "
+                      'const Loop{...}, field_0xc: "hi"}, field_0xc: "hi"};')
+    assert len(got[3]) < _CUT + 40 and got[4:] == ["return x0;"]
+    body = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(
+        [("ldr", "x16, [x27, #0x18]"), ("cmp", "w5, w16"), ("cset", "x0, ne"),
+         ("stur", "x0, [x9, #7]"), ("ret", "")])], pool_map=pm)
+    assert any(ln.strip() == 'x9.field_0x8 = x5 != const Loop{field_0x8: "hi", '
+               'field_0xc: null} ? 1 : 0;' for ln in body), body
+
+
+def test_two_const_instances_that_print_alike_stay_their_slots():
+    """Two objects can spell the same text: a `Color` holds its value unboxed, and an
+    unboxed field prints `?`. `ColorScheme.fromSwatch` picks one of two such colours on
+    a branch, and a lift that printed both would join the arms as one value and lose
+    the branch. A text that more than one object spells prints as the slot (#363)."""
+    from jadart.expr import lift_function
+    fr = _held_fr([("ref", 100), ("ref", 101), ("ref", 102), ("ref", 100)],
+                  instances={100: (600, 0, (11,)), 101: (600, 0, (11,)),
+                             102: (600, 0, (12,))},
+                  strings={11: "hi", 12: "Loop"}, classes=[(50, 12, 600, 0)])
+    rows = [("cmp", "x1, x2"), ("b.eq", "#0x10"), ("ldr", "x0, [x27, #0x10]"),
+            ("b", "#0x14"), ("ldr", "x0, [x27, #0x18]"), ("stur", "w0, [x3, #0xf]"),
+            ("ldr", "x4, [x27, #0x20]"), ("stur", "w4, [x3, #0x13]"),
+            ("ldr", "x5, [x27, #0x28]"), ("stur", "w5, [x3, #0x17]"), ("ret", "")]
+    body = [ln.strip() for ln in lift_function(
+        [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+        pool_map=_held_pool_map(fr))]
+    assert body == ["var t0;", "if (x1 != x2) {", "t0 = pool_0x10;", "} else {",
+                    "t0 = pool_0x18;", "}", "x3.field_0x10 = t0;",
+                    'x3.field_0x14 = const Loop{field_0x8: "Loop"};',
+                    "x3.field_0x18 = pool_0x28;", "return t0;"], body
+    _needs_capstone()
+    from jadart.cli import main
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["lift", CLEAN, "0x17f0f0"]) == 0
+    out = buf.getvalue()
+    assert "    t6 = pool_0x7520;" in out and "    t6 = pool_0x7518;" in out
+    assert "  t8.field_0x30 = t6;" in out
+
+
+def test_a_const_instance_named_like_the_lifters_own_words_stays_its_slot():
+    """A crafted snapshot can name an enum class `x1` and its value `field_0x8`. Printed
+    as a value that reads as a field of the register x1; named `t1` it reads as a
+    temporary and the lift declared `var t1;`. Any word the lifter spells itself, taken
+    from its own tables, keeps the slot as `pool_0x...`; quoted strings, the label held
+    gives a field with no name and its null are the binary's or held's (#363)."""
+    from jadart.expr import _spells_own
+    for text in ("x1.field_0x8", "t1.light", "Brightness.t1", "a0.b", "LR.x", "THR.c",
+                 "PP.c", "this.c", "sub_0x10.c", "pool_0x8.c", "sel_x.c", "return.c",
+                 "Foo{field_0x8: x1}", "SP{field_0x8: ?}"):
+        assert _spells_own(text), text
+    for text in ("Brightness.light", 'const Loop{field_0x8: "x1 t1"}',
+                 "const Duration{field_0x8: ?}", "const A{field_0x10: null}",
+                 "Mode.ox1", "Color{value: 0x10}"):
+        assert not _spells_own(text), text
+    _needs_capstone()
+    from jadart.disasm import load_instructions, build_pool_map
+    from jadart.expr import lift_function
+    image, fr, _hdr = load_instructions(CLEAN)
+    pm = build_pool_map(fr, image.arch)
+    ref = fr.pool[(0x9e0 - 16) // 8][1]
+    cid = pm.held._insts[ref][0]
+    cname = [nr for _r, nr, c, _s in fr.classes if c & 0xFFFFFFFF == cid][0]
+    t = pm.held._tab()
+    vname = pm.held._insts[ref][2][t["enum_off"] // t["cws"] - t["hw"]]
+    rows = [("ldr", "x0, [x27, #0x9e0]"), ("stur", "w0, [x1, #7]"), ("ret", "")]
+
+    def lift(pool_map):
+        return [ln.strip() for ln in lift_function(
+            [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)],
+            pool_map=pool_map, arch=image.arch)]
+    assert lift(pm) == ["x1.field_0x8 = Brightness.light;", "return Brightness.light;"]
+    keep = (fr.strings[cname], fr.strings[vname])
+    try:
+        for a, b in (("x1", "field_0x8"), ("t1", "light"), ("Brightness", "t1")):
+            fr.strings[cname], fr.strings[vname] = a, b
+            got = lift(build_pool_map(fr, image.arch))
+            want = ["x1.field_0x8 = pool_0x9e0;", "return pool_0x9e0;"]
+            assert got == want, (a, b, got)
+    finally:
+        fr.strings[cname], fr.strings[vname] = keep
+
+
+def test_every_name_the_lifter_mints_counts_as_its_own():
+    """The words a binary may not print as are read from the lifter's tables, not
+    copied; this keeps that true for the names it mints with an f-string, so a new
+    prefix (`sel_m0x`, `pool_base_0x`) is caught the day it is added (#363)."""
+    from jadart.expr import _spells_own
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "jadart")
+    seen = set()
+    for name in ("expr.py", "program.py", "cfg.py"):
+        with open(os.path.join(src, name), encoding="utf-8") as fh:
+            seen.update(re.findall(r'f"([A-Za-z_][A-Za-z_0-9]*)\{', fh.read()))
+    assert {"t", "x", "a", "pool_0x", "sub_0x", "L_0x"} <= seen, sorted(seen)
+    for prefix in sorted(seen):
+        assert _spells_own(prefix + "1"), prefix
+
+
+def test_a_const_instance_slot_spells_only_its_own_class_siblings():
+    """Whether a slot's text is one more than one object spells is asked of the slots
+    whose class has the same name, and only of those; a lift that asks for one slot
+    reads one class's instances, not the pool's (#363)."""
+    fr = _held_fr([("ref", 100), ("ref", 101), ("ref", 102), ("ref", 103)],
+                  instances={100: (600, 0, (11,)), 101: (600, 0, (12,)),
+                             102: (601, 0, (11,)), 103: (601, 0, (12,))},
+                  strings={11: "hi", 12: "Loop", 13: "Other"},
+                  classes=[(50, 12, 600, 0), (51, 13, 601, 0)])
+    h = _held_pool_map(fr).held
+    asked = []
+    real = h._inst_text
+
+    def counted(ref, depth):
+        asked.append(ref)
+        return real(ref, depth)
+    h._inst_text = counted
+    assert h.lift_object(16) == 'const Loop{field_0x8: "hi"}'
+    assert sorted(set(asked)) == [100, 101], asked
 
 
 if __name__ == "__main__":

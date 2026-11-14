@@ -115,6 +115,35 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
   pool_0xc418) {` is `if ((t12 - t6) > -1e-10) {`, and `var t1 = t0.field_0x8 /
   pool_0x99c0;` is `var t1 = t0.field_0x8 / 1000000.0;`.
 
+- **A pool slot that holds a const instance prints the instance (#363).**
+  `DiagnosticsNode.message` printed `t0.field_0x24 = pool_0x2318;` and `t0.field_0x28 =
+  pool_0x2138;`, and the snapshot states both objects: the slot's ref falls in a cluster
+  whose class id names the class. They print `const _NoDefaultValue@19198569{}` and
+  `DiagnosticLevel.info` now. An enum value prints by the `_name` it holds; any other
+  instance as `const Class{field: value, ...}`, its fields by the names the snapshot
+  keeps and by offset where it keeps none, an unboxed field as `?` since the snapshot
+  does not say whether its bits are an int or a double, and a field it cannot spell as
+  `?` too. What is read out of the binary is escaped and cut as a string literal is, the
+  whole is cut near 200 characters, and an instance inside an instance is spelled two
+  deep at most, so one that holds itself prints bounded. The instance compares as a
+  reference, whole. A slot whose object the snapshot does not hold prints as before. Two
+  objects can spell alike, as two `Color` constants do with their value unboxed, and a
+  lift that printed both would join a branch that picks one of them as one value: a text
+  that more than one object in the pool spells prints as the slot, so
+  `ColorScheme.fromSwatch` keeps both arms. A crafted snapshot can name a class or a
+  value anything, and `x1.field_0x8` or `t1` printed as a value reads as a register's
+  field or a temporary: a text with a word the lifter spells itself, a register, a
+  temporary, a parameter, `this`, a role such as `THR` or `PP`, a name it mints such as
+  `field_0x`, `pool_0x` or `sub_0x`, or a keyword, prints as the slot. The words come
+  from the lifter's own tables and patterns. Tier 3 dumps of the nine binaries against
+  the commit before: 18,761 ranges change, 58,788 lines out and as many in (645 ranges
+  and 1,562 lines on the clean fixture, 640 and 1,557 on the obfuscated one, 3,790 and
+  12,215 on FluffyChat, the most). Typical lines: `t5.colorSpace = pool_0x77c8;` is
+  `t5.colorSpace = ColorSpace.sRGB;`, `this.field_0x20 = pool_0xab40;` is
+  `this.field_0x20 = const _RoutePlaceholder@39124995{};`, and `var t86 =
+  layoutChild(this, pool_0xad08, t85);` is `var t86 = layoutChild(this,
+  _ScaffoldSlot@71420462.snackBar, t85);`.
+
 - **`follow` finds a join one way, off the dominator tree, and the scan is gone.** It had
   two: a scan that pushed a tag per arm forward in reverse postorder, and `meet`, which
   reads the same join off the dominator tree and which took over once the scans of a
