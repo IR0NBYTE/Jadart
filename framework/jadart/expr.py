@@ -1173,6 +1173,29 @@ def _word(v: V) -> V:
     return _narrow(got) if v.wide is not None else got
 
 
+def _held(v: V) -> V:
+    """The word a register holding `v` holds, as a value with no record beside it: `v`,
+    and for a Smi-tagged register the tagged word spelled out (`_word`). What a name
+    is set to where the ways into it do not agree on the record (#478)."""
+    return _word(v) if v.smi else v
+
+
+def _named(name: str, v: V) -> V:
+    """What `name` holds once the body prints `name = <v's text>`: the name, and every
+    record `v` keeps beside its text that says how the register holds it. A Smi tag
+    (`V.smi`) is one, and so is the 32-bit write that cleared the top half of a
+    tagged word (`V.wide`), which the text of a tagged value does not say: `sbfiz w6,
+    w8, #1, #31`, a store that named x6, and `add x0, x6, #2` printed the word
+    sign-extended, where the register holds it zero-extended (#478). A value with no
+    tag is what its text says, truncation and all, so the name is only the name."""
+    if not v.smi:
+        return V(name, P_ATOM, calc=v.calc) if v.calc else V(name, P_ATOM)
+    got = V(name, P_ATOM, smi=v.smi, calc=v.calc)
+    if v.wide is None:
+        return got
+    return V(name, P_ATOM, wide=got, bits=32, smi=v.smi, calc=v.calc)
+
+
 def _narrow(v: V) -> V:
     """`v` as a 32-bit destination holds it: the low 32 bits, zero-extended.
 
@@ -1757,7 +1780,7 @@ class State:
                 self.spill.append(f"{name} = {v.text};")
             else:
                 self.spill.append(f"var {name} = {v.text};")
-            v = V(name, P_ATOM, smi=v.smi, calc=v.calc)
+            v = _named(name, v)
         self.reg[reg] = v
         self.elem.pop(reg, None)
         self.poolbase.pop(reg, None)
@@ -2543,9 +2566,9 @@ def _forget_frame(st: State):
 
 def _joined(a: V, b: V):
     """The value two paths agree a register holds, or None where they do not. A value
-    held Smi-tagged on one path and not on the other is still the value, which is what a
-    store, a call or a return reads, so the paths agree on it without the record: an
-    untag past the join cannot tell which word it reads (`V.smi`, #290)."""
+    held Smi-tagged on one path and not on the other is two words under one text, and
+    an instruction past the join that computes with the register reads the word: the
+    paths do not agree, and `_phi` names what each one holds (`V.smi`, #478)."""
     if a == b:
         # One value by two paths, and what each knew of it: computed on either is
         # computed, and the constant it stands off its base by holds where both have
@@ -2553,10 +2576,10 @@ def _joined(a: V, b: V):
         if a.calc == b.calc and a.at == b.at:
             return a
         return replace(a, calc=a.calc or b.calc, at=a.at if a.at == b.at else None)
-    if a.smi != b.smi and replace(a, smi=0) == replace(b, smi=0):
-        # Where one of them holds the tagged word, the register holds arithmetic.
-        return replace(a, smi=0, at=None,
-                       calc=a.calc or b.calc or _SMI_TAG in (a.smi, b.smi))
+    if a.smi and b.smi and replace(a, smi=0) == replace(b, smi=0):
+        # Tagged on one path and boxed on the other: the box-or-tag check found the
+        # value fits, so both hold its low 31 bits tagged.
+        return replace(a, smi=_SMI_TAG, at=None, calc=a.calc or b.calc)
     return None
 
 
@@ -5103,7 +5126,7 @@ class Lifter:
                 continue
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
-            st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+            st.reg[key] = _named(tmp, v)
         return out
 
     def _call_reads(self, insns) -> dict:
@@ -5852,7 +5875,7 @@ class Lifter:
             # after it, and SP may move between the two.
             (self.raw_names if off_sp else self.slot_names).add(tmp)
             out.append(decl)
-        name = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+        name = _named(tmp, v)
         if self._low32.get(id(v)) is v:
             self._low32[id(name)] = name
         if st.reg.get(reg) == v:
@@ -6061,7 +6084,7 @@ class Lifter:
                     if pat.search(v.text):
                         name, decl = self._mint(st, v.text)
                         out.append(decl)
-                        vals[r] = V(name, P_ATOM)
+                        vals[r] = _named(name, v)
             self._flags = (mn, op, vals, regs)
         elif mn in _FLAG_KILL:
             self._flags = None
@@ -6159,7 +6182,7 @@ class Lifter:
                 tmp, decl = self._mint(st, text)
                 out.append(decl)
                 self.raw_names.add(tmp)
-                new = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                new = _named(tmp, v)
                 if self._low32.get(id(v)) is v:
                     self._low32[id(new)] = new
             else:
@@ -6630,7 +6653,7 @@ class Lifter:
                 tmp, decl = self._mint(st, v.text)
                 self.raw_names.add(tmp)     # one only the moving row read goes unread
                 out.append(decl)
-                st.reg[r] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                st.reg[r] = _named(tmp, v)
                 st.elem.pop(r, None)
                 st.poolbase.pop(r, None)
             else:
@@ -6770,7 +6793,7 @@ class Lifter:
                     continue
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
-                holder[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                holder[key] = _named(tmp, v)
         for key, (b, i, *_r) in list(st.elem.items()):
             if pat.search(b.text) or pat.search(i.text):
                 del st.elem[key]
@@ -6829,7 +6852,7 @@ class Lifter:
                 continue                      # feeds a later self-referential store
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
-            st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+            st.reg[key] = _named(tmp, v)
             st.elem.pop(key, None)
             st.poolbase.pop(key, None)
         return out
@@ -7060,7 +7083,7 @@ class Lifter:
             tmp, decl = self._mint(st, v.text)
             out.append(decl)
             self.raw_names.add(tmp)
-            st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+            st.reg[key] = _named(tmp, v)
             if flags is not None:
                 flags[key] = (v.text, st.reg[key])
         if flags is not None:
@@ -7121,7 +7144,7 @@ class Lifter:
                     tmp, decl = self._mint(st, v.text)
                     out.append(decl)
                     self.raw_names.add(tmp)
-                    v = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                    v = _named(tmp, v)
                 got.append(v)
             st.elem[key] = (got[0], got[1], *_r)
         return out
@@ -9543,7 +9566,9 @@ class Lifter:
         # Read every value BEFORE any of them is written back: this is the same parallel
         # copy the back edge makes, and one name that another reads has to be captured
         # first. See _parallel_copy.
-        here = [(r, st.get(r)) for r in sorted(names)]
+        # The word each register holds: a loop's name is set on the way in, at the
+        # tail and here, and no one of them knows what the others hold (`_held`).
+        here = [(r, _held(st.get(r))) for r in sorted(names)]
         here = [(r, v) for r, v in here if v.text != names[r]]
         pins = ([] if target is None else
                 self._arrive(target, st, {names[r]: r for r, _v in here}, pad))
@@ -9632,15 +9657,19 @@ class Lifter:
         moves = _mentions(moved)
         now = {}
         for n in sorted(moved, reverse=True):
-            now[got.get(moved[n]).text] = n
+            now[_held(got.get(moved[n])).text] = n      # as `_carry_out` sets it
         out, pinned = [], {}
         live = self._livein.get(addr, 0)
         for side, held in (("reg", got.reg), ("slot", got.slot)):
             for k, v in sorted(held.items()):
                 if not moves(v.text):
                     continue
-                n = now.get(v.text) or pinned.get(v.text)
-                if n is None:
+                n = now.get(_held(v).text)
+                # A value written out here keeps what it knew of how the register
+                # holds it; one that is a loop's name is the word that name was set to.
+                seen = (v.text, v.smi, v.wide is None)
+                name = V(n, P_ATOM) if n is not None else pinned.get(seen)
+                if name is None:
                     # The first walk writes out what can be read at all: a register live
                     # at the target or one a call can take, which liveness counts only
                     # where the callee's arity is known, and a slot the function loads
@@ -9662,13 +9691,13 @@ class Lifter:
                             del held[k]
                         continue
                     n, decl = self._mint(st, v.text, pad)
-                    pinned[v.text] = n
+                    name = pinned[seen] = _named(n, v)
                     out.append(decl)
                     self.pins[n] = (addr, side, k)
                     # Set on the goto's path, and that is every path into its one-way
                     # target; see the join in `walk`.
                     self._anchor[int(n[1:])] = addr
-                held[k] = V(n, P_ATOM)
+                held[k] = name
                 if side == "reg":
                     got.elem.pop(k, None)
                     got.poolbase.pop(k, None)
@@ -10224,7 +10253,9 @@ class Lifter:
                 elif (held in owner and owner[held][1] == r
                         and owner[held] != (addr, r) and self._written_by(srcs, r)):
                     self._join_dep.setdefault((addr, r), set()).add(owner[held])
-            pairs.append((self._join_named(addr, r, st), st.get(r), r))
+            # The word, spelled out: the join reads the name before it has seen every
+            # edge set it, so the name cannot say how each one holds its value (#478).
+            pairs.append((self._join_named(addr, r, st), _held(st.get(r)), r))
             self._join_wrote.setdefault((addr, r), set()).update(srcs)
         return pairs
 
@@ -10887,10 +10918,11 @@ class Lifter:
         is what the previous version already paid.
 
         Returns {register: name} for the caller to bind after `_merge`, the declarations
-        that go above the `if`, and whether a goto enters either arm.
+        that go above the `if`, whether a goto enters either arm, and {register: the
+        name as a value} for each name that carries a record of how it is held.
         """
         pad2 = pad + indent
-        bare, named, decls = {}, {}, []
+        bare, named, decls, held = {}, {}, [], {}
         # An arm a `goto` jumps into is entered below the declaration, so it cannot leave
         # the name holding what the declaration gave it (#121); it assigns it itself.
         facts = {id(lines): self._arm_facts(lines) for lines in (tlines, elines)}
@@ -10920,7 +10952,7 @@ class Lifter:
             return wrote[k]
 
         def lost(k, v, r, pre):
-            if v.text != pre.text or r not in writes(k):
+            if v.text != pre.text or r not in writes(k) or v.smi != pre.smi:
                 return False
             return v.text == r or any(canon(m) in writes(k)
                                       for m in _REG_RE.findall(v.text))
@@ -11014,6 +11046,23 @@ class Lifter:
             gone = [lost(k, v, r, pre) for k, (_lines, v) in enumerate(arms)]
             sets = [changed(v) or entered[id(lines)] or r in printed[id(lines)] or gone[k]
                     for k, (lines, v) in enumerate(arms)]
+            # What the name holds. A Smi tag is a record beside the value and not in
+            # its text (`V.smi`), and a name that took the text alone compared the
+            # value where the machine compares the tagged word: `sbfiz x6, x8, #1,
+            # #31` on each arm and `cmp w6, #0x44` printed `t0.toSigned(32) < 0x44`
+            # (#478). Where both arms hold their value tagged, and at one width, the
+            # name is set to the values and carries the record, the tag where one arm
+            # is boxed; where they do not agree it is set to the word each arm holds,
+            # spelled out. An arm that lost the register sets it to the register,
+            # which is a word.
+            if va.smi or vb.smi:
+                if (va.smi and vb.smi and (va.wide is None) == (vb.wide is None)
+                        and not any(gone)):
+                    held[r] = _named(name, replace(
+                        va, smi=min(va.smi, vb.smi), calc=va.calc or vb.calc))
+                else:
+                    pre = _held(pre)
+                    arms = [(lines, _held(v)) for lines, v in arms]
             if name in self.hoist:
                 # Declared at the top instead, because a reader outside this `if`'s scope
                 # needs it. The INITIALISER stays here: it is the value from before this
@@ -11030,7 +11079,7 @@ class Lifter:
                 if assign:
                     lines.append(pad2 + self._assign(V(name, P_ATOM),
                                                      V(r, P_ATOM) if g else v))
-        return named, decls, any(entered.values())
+        return named, decls, any(entered.values()), held
 
     def _phi_name(self, st: State, r: str) -> str:
         """The name a phi result is bound to: always a FRESH one, never the register.
@@ -11252,7 +11301,7 @@ class Lifter:
                 named = {}
                 if tfalls and efalls:
                     first = st.tmpc[0]
-                    named, decls, entered = self._phi(
+                    named, decls, entered, held = self._phi(
                         st, a, b, tlines, elines, self._livein.get(joins[i], 0), pad,
                         indent, (then, els))
                     self.phi_names.update(named.values())
@@ -11275,7 +11324,7 @@ class Lifter:
                     # every line that reads the result.
                     for r, name in sorted(named.items()):
                         st._stale_lost(r)       # the register's old lost value is gone
-                        st.reg[r] = V(name, P_ATOM)
+                        st.reg[r] = held.get(r) or V(name, P_ATOM)
                         st.elem.pop(r, None)
                         st.poolbase.pop(r, None)
                         st.lost.discard(r)      # a named phi is a stable name, not lost
@@ -11492,7 +11541,7 @@ class Lifter:
                     continue
                 tmp, decl = self._mint(st, v.text)
                 out.append(decl)
-                st.reg[key] = V(tmp, P_ATOM, smi=v.smi, calc=v.calc)
+                st.reg[key] = _named(tmp, v)
                 st.elem.pop(key, None)
                 st.poolbase.pop(key, None)
         # Anchored above the loop, as a carried name is. A goto out of the loop hands its
@@ -11551,7 +11600,11 @@ class Lifter:
         # use of it before the loop. The state is the one the loop is entered in, so the
         # rule is the one every use has: the name holds only where no path to here
         # recorded the register (#255).
-        init = {r: self._leaf(r, st) for r in sorted(carried)}
+        # ...and as the word the register holds: the body is walked before the tail
+        # says what the back edge brings round, so the name is the word on every way
+        # in. `sbfiz x6, x1, #1, #31` before a loop that adds 2 to x6 printed `var t0
+        # = x1;` and `t0 += 2;`, where the machine adds to x1 tagged (#478).
+        init = {r: _held(self._leaf(r, st)) for r in sorted(carried)}
         names = {}
         before = self._loop_before
         for r in sorted(carried):
@@ -11621,7 +11674,7 @@ class Lifter:
         # duplication this whole exercise exists to stop.
         pairs, drop = [], set()
         for r in sorted(carried):
-            v = loop_st.get(r)
+            v = _held(loop_st.get(r))
             if v.text != names[r]:
                 pairs.append((names[r], v))
             elif init[r].prec == P_ATOM and r not in copied:
