@@ -232,6 +232,31 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A name keeps the tag of the value it is set to (#478).** `sbfiz x6, x8, #1, #31`
+  tags a small integer: the register holds twice the value. The lifter keeps that as a
+  mark beside the value and not in its text, and a name took the text and dropped the
+  mark. With the tag made on each arm of an `if` and `cmp w6, #0x44` after it, the body
+  read `t0 = x10.field_0x8;`, `t0 = x11.field_0x8;` and `if (t0.toSigned(32) < 0x44)`:
+  the field against a constant the machine compares with twice the field, wrong on 19 of
+  40 entry states against an arm64 CPU. A name now carries the mark, and the width the
+  tag was made at, wherever a value is named: before a store, across a call, for the
+  flags of a `subs`. At a join the name carries it where both arms hold their value
+  tagged at one width, and the read is `if ((t0.toSigned(31) << 1) < 0x44)`. Where one
+  arm is tagged and the other is not, the name is set to the word each arm leaves, `t0 =
+  x10.field_0x8.toSigned(31) << 1;` beside `t0 = x11.field_0x8;`. A name set on the way
+  to a label a goto reaches, or round a loop, is always the word. Of 136 crafted forms,
+  each condition code after the join on x and w registers, three ways in, a goto join, a
+  loop, and the value stored, passed, returned and used as an index, 28 agreed with the
+  CPU and 130 do. One is a frame slot the body declines to read, and five return or
+  store the tagged value, where the body prints the integer as it does with no join.
+  None that agreed is wrong, and the two generated sets do not move: 20,420 programs
+  give 17,082 agreeing and 5 wrong before and after, and 10,600 others 8,847 and none.
+  On the nine binaries 1,149 of 273,863 ranges change, 2,886 lines replaced by 2,996,
+  none with an error: 51 ranges and 85 lines on each fixture, such as `t7 = t6;` to `t7
+  = t6 << 1;` where the other arm sets `t7 = a2;`, the argument as it came in, and `t58
+  = 16 - t43;` to `t58 = 16 - t43 << 1;`. The clean fixture lifts in 23.3 s before and
+  after.
+
 - **A stack argument reads as its parameter (#420).** An argument the caller pushed
   printed as a bare frame slot, `FP.field_0x10`, though the snapshot states how many
   parameters the function takes. Where it does, with no optional or type parameters and

@@ -27660,6 +27660,111 @@ def test_a_join_an_if_falls_into_is_named_on_the_way_in_from_each_arm():
     assert "if (t1 >= x4) {" in compared, compared
 
 
+def _tag_read(at, reg="w6"):
+    """Rows that compare `reg` with 0x44 at address `at` and return 1 or 2, and the
+    lines the lifter closes that `if` with."""
+    rows = [("cmp", f"{reg}, #0x44"), ("b.ge", f"#{at + 16:#x}"), ("mov", "x0, #1"),
+            ("ret", ""), ("mov", "x0, #2"), ("ret", "")]
+    return rows, ["return 1;", "} else {", "return 2;", "}"]
+
+
+def test_a_join_keeps_the_tag_an_arm_put_on_its_value():
+    """`sbfiz x6, x8, #1, #31` on one arm, `sbfiz x6, x9, #1, #31` on the other and
+    `cmp w6, #0x44` after printed `t0 = x10.field_0x8;`, `t0 = x11.field_0x8;` and
+    `if (t0.toSigned(32) < 0x44)`: the register holds twice the field, and the name
+    took the text the lifter keeps for a tagged value and dropped the mark beside
+    it that says it is tagged (#478). A name now carries the mark where both arms
+    have it, and holds the word each arm leaves, spelled out, where they do not."""
+    load = [("ldur", "x8, [x10, #7]"), ("ldur", "x9, [x11, #7]")]
+    rows, done = _tag_read(0x18)
+    arms = ["var t0;", "if (x2 != 0) {", "t0 = x10.field_0x8;", "} else {",
+            "t0 = x11.field_0x8;", "}"]
+    tagged = "if ((t0.toSigned(31) << 1) < 0x44) {"
+    assert _lift_rows(load + [
+        ("cbz", "x2, #0x14"), ("sbfiz", "x6, x8, #1, #0x1f"), ("b", "#0x18"),
+        ("sbfiz", "x6, x9, #1, #0x1f")] + rows) == arms + [tagged] + done
+    # The 32-bit form of the tag on both arms: the name is the low word of each.
+    assert _lift_rows(load + [
+        ("cbz", "x2, #0x14"), ("sbfiz", "w6, w8, #1, #0x1f"), ("b", "#0x18"),
+        ("sbfiz", "w6, w9, #1, #0x1f")] + rows) == [
+        "var t0;", "if (x2 != 0) {", "t0 = x10.field_0x8.toUnsigned(32);", "} else {",
+        "t0 = x11.field_0x8.toUnsigned(32);", "}", tagged] + done
+    # Tagged on one arm only: the name is the word, and the read is of a word.
+    word = ["var t0;", "if (x2 != 0) {", "t0 = x10.field_0x8.toSigned(31) << 1;",
+            "} else {"]
+    plain = "if (t0.toSigned(32) < 0x44) {"
+    assert _lift_rows(load + [
+        ("cbz", "x2, #0x14"), ("sbfiz", "x6, x8, #1, #0x1f"), ("b", "#0x18"),
+        ("mov", "x6, x9")] + rows) == word + ["t0 = x11.field_0x8;", "}", plain] + done
+    # The same field on both arms, tagged on one: it printed no name and no `if`,
+    # `if (x10.field_0x8.toSigned(32) < 0x44)`, as if the arms held one value.
+    rows, done = _tag_read(0x10)
+    assert _lift_rows([
+        ("ldur", "x8, [x10, #7]"), ("mov", "x6, x8"), ("cbz", "x2, #0x10"),
+        ("sbfiz", "x6, x8, #1, #0x1f")] + rows) == word + [
+        "t0 = x10.field_0x8;", "}", plain] + done
+    # Tagged on one arm and boxed on the other, which is tagged too.
+    rows, done = _tag_read(0x24)
+    assert _lift_rows(load + [
+        ("cbz", "x2, #0x14"), ("sbfiz", "x6, x8, #1, #0x1f"), ("b", "#0x24"),
+        ("sbfiz", "x6, x7, #1, #0x1f"), ("cmp", "x7, x6, asr #1"), ("b.eq", "#0x24"),
+        ("bl", "#0x3000")] + rows) == [
+        "var t0;", "if (x2 != 0) {", "t0 = x10.field_0x8;", "} else {", "t0 = x7;",
+        "}", tagged] + done
+
+
+def test_a_name_set_on_the_way_to_a_label_or_round_a_loop_holds_the_tagged_word():
+    """A join that gotos reach reads its name before the walk has seen every way in
+    set it, and a loop's name is set again by each trip, so neither can say how each
+    one holds its value: the name is the word the register holds (#478). Both
+    printed the untagged field into the name and compared it as the word."""
+    rows, done = _tag_read(0x2c, "w3")
+    assert _lift_rows([
+        ("ldur", "x8, [x10, #7]"), ("ldur", "x9, [x11, #7]"),
+        ("ldur", "x12, [x10, #0xf]"), ("sbfiz", "x3, x8, #1, #0x1f"),
+        ("cbz", "x1, #0x28"), ("sbfiz", "x3, x9, #1, #0x1f"), ("cbz", "x2, #0x2c"),
+        ("sbfiz", "x3, x12, #1, #0x1f"), ("cbz", "x5, #0x28"),
+        ("sbfiz", "x3, x8, #1, #0x1f"), ("add", "x4, x4, #1")] + rows) == [
+        "var t1;", "var t2;", "if (x1 != 0) {", "if (x2 != 0) {", "var t0;",
+        "if (x5 != 0) {", "t0 = x10.field_0x8;", "} else {", "t0 = x10.field_0x10;",
+        "}", "t1 = t0.toSigned(31) << 1;", "L_0x28:", "t2 = t1;", "} else {",
+        "t2 = x11.field_0x8.toSigned(31) << 1;", "}", "} else {",
+        "t1 = x10.field_0x8.toSigned(31) << 1;", "goto L_0x28;", "}",
+        "if (t2.toSigned(32) < 0x44) {"] + done
+    rows, done = _tag_read(0x18)
+    assert _lift_rows([
+        ("ldur", "x8, [x10, #7]"), ("sbfiz", "x6, x8, #1, #0x1f"),
+        ("add", "x7, x7, #1"), ("add", "x6, x6, #2"), ("sub", "x7, x7, #1"),
+        ("cbnz", "x7, #0xc")] + rows) == [
+        "var t0 = x10.field_0x8.toSigned(31) << 1;", "var t1 = x7 + 1;",
+        "while (true) {", "if ((t1 - 1) == 0) {", "t0 += 2;", "t1 -= 1;", "break;",
+        "}", "t0 += 2;", "t1 -= 1;", "}", "if (t0.toSigned(32) < 0x44) {"] + done
+
+
+def test_a_name_for_a_tagged_value_keeps_the_width_the_tag_was_made_at():
+    """`sbfiz w6, w8, #1, #31` leaves the tagged value in the low word and zeroes
+    above it. Named, because a store came between, and compared as an x register, it
+    printed `(t0.toSigned(31) << 1) < 0x44`, which is negative where the register is
+    not: the name kept the tag and dropped the width beside it (#478)."""
+    rows, done = _tag_read(0xc, "x6")
+    assert _lift_rows([
+        ("ldur", "x8, [x10, #7]"), ("sbfiz", "w6, w8, #1, #0x1f"),
+        ("stur", "x9, [x11, #7]")] + rows) == [
+        "var t0 = x10.field_0x8.toUnsigned(32);", "x11.field_0x8 = x9;",
+        "if ((t0.toSigned(31) << 1).toUnsigned(32) < 0x44) {"] + done
+    assert _lift_rows([
+        ("ldur", "x8, [x10, #7]"), ("ldur", "x9, [x11, #7]"),
+        ("sbfiz", "x6, x8, #1, #0x1f"), ("mov", "w6, w6"), ("stur", "x9, [x11, #7]"),
+        ("add", "x0, x6, #2"), ("ret", "")]) == [
+        "var t0 = x10.field_0x8.toUnsigned(32);", "x11.field_0x8 = x11.field_0x8;",
+        "return (t0.toSigned(31) << 1).toUnsigned(32) + 2;"]
+    # The name the flags of a `subs` are kept under: it printed `if (t0 < 4)`.
+    assert _lift_rows([
+        ("sbfiz", "x5, x5, #1, #0x1f"), ("subs", "x5, x5, #4"), ("b.ge", "#0x14"),
+        ("mov", "x0, #1"), ("ret", ""), ("mov", "x0, #2"), ("ret", "")]) == [
+        "var t0 = x5;", "if ((t0.toSigned(31) << 1) < 4) {"] + done
+
+
 def test_naming_a_join_an_if_falls_into_takes_two_walks_at_any_length():
     # The cost, counted and not timed: the join above and a run of joins a goto
     # reaches after it, each reading the name of the one before. It was three walks,
