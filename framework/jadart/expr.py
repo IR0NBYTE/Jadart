@@ -9737,6 +9737,40 @@ class Lifter:
                                             if st.get(r).text != n)
             self._breakers.setdefault(header, set()).add(st.src)
 
+    def _left_behind(self, st: State, addr):
+        """Record in `lost_reads` each register an inner loop left behind that a name
+        of the loop being walked holds here, where a throw at `addr` leaves the loop,
+        and each one a loop being left writes and does not carry that the throw reads.
+
+        A goto out of the loop wrote those names back, and its lines were where the
+        read was seen (`_lost_spelled`): the inner loop then carries the register and
+        the tail of this one assigns its name from that. With the throw printed in
+        place nothing is written back, the read went unseen, and the tail of a loop
+        that sums into x3 after an inner loop with a stack check read `t1 = x3 + t5;`
+        on the bare register where it had read `t1 += t7;` (#424). The names are not
+        written: nothing after a throw reads them.
+
+        So too a register the loop forgot at its header (`_unset`) and the throw
+        reads where it is still its bare name: `_note_goto` makes it an exit hazard,
+        but no printed line writes it, and with no goto's lines to spell it the read
+        went unseen too, so the loop did not carry it and the throw printed `x2 << 6`
+        where the goto's target had read `t0 << 6`."""
+        live = _mask_regs(self._livein.get(addr, 0))
+        for header, _names, _copied in self._carrying:
+            for r in live & self._unset.get(header, {}).keys():
+                if st.get(r).text == r:
+                    self.lost_reads.add(r)
+        lost = st.opaque | st.stale
+        if not lost:
+            return
+        _header, names, _copied = self._carrying[-1]
+        for r in sorted(names):
+            v = _held(st.get(r))
+            if v.text != names[r]:
+                for w in _REG_RE.findall(v.text):
+                    if canon(w) in lost:
+                        self.lost_reads.add(canon(w))
+
     def _note_goto(self, addr):
         """Record the registers a goto out of a loop may hand its target unknown (#154).
 
@@ -10534,6 +10568,17 @@ class Lifter:
             st.dropped = {}
             st.slot_by_reg = {}
             st.result = _T.ret_int
+            # Each register is its own name again and no copy of an older value is
+            # held, which is where `State.set` gives a mark up. Left standing, the
+            # marks of a section printed before this one made a catch entry's call
+            # print `(...)` for the exception and the stack trace, where a block
+            # that throws used to be lifted on the way and cleared it (#424).
+            # Only where no edge reaches the block: at a join the marks are what the
+            # ways in left, and cleared there a loop's write read as its register,
+            # `if (x10 == 0)` where it had read `if (? == 0)`.
+            if not preds:
+                st.opaque.clear()
+                st.stale.clear()
         # Where the state came from NOW, which is the predecessor it was taken from, or
         # nowhere when no single way in justified one. `_lift_block` sets this at its end,
         # which was enough while this only ran where nothing fell through and the block
@@ -11405,6 +11450,12 @@ class Lifter:
                 # A block of the body that leads nowhere, printed again under a section
                 # no edge leads into and lifted from its state (`_ends_again`). No label:
                 # nothing jumps to this copy, and the body's own is where its gotos go.
+                # So too a block that throws, where a goto to it stood
+                # (`_throws_in_place`). Out of a loop it leaves as that goto did, but
+                # for the write-back: nothing after a throw reads the loop's names.
+                if self._carrying:
+                    self._note_goto(s[1])
+                    self._left_behind(st, s[1])
                 blines, _bfalls = self._lift_block(s[1], st)
                 out.extend(pad + ln for ln in blines)
                 falls = alive = False
@@ -14358,9 +14409,14 @@ def _tier3_graph(ann, cut_end, mono):
     if stmts and stmts[-1][0] == "rest":
         stmts[-1] = ("rest", _rest_sections(blocks, stmts[-1][1], ann, cut, mono))
     trapped = past_trap(blocks, entry, placed, cut)
-    return Tier3Graph(stripped, frozenset(slow), blocks, entry, raw, cut,
-                      _ends_again(blocks, stmts, placed, second, trapped), roots, second,
-                      trapped)
+    stmts = _ends_again(blocks, stmts, placed, second, trapped)
+    # Asked here and not in the pass: most functions hold no block that ends its path
+    # at a call, and one that holds none has no goto to look for.
+    if any(b.ends_path and not b.succ and b.insns and b.insns[-1][1] not in TRAPS
+           for b in blocks.values()):
+        stmts = _throws_in_place(blocks, stmts)
+    return Tier3Graph(stripped, frozenset(slow), blocks, entry, raw, cut, stmts, roots,
+                      second, trapped)
 
 
 def _rest_sections(blocks, left, ann, cut, mono) -> tuple:
@@ -14444,6 +14500,118 @@ def _ends_again(blocks, stmts, placed, second=frozenset(), trapped=frozenset()) 
                     else placed if s[1] in second else above)
         out.extend(copy([s], into) if into is not None else (s,))
     return out
+
+
+#: How many instructions a block that throws may hold for a second way into it to print
+#: a copy of it (`_throws_in_place`). Eight covers a throw of an error the block makes:
+#: the allocation, a store or two into it and the call that throws, three or four lines.
+#: Of the 38 blocks of the two fixtures with more than one way in, 14 hold 2 to 5 and
+#: print 1 to 3 lines, and the other 24 hold 11 or more: an error with a message built
+#: for it, six lines and up, which a reader wants once, under its label.
+_THROW_COPY = 8
+
+
+def _throws_in_place(blocks, stmts) -> list:
+    """`stmts` with each goto to a block that only throws made `("again", block)`: the
+    block printed where the branch to it is, and lifted from the state there.
+
+    The compiler lays a function's error paths out after its last return, so a check
+    inside a loop branches out of the loop to a block that throws, and no statement of
+    the loop can stand for that edge but a goto. `detach` on the clean fixture printed
+    `t0 = x2; goto L_0x148ec0;` in its loop and `L_0x148ec0: throw NullCastError();`
+    after `return NULL;`: 2,234 of the 8,125 goto targets of the two fixtures are such
+    a block, and 2,196 of those have that goto as their one way in (#424). A throw ends
+    its path, so it reads the same wherever it is printed, and printed at the branch
+    it needs no label, no goto, and none of what a goto writes out for its target.
+
+    A block that throws is one that ends at a call the caller said cannot return
+    (`build_cfg`'s `ends`) and leads nowhere. Not one that ends at a trap: the call
+    before a `brk` prints as a call, and under a branch with more code after it that
+    would read as going on into it.
+
+    With one goto and a section of its own, the block moves: the goto prints it and the
+    section goes. With more ways in, each goto prints a copy, each lifted from its own
+    way in, where the block is short enough (`_THROW_COPY`); a longer one keeps its
+    label and every goto to it. So a label goes only when no goto to it is left, and a
+    block the code above falls into stays where it is.
+
+    This is what jadx does to an exit block before it makes regions (BlockProcessor's
+    splitExitBlocks: one copy per predecessor) and what Ghidra and angr do to a return
+    (ActionReturnSplit, ReturnDuplicatorLow), which split only the edges that would
+    print as a goto, as here, and bound what they copy.
+
+    A goto that is the whole of a section, its labels and the goto and nothing else
+    (`_jumps_back`), stays a goto: the slow path of a stack check once its stub call is
+    dropped. It is a jump back, not a branch a reader follows, and a copy there is
+    lifted from the state of a section no edge reaches, which knows nothing: kazumi's
+    0x26ad08 printed its `throw DioException.connectionTimeout(...)` a second time on
+    bare registers, `x1.field_0x10` for `t0.field_0x18.field_0x10`. Its target keeps
+    its label and its section, and the other gotos to it are copies as above.
+
+    In place, without recursion: the body is as deep as `structure` could nest it, and
+    a pass that nested as deep again would run out of stack on rows it had managed."""
+    sites, todo = {}, [stmts]
+    while todo:
+        ss = todo.pop()
+        for i, s in enumerate(ss):
+            k = s[0]
+            if k == "goto":
+                sites.setdefault(s[1], []).append((ss, i))
+            elif k == "if":
+                todo.append(s[2])
+                todo.append(s[3])
+            elif k == "loop":
+                todo.append(s[2])
+    throws = {}
+    for t in sites:
+        blk = blocks.get(t)
+        if (blk is not None and blk.ends_path and not blk.succ and blk.insns
+                and blk.insns[-1][1] not in TRAPS):
+            throws[t] = blk
+    if not throws:
+        return stmts
+    # The sections that are such a block and nothing else: a label and the block.
+    own = {s[1]: i for i, s in enumerate(stmts[:-1])
+           if s[0] == "label" and s[1] in throws and stmts[i + 1] == ("asm", s[1])
+           and not (i and stmts[i - 1][0] == "note")}
+    gone = set()
+    for t, blk in throws.items():
+        moved = [(ss, i) for ss, i in sites[t]
+                 if not (ss is stmts and _jumps_back(blocks, ss, i))]
+        # A goto that stays names the label, so the section the block has stays too.
+        alone = t in own and len(moved) == len(sites[t])
+        copies = len(moved) - alone
+        if copies and len(blk.insns) > _THROW_COPY:
+            continue
+        for ss, i in moved:
+            ss[i] = ("again", t)
+        if alone:
+            gone.update((own[t], own[t] + 1))
+    return [s for i, s in enumerate(stmts) if i not in gone] if gone else stmts
+
+
+def _jumps_back(blocks, stmts, i) -> bool:
+    """Whether the goto at `stmts[i]`, the top level, is the whole of its section: after
+    its labels, with a note among them if one stands there, and before the next section
+    or the end (`_throws_in_place`). A block of the section that prints nothing counts
+    as none: the stack check's call to its stub, which tier 3 drops (`_classify_stub`),
+    and the branch back, which is this goto."""
+    j, labels = i - 1, 0
+    while j >= 0:
+        k = stmts[j][0]
+        if k == "label":
+            labels += 1
+        elif k == "asm":
+            blk = blocks.get(stmts[j][1])
+            if blk is None or not all(
+                    mn == "b"
+                    or (mn == "bl" and (_stub_of(note) or ("",))[0] == "suppress")
+                    for _a, mn, _o, note in blk.insns):
+                break
+        elif k != "note":
+            break
+        j -= 1
+    return labels > 0 and (i + 1 == len(stmts) or stmts[i + 1][0] in ("label", "note"))
 
 
 def _args_kept(blocks, raw, stack) -> bool:
