@@ -232,6 +232,53 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A branch to a block that only throws prints the throw (#424).** The compiler lays a
+  function's error paths out after its last return, so a check inside a loop branches
+  out of the loop to one, and tier 3 had no statement for that edge but a goto. `detach`
+  on the clean fixture read `t0 = x2;` and `goto L_0x148ec0;` in its loop, with
+  `L_0x148ec0:` and `throw NullCastError();` after its `return NULL;`. A throw ends its
+  path, so it reads the same wherever it is printed, and the loop now reads `throw
+  NullCastError();` where the goto stood: no goto, no label, and no `t0 = x2;`, which
+  wrote the loop's name back for code after the label that a throw does not have.
+  `fillRange` read `goto L_0x16248;` under its bounds check and reads `throw
+  RangeError();`. The rule is the same outside a loop. A block one goto reaches moves to
+  it. A block with more ways in prints once at each, lifted from the values that way
+  holds, where it is 8 instructions or fewer: the two fixtures have 38 such blocks, 14
+  of 2 to 5 instructions and 24 of 11 or more, and a long one reads better once, under
+  its label, so it keeps the label and every goto. A block the code above falls into
+  stays where it is and loses its label with the last goto. A goto that is the whole of
+  its section, the jump back of a stack check's slow path, stays a goto, since a copy
+  there would be lifted from a section no edge reaches. Two shapes are left as they
+  were: a block that ends at a trap after a call, which prints as a call and would read
+  as going on into the code under it, and an error path of more than one block. On the
+  clean fixture 1,100 of 5,623 gotos and as many labels go, 410 of the 8,194 ranges
+  change and 79 of the 1,428 that held a goto hold none, in 3,940 fewer lines (204,274
+  to 200,334); on the obfuscated one 1,100 of 5,628 gotos go, 410 of the 8,188 ranges
+  change, and the lines are 204,386 to 200,445. Of the 1,117 blocks on each that throw
+  and were a goto's target, 1,098 moved, 2 print a copy and 17 keep their 23 gotos. On
+  the nine binaries 24,033 of 127,322 gotos go, 8,486 of the 273,863 ranges change and
+  1,698 of the 32,077 that held a goto hold none, in 92,371 fewer lines and with no
+  error; goto targets that hold only a throw go from 19,988 to 97, nearly all of those
+  left the target of such a jump back. Two things rode on the goto and are kept without
+  it. Its write-back was where a register an inner loop left behind was seen read, which
+  is what makes that loop carry it under a name, so a throw out of the outer loop now
+  reports the same read. So does a register the loop itself writes and does not carry:
+  read by the throw, it is still carried under a name and not printed bare, as the value
+  the function came in with. And a section no edge reaches, a catch entry, starts
+  without the marks of the section printed before it, which a throw block lifted between
+  the two had been clearing. A join keeps them: there they are what the ways in left. 14
+  crafted forms (a throw out of one loop and out of two, several ways in with a value
+  each, a block over the bound, one the code falls into, one after an inner loop) agree
+  with an arm64 CPU on all 530 entry states it ran, before and after: 13 of them held a
+  goto and 2 still do, the block over the bound and the trap. Of 3,320 generated
+  programs with a throw none prints a wrong line before or after; 52 agree with the CPU
+  on more entry states than before and 10 on fewer, where the throw reads a bare
+  register that the goto's label read under a name, a fault that is there with no throw
+  in sight (#485). 14 ranges of each fixture give a thrown value that is used once a
+  name, `t92 = noElement();` and `throw t92;`, from how names are declared ahead (#486).
+  `tools/cfgcheck.py` counts a block printed where its goto stood as placed. Lifting the
+  clean fixture takes 22.1 s of CPU against 22.8 s, two runs of each.
+
 - **A name keeps the tag of the value it is set to (#478).** `sbfiz x6, x8, #1, #31`
   tags a small integer: the register holds twice the value. The lifter keeps that as a
   mark beside the value and not in its text, and a name took the text and dropped the

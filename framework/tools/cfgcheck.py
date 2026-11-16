@@ -340,7 +340,9 @@ def tier3_left_out(g):
 
     def walk(stmts):
         for s in stmts:
-            if s[0] == "asm":
+            # `again` too: a block that throws is printed where the goto to it stood,
+            # and one only a section reaches then has no other place (#424)
+            if s[0] in ("asm", "again"):
                 placed.add(s[1])
             elif s[0] == "if":
                 walk(s[2])

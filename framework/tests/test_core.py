@@ -29313,6 +29313,359 @@ def test_a_stack_argument_is_named_only_where_its_slot_still_holds_it():
     assert read == () and "a1" not in str(lines), lines
 
 
+#: What `annotate` writes after a call to a stub that throws, by which tier 3 knows the
+#: call does not return (#424).
+_RANGE_424 = "  ; -> _iso_stub_RangeErrorSharedWithoutFPURegsStub"
+_NULL_424 = "  ; -> _iso_stub_NullCastErrorSharedWithoutFPURegsStub"
+_THROW_424 = "  ; -> _iso_stub_ThrowStub"
+_STACK_424 = "  ; -> _iso_stub_StackOverflowSharedWithoutFPURegsStub"
+
+
+def _lift_noted(rows, base=0x1000, **kw):
+    """Tier 3 of `rows`, (mnemonic, operands) or (mnemonic, operands, note), laid out 4
+    bytes apart from `base`."""
+    from jadart.expr import lift_function
+    ann = [(base + i * 4, r[0], r[1], r[2] if len(r) > 2 else "")
+           for i, r in enumerate(rows)]
+    return [ln.strip() for ln in lift_function(ann, **kw)]
+
+
+def test_a_loop_exit_into_a_throw_prints_the_throw_where_it_leaves():
+    """A null check in a loop branches to a block past the return that throws. It was
+    printed as a section of its own under a label, and the branch as a goto to it with
+    the loop's name written back first: `t0 = x2; goto L_0x102c;`, a write nothing
+    reads, since nothing follows a throw. That was 1,117 of the 4,062 goto targets of
+    the clean fixture. The throw is printed where the branch is, as the source has it,
+    and the label, the goto and the write-back are gone. A call followed by a trap is
+    not such a block: tier 3 prints nothing for the trap, and in place the call would
+    read as running on into what follows the `if` (#424)."""
+    rows = [("ldur", "x2, [x1, #7]"), ("cbz", "x2, #0x1024"), ("mov", "x1, x2"),
+            ("bl", "#0x9100", "  ; -> foo"), ("ldur", "x3, [x0, #7]"),
+            ("cbz", "x3, #0x102c"), ("ldur", "x2, [x3, #0xf]"), ("b", "#0x1004"),
+            ("brk", "#0"), ("mov", "x0, x22"), ("ret", ""), ("bl", "#0x9000", _NULL_424)]
+    body = _lift_noted(rows)
+    at = body.index("if (t1.field_0x8 == 0) {")
+    assert body[at + 1:at + 3] == ["throw NullCastError();", "}"], body
+    assert body.count("throw NullCastError();") == 1, body
+    assert not any("goto" in ln or ln == "L_0x102c:" or ln == "t0 = x2;"
+                   for ln in body), body
+    assert body[-2] == "return NULL;", body
+    # a plain range check, where no write-back stood: the same
+    rows = [("mov", "x2, #0"), ("cmp", "x2, x3"), ("b.ge", "#0x1020"), ("cmp", "x2, x4"),
+            ("b.hs", "#0x1028"), ("add", "x2, x2, #1"), ("b", "#0x1004"), ("brk", "#0"),
+            ("mov", "x0, x2"), ("ret", ""), ("bl", "#0x9000", _RANGE_424)]
+    body = _lift_noted(rows)
+    assert body[:6] == ["var t0 = 0;", "while (true) {", "if (t0 < x3) {",
+                        "if (t0 u>= x4) {", "throw RangeError();", "}"], body
+    assert body[-2:] == ["return t0;", "L_0x101c:"], body
+    # a call and then a trap: the goto and the label stay
+    body = _lift_noted(rows[:-1] + [("bl", "#0x9000", "  ; -> fail"), ("brk", "#0")])
+    assert body[4] == "goto L_0x1028;", body
+    assert body[-3:-1] == ["L_0x1028:", "fail(...);"], body
+
+
+def test_a_throw_several_paths_reach_prints_once_for_each_with_its_own_value():
+    """Two paths set x0 and branch to one block that throws it. That printed a name
+    declared above the body, set on each path, a label and a goto: `t0 = 2; goto
+    L_0x1020;`. Each path prints its own copy of the block, lifted from the state it
+    arrives with, so each throws the value it holds and the name has no reader left.
+    One way in moves the block whatever its length. More than one copies it only up to
+    eight instructions, the size of the larger of the two groups such blocks fall into
+    on the fixtures: of the 38 with several ways in, 14 hold 2 to 5 and the other 24
+    hold 11 or more. Past that the label and every goto to it stay (#424)."""
+    head = [("cbz", "x2, #0x1010"), ("mov", "x0, #1"), ("cbz", "x3, #0x1020"),
+            ("b", "#0x1018"), ("mov", "x0, #2"), ("cbz", "x4, #0x1020"),
+            ("mov", "x0, #0"), ("ret", "")]
+    throw = [("bl", "#0x9000", _THROW_424)]
+    body = _lift_noted(head + throw)
+    assert body == ["if (x2 != 0) {", "if (x3 == 0) {", "throw 1;", "}", "} else {",
+                    "if (x4 == 0) {", "throw 2;", "}", "}", "return 0;"], body
+    # eight instructions: still a copy each
+    body = _lift_noted(head + [("add", "x0, x0, #1")] * 7 + throw)
+    ones = " + 1" * 7
+    assert [ln for ln in body if ln.startswith("throw")] == [
+        f"throw 1{ones};", f"throw 2{ones};"], body
+    assert not any("goto" in ln or ln.startswith("L_") for ln in body), body
+    # nine: the block where it was, under its label, and the goto to it
+    body = _lift_noted(head + [("add", "x0, x0, #1")] * 8 + throw)
+    assert body.count("L_0x1020:") == 1 and body.count("goto L_0x1020;") == 1, body
+    assert len([ln for ln in body if ln.startswith("throw")]) == 1, body
+    # ...unless one goto is the only way in, which moves it whole
+    rows = [("mov", "x2, #0"), ("cmp", "x2, x3"), ("b.ge", "#0x1020"), ("cmp", "x2, x4"),
+            ("b.hs", "#0x1028"), ("add", "x2, x2, #1"), ("b", "#0x1004"), ("brk", "#0"),
+            ("mov", "x0, x2"), ("ret", "")]
+    body = _lift_noted(rows + [("add", "x0, x2, #1")] + [("add", "x0, x0, #1")] * 8
+                       + throw)
+    assert f"throw t0{ones} + 1 + 1;" in body, body
+    assert not any("goto" in ln or ln == "L_0x1028:" for ln in body), body
+
+
+def test_a_throw_a_path_falls_into_keeps_its_place_and_loses_its_label():
+    """A block that throws can be the arm of an `if` after a loop and the target of a
+    branch out of that loop as well. The arm stays where it is, the loop's branch prints
+    a copy, and the label over the arm goes with the last goto that named it (#424)."""
+    rows = [("mov", "x2, #0"), ("cmp", "x2, x3"), ("b.ge", "#0x1020"), ("cmp", "x2, x4"),
+            ("b.hs", "#0x1028"), ("add", "x2, x2, #1"), ("b", "#0x1004"), ("brk", "#0"),
+            ("cbz", "x2, #0x1030"), ("mov", "x7, x2"), ("bl", "#0x9000", _RANGE_424),
+            ("brk", "#0"), ("mov", "x0, x2"), ("ret", "")]
+    body = _lift_noted(rows)
+    assert body[3:6] == ["if (t0 u>= x4) {", "throw RangeError();", "}"], body
+    at = body.index("if (t0 != 0) {")
+    assert body[at:at + 5] == ["if (t0 != 0) {", "throw RangeError();", "} else {",
+                               "return t0;", "}"], body
+    assert not any("goto" in ln or ln == "L_0x1028:" for ln in body), body
+
+
+def test_a_throw_out_of_two_loops_writes_the_name_of_neither_back():
+    """A branch out of an inner loop to a block that throws leaves the outer loop too.
+    As a goto it made the inner loop's name one declared above the body, for the label
+    to read. In place the throw reads the name where the loop declares it, and neither
+    loop writes anything back (#424)."""
+    rows = [("mov", "x2, #0"), ("cmp", "x2, x3"), ("b.ge", "#0x1038"), ("mov", "x5, #0"),
+            ("cmp", "x5, x4"), ("b.ge", "#0x1030"), ("cmp", "x5, x6"),
+            ("b.hs", "#0x1040"), ("add", "x5, x5, x2"), ("add", "x5, x5, #1"),
+            ("b", "#0x1010"), ("brk", "#0"),
+            ("add", "x2, x2, #1"), ("b", "#0x1004"), ("mov", "x0, x2"), ("ret", ""),
+            ("mov", "x0, x5"), ("bl", "#0x9000", _THROW_424)]
+    body = _lift_noted(rows)
+    assert body[:8] == ["var t0 = 0;", "while (true) {", "if (t0 < x3) {", "var t1 = 0;",
+                        "while (true) {", "if (t1 < x4) {", "if (t1 u>= x6) {",
+                        "throw t1;"], body
+    assert body[-2:] == ["return t0;", "L_0x102c:"], body
+    assert not any("goto" in ln or ln == "L_0x1040:" for ln in body), body
+
+
+def test_a_throw_printed_in_a_loop_still_names_what_an_inner_loop_left():
+    """An inner loop with a stack check leaves the outer loop's registers behind, and
+    the outer loop sums into one of them at its tail. The goto out of the outer loop
+    wrote its names back, and those lines were where the registers were seen to be
+    read, so that the inner loop carries them. With the throw printed in place of the
+    goto nothing is written back, and the tail read `t1 = x3 + t5;`, the bare register,
+    where it had read `t1 += t7;`. The read is on record at the throw as it was at the
+    goto (#424)."""
+    rows = [("mov", "x3, #0"), ("mov", "x2, #0"), ("ldr", "x16, [x26, #0x48]"),
+            ("cmp", "x15, x16"), ("b.ls", "#0x1058"), ("cmp", "x2, x4"),
+            ("b.ge", "#0x1050"), ("mov", "x5, #0"), ("ldr", "x16, [x26, #0x48]"),
+            ("cmp", "x15, x16"), ("b.ls", "#0x1060"), ("cmp", "x5, x6"),
+            ("b.ge", "#0x103c"), ("add", "x5, x5, #1"), ("b", "#0x1020"),
+            ("cmp", "x5, x7"), ("b.hs", "#0x1068"), ("add", "x3, x3, x5"),
+            ("add", "x2, x2, #1"), ("b", "#0x1008"), ("mov", "x0, x3"), ("ret", ""),
+            ("bl", "#0x9000", _STACK_424), ("b", "#0x1014"),
+            ("bl", "#0x9000", _STACK_424), ("b", "#0x102c"),
+            ("bl", "#0x9100", _RANGE_424)]
+    body = _lift_noted(rows)
+    at = body.index("throw RangeError();")
+    assert re.fullmatch(r"if \(t\d+ u>= x7\) \{", body[at - 1]), body
+    assert not any("goto" in ln or ln.startswith("L_") for ln in body), body
+    assert "t0 += 1;" in body and any(re.fullmatch(r"t1 \+= t\d+;", ln)
+                                      for ln in body), body
+    assert not any(re.search(r"\bx[23]\b", ln) for ln in body), body
+
+
+def test_a_catch_entry_does_not_start_with_the_marks_of_the_section_before_it():
+    """A section no edge leads into starts from bare registers, and the marks a loop
+    left on the state before it are about values that state held. They were kept: a
+    catch entry after a loop that loads x1 printed `foo(...)` for the exception and the
+    stack trace, unless a block that throws stood between the two and its call cleared
+    the mark on the way. That block now prints where its branch is, so the entry gives
+    the marks up itself (#424)."""
+    rows = [("mov", "x6, #0"), ("ldur", "x1, [x4, #7]"), ("cmp", "x6, x5"),
+            ("b.hs", "#0x1024"), ("add", "x6, x6, x1"), ("cmp", "x6, x3"),
+            ("b.lt", "#0x1004"), ("mov", "x0, x6"), ("ret", ""),
+            ("bl", "#0x9000", _RANGE_424), ("mov", "x2, x1"), ("mov", "x1, x0"),
+            ("bl", "#0x9100", "  ; -> foo"), ("ret", "")]
+    body = _lift_noted(rows, arity=lambda pc: 2 if pc == 0x9100 else None)
+    assert body[-2:] == ["L_0x1028:", "return foo(x0, x1);"], body
+    assert "throw RangeError();" in body and "goto L_0x1024;" not in body, body
+
+
+def _loops_to_one_throw_424(k, base=0x1000):
+    """`k` loops in a row, each left by a range check to ONE block that throws x2 + 1."""
+    end = base + 4 * (6 * k + 2)
+    rows = []
+    for i in range(k):
+        rows += [("add", "x2, x2, #1"), ("cmp", "x2, x4"), ("b.hs", f"#{end:#x}"),
+                 ("cmp", "x2, x3"), ("b.lt", f"#{base + 24 * i:#x}"),
+                 ("add", "x3, x3, #8")]
+    rows += [("mov", "x0, x2"), ("ret", ""), ("add", "x0, x2, #1"),
+             ("bl", "#0x9000", _THROW_424)]
+    return [(base + 4 * i, r[0], r[1], r[2] if len(r) > 2 else "")
+            for i, r in enumerate(rows)]
+
+
+def test_many_ways_into_one_throw_cost_the_same_for_each():
+    """A block that throws is printed once for each way in, so a body with many ways
+    into one must not pay for all of them at each: 400 loops that each leave to the same
+    two instructions lift in 0.12 s, where the label and its 400 gotos took 0.20 s.
+    Counted, not timed: the Python calls made to lift the body, per row, at 50 loops
+    and at 200, which is 186 and 187 here and 280 on main, where each is a goto. The
+    pass that moves them walks the statements with a list and not the call stack, so a
+    body nested deeper than Python's own limit goes through it (#424)."""
+    from jadart import expr
+    from jadart.cfg import Block
+    calls = [0]
+
+    def count(frame, event, arg):
+        if event == "call":
+            calls[0] += 1
+
+    def per_row(k):
+        rows = _loops_to_one_throw_424(k)
+        body = [ln.strip() for ln in expr.lift_function(rows)]      # the memos, filled
+        assert len([ln for ln in body if ln.startswith("throw t")]) == k, body[:30]
+        assert not any("goto" in ln or ln.startswith("L_") for ln in body), body[:30]
+        calls[0] = 0
+        was = sys.getprofile()
+        sys.setprofile(count)
+        try:
+            expr.lift_function(rows)
+        finally:
+            sys.setprofile(was)
+        return calls[0] / len(rows)
+
+    small, large = per_row(50), per_row(200)
+    assert large <= small * 1.1 + 1, (small, large)
+    # 3,000 `if`s deep, at the limit the CLI runs with
+    blocks = {0x9000: Block(0x9000, [(0x9000, "bl", "#0x100", "")], ends_path=True)}
+    stmts = inner = [("goto", 0x9000)]
+    for _ in range(3000):
+        stmts = [("if", "x1 == 0", stmts, [])]
+    stmts += [("label", 0x9000), ("asm", 0x9000)]
+    out = _at_default_limit(lambda: expr._throws_in_place(blocks, stmts))
+    assert inner == [("again", 0x9000)] and len(out) == 1 and out[0][0] == "if", out[-2:]
+
+
+def test_a_block_printed_only_where_its_goto_stood_is_not_counted_as_dropped():
+    """cfgcheck counts the blocks no edge from the entry reaches that tier 3 prints
+    nowhere. A block that throws is printed where the goto to it stood, as `again`,
+    and one only a section reaches then has no place of its own, so it was counted as
+    dropped though it is printed. None is on the two fixtures, where each of the 1,098
+    blocks moved is one the entry reaches (#424)."""
+    import types
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import cfgcheck
+    from jadart.cfg import Block
+    blocks = {0: Block(0, [(0, "ret", "", "")]),
+              8: Block(8, [(8, "cbz", "x0, #0x10", "")], succ=[0x10, 0xc]),
+              0xc: Block(0xc, [(0xc, "ret", "", "")]),
+              0x10: Block(0x10, [(0x10, "bl", "#0x100", "")], ends_path=True)}
+    stmts = [("asm", 0), ("asm", 8),
+             ("if", "x0 == 0", [("again", 0x10)], [("asm", 0xc)])]
+    g = types.SimpleNamespace(blocks=blocks, entry=0, cut=frozenset(), slow=frozenset(),
+                              stmts=stmts)
+    assert cfgcheck.tier3_left_out(g) == (set(), set(), set())
+    g.stmts = stmts[:2] + [("if", "x0 == 0", [], [("asm", 0xc)])]
+    assert cfgcheck.tier3_left_out(g) == ({0x10}, set(), set())
+
+
+def _join_after_loop_424(write, use):
+    """A loop that `write`s x10, then two loops whose exits branch to one join that
+    `use`s it: the join has two ways in and no throw anywhere."""
+    return ([("and", "x3, x3, #7"), ("mov", "x12, #0"), ("cmp", "x12, x3"),
+             ("b.ge", "#0x101c"), write, ("add", "x12, x12, #1"), ("b", "#0x1008"),
+             ("add", "x2, x2, #1"), ("cmp", "x2, x4"), ("b.ge", "#0x1050"),
+             ("cmp", "x2, x3"), ("b.lt", "#0x101c"), ("add", "x3, x3, #8"),
+             ("add", "x2, x2, #3"), ("cmp", "x2, x5"), ("b.ge", "#0x1050"),
+             ("cmp", "x2, x3"), ("b.lt", "#0x1034"), ("mov", "x0, x2"), ("ret", "")]
+            + use)
+
+
+def test_a_join_two_gotos_reach_keeps_the_marks_of_a_loop_before_it():
+    """A guard: a section no edge reaches starts without the marks of the one printed
+    before it, and that reset ran at every join that dropped to bare registers, where
+    the marks are what the ways in left. x10, written in the first loop and not
+    carried, then read as the value the function came in with: `if (x10 == 0)` where
+    the CPU tests what the loop left, and `x10.field_0x8 = t2;` for a store through
+    it. Only a block no edge reaches has its marks cleared (#424)."""
+    body = _lift_noted(_join_after_loop_424(
+        ("and", "x10, x4, #1"),
+        [("cbnz", "x10, #0x1058"), ("mov", "x7, #5"), ("add", "x0, x7, x2"),
+         ("ret", "")]))
+    assert "if (? == 0) {" in body and "if (x10 == 0) {" not in body, body
+    body = _lift_noted(_join_after_loop_424(
+        ("add", "x10, x8, x12, lsl #3"),
+        [("stur", "x2, [x10, #7]"), ("mov", "x1, x10"), ("bl", "#0x9100", "  ; -> foo"),
+         ("ret", "")]))
+    assert not any(ln.startswith("x10.") for ln in body), body
+
+
+def test_a_throw_printed_in_a_loop_names_a_register_the_loop_writes():
+    """A guard: a register a loop writes and does not carry, read by a throw out of
+    the loop, is forgotten at the header, and the goto to the throw's label was where
+    that read was seen, so the loop carried it under a name. Printed in place, with
+    no goto, the throw read x2 bare, the value the function came in with, where the
+    CPU throws with the 6 or the `x4 & 3` the loop put there: `^ x2 << 6` for
+    `^ t0 << 6`. The read is recorded where the throw leaves the loop (#424)."""
+    rows = [("mov", "x2, #6"), ("mov", "x9, #0"), ("mov", "x10, #7"),
+            ("and", "x3, x3, #3"), ("and", "x4, x4, #3"), ("add", "x11, x13, #3"),
+            ("mov", "x5, #0"), ("cmp", "x5, x3"), ("b.ge", "#0x1040"),
+            ("cmp", "x13, #17"), ("b.le", "#0x1048"), ("tbnz", "x5, #1, #0x1074"),
+            ("and", "x2, x4, #3"), ("tbnz", "x9, #5, #0x1040"), ("add", "x5, x5, #1"),
+            ("b", "#0x101c"), ("add", "x0, x7, x6"), ("ret", ""),
+            ("ldur", "x14, [x8, #15]"), ("add", "x0, x14, x3"),
+            ("eor", "x0, x0, x7, lsl #8"), ("sub", "x0, x0, x5"), ("add", "x0, x0, x7"),
+            ("eor", "x0, x0, x5"), ("add", "x0, x0, x13, lsl #5"),
+            ("sub", "x0, x0, x10, lsl #6"), ("eor", "x0, x0, x2, lsl #6"),
+            ("add", "x0, x0, x13, lsl #6"), ("bl", "#0x9000", _THROW_424),
+            ("add", "x0, x5, x9"), ("eor", "x0, x0, x9"), ("add", "x0, x0, x3"),
+            ("add", "x0, x0, x12, lsl #8"), ("eor", "x0, x0, x4"),
+            ("sub", "x0, x0, x9, lsl #8"), ("sub", "x0, x0, x11"),
+            ("add", "x0, x0, x13"), ("bl", "#0x9000", _THROW_424)]
+    body = _lift_noted(rows)
+    throw = [ln for ln in body if ln.startswith("throw") and "<< 6" in ln]
+    assert len(throw) == 1 and "x2" not in throw[0], body
+    assert "var t0 = 6;" in body and "t0 = x4 & 3 & 3;" in body, body
+    assert throw[0].endswith("^ t0 << 6) + (x13 << 6);"), body
+
+
+def test_a_stack_check_that_jumps_back_to_a_throw_keeps_its_goto():
+    """A guard: the slow path of a stack check is a section of labels and one goto back
+    once the call to its stub is dropped, and where it goes back to a block that throws
+    the goto printed a second copy of the throw there, lifted from a section no edge
+    reaches: kazumi's 0x26ad08 read `x1.field_0x10` for `t0.field_0x18.field_0x10`. A
+    jump back stays a goto, and the block it goes to keeps its label (#424)."""
+    body = _lift_noted([("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"),
+                        ("b.ls", "#0x1014"), ("ldur", "x0, [x1, #0x17]"),
+                        ("bl", "#0x9000", _THROW_424), ("bl", "#0x9200", _STACK_424),
+                        ("b", "#0x100c")])
+    assert body == ["L_0x100c:", "throw x1.field_0x18;", "L_0x1014:",
+                    "goto L_0x100c;"], body
+
+
+def test_a_throw_a_branch_and_a_jump_back_reach_keeps_its_section_for_the_jump():
+    """A check in a loop branches to a block past the return that throws, and the slow
+    path of the stack check jumps back to the same block. The branch prints the throw
+    where it is, lifted from its own values, and the jump back keeps its goto, so the
+    block keeps its section and its label: nothing is printed twice from a state that
+    knows nothing, and no goto is left without its label (#424)."""
+    body = _lift_noted([("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"),
+                        ("b.ls", "#0x1034"), ("mov", "x3, #0"), ("cmp", "x3, x4"),
+                        ("b.ge", "#0x1024"), ("cbz", "x2, #0x102c"),
+                        ("add", "x3, x3, #1"), ("b", "#0x1010"), ("mov", "x0, x3"),
+                        ("ret", ""), ("add", "x0, x3, #1"), ("bl", "#0x9000", _THROW_424),
+                        ("bl", "#0x9200", _STACK_424), ("b", "#0x102c")])
+    at = body.index("if (x2 == 0) {")
+    assert body[at + 1:at + 3] == ["throw t0 + 1;", "}"], body
+    assert body[-5:] == ["return t0;", "L_0x102c:", "throw x3 + 1;", "L_0x1034:",
+                         "goto L_0x102c;"], body
+
+
+def test_a_throw_whose_only_goto_jumps_back_keeps_its_section():
+    """A block that throws with a section of its own and one goto to it, from a section
+    that is only that goto, is not moved: the goto stays and so do the label and the
+    section it names. Moved, the section would go and the throw be printed under the
+    jump back, from a state no edge brings there (#424)."""
+    from jadart import expr
+    from jadart.cfg import Block
+    blocks = {0: Block(0, [(0, "ret", "", "")]),
+              8: Block(8, [(8, "ldur", "x0, [x1, #0x17]", ""),
+                           (0xc, "bl", "#0x9000", _THROW_424)], ends_path=True),
+              0x10: Block(0x10, [(0x10, "bl", "#0x9200", _STACK_424),
+                                 (0x14, "b", "#0x8", "")], succ=[8])}
+    stmts = [("asm", 0), ("label", 8), ("asm", 8), ("label", 0x10), ("goto", 8)]
+    assert expr._throws_in_place(blocks, list(stmts)) == stmts
+
+
 if __name__ == "__main__":
     # At EOF, and it has to stay there. `globals()` is read when this block RUNS, so
     # sitting mid-file it collected only the tests defined above it: CI ran 180 of 188
