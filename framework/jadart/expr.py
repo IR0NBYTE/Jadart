@@ -1474,6 +1474,84 @@ def _slot_regs(text: str) -> frozenset:
     return hit
 
 
+#: The `unnamed` of every `_Slots` no write has needed its own for. Never written.
+_NO_UNNAMED: dict = {}
+
+
+class _Slots(dict):
+    """The slot map, which also keeps the keys whose value is not a bare minted name
+    (`unnamed`). A store asks every slot whether it reads the written location
+    (`Lifter._pin_mem`), and a name is no read of memory, so where a walk names the
+    saves a store would change (#481) a frame of thousands of named slots would
+    otherwise be asked about whole at every store after them. `ordered` says the
+    unnamed keys are in the map's own order, which a slot whose name is replaced by
+    another value in place breaks. Both are class defaults until a write needs its
+    own, and the map is built in C, so a State and its copies cost no Python call for
+    it: ordinary code lifts in the calls it was recorded at (#346)."""
+    unnamed: dict = _NO_UNNAMED
+    ordered = True
+
+    def __setitem__(self, k, v):
+        had = k in self
+        super().__setitem__(k, v)
+        if _MINTED_RE.fullmatch(getattr(v, "text", "")):
+            self.unnamed.pop(k, None)
+        elif k not in self.unnamed:
+            if had:
+                self.ordered = False
+            if self.unnamed is _NO_UNNAMED:
+                self.unnamed = {}
+            self.unnamed[k] = None
+
+    def __delitem__(self, k):
+        super().__delitem__(k)
+        self.unnamed.pop(k, None)
+
+    def pop(self, k, *d):
+        self.unnamed.pop(k, None)
+        return super().pop(k, *d)
+
+    def popitem(self):
+        k, v = super().popitem()
+        self.unnamed.pop(k, None)
+        return k, v
+
+    def clear(self):
+        super().clear()
+        self.unnamed = _NO_UNNAMED
+        self.ordered = True
+
+    def setdefault(self, k, v=None):
+        if k not in self:
+            self[k] = v
+        return self[k]
+
+    def update(self, *a, **k):
+        for key, v in dict(*a, **k).items():
+            self[key] = v
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+    def copy(self):
+        return _slots_of(self)
+
+
+def _slots_of(d) -> _Slots:
+    """A `_Slots` holding `d`'s slots, its `unnamed` taken over or worked out."""
+    s = _Slots(d)
+    if type(d) is _Slots:
+        if d.unnamed:
+            s.unnamed = dict(d.unnamed)
+        if not d.ordered:
+            s.ordered = False
+    elif s:
+        s.unnamed = dict.fromkeys(k for k, v in s.items()
+                                  if not _MINTED_RE.fullmatch(getattr(v, "text", "")))
+    return s
+
+
 class State:
     __slots__ = ("reg", "slot", "elem", "result", "poolbase", "spill", "tmpc", "pair",
                  "src", "via", "views", "lost", "lost_slot", "slot_by_reg", "dropped",
@@ -1481,7 +1559,7 @@ class State:
 
     def __init__(self):
         self.reg: dict = {}          # canonical reg -> V
-        self.slot: dict = {}         # "(base,disp)" stack slot -> V
+        self.slot: dict = _Slots()   # "(base,disp)" stack slot -> V
         #: {slot key: (value, memory still fresh)} for the slots `stale_on_write` dropped,
         #: so `_reload` can spell the value rather than the load's own register (#196).
         #:
@@ -1569,7 +1647,11 @@ class State:
     def copy(self) -> "State":
         s = State()
         s.reg = dict(self.reg)
-        s.slot = dict(self.slot)
+        sl = self.slot
+        if type(sl) is _Slots and not sl.unnamed and sl.ordered:
+            s.slot = _Slots(sl)     # built in C, no call (#346)
+        else:
+            s.slot = _slots_of(sl)
         s.elem = dict(self.elem)
         s.result = self.result
         s.poolbase = dict(self.poolbase)
@@ -1802,6 +1884,8 @@ class State:
 #: as opposed to a machine register or a source-level name. It is spelled only in the
 #: printed body, so dropping it loses the only statement that says what the value is.
 _MINTED_RE = re.compile(r"t\d+")
+#: What can be found inside a minted name (`Lifter._pin_mem`).
+_IN_MINTED = re.compile(r"t?\d*")
 #: A double literal. The instruction that made it (`fmov #`, the `eor` zeroing idiom)
 #: prints nothing, so a join one arm of which held it was named before #409 as well.
 _FLIT_RE = re.compile(r"-?\d+\.\d+")
@@ -2558,7 +2642,7 @@ def _forget_frame(st: State):
     for its whole argument list (_stack_args)."""
     sp = next((r for r, v in _T.roles.items() if v == "SP"), "x15")
     lost = any(k.startswith(sp) for k in st.slot)
-    st.slot.clear()
+    st.slot = _Slots()
     st.dropped.clear()          # the frame is not trustworthy, so neither is a record
     if lost:
         st.slot[_LOST] = V("", P_ATOM)
@@ -2614,8 +2698,11 @@ def _merge(dst: State, a: State, b: State):
             agreed[r] = V(r, P_ATOM)
             dropped.add(r)
     dst.reg = agreed
-    dst.slot = {k: j for k in a.slot if k in b.slot
-                and (j := _joined(a.slot[k], b.slot[k])) is not None}
+    dst.slot = sl = _Slots({k: j for k in a.slot if k in b.slot
+                            and (j := _joined(a.slot[k], b.slot[k])) is not None})
+    if sl:      # `_slots_of` inline: a join is on every path ordinary code takes (#346)
+        sl.unnamed = dict.fromkeys(k for k, v in sl.items()
+                                   if not _MINTED_RE.fullmatch(getattr(v, "text", "")))
     # ...and the same rule for the records, with the freshness ANDed: a record only one
     # path justifies would be spelled on the path that never made it, and one arm having
     # written memory makes it unfresh for both (#199).
@@ -4816,6 +4903,16 @@ class Lifter:
         self._taint = None
         #: (address, slot) of the frame stores that name their value; see _slot_crossings.
         self._crossings = None
+        #: The stores a walk before this one found a store to memory overwrite the read
+        #: of while their slot is still to be reloaded, which name their value too; the
+        #: ones this walk found; {(slot, text): the stores that put the text there}; and
+        #: {row: block} and {block: the liveness after each of its slot events} for
+        #: the liveness asked there. See _forget_read.
+        self.slot_more = frozenset()
+        self._slot_found: set = set()
+        self._slot_site: dict = {}
+        self._slot_rows = None
+        self._slot_after: dict = {}
         #: The names those stores gave; see _lift_function.
         self.slot_names: set = set()
         #: {id: value} of the values a load of four bytes or fewer zero-extended, and of
@@ -5395,6 +5492,7 @@ class Lifter:
                     ev.append(("kill", a, 0))
             if ev:
                 events[b] = ev
+        self._slot_events = events
 
         def back(b, live, cross, hits=None):
             for e in reversed(events.get(b, ())):
@@ -5426,9 +5524,74 @@ class Lifter:
             self._backward(lambda b: back(b, *out_of(b)), live_in, (0, 0))
             for b in events:
                 back(b, *out_of(b), found)
-        self._crossings = frozenset(found)
+        self._crossings = frozenset(found) | self.slot_more
         self._slot_live = (bit, live_in)
         return self._crossings
+
+    def _slot_live_after(self, key: str) -> bool:
+        """Whether frame slot `key` is reloaded, and the register it fills read, on some
+        path from just after the row being stepped with no store to the slot between:
+        `_slot_crossings`' liveness, run back through the row's own block."""
+        self._slot_crossings()
+        bit, live_in = self._slot_live
+        m = bit.get(key, 0)
+        if not m:
+            return False
+        rows = self._slot_rows
+        if rows is None:
+            rows = self._slot_rows = {a: b for b, blk in self.blocks.items()
+                                      for a, *_r in blk.insns}
+        b = rows.get(self._here)
+        if b is None:
+            return False
+        # Once per block and not once per drop, which made a block of n rows that
+        # drops n slots cost n squared: the liveness ahead of each of its events, run
+        # back from its successors, and a row asks the first event after it.
+        after = self._slot_after.get(b)
+        if after is None:
+            live = 0
+            for s in self.blocks[b].succ:
+                live |= live_in.get(s, (0, 0))[0]
+            evs = self._slot_events.get(b, ())
+            masks = [0] * (len(evs) + 1)
+            masks[-1] = live
+            for i in range(len(evs) - 1, -1, -1):
+                kind, e_m = evs[i][0], evs[i][2]
+                if kind == "load":
+                    live |= e_m
+                elif kind == "store":
+                    live &= ~e_m
+                elif kind == "kill":
+                    live = 0
+                masks[i] = live
+            after = self._slot_after[b] = ([e[1] for e in evs], masks)
+        addrs, masks = after
+        live = masks[bisect.bisect_right(addrs, self._here)]
+        return bool(live & m)
+
+    def _forget_read(self, st: State, key: str) -> None:
+        """Drop slot `key`, whose text reads memory a store or a raw write has just
+        changed, and where the slot is still to be reloaded, have the stores that put
+        the text there name it on the next walk.
+
+        The frame-slot half of `_pin_mem`, as `_slot_crossings` is of `_pin_call`. A
+        register holding the read is named at the store; a slot is dropped there, and its
+        reload then reads the frame raw, or round a loop, where the reload came first,
+        prints the field a later trip has overwritten. So the name goes where the value
+        was saved, as a call's does: the read is printed once, and every reload reads the
+        name. Only the stores a walk sees put the text in the slot, and only where a
+        reload is ahead: a slot nothing reads again is dropped as before."""
+        v = st.slot.get(key)
+        if v is not None:
+            sites = self._slot_site.get((key, v.text))
+            if sites and self._slot_live_after(key):
+                self._slot_found.update((a, key) for a in sites
+                                        if (a, key) not in self.slot_more)
+                # On record now, so a later drop of the same text pays only for the
+                # stores made since: a slot saved and overwritten n times would
+                # otherwise walk all n sites at each drop.
+                sites.clear()
+        st.forget_slot(key)
 
     def _backward(self, step, live_in: dict, empty) -> None:
         """Run a backward dataflow to its fixed point: `step(b)` is block b's answer from
@@ -5865,6 +6028,7 @@ class Lifter:
             st.slot[key] = v
             if fp is not None and key.startswith(fp):
                 st.note_slot(key, v)
+                self._slot_site.setdefault((key, v.text), set()).add(at)
             return []
         out = []
         tmp = named.get(v.text)
@@ -5881,6 +6045,10 @@ class Lifter:
         if st.reg.get(reg) == v:
             st.reg[reg] = name
         st.slot[key] = name
+        if fp is not None and key.startswith(fp):
+            # A fill, so it ends a record an earlier drop left: a reload past a join
+            # where both arms named the save would spell that stale value (#481).
+            st.note_slot(key, name)
         return out
 
     # leaf rendering
@@ -6339,7 +6507,7 @@ class Lifter:
             # And what a comparison still to be read holds of memory (#386).
             out += self._pin_flags(st, self._reads_mem)
         for k in [k for k, v in st.slot.items() if self._reads_mem(v.text)]:
-            st.forget_slot(k)
+            self._forget_read(st, k)
         return out
 
     def _reload(self, st: State, key: str, mn: str, reg: str) -> V:
@@ -6591,7 +6759,7 @@ class Lifter:
                 off = int(k[len(base):]) - delta
                 if off >= 0:
                     renamed[f"{base}{off:+d}"] = v
-            st.slot = renamed
+            st.slot = _slots_of(renamed) if renamed else _Slots()
             st.reindex_slots()      # keys moved, so the register index has to (#173)
             return
         gone = [k for k in st.slot if k != _LOST and k.startswith(base)]
@@ -7091,18 +7259,35 @@ class Lifter:
         # A stack slot has no liveness to consult, it is read back by a later load or not
         # at all, so a slot that reads the written location is dropped rather than named.
         # Dropping is honest (the reload renders as the bare destination register) and does
-        # not spend a declaration on a spill nothing reloads.
+        # not spend a declaration on a spill nothing reloads. Where a reload is still to
+        # come, the next walk names the read at the store that saved it (_forget_read).
         slots = st.slot
         if slots:
-            self._pin_walked += len(slots)
+            # A bare minted name is no read of memory: it has neither a `.` nor a `[`,
+            # which every later test of `reads` needs, and the alias patterns start with
+            # one of them. It is found only where a spelling the store or an earlier
+            # access looks for could be inside it, and it cannot be what makes `maybe`
+            # settle unless a spelling there could be. Where `maybe` is still to settle
+            # the order of the asking matters, so the unnamed keys must be in the map's
+            # order. Elsewhere only the slots `_Slots` keeps unnamed are asked, which is
+            # every slot but the saves a walk named (#481).
+            ask = slots
+            if (type(slots) is _Slots and len(slots.unnamed) < len(slots)
+                    and (maybe is None or slots.ordered
+                         and not any(map(_IN_MINTED.fullmatch, maybe)))
+                    and not (not dotted and not indexed
+                             and any(map(_IN_MINTED.fullmatch, texts)))
+                    and not (at is not None and any(map(_IN_MINTED.fullmatch, at)))):
+                ask = {k: slots[k] for k in slots.unnamed}
+            self._pin_walked += len(ask)
             budget = self._pin_budget
             if budget is None:
                 budget = self._pin_budget = _PIN_WALK * sum(
                     len(b.insns) for b in self.blocks.values())
             if (self._pin_walked <= budget or maybe is not None
                     or anywhere and anywhere is not True):
-                for key in [k for k, v in slots.items() if reads(v.text)]:
-                    st.forget_slot(key)
+                for key in [k for k, v in ask.items() if reads(v.text)]:
+                    self._forget_read(st, key)
             else:
                 # Past `_PIN_WALK` the walks have cost more than the body is long, which
                 # is a frame of thousands of slots under thousands of stores. A slot's
@@ -7125,10 +7310,10 @@ class Lifter:
                     if len(kept) >= _PIN_KEPT:
                         del kept[next(iter(kept))]
                     unread = kept[what] = set()
-                for key, text in [(k, v.text) for k, v in slots.items()
+                for key, text in [(k, v.text) for k, v in ask.items()
                                   if v.text not in unread]:
                     if reads(text):
-                        st.forget_slot(key)
+                        self._forget_read(st, key)
                     else:
                         unread.add(text)
         for key, (b, i, *_r) in list(st.elem.items()):
@@ -8631,7 +8816,7 @@ class Lifter:
                 self.raw_names.add(tmp)
                 st.set(base, V(tmp, P_ATOM))
             if frame and index is not None:
-                st.slot.clear()              # an offset _fold_frame_offsets left
+                st.slot = _Slots()           # an offset _fold_frame_offsets left
                 st.dropped.clear()
                 return self._verbatim(st, mn, op, op)
             if frame:                                        # spill to a stack slot
@@ -10547,7 +10732,9 @@ class Lifter:
         st.pair.clear()
         if carry is not None:
             st.reg = dict(carry.reg)
-            st.slot = dict(carry.slot)
+            cs = carry.slot         # `_slots_of` without its call where it can (#346)
+            st.slot = (_Slots(cs) if type(cs) is _Slots and not cs.unnamed and cs.ordered
+                       else _slots_of(cs))
             st.dropped = dict(carry.dropped)     # with the slot map, from its source
             st.slot_by_reg = {r: set(ks) for r, ks in carry.slot_by_reg.items()}
             st.elem.update(carry.elem)
@@ -10564,7 +10751,7 @@ class Lifter:
             # them. So is the Mint slow path the box-or-tag strip cuts off, where the
             # register being boxed is one the body has long since rewritten (#255).
             st.reg = {r: V(r, P_ATOM) for r in sorted(self.alias)}
-            st.slot = {}
+            st.slot = _Slots()
             st.dropped = {}
             st.slot_by_reg = {}
             st.result = _T.ret_int
@@ -11120,10 +11307,16 @@ class Lifter:
             else:
                 decls.append(f"{pad}var {name};" if all(sets)
                              else f"{pad}var {name} = {pre.text};")
-            for (lines, v), assign, g in zip(arms, sets, gone):
+            for (lines, v), assign, g, arm in zip(arms, sets, gone, (a, b)):
                 if assign:
                     lines.append(pad2 + self._assign(V(name, P_ATOM),
                                                      V(r, P_ATOM) if g else v))
+                    # A register a loop in the arm wrote and its exit dropped, set
+                    # bare to the name, reads as the value the function came in with,
+                    # as a line that spells it does (`_lost_spelled`): on record, so
+                    # the next walk has the loop carry it out (#481).
+                    if (g or v.text == r) and r in arm.opaque:
+                        self.lost_reads.add(r)
         return named, decls, any(entered.values()), held
 
     def _phi_name(self, st: State, r: str) -> str:
@@ -11293,7 +11486,7 @@ class Lifter:
                     # that dominates the join declares is on every path into it.
                     _forget_temps(st, lambda k: self._unset_at(k, s[1]))
                     if mem:
-                        st.slot.clear()
+                        st.slot = _Slots()
                         st.dropped.clear()
                     else:
                         self._stale_slots(st, kill)
@@ -11407,7 +11600,7 @@ class Lifter:
                     for r in sorted(kill):
                         st.forget(r)
                     if mem:
-                        st.slot.clear()
+                        st.slot = _Slots()
                         st.dropped.clear()
                     else:
                         self._stale_slots(st, kill)
@@ -12132,13 +12325,13 @@ class Lifter:
         if got is None:
             got = _exit_join([one(b) for b in sorted(body)])
         if fp is None or self._frame_escaped() or fp in got[0]:
-            st.slot.clear()
+            st.slot = _Slots()
             return
         if sp is not None:
             for k in [k for k in st.slot if k.startswith(sp)]:
                 del st.slot[k]
         if got[1] is None:
-            st.slot.clear()
+            st.slot = _Slots()
             return
         for k in [k for k in st.slot if k in got[1]]:
             del st.slot[k]
@@ -12154,7 +12347,7 @@ class Lifter:
         it is asked once, and stops at the first block that clears."""
         loop = {b for b in body if not self._quiet(b)}
         if fp is None or self._frame_escaped() or fp in self._written(loop):
-            st.slot.clear()
+            st.slot = _Slots()
             return True
         if sp is not None:
             for k in [k for k in st.slot if k.startswith(sp)]:
@@ -12166,11 +12359,11 @@ class Lifter:
                 if mn in _STORES:
                     got = _addr(_split_ops(op))
                     if got is None or got[1] is _BAD_POST:
-                        st.slot.clear()
+                        st.slot = _Slots()
                         return True
             for i, keys, delta, ops, backs in self._accesses(b):
                 if delta:
-                    st.slot.clear()
+                    st.slot = _Slots()
                     return True
                 if backs is not None:
                     lo = int(keys[0][len(fp):])
@@ -14807,6 +15000,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
     short: set = set()
     #: The lines `wants_hoist` last read, what ships of them, and its answer.
     shipped = [None, None, None]
+    slot_more = [frozenset()]
     #: {pair: the pairs an edge held the name of where it would be lost without},
     #: from every walk made so far (`Lifter._join_dep`).
     leans: dict = {}
@@ -14927,6 +15121,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
                         fields=fields, allocs=allocs, casts=cast_at)
         lifter.data_offsets, lifter._elem_box = data, elem_box
         lifter.pool_at = pool_at
+        lifter.slot_more = slot_more[0]
         lifter.show = show
         lifter.slow_paths = frozenset(slow)
         lifter.frame_meets = meets
@@ -14970,6 +15165,18 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         return lifter, lines
 
     lifter, lines = walk(None)
+    # A slot a store to memory overwrote the read of, and that is reloaded after, names
+    # the read where it was saved (`_forget_read`). Only the walk finds those, so it
+    # runs again with them. A name changes what the rows after it hold, a join of two
+    # names or a register a loop has to carry, so a walk may find more, and past the
+    # bound they stay raw. So do the sites only the walks below find, with a register
+    # carried out of a loop or a join written: nothing here walks again for them.
+    for _ in range(2):
+        if not lifter._slot_found:
+            break
+        slot_more[0] = slot_more[0] | lifter._slot_found
+        lifter = lines = None
+        lifter, lines = walk(None)
     keep = None
     if lifter.pins:
         # Which of the values `_arrive` wrote out the body goes on to read is only known
