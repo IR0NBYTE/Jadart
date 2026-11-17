@@ -1158,6 +1158,153 @@ def test_a_spilled_field_named_across_a_call_agrees_at_the_join_and_round_a_loop
     assert "field_0xc" not in loop.split("while (true) {", 1)[1], loop
 
 
+def test_a_spilled_field_is_named_where_it_is_stored_when_a_store_overwrites_it():
+    """A slot holding a field read keeps its text, and a store to that field drops the
+    slot. Round a loop the reload came first, and printed the field a later trip has
+    overwritten: wrong on every CPU state. A register holding the read is named above
+    the loop; the slot is now named where it is stored, as a call names it (#64), and
+    the reload reads the name. Without a loop the reload read the frame raw."""
+    loop = _lift_asm([("ldur", "x7, [x20, #7]"), ("stur", "x7, [x29, #-8]"),
+                      ("mov", "x19, #0"), ("ldur", "x2, [x29, #-8]"),
+                      ("stur", "x2, [x3, #7]"), ("stur", "x0, [x20, #7]"),
+                      ("add", "x19, x19, #1"), ("cmp", "x19, #3"), ("b.lt", "#0xc"),
+                      ("ret", "")])
+    lines = [ln.strip() for ln in loop.splitlines()]
+    assert "var t0 = x20.field_0x8;" in lines, loop
+    assert lines.index("var t0 = x20.field_0x8;") < lines.index("while (true) {"), loop
+    assert "x3.field_0x8 = t0;" in lines and loop.count("= x20.field_0x8") == 1, loop
+    # The store before the reload in the body, and in one arm of an `if` in it.
+    loop = _lift_asm([("ldur", "x7, [x20, #7]"), ("stur", "x7, [x29, #-8]"),
+                      ("mov", "x19, #0"), ("ldur", "x2, [x29, #-8]"),
+                      ("stur", "x2, [x3, #7]"), ("cbz", "x1, #0x1c"),
+                      ("stur", "x0, [x20, #7]"), ("add", "x19, x19, #1"),
+                      ("cmp", "x19, #3"), ("b.lt", "#0xc"), ("ret", "")])
+    lines = [ln.strip() for ln in loop.splitlines()]
+    assert "var t0 = x20.field_0x8;" in lines, loop
+    assert lines.index("var t0 = x20.field_0x8;") < lines.index("while (true) {"), loop
+    assert "x3.field_0x8 = t0;" in lines, loop
+    line = _lift_asm([("ldur", "x7, [x20, #7]"), ("stur", "x7, [x29, #-8]"),
+                      ("stur", "x0, [x20, #7]"), ("ldur", "x2, [x29, #-8]"),
+                      ("stur", "x2, [x3, #7]"), ("ret", "")])
+    lines = [ln.strip() for ln in line.splitlines()]
+    assert lines[:3] == ["var t0 = x20.field_0x8;", "x20.field_0x8 = x0;",
+                         "x3.field_0x8 = t0;"], line
+
+
+def test_guard_a_spilled_field_no_store_overwrites_before_its_reload_stays_inline():
+    """The name is only for a reload a store to the field comes before: a store at
+    another offset, or one after the last reload, leaves the read printed where it is
+    used, as it was."""
+    other = _lift_asm([("ldur", "x7, [x20, #7]"), ("stur", "x7, [x29, #-8]"),
+                       ("stur", "x0, [x20, #0xf]"), ("ldur", "x2, [x29, #-8]"),
+                       ("stur", "x2, [x3, #0x17]"), ("ret", "")])
+    assert "x3.field_0x18 = x20.field_0x8;" in other and "var" not in other, other
+    after = _lift_asm([("ldur", "x7, [x20, #7]"), ("stur", "x7, [x29, #-8]"),
+                       ("ldur", "x2, [x29, #-8]"), ("stur", "x2, [x3, #0xf]"),
+                       ("stur", "x0, [x20, #7]"), ("ret", "")])
+    assert "x3.field_0x10 = x20.field_0x8;" in after and "var" not in after, after
+
+
+def test_guard_a_save_named_in_one_arm_does_not_leave_the_slot_an_older_value():
+    """A slot saved twice, the second save in one arm of an `if`, then a store to the
+    field and the reload. The first save was dropped when the second filled the slot,
+    and a drop leaves a record a reload may spell; the name the arm gives the second
+    save is a fill too, so it ends that record. Spelled, the reload read `x4`, the
+    value the slot held before either save (#481)."""
+    body = _lift_asm([("stur", "x4, [x29, #-8]"), ("ldur", "x4, [x20, #0x17]"),
+                      ("stur", "x4, [x29, #-8]"), ("cbnz", "x0, #0x18"),
+                      ("ldur", "x2, [x20, #0x17]"), ("stur", "x2, [x29, #-8]"),
+                      ("stur", "x10, [x20, #0x17]"), ("ldur", "x7, [x29, #-8]"),
+                      ("stur", "x7, [x23, #7]"), ("ret", "")])
+    got = re.search(r"x23\.field_0x8 = (\w+);", body)
+    assert got and got.group(1) != "x4", body
+    assert f"var {got.group(1)} = (FP - 8).field_0x0;" in body, body
+
+
+def test_guard_a_loop_in_an_arm_carries_a_register_a_save_named():
+    """A field read saved to a slot, a loop in one arm of an `if` that loads another
+    slot into the register the read was in, and a store to the field before the slot
+    is reloaded. The register took the save's name, and the join after the arm wrote
+    it bare, as the value the function came in with: the loop has to carry it out,
+    as it does where nothing is named (#481)."""
+    body = _lift_asm([("stur", "x0, [x29, #-0x20]"), ("ldur", "x11, [x3, #0x17]"),
+                      ("stur", "x11, [x29, #-8]"), ("tbz", "x0, #0, #0x24"),
+                      ("mov", "x19, #0"), ("ldur", "x11, [x29, #-0x20]"),
+                      ("add", "x19, x19, #1"), ("cmp", "x19, #2"), ("b.lt", "#0x14"),
+                      ("stur", "x12, [x20, #0x17]"), ("ldp", "x12, x4, [x29, #-0x10]"),
+                      ("stur", "x4, [x1, #0xf]"), ("mov", "x0, x11"), ("ret", "")])
+    assert "x11" not in body and re.search(r"\bt\d+ = x0;", body), body
+
+
+def test_guard_the_slot_map_keeps_its_unnamed_keys_in_step(monkeypatch):
+    """`_Slots.unnamed` is every slot whose value is not a bare minted name, and a
+    store asks only those whether they read what it writes (#481). A key it misses is
+    a slot no store drops or names again, which prints a stale read, so the map is held
+    to it through each way it is written and at every store of three lifts."""
+    from types import SimpleNamespace as val
+    from jadart import expr
+
+    def held(s):
+        want = {k for k, v in s.items()
+                if not expr._MINTED_RE.fullmatch(getattr(v, "text", ""))}
+        assert set(s.unnamed) == want, (dict(s), s.unnamed)
+
+    s = expr._Slots()
+    s["a"] = val(text="x1.field_0x8")
+    s["b"] = val(text="t0")
+    held(s)
+    s["b"] = val(text="x2")              # a name replaced in place by a value
+    s["a"] = val(text="t1")              # and a value by a name
+    held(s)
+    assert not s.ordered
+    c = s.copy()
+    c["c"] = val(text="x3[x4]")
+    held(c)
+    held(s)
+    assert "c" not in s and not c.ordered
+    del c["c"]
+    c.pop("b")
+    held(c)
+    c.setdefault("d", val(text="(FP - 8).field_0x0"))
+    c.update({"e": val(text="t2"), "f": val(text="x5")})
+    c |= {"g": val(text="x6.field_0x10")}
+    held(c)
+    c.popitem()
+    held(c)
+    c.clear()
+    held(c)
+    assert c.ordered
+    held(expr._slots_of({"a": val(text="t0"), "b": val(text="x1")}))
+
+    asked = []
+    real = expr.Lifter._pin_mem
+
+    def checked(self, st, *a, **k):
+        if type(st.slot) is expr._Slots:
+            held(st.slot)
+            asked.append(len(st.slot))
+        return real(self, st, *a, **k)
+
+    monkeypatch.setattr(expr.Lifter, "_pin_mem", checked)
+    save = [("ldur", "x7, [x20, #7]"), ("stur", "x7, [x29, #-8]"),
+            ("ldur", "x6, [x20, #0xf]"), ("stur", "x6, [x29, #-16]")]
+    loop = [("mov", "x19, #0"), ("ldur", "x2, [x29, #-8]"), ("stur", "x2, [x3, #7]")]
+    trip = [("add", "x19, x19, #1"), ("cmp", "x19, #3"), ("b.lt", "#0x14"),
+            ("ldur", "x4, [x29, #-16]"), ("stur", "x4, [x3, #0x17]"), ("ret", "")]
+    _lift_asm(save + loop + [("stur", "x0, [x20, #7]")] + trip)
+    _lift_asm(save + loop + [("cbz", "x1, #0x24"), ("stur", "x0, [x20, #7]"),
+                             ("add", "x19, x19, #1"), ("cmp", "x19, #3"),
+                             ("b.lt", "#0x14"), ("ldur", "x4, [x29, #-16]"),
+                             ("stur", "x4, [x3, #0x17]"), ("ret", "")])
+    _lift_asm(save + [("stur", "x0, [x20, #7]"), ("stur", "x0, [x20, #0xf]"),
+                      ("ldur", "x2, [x29, #-8]"), ("ldur", "x4, [x29, #-16]"),
+                      ("stur", "x2, [x3, #7]"), ("stur", "x4, [x3, #0xf]"),
+                      ("ret", "")])
+    assert asked and max(asked) >= 2, asked
+    # The default every map shares until a write needs its own is never written.
+    assert expr._NO_UNNAMED == {}
+
+
 def test_a_spill_passed_to_a_call_counts_as_read():
     """Liveness says a direct call reads no register, and a reload that only feeds a call
     looked unread, so its slot kept no name: `handleMessage` passed a spilled field on as
@@ -16623,11 +16770,13 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
     # with.
     assert "var t4 = t1 + 1;" in body and body.count("t4 = x6 + 1;") == 2, body
     assert body[-3:] == ["L_0x30:", "x2.field_0x60 = t4;", "return x0;"], body
-    # Not where the slot holds a read of the field a trip stores to: the reload would
-    # print that read again, which a later trip does not load, so no name is set.
+    # Not where the slot holds a read of memory and a trip stores to memory. A store
+    # to the field read names the read where it is saved, before the loop (#481), so
+    # the trip here stores to another field of the object, which the exit counts all
+    # the same.
     body = lift([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x29, #-8]"), ("mov", "x19, #2"),
                  ("cmp", "x19, #1"), ("b.eq", "#0x28"), ("ldur", "x7, [x29, #-8]"),
-                 ("stur", "x0, [x1, #7]"), ("sub", "x19, x19, #1"),
+                 ("stur", "x0, [x1, #15]"), ("sub", "x19, x19, #1"),
                  ("tbz", "x19, #63, #0xc"), ("ret", "")] + out, receiver={"x1": "this"})
     assert "x2.field_0x60 = x7;" in body, body
 
@@ -17471,10 +17620,10 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     out = counted(("add", "x5, x5, #1"), before=field)
     assert "x2.field_0x10 = x1.field_0x8;" in out, out
     out = counted(("stur", "x5, [x1, #7]"), before=field)
-    # The store took the slot, so the reload says the read rather than keeping x6, which
-    # read as the value the function came in with (#198).
-    m = re.fullmatch(r"var (t\d+) = \(FP - 32\)\.field_0x0;", out[-3])
-    assert m and out[-2] == f"x2.field_0x10 = {m.group(1)};", out
+    # The store took the slot, and the reload after the loop is still to come, so the
+    # read is named where it is saved, as across a call (#481); the reload read the
+    # frame raw before.
+    assert out[0] == "var t0 = x1.field_0x8;" and out[-2] == "x2.field_0x10 = t0;", out
     # Across a call it has a name from before the loop (_slot_crossings), which holds.
     out = counted(("bl", "#0x100"), before=field)
     assert out[0] == "var t0 = x1.field_0x8;" and "x2.field_0x10 = t0;" in out, out
@@ -18684,9 +18833,10 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
     assert lift([("ldur", "x5, [x1, #7]"), ("stlr", "x0, [x16]"),
                  ("stur", "x5, [x2, #7]")])[:3] == [
         "var t0 = x1.field_0x8;", "stlr x0, [x16]", "x2.field_0x8 = t0;"]
-    got = lift([("ldur", "x5, [x1, #7]"), ("stur", "x5, [x29, #-8]"),
-                 ("stlr", "x0, [x16]"), load] + keep)
-    assert lost(got), got
+    # A slot holding the read is named where it is saved, as the register is (#481).
+    assert lift([("ldur", "x5, [x1, #7]"), ("stur", "x5, [x29, #-8]"),
+                 ("stlr", "x0, [x16]"), load] + keep)[:3] == [
+        "var t0 = x1.field_0x8;", "stlr x0, [x16]", "x2.field_0x8 = t0;"]
     # What a call takes off the stack, where a store broke the run of what was pushed:
     # one over half a slot, a raw one off the frame, one over a q register's top half.
     # Taken without them, the run reads as the whole list.
@@ -23184,6 +23334,53 @@ def test_reads_kept_in_slots_under_many_stores_cost_the_same_per_row():
         assert large <= small * 1.1, (shape, small, large)
 
 
+def test_saves_named_at_their_stores_cost_the_same_per_row():
+    """A field read saved to a slot, a store to the field and the reload, k times:
+    to one slot, or to a slot per trip with every reload at the end. Each save is
+    named where it is stored, which takes a second walk (#481). The first version
+    asked the liveness of the block from its end at every drop, kept every site a
+    text was saved at, and asked every named slot at every store after it: 36 s at
+    40,000 rows where main takes 1.2. Counted, not timed, as above: the Python calls
+    per row at about 1,000 rows and at about 2,000. Then the larger took 1.07 and 1.30
+    times the calls per row of the smaller, and here 1.00 and 0.99."""
+    from jadart import expr
+    calls = [0]
+
+    def count(frame, event, arg):
+        if event == "call":
+            calls[0] += 1
+
+    def shape(name, k):
+        rows = []
+        for i in range(k):
+            at = 8 if name == "same" else 8 * (i + 1)
+            rows += [("ldur", "x7, [x1, #7]"), ("stur", f"x7, [x29, #-{at}]"),
+                     ("stur", "x0, [x1, #7]")]
+            if name == "same":
+                rows += [("ldur", "x2, [x29, #-8]"), ("stur", "x2, [x3, #0xf]")]
+        if name == "many":
+            for i in range(k):
+                rows += [("ldur", f"x2, [x29, #-{8 * (i + 1)}]"),
+                         ("stur", "x2, [x3, #0xf]")]
+        return [(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows + [("ret", "")])]
+
+    def per_row(name, k):
+        rows = shape(name, k)
+        calls[0] = 0
+        was = sys.getprofile()
+        sys.setprofile(count)
+        try:
+            out = expr.lift_function(rows)
+        finally:
+            sys.setprofile(was)
+        assert not any("FP" in ln for ln in out), out
+        return calls[0] / len(rows)
+
+    for name in ("same", "many"):
+        small, large = per_row(name, 200), per_row(name, 400)
+        assert large <= small * 1.1, (name, small, large)
+
+
 #: `Assembler::TryAllocateObject` and `TryAllocateArray` (assembler_arm64.cc, 3.12.2),
 #: and the register bump of the allocation stubs (stub_code_compiler_arm64.cc,
 #: AllocateArray), each up to the header store.
@@ -27477,12 +27674,13 @@ def test_a_branch_on_a_register_a_loop_lost_says_so_where_no_name_is_set():
     """Where the loop sets no name, the branch after it still prints, on `?`: what it
     tests has no name there, and neither `if (x2 == 0)` nor `return x4;` on every path
     is true (#468). No name is set where a slot comes into the loop holding a read of
-    memory and a trip stores to memory: the reload prints that read, which a later
-    trip does not load. Nor for a register the loop does not write itself: x7 here is
-    the callee's to change, #216's class, and reads as it did."""
+    memory and a trip stores to memory, here another field of the object: one to the
+    field read names the read where it is saved, before the loop (#481). Nor for a
+    register the loop does not write itself: x7 here is the callee's to change, #216's
+    class, and reads as it did."""
     got = _lift_rows([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x29, #-8]"),
                       ("add", "x2, x4, #8"), ("ldur", "x7, [x29, #-8]"),
-                      ("stur", "x7, [x1, #7]"), ("sub", "x9, x9, #1"),
+                      ("stur", "x7, [x1, #15]"), ("sub", "x9, x9, #1"),
                       ("cbnz", "x9, #0x8"), ("cbnz", "x2, #0x24"), ("mov", "x4, #5"),
                       ("mov", "x0, x4"), ("ret", "")])
     assert got[-5:] == ["var t1 = x4;", "if (? == 0) {", "t1 = 5;", "}",
@@ -27519,7 +27717,7 @@ def test_a_copy_of_a_register_a_loop_wrote_keeps_its_name_past_a_write_to_it():
                         "return t2 + 9;"], got
     unsure = [("ldur", "x7, [x1, #7]"), ("stur", "x7, [x29, #-8]"),
               ("add", "x2, x4, #8"), ("ldur", "x7, [x29, #-8]"),
-              ("stur", "x7, [x1, #7]"), ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8")]
+              ("stur", "x7, [x1, #15]"), ("sub", "x9, x9, #1"), ("cbnz", "x9, #0x8")]
     got = _lift_rows(unsure + copy + [("bl", "#0x100"), ("ret", "")], **two)
     assert got[-1] == "return sub_0x100(...);", got
     got = _lift_rows(unsure + [("mov", "x3, x2"), ("mov", "x2, #9"),

@@ -232,6 +232,36 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A read saved to the frame is named where a store would change it (#481).** A store
+  already named a read of memory held in a register, and a call named one held in a
+  frame slot, but a store dropped a slot holding a read of the field it wrote, so the
+  reload after it printed the raw frame, `(FP - 8).field_0x0`, or, in a loop, a fresh
+  read of the field on every trip, which the second trip does not load. Where the slot
+  is still to be reloaded, the read is now named at the store that saved it, as across
+  a call, with the same alias rule: `var t0 = x1.field_0x8;` before the loop, and the
+  trip stores `t0`. The reproducer goes from wrong on all 40 CPU states to right on all
+  40. Of nine more shapes, the store in an if arm goes from 39 wrong to 40 right, an
+  inner loop and two slots from 40 wrong to 40 right, an element read from 1 wrong to
+  none, a read of a read from 3 undecided to 3 right, and the other four agreed before
+  and after. Naming a save also clears the record of the value the slot held before,
+  which a call left behind too: where two arms each named it, or a call came between,
+  the reload printed that old register, and now prints the value or the raw read. A
+  register a loop in an arm writes after taking the slot's name is carried by the loop
+  rather than printed bare. A store asks only the slots that do not hold a bare name,
+  so a function of thousands of saves lifts in linear time, in under twice what it
+  took before (1.8 to 1.9 times at 40,000 to 160,000 rows), as it walks twice. The
+  rule is the one Ghidra, jadx and angr follow: a read of memory prints at its use only
+  where nothing that may write it lies on a path between. On the nine binaries 998 of
+  the 273,863 ranges change, with no error, in 281 more lines (32,726 out, 33,007 in),
+  and 1,359 raw frame reads go (87,699 to 86,340), net of 17 new ones printed where a
+  stale register was. Other ranges print one name for a value a loop read afresh, as
+  the length of a growable list in `add`. A slot that no reload reaches is still
+  dropped, not named. Of 4,300 generated programs run on 40 CPU states each, the states
+  the CPU contradicts fall from 399 to 240 and the agreeing ones rise from 125,688 to
+  130,765; two programs agree on fewer states, at a bare register main prints too
+  (#485). Left for their own issues: a slot off SP (#488), a 16 byte store over a slot
+  (#489), a name read that nothing sets (#490) and carried names nothing reads (#491).
+
 - **A branch to a block that only throws prints the throw (#424).** The compiler lays a
   function's error paths out after its last return, so a check inside a loop branches
   out of the loop to one, and tier 3 had no statement for that edge but a goto. `detach`
