@@ -232,6 +232,40 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A read saved off SP is named where a store would change it (#488).** #481 named a
+  read held in a slot off FP at the store that saved it, but a slot off SP was still
+  dropped, so a reload after a store to the field printed the raw `SP.field_0x8` or, in
+  a loop, a fresh read of the field on every trip. The same mechanism now covers SP:
+  the save is named, `var t0 = x1.field_0x8;` before the loop, and the reload reads
+  `t0`. A slot a push, a pop or a `sub` of SP renames keeps its save, and a reload of
+  it counts the stores filed under the keys it had before. Of the crafted shapes, a
+  loop, a pair, a 32 bit save and an inner loop go from wrong on 40 of 40 CPU states
+  to right on 40, a pop and a `sub` of SP from 40 undecided to 40 right, and the
+  rest agreed before and after; a call argument read from a slot now prints the name.
+  On the nine binaries 4 of the 273,863 ranges change, only in how their names are
+  numbered, with no error. Of 1,800 generated programs off SP run on 40 CPU states
+  each, together with the fix below, the agreeing states rise from 61,052 to 61,579
+  and the contradicted ones fall from 249 to 114, and no program agrees on fewer
+  states or is contradicted on more. A store off SP no longer scans every slot for
+  FP's in a function that never stores off FP, so 40,000 saves lift in 1.6 to 1.8
+  times what they took before, as the function walks twice.
+- **A loop that moves SP reads its slots off SP from the stack (#493).** A slot off SP
+  is named by how far it is from SP, so where a trip round a loop leaves SP somewhere
+  other than where the head had it, the same name is another cell on the next trip.
+  The head kept the slots saved before the loop all the same, and a loop that popped
+  read the value saved before it on every trip: a register saved and read back printed
+  `x4 + 9` where the CPU's second trip reads what was stored past it. The head now
+  sums the moves on every path round the loop, as `_step` counts them, the way Ghidra
+  and angr track the stack offset; where a path does not come back to zero, two paths
+  meet a block at different offsets or a move is by an amount not known, it drops
+  every slot off SP and the body reads `SP.field_0x0`. A loop that pushes and pops the
+  same on every path keeps its slots as before, and an `if` needs nothing, as a join
+  keeps a slot only where both arms hold the same value under the same key. A crafted
+  loop that pops goes from 40 of 40 CPU states undecided to 40 right. Of 600
+  generated programs that push and pop inside loops, balanced and not, the agreeing
+  states rise from 17,602 to 17,719 and the contradicted ones fall from 53 to 40, with
+  no program worse. A function with no move of SP in a loop pays a lookup per loop.
+
 - **A read saved to the frame is named where a store would change it (#481).** A store
   already named a read of memory held in a register, and a call named one held in a
   frame slot, but a store dropped a slot holding a read of the field it wrote, so the

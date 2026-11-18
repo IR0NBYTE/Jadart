@@ -1205,6 +1205,131 @@ def test_guard_a_spilled_field_no_store_overwrites_before_its_reload_stays_inlin
     assert "x3.field_0x10 = x20.field_0x8;" in after and "var" not in after, after
 
 
+def test_a_field_saved_off_sp_is_named_where_it_is_stored_when_a_store_overwrites_it():
+    """#481 with the slot off SP. A field read saved at [SP + 8] and reloaded round a
+    loop that stores to the field printed the field read again on every trip: wrong on
+    every CPU state. The read is now named where it is saved, as off FP, through an
+    `stp` and `ldp` pair, a 32 bit save, and a store in an inner loop alike (#488)."""
+    def named_once(rows, read="x1.field_0x8"):
+        body = _lift_asm(rows)
+        lines = [ln.strip() for ln in body.splitlines()]
+        assert f"var t0 = {read};" in lines, body
+        assert lines.index(f"var t0 = {read};") < lines.index("while (true) {"), body
+        assert "x3.field_0x8 = t0;" in lines and body.count(f"= {read}") == 1, body
+
+    tail = [("sub", "x19, x19, #1"), ("cbnz", "x19, #0xc"), ("ret", "")]
+    named_once([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"), ("mov", "x19, #3"),
+                ("ldur", "x7, [x15, #8]"), ("stur", "x7, [x3, #7]"),
+                ("stur", "x0, [x1, #7]")] + tail)
+    named_once([("ldur", "x7, [x1, #7]"), ("stp", "x7, x2, [x15]"), ("mov", "x19, #3"),
+                ("ldp", "x7, x6, [x15]"), ("stur", "x7, [x3, #7]"),
+                ("stur", "x6, [x3, #0xf]"), ("stur", "x0, [x1, #7]"),
+                ("sub", "x19, x19, #1"), ("cbnz", "x19, #0xc"), ("ret", "")])
+    named_once([("ldur", "w7, [x1, #7]"), ("str", "w7, [x15, #8]"), ("mov", "x19, #3"),
+                ("ldr", "w7, [x15, #8]"), ("stur", "w7, [x3, #7]"),
+                ("stur", "x0, [x1, #7]")] + tail)
+    named_once([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"), ("mov", "x19, #3"),
+                ("ldur", "x7, [x15, #8]"), ("stur", "x7, [x3, #7]"),
+                ("mov", "x20, #2"), ("stur", "x0, [x1, #7]"), ("sub", "x20, x20, #1"),
+                ("cbnz", "x20, #0x18")] + tail)
+    # A store to x3.field_0x8 may write x1.field_0x8 too, so the read is named here as
+    # well, as the same loop off FP is.
+    named_once([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"), ("mov", "x19, #3"),
+                ("ldur", "x7, [x15, #8]"), ("stur", "x7, [x3, #7]"),
+                ("stur", "x0, [x1, #0xf]")] + tail)
+    # Without a loop the reload read the stack raw, in a line and in one arm.
+    line = _lift_asm([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"),
+                      ("stur", "x0, [x1, #7]"), ("ldur", "x7, [x15, #8]"),
+                      ("stur", "x7, [x3, #7]"), ("ret", "")])
+    want = ["var t0 = x1.field_0x8;", "x1.field_0x8 = x0;", "x3.field_0x8 = t0;"]
+    assert [ln.strip() for ln in line.splitlines()][:3] == want, line
+    arm = _lift_asm([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"),
+                     ("cbz", "x2, #0x10"), ("stur", "x0, [x1, #7]"),
+                     ("ldur", "x7, [x15, #8]"), ("stur", "x7, [x3, #7]"), ("ret", "")])
+    assert "var t0 = x1.field_0x8;" in arm and "x3.field_0x8 = t0;" in arm, arm
+    # Pushed for a call, the argument the store would change prints as the name.
+    call = _lift_asm([("ldur", "x7, [x1, #7]"), ("str", "x7, [x15, #16]"),
+                      ("str", "x2, [x15, #8]"), ("ldur", "x6, [x1, #0xf]"),
+                      ("str", "x6, [x15]"), ("stur", "x0, [x1, #7]"), ("bl", "#0x100"),
+                      ("ret", "")])
+    assert "var t0 = x1.field_0x8;" in call, call
+    assert "sub_0x100(t0, x2, x1.field_0x10)" in call, call
+
+
+def test_a_field_saved_off_sp_is_named_across_a_move_of_sp():
+    """The slot moves with SP: a push, a pop or a `sub` of SP between the save and the
+    reload renames it. The read is named where it was saved, under the key it had there,
+    and the reload past the move reads the name; it read the stack raw (#488)."""
+    want = ["var t0 = x1.field_0x8;", "x1.field_0x8 = x0;", "x3.field_0x8 = t0;"]
+    sub = _lift_asm([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"),
+                     ("sub", "x15, x15, #16"), ("stur", "x0, [x1, #7]"),
+                     ("ldur", "x7, [x15, #0x18]"), ("stur", "x7, [x3, #7]"),
+                     ("add", "x15, x15, #16"), ("ret", "")])
+    assert [ln.strip() for ln in sub.splitlines()][:3] == want, sub
+    pop = _lift_asm([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #16]"),
+                     ("add", "x15, x15, #8"), ("stur", "x0, [x1, #7]"),
+                     ("ldur", "x7, [x15, #8]"), ("stur", "x7, [x3, #7]"),
+                     ("sub", "x15, x15, #8"), ("ret", "")])
+    assert [ln.strip() for ln in pop.splitlines()][:3] == want, pop
+    push = _lift_asm([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"),
+                      ("str", "x5, [x15, #-8]!"), ("mov", "x19, #3"),
+                      ("ldur", "x7, [x15, #0x10]"), ("stur", "x7, [x3, #7]"),
+                      ("stur", "x0, [x1, #7]"), ("sub", "x19, x19, #1"),
+                      ("cbnz", "x19, #0x10"), ("add", "x15, x15, #8"), ("ret", "")])
+    lines = [ln.strip() for ln in push.splitlines()]
+    assert lines.index("var t0 = x1.field_0x8;") < lines.index("while (true) {"), push
+    assert "x3.field_0x8 = t0;" in lines and "SP." not in push, push
+
+
+def test_guard_a_field_saved_off_sp_no_store_may_change_stays_inline():
+    """The name is only for a reload a store that may write the field comes before:
+    round a loop that stores to other fields of both objects, the read off SP prints
+    where it is used, as it did (#488)."""
+    body = _lift_asm([("ldur", "x7, [x1, #7]"), ("stur", "x7, [x15, #8]"),
+                      ("mov", "x19, #3"), ("ldur", "x7, [x15, #8]"),
+                      ("stur", "x7, [x3, #0xf]"), ("stur", "x0, [x1, #0xf]"),
+                      ("sub", "x19, x19, #1"), ("cbnz", "x19, #0xc"), ("ret", "")])
+    assert "x3.field_0x10 = x1.field_0x8;" in body, body
+    assert "var t0 = x1.field_0x8;" not in body, body
+
+
+def test_guard_a_slot_off_sp_renamed_by_a_push_is_still_an_argument():
+    """A field read pushed, then another push: the move renames the first slot, and the
+    call reads both in order. Naming follows the rename and must leave this alone, as
+    it must a reload past the push with no store to the field between (#488)."""
+    call = _lift_asm([("ldur", "x7, [x1, #7]"), ("str", "x7, [x15, #-8]!"),
+                      ("str", "x5, [x15, #-8]!"), ("bl", "#0x100"),
+                      ("add", "x15, x15, #16"), ("ret", "")])
+    assert "return sub_0x100(x1.field_0x8, x5);" in call and "var" not in call, call
+
+
+def test_a_loop_that_pops_reads_its_slots_off_sp_raw():
+    """Two values saved off SP, then a loop that pops one and reads the slot SP then
+    points at. Each trip pops, so the slot is another cell on the next trip: the head
+    carried the save in under its key, and every trip read `x4 + 9`, the second save,
+    where the CPU's second trip reads what was stored past it (#493)."""
+    body = _lift_asm([("add", "x12, x0, #5"), ("add", "x2, x4, #9"),
+                      ("stp", "x12, x2, [x15]"), ("mov", "x19, #0"),
+                      ("ldr", "x2, [x15], #8"), ("ldur", "x10, [x15]"),
+                      ("eor", "x11, x10, x11"), ("add", "x19, x19, #1"),
+                      ("cmp", "x19, #2"), ("b.lt", "#0x10"), ("mov", "x0, x11"),
+                      ("ret", "")])
+    assert "x4 + 9" not in body and "SP.field_0x0" in body, body
+
+
+def test_guard_a_loop_that_pops_and_pushes_back_keeps_its_slots_off_sp():
+    """The same loop, but each trip loads back into place what it popped, so SP is where
+    the head had it at the end of every trip: the save is still the slot's value, and
+    the trip reads it as `x4 + 9`, as before (#493)."""
+    body = _lift_asm([("add", "x12, x0, #5"), ("add", "x2, x4, #9"),
+                      ("stp", "x12, x2, [x15]"), ("mov", "x19, #0"),
+                      ("ldr", "x3, [x15], #8"), ("ldr", "x5, [x15, #-8]!"),
+                      ("ldur", "x10, [x15, #8]"), ("eor", "x11, x10, x11"),
+                      ("add", "x19, x19, #1"), ("cmp", "x19, #2"), ("b.lt", "#0x10"),
+                      ("mov", "x0, x11"), ("ret", "")])
+    assert "x4 + 9 ^ " in body and "SP." not in body, body
+
+
 def test_guard_a_save_named_in_one_arm_does_not_leave_the_slot_an_older_value():
     """A slot saved twice, the second save in one arm of an `if`, then a store to the
     field and the reload. The first save was dropped when the second filled the slot,
@@ -19071,10 +19196,11 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
     # `_drop_unread` takes that line and the slot read keeps the number after it.
     got = lift(frame(0x20, push, ("ldr", "x15, [x15]"), top, *keep))
     assert lost(got) and not any("SP.field_0x0;" in l for l in got), got
-    # Dropped rather than moved with SP, so this is a fresh read; the address is the
-    # pushed slot's own, which SP - 8 plus 0x10 comes back to, and it now says so (#207).
+    # The pushed slot's own address, which SP - 8 plus 0x10 comes back to (#207). The
+    # walk moves the slot with SP, and the reload reads what was pushed, as the stores
+    # filed under the key it had before say it may (#488).
     assert lift(frame(0x20, push, ("sub", "x15, x15, #8"), ("ldr", "x3, [x15, #0x10]"),
-                      *keep))[:2] == gone_at("(FP - 24).field_0x0")
+                      *keep))[0] == held
     # An FFI call's frame and a leaf call's put FP back where it was: a slot kept from
     # before reads the same after, an access through the moved FP is to where it points,
     # and a store through it changes the slot it lands in.

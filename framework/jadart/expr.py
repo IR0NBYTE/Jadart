@@ -4911,6 +4911,15 @@ class Lifter:
         self.slot_more = frozenset()
         self._slot_found: set = set()
         self._slot_site: dict = {}
+        #: {SP slot: (widths, register files) of the stores that filled a slot a move
+        #: of SP renamed into it, under the keys it had before}; see _frame_moved.
+        self._sp_from: dict = {}
+        #: {frame register: whether any store in the function is off it}; _cross_write.
+        self._stored_off: dict = {}
+        #: {loop header: whether every trip brings SP back where the head had it}, and
+        #: {block: how far its rows move SP, None where not known}; see _sp_balanced.
+        self._sp_round: dict = {}
+        self._sp_moves: dict | None = None
         self._slot_rows = None
         self._slot_after: dict = {}
         #: The names those stores gave; see _lift_function.
@@ -5584,13 +5593,14 @@ class Lifter:
         v = st.slot.get(key)
         if v is not None:
             sites = self._slot_site.get((key, v.text))
-            if sites and self._slot_live_after(key):
-                self._slot_found.update((a, key) for a in sites
-                                        if (a, key) not in self.slot_more)
+            if sites and (key.startswith(_frame_regs()[0])
+                          or self._slot_live_after(key)):
+                self._slot_found.update(s for s in sites if s not in self.slot_more)
                 # On record now, so a later drop of the same text pays only for the
                 # stores made since: a slot saved and overwritten n times would
-                # otherwise walk all n sites at each drop.
-                sites.clear()
+                # otherwise walk all n sites at each drop. Replaced, not cleared: a
+                # move of SP files one set under more than one key.
+                self._slot_site[(key, v.text)] = set()
         st.forget_slot(key)
 
     def _backward(self, step, live_in: dict, empty) -> None:
@@ -6028,7 +6038,11 @@ class Lifter:
             st.slot[key] = v
             if fp is not None and key.startswith(fp):
                 st.note_slot(key, v)
-                self._slot_site.setdefault((key, v.text), set()).add(at)
+                self._slot_site.setdefault((key, v.text), set()).add((at, key))
+            elif key.startswith(_frame_regs()[0]):
+                # Frozen: a move of SP files one set under each key it renames.
+                got = self._slot_site.get((key, v.text), frozenset())
+                self._slot_site[(key, v.text)] = got | {(at, key)}
             return []
         out = []
         tmp = named.get(v.text)
@@ -6525,12 +6539,16 @@ class Lifter:
         x0 for x3, and `strh w0; ldrh w3` x0 for its low 16 bits (#165). A 4-byte load
         into a w register reads as every w value does, as its value's 64 bits and exact
         in the low 32, as `mov w3, w0` prints x0."""
-        width, held = _access_width(mn, reg), self._slot_widths()[0].get(key, ())
+        width = _access_width(mn, reg)
+        # A slot off SP that a move of SP renamed counts the stores filed under the
+        # keys it had before too (#488).
+        held, files = self._sp_from.get(key) or (self._slot_widths()[0].get(key, ()),
+                                                 self._slot_widths()[4].get(key))
         got = st.slot.get(key, _UPPER)
         if (held and min(held) < 8) if width >= 8 else held != {width}:
             got = _UPPER
         kind = _reg_file(reg)
-        if self._slot_widths()[4].get(key) != {kind}:
+        if files != {kind}:
             got = _UPPER
         signed = mn in _SIGNED_LOADS
         if got.text and kind == "x" and (width < 4 or width < 8 and signed):
@@ -6696,6 +6714,15 @@ class Lifter:
         sp, fp = _frame_regs()
         if cross is None:
             other = fp if base == sp else sp
+            # Every slot is filled by a store off its own base, a move of SP renaming
+            # it off SP still, so where the function never stores off the other one
+            # there is nothing to look for: a frame of thousands of saves off SP, which
+            # a walk names and keeps (#488), was asked about whole at every store.
+            if other not in self._stored_off:
+                self._stored_off[other] = any(k.startswith(other)
+                                              for k in self._slot_widths()[0])
+            if not self._stored_off[other]:
+                return
             gone = [k for k in st.slot if k != _LOST and k.startswith(other)]
         else:
             at, slack = cross
@@ -6751,14 +6778,32 @@ class Lifter:
             # drop, so a second push does not lose what the first stored and a call then
             # read short, `_setFlag` for three values pushed as two pushes (#144, #147). A
             # slot the move takes below SP (a pop past it) is gone.
-            renamed = {}
+            renamed, held, site = {}, self._sp_from, self._slot_site
             for k, v in st.slot.items():
                 if k == _LOST or not k.startswith(base):
                     renamed[k] = v
                     continue
                 off = int(k[len(base):]) - delta
                 if off >= 0:
-                    renamed[f"{base}{off:+d}"] = v
+                    to = f"{base}{off:+d}"
+                    renamed[to] = v
+                    # How wide the stores that filled it were and which register file
+                    # they stored from, which `_reload` asks: they are filed under the
+                    # keys it had before. And the stores that saved its text, still the
+                    # ones a drop past the move has name the value: a site keeps the
+                    # key it was saved under, which is the one `_name_slot` is asked
+                    # for there. Both by key and whatever the path, which only declines
+                    # or names more; the sites are one set however far the slot moves,
+                    # so a run of pushes costs no more than the renaming (#488).
+                    old = held.get(k) or self._sp_held(k)
+                    new = held.get(to) or self._sp_held(to)
+                    if old is not new and not (old[0] <= new[0] and old[1] <= new[1]):
+                        held[to] = (new[0] | old[0], new[1] | old[1])
+                    sites = site.get((k, v.text))
+                    if sites is not None:
+                        got = site.setdefault((to, v.text), sites)
+                        if got is not sites and not sites <= got:
+                            site[(to, v.text)] = got | sites
             st.slot = _slots_of(renamed) if renamed else _Slots()
             st.reindex_slots()      # keys moved, so the register index has to (#173)
             return
@@ -6767,6 +6812,15 @@ class Lifter:
             del st.slot[k]
         if delta < 0 and gone:
             st.slot[_LOST] = V("", P_ATOM)
+
+    def _sp_held(self, key: str) -> tuple:
+        """(widths, register files) of the stores that may have filled SP slot `key`:
+        `_slot_widths`' and those of the slots a move of SP renamed into it."""
+        got = self._sp_from.get(key)
+        if got is None:
+            got = self._sp_from[key] = (frozenset(self._slot_widths()[0].get(key, ())),
+                                        frozenset(self._slot_widths()[4].get(key, ())))
+        return got
 
     def _moved_unseen(self, st: State, fp: bool, delta):
         """A frame register moved where `_step` did not see it (_frame_moves), as a
@@ -11892,7 +11946,11 @@ class Lifter:
         # The outgoing area too, where a trip may write it or a call in it takes it: the
         # next trip starts with what the last one left there, which _loop_rewrites, over
         # FP's slots alone, did not see (#162).
-        if self._writes_outgoing(trip):
+        # And every slot off SP where a trip may bring SP back somewhere else: each key
+        # is a displacement from where SP was at the head, so on the next trip it names
+        # another cell, and a slot saved before a loop that pops read as that save on
+        # every trip (#493).
+        if self._writes_outgoing(trip) or not self._sp_balanced(header, trip):
             sp = next((r for r, v in _T.roles.items() if v == "SP"), None)
             gone = [k for k in loop_st.slot if sp and k.startswith(sp)]
             for k in gone:
@@ -12054,6 +12112,60 @@ class Lifter:
         st.dropped.clear()
         self._exit_slots(st, header)
         return out
+
+    def _sp_balanced(self, header, trip) -> bool:
+        """Whether every path round the loop at `header`, through `trip`, its blocks,
+        brings SP back to where the head had it: the moves of the rows on it, as `_step`
+        and `_frame_moved` count them (`shift_rows`), sum to nothing. Where two paths
+        reach a block with SP at different places, or a row moves it by an amount not
+        known, it is not: the stack offset there is not known, as Ghidra and angr have
+        it. A loop with no row that moves SP answers from a lookup (#493)."""
+        got = self._sp_round.get(header)
+        if got is not None:
+            return got
+        moves = self._sp_moves
+        if moves is None:
+            # Once per function, from the rows that move SP alone: each goes to the block
+            # whose first row is the last at or before it.
+            moves = self._sp_moves = {}
+            rows = [(a, got[1]) for a, got in (self.shift_rows or {}).items()
+                    if got[1] != 0]
+            if rows:
+                starts = sorted(self.blocks)
+                for a, d in rows:
+                    i = bisect.bisect_right(starts, a) - 1
+                    if i < 0:
+                        continue
+                    b = starts[i]
+                    insns = self.blocks[b].insns
+                    if not insns or a > insns[-1][0]:
+                        continue
+                    was = moves.get(b, 0)
+                    moves[b] = None if was is None or d is None else was + d
+                for b in [b for b, d in moves.items() if d == 0]:
+                    del moves[b]
+        got = True
+        if not moves.keys().isdisjoint(trip):
+            at, stack = {header: 0}, [header]
+            while stack and got:
+                b = stack.pop()
+                d = moves.get(b, 0)
+                if d is None:
+                    got = False
+                    break
+                out = at[b] + d
+                for n in self.blocks[b].succ:
+                    if n not in trip:
+                        continue
+                    was = at.get(n)
+                    if was is None:
+                        at[n] = out
+                        stack.append(n)
+                    elif was != out:
+                        got = False         # the head too: a trip that moved SP
+                        break
+        self._sp_round[header] = got
+        return got
 
     def _back_loop(self, header) -> frozenset:
         """The natural loop at `header`: the predecessors it dominates are its latches,
