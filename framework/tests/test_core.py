@@ -18605,6 +18605,74 @@ def test_no_frame_slot_record_outlives_the_path_that_made_it():
             f"measuring what it claims")
 
 
+def _reload_past(stores, head=()):
+    """`x1 + 1` saved at FP - 8, x1 reassigned, `stores` run, then the slot reloaded
+    and stored to a field: the body, and what the field store prints."""
+    rows = list(head) + [("add", "x4, x1, #1"), ("stur", "x4, [x29, #-8]"),
+                         ("mov", "x1, #5")] + list(stores) + [
+        ("ldur", "x2, [x29, #-8]"), ("stur", "x2, [x3, #15]"), ("ret", "")]
+    body = _lift_asm(rows)
+    got = re.search(r"x3\.field_0x10 = ([^;]+);", body)
+    assert got, body
+    return body, got.group(1)
+
+
+def _reads_the_slot(body, got):
+    return got != "x1 + 1" and f"var {got} = (FP - 8).field_0x0;" in body
+
+
+def test_a_q_store_over_a_dropped_slot_ends_its_record():
+    """A save of `x1 + 1` at FP - 8 was dropped to a record when x1 was reassigned, and
+    `stur q0, [x29, #-0x10]` then wrote all 16 bytes of FP - 16 and FP - 8. Only the
+    keys still in the slot map lost what they held, so the reload printed the record,
+    `x1 + 1`, for bytes q0 had replaced (#489). A pair of q registers likewise."""
+    for stores in ([("stur", "q0, [x29, #-0x10]")], [("stp", "q0, q1, [x29, #-0x20]")]):
+        body, got = _reload_past(stores)
+        assert _reads_the_slot(body, got), body
+
+
+def test_an_unaligned_store_over_a_dropped_slot_ends_its_record():
+    """`stur x6, [x29, #-0xc]` writes the low half of the slot at FP - 8, whose record
+    the reload printed as `x1 + 1` (#489). So do a byte and a half word into it."""
+    for stores in ([("stur", "x6, [x29, #-0xc]")], [("sturb", "w6, [x29, #-3]")],
+                   [("sturh", "w6, [x29, #-6]")]):
+        body, got = _reload_past(stores)
+        assert _reads_the_slot(body, got), body
+
+
+def test_a_store_to_the_top_half_of_a_dropped_slot_ends_its_record():
+    """`stur w6, [x29, #-4]` writes the top half of the slot at FP - 8, whose record
+    the reload printed as `x1 + 1` (#489). In one arm of an `if` it may write it, so
+    the reload past the join reads the slot too."""
+    for stores in ([("stur", "w6, [x29, #-4]")],
+                   [("cbz", "x6, #0x14"), ("stur", "w7, [x29, #-4]")],
+                   [("cbz", "x6, #0x14"), ("stur", "q0, [x29, #-0x10]")]):
+        body, got = _reload_past(stores)
+        assert _reads_the_slot(body, got), body
+
+
+def test_a_store_through_sp_ends_the_records_it_may_reach():
+    """Where SP is not known against FP a store through SP may write any slot off FP,
+    and the lifter drops them all; their records stayed, so the reload printed
+    `x1 + 1` (#489). Where `sub x15, x29, #0x20` says how far apart they are, a store
+    to SP + 24 is FP - 8 and ends the record too."""
+    body, got = _reload_past([("sub", "x15, x15, x6"), ("stur", "x7, [x15, #0]")])
+    assert _reads_the_slot(body, got), body
+    body, got = _reload_past([("str", "x7, [x15, #24]")],
+                             head=[("sub", "x15, x29, #0x20")])
+    assert _reads_the_slot(body, got), body
+
+
+def test_guard_a_store_beside_a_dropped_slot_keeps_its_record():
+    """A store that writes none of the slot's bytes leaves its record, so the reload
+    still spells what was saved: FP - 24 off FP, and SP + 8 where SP is FP - 32."""
+    body, got = _reload_past([("stur", "x6, [x29, #-0x18]")])
+    assert got == "x1 + 1", body
+    body, got = _reload_past([("str", "x7, [x15, #8]")],
+                             head=[("sub", "x15, x29, #0x20")])
+    assert got == "x1 + 1", body
+
+
 def test_the_census_judges_a_reload_past_a_reset_by_the_way_in_it_came():
     """The census keeps, per walk state, what each frame slot was filled with, and judges
     a reload the lifter declines against it. `_reenter` hands a block a slot map of its
