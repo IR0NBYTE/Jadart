@@ -6678,6 +6678,10 @@ class Lifter:
         up, not each slot held (#154). A slot off SP that goes marks the outgoing area
         short, as a push does (_frame_moved).
 
+        A key the store covers loses its record too, whether or not it is still in the
+        map: `stale_on_write` moved the slot to `st.dropped`, and a reload spelled that
+        record after `stur q0, [x29, #-0x10]` wrote over the bytes at -8 (#489).
+
         So do the other frame register's slots the store's bytes may cover
         (_cross_write).
         """
@@ -6693,9 +6697,13 @@ class Lifter:
         gone = False
         for off in range(lo - 15 if wide else lo - 7, hi):
             key = f"{base}{off:+d}"
-            if key in st.slot and (off >= lo - 7 or key in wide):
+            if off < lo - 7 and key not in wide:
+                continue
+            if key in st.slot:
                 st.forget_slot(key)
                 gone = gone or key not in own
+            else:
+                st.dropped.pop(key, None)
         if gone and base == sp:
             st.slot[_LOST] = V("", P_ATOM)
 
@@ -6710,7 +6718,8 @@ class Lifter:
         below it (#162). This drops only the slots the store may write, and only where it
         stores, so a cell an FFI call's push and a leaf call use at different times costs
         nothing (#165). Where SP is not known, a store through SP may write any slot off
-        FP, and one through FP any slot off SP."""
+        FP, and one through FP any slot off SP. The records under those keys go with
+        them (#489)."""
         sp, fp = _frame_regs()
         if cross is None:
             other = fp if base == sp else sp
@@ -6724,25 +6733,30 @@ class Lifter:
             if not self._stored_off[other]:
                 return
             gone = [k for k in st.slot if k != _LOST and k.startswith(other)]
+            gone += [k for k in st.dropped if k.startswith(other) and k not in st.slot]
         else:
             at, slack = cross
             if base == sp:
                 gone = self._covered(st, fp, at + lo - slack, at + lo + n)
             else:
                 gone = self._covered(st, sp, lo - at, lo - at + slack + n)
+        # A record alone is no slot, so only a slot off SP marks the outgoing area short.
+        short = base == fp and any(k != _LOST and k in st.slot for k in gone)
         for k in gone:
             st.forget_slot(k)
-        if base == fp and any(k != _LOST for k in gone):
+        if short:
             st.slot[_LOST] = V("", P_ATOM)
 
     def _covered(self, st: State, base: str, lo: int, hi: int) -> list:
         """The slots off `base` with a byte in [lo, hi): 8 bytes from a key, 16 where a
-        q register fills it (_wide_slots)."""
+        q register fills it (_wide_slots). A record (`st.dropped`) under such a key is
+        the same bytes, so it is listed too, for the caller to end with the slot."""
         wide = self._wide_slots()
         out = []
         for off in range(lo - 15 if wide else lo - 7, hi):
             key = f"{base}{off:+d}"
-            if key in st.slot and key != _LOST and (off >= lo - 7 or key in wide):
+            if ((key in st.slot or key in st.dropped) and key != _LOST
+                    and (off >= lo - 7 or key in wide)):
                 out.append(key)
         return out
 
