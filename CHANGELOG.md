@@ -232,6 +232,23 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A store over part of a dropped frame slot ends what the slot was known to hold
+  (#489).** A save of `x1 + 1` at FP - 8 is kept as a record once x1 is reassigned, and
+  a store that wrote the slot's bytes under another key, `stur q0, [x29, #-0x10]`,
+  `stur x6, [x29, #-0xc]` or `stur w6, [x29, #-4]`, left that record alive, so the
+  reload printed `x1 + 1` for bytes the store had replaced. A store now ends the record
+  of every key its bytes cover, as it ends the slots, and so does a store through SP
+  that may reach the slot. Of 24 crafted shapes, 9 go from undecided on 39 or 40 CPU
+  states to right on 40 (a q store, a q pair, an unaligned store, the top half, a byte,
+  a half word, a store in one arm of an if, a store through SP known against FP), 3
+  more with a CPU side that cannot judge them now read the slot raw, a store beside
+  the slot and one through SP that cannot reach it keep the saved value, and a reload
+  of a slot a q store fills elsewhere reads it raw where it read the save. Of 1,600
+  generated programs run on 40 CPU states each, the agreeing states rise from 40,874 to
+  53,345 and the undecided fall from 13,486 to 1,015, none contradicted on either
+  tree, and no program agrees on fewer states. On the nine binaries none of the
+  273,863 ranges changes, and no error is new.
+
 - **A read saved off SP is named where a store would change it (#488).** #481 named a
   read held in a slot off FP at the store that saved it, but a slot off SP was still
   dropped, so a reload after a store to the field printed the raw `SP.field_0x8` or, in
