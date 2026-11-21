@@ -232,6 +232,25 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A narrow reload of a dropped frame slot follows the slot's rules (#495).** A save of
+  `x1 + 1` at FP - 8 is kept as a record once x1 is reassigned, and a reload that read
+  the record skipped the width rule, the register file rule and the extension a narrow
+  or signed load gives the held slot: `stur x4; ldur w2` printed all of `x1 + 1`,
+  `sturh w4; ldurh w2` printed it without `& 0xffff`, and `ldursb x2` without the sign
+  extension. A record now reads only where the slot would, extended the same way; where
+  the rules refuse, the reload reads the slot raw, as the held slot does. Of 14 crafted
+  shapes, 9 go from undecided on 20 to 40 of 40 CPU states to right on 40 (a w, x, byte,
+  half word or pair reload, signed or not). A reload into the other register file now
+  reads raw too: `ldur d2` of an x save printed `x1 + 1`, right in its bits, and reads
+  `(FP - 8).field_0x0` now, as the held slot already did; `ldur x2` of a d save printed
+  `x1.toDouble()`. Of the 1,600 generated programs of #489 the agreeing states rise from
+  53,345 to 54,360 and the undecided fall from 1,015 to 0. Of 800 new ones that save
+  1 to 8 bytes and reload 1 to 8, signed or not, into w, x or d, the agreeing states rise
+  from 20,488 to 30,815 and the undecided fall from 7,889 to 322, with no program worse.
+  The 17 programs still wrong reload a 4 byte save with `ldur w`, which prints all 64
+  bits of the value on main too (#498). On the nine binaries none of the 273,863 ranges
+  changes, and no error is new.
+
 - **A store over part of a dropped frame slot ends what the slot was known to hold
   (#489).** A save of `x1 + 1` at FP - 8 is kept as a record once x1 is reassigned, and
   a store that wrote the slot's bytes under another key, `stur q0, [x29, #-0x10]`,
