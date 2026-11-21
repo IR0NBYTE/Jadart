@@ -6544,18 +6544,26 @@ class Lifter:
         # keys it had before too (#488).
         held, files = self._sp_from.get(key) or (self._slot_widths()[0].get(key, ()),
                                                  self._slot_widths()[4].get(key))
-        got = st.slot.get(key, _UPPER)
-        if (held and min(held) < 8) if width >= 8 else held != {width}:
-            got = _UPPER
         kind = _reg_file(reg)
-        if files != {kind}:
-            got = _UPPER
+        # The width rule and the file rule refuse the KEY, so they refuse what a record
+        # of it holds as well as the slot. Before, the record path below spelled the
+        # whole saved value for `stur x4; ldur w2` and for `ldur d2` (#495).
+        refused = (((held and min(held) < 8) if width >= 8 else held != {width})
+                   or files != {kind})
+        got = _UPPER if refused else st.slot.get(key, _UPPER)
         signed = mn in _SIGNED_LOADS
-        if got.text and kind == "x" and (width < 4 or width < 8 and signed):
-            got = _extended(got, 8 * width, signed)
-            if signed and reg.strip()[:1] == "w":
-                got = _narrow(got)              # extended to 32 bits, not to 64 (#374)
-        if not got.text:
+
+        def loaded(v: V) -> V:
+            """`v` as the load extends it, the slot's value and a record's alike."""
+            if kind == "x" and (width < 4 or width < 8 and signed):
+                v = _extended(v, 8 * width, signed)
+                if signed and reg.strip()[:1] == "w":
+                    v = _narrow(v)              # extended to 32 bits, not to 64 (#374)
+            return v
+
+        if got.text:
+            got = loaded(got)
+        if not got.text and not refused:
             # The fallback spells the LOAD'S OWN register, right only where the slot held
             # that very register, whose entry value the printed body still reads so the
             # reload round-trips. Where it held anything else the fallback names a
@@ -6569,7 +6577,7 @@ class Lifter:
                                     for r in _slot_regs(v.text))):
                     self.spelled_regs.update(_slot_regs(v.text))
                     self._reload_blind = False
-                    return v
+                    return loaded(v)
         # Whether the fallback ran, which the caller cannot tell from the value: a slot
         # that held this very register reads back the same text as the fallback spells.
         self._reload_blind = not got.text

@@ -18621,6 +18621,92 @@ def _reads_the_slot(body, got):
     return got != "x1 + 1" and f"var {got} = (FP - 8).field_0x0;" in body
 
 
+def _narrow_past(save, load, out="x2", value=(("add", "x4, x1, #1"),)):
+    """`value` saved at FP - 8 with `save`, read back with `load` and stored to a field,
+    once with x1 reassigned between (the slot's record) and once with the slot held:
+    what the field store prints in each, and the first body."""
+    got = []
+    for mid in ([("mov", "x1, #5")], []):
+        rows = list(value) + [save] + mid + [load, ("stur", f"{out}, [x3, #15]"),
+                                             ("ret", "")]
+        body = _lift_asm(rows)
+        m = re.search(r"x3\.field_0x10 = ([^;]+);", body)
+        assert m, body
+        got.append((body, m.group(1)))
+    return got[0][0], got[0][1], got[1][1]
+
+
+def test_a_w_reload_of_a_dropped_x_slot_reads_the_slot():
+    """`stur x4; mov x1, #5; ldur w2` printed `x1 + 1`, all 64 bits of the saved value,
+    for the low half the w load reads: the width rule refuses a 4-byte load of a slot
+    an 8-byte store fills, and the record path skipped it (#495). It reads the slot,
+    as the reload of the held slot does."""
+    body, got, live = _narrow_past(("stur", "x4, [x29, #-8]"), ("ldur", "w2, [x29, #-8]"))
+    assert _reads_the_slot(body, got), body
+    assert got == live, body
+
+
+def test_a_half_word_reload_of_a_dropped_slot_is_extended():
+    """`sturh w4; mov x1, #5; ldurh w2` printed `x1 + 1` where the held slot prints
+    `x1 + 1 & 0xffff`: the record path skipped the extension (#495). A byte too."""
+    for save, load, want in (("sturh", "ldurh", "x1 + 1 & 0xffff"),
+                             ("sturb", "ldurb", "x1 + 1 & 0xff")):
+        body, got, live = _narrow_past((save, "w4, [x29, #-8]"),
+                                       (load, "w2, [x29, #-8]"))
+        assert got == live == want, body
+
+
+def test_a_signed_reload_of_a_dropped_slot_is_extended():
+    """A signed load of a record printed the saved value as it was, `x1 + 1`, where the
+    held slot prints it sign extended from the width it loads (#495)."""
+    for save, load, want in (
+            (("stur", "w4"), ("ldursw", "x2"), "x1 + 1 << 32 >> 32"),
+            (("sturb", "w4"), ("ldursb", "x2"), "x1 + 1 << 56 >> 56"),
+            (("sturh", "w4"), ("ldursh", "x2"), "x1 + 1 << 48 >> 48"),
+            (("sturh", "w4"), ("ldursh", "w2"), "(x1 + 1 << 48 >> 48).toUnsigned(32)")):
+        body, got, live = _narrow_past((save[0], save[1] + ", [x29, #-8]"),
+                                       (load[0], load[1] + ", [x29, #-8]"))
+        assert got == live == want, body
+
+
+def test_an_x_reload_of_a_dropped_w_slot_reads_the_slot():
+    """`stur w4; mov x1, #5; ldur x2` printed `x1 + 1` for 8 bytes of which the store
+    wrote 4 (#495). A pair of x saves read back as two w loads likewise printed the
+    first as `x1 + 1`."""
+    body, got, live = _narrow_past(("stur", "w4, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"))
+    assert _reads_the_slot(body, got) and got == live, body
+    body = _lift_asm([("add", "x4, x1, #1"), ("add", "x5, x1, #2"),
+                      ("stp", "x4, x5, [x29, #-16]"), ("mov", "x1, #5"),
+                      ("ldp", "w2, w6, [x29, #-16]"), ("stur", "x2, [x3, #15]"),
+                      ("stur", "x6, [x3, #23]"), ("ret", "")])
+    assert "x1 + " not in body, body
+
+
+def test_a_reload_of_a_dropped_slot_into_the_other_file_reads_the_slot():
+    """A load into the other register file reads the bits as another kind of value, so
+    the held slot reads raw there; the record path printed `x1 + 1` for `ldur d2` of an
+    x save and `x1.toDouble()` for `ldur x2` of a d save (#495)."""
+    body, got, live = _narrow_past(("stur", "x4, [x29, #-8]"), ("ldur", "d2, [x29, #-8]"),
+                                   out="d2")
+    assert _reads_the_slot(body, got) and got == live, body
+    body, got, live = _narrow_past(("stur", "d4, [x29, #-8]"), ("ldur", "x2, [x29, #-8]"),
+                                   value=(("scvtf", "d4, x1"),))
+    assert "toDouble" not in got and got == live, body
+
+
+def test_guard_a_reload_of_a_dropped_slot_at_its_own_width_keeps_the_record():
+    """The width and file rules allow these, so the record still spells what was saved:
+    `stur x4; ldur x2`, `stur w4; ldur w2` and `stur d4; ldur d2`."""
+    for save, load, out, value, want in (
+            ("x4", "x2", "x2", ("add", "x4, x1, #1"), "x1 + 1"),
+            ("w4", "w2", "w2", ("add", "x4, x1, #1"), "x1 + 1"),
+            ("d4", "d2", "d2", ("scvtf", "d4, x1"), "x1.toDouble()")):
+        body, got, live = _narrow_past(("stur", save + ", [x29, #-8]"),
+                                       ("ldur", load + ", [x29, #-8]"), out=out,
+                                       value=(value,))
+        assert got == want, body
+
+
 def test_a_q_store_over_a_dropped_slot_ends_its_record():
     """A save of `x1 + 1` at FP - 8 was dropped to a record when x1 was reassigned, and
     `stur q0, [x29, #-0x10]` then wrote all 16 bytes of FP - 16 and FP - 8. Only the
