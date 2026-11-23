@@ -232,6 +232,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A 4 byte reload into a w register prints its low 32 bits (#498).** A save of
+  `x1 + 1` with `stur w4` read back with `ldur w2` printed all 64 bits of `x1 + 1`, held
+  slot or record, where `mov w2, w4` prints `(x1 + 1).toUnsigned(32)`: the reload handed
+  on the saved value as it was. It is cut as every w destination is now, and a value that
+  fits in 32 bits, such as `x1 & 255`, or that a load of 4 bytes or fewer read, still
+  prints as it is. A 32 bit operation on the reload prints the conversion once. Of 16
+  crafted shapes (a w, pair, push and pop, SP, loop and join reload, a copy to x), 10 go
+  from contradicted or undecided on 23 of 40 CPU states to right on 40 and the other 6
+  print as before. Of the 2,400 generated programs of #495 the agreeing states rise from
+  85,175 to 85,600 and the contradicted or undecided fall from 425 to 0. Of 800 new ones
+  that save 4 bytes off FP or SP and reload them into w, the agreeing states rise from
+  26,418 to 32,000 and the contradicted or undecided fall from 5,582 to 0, with no
+  program worse. On the nine binaries none of the 273,863 ranges changes, and no error
+  is new.
+
 - **A narrow reload of a dropped frame slot follows the slot's rules (#495).** A save of
   `x1 + 1` at FP - 8 is kept as a record once x1 is reassigned, and a reload that read
   the record skipped the width rule, the register file rule and the extension a narrow

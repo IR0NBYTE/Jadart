@@ -6537,8 +6537,9 @@ class Lifter:
         every store that fills it is from the load's own file. And a load that extends
         what it reads is spelled as `sxtw` and `uxth` are: `stur w0; ldursw x3` printed
         x0 for x3, and `strh w0; ldrh w3` x0 for its low 16 bits (#165). A 4-byte load
-        into a w register reads as every w value does, as its value's 64 bits and exact
-        in the low 32, as `mov w3, w0` prints x0."""
+        into a w register reads as every w value does, the low 32 bits zero-extended
+        (`_narrow`), as `mov w3, w0` prints `x0.toUnsigned(32)`. It printed the saved
+        value whole, all 64 bits, for `stur w1; ldur w2`, held slot or record (#498)."""
         width = _access_width(mn, reg)
         # A slot off SP that a move of SP renamed counts the stores filed under the
         # keys it had before too (#488).
@@ -6559,6 +6560,11 @@ class Lifter:
                 v = _extended(v, 8 * width, signed)
                 if signed and reg.strip()[:1] == "w":
                     v = _narrow(v)              # extended to 32 bits, not to 64 (#374)
+            elif (kind == "x" and width == 4 and not signed
+                  and self._low32.get(id(v)) is not v):
+                # A w destination, as `mov w2, w1` (#498), save a value a load of 4
+                # bytes or fewer zero-extended, whose top half is clear (`_known32`).
+                v = _narrow(v)
             return v
 
         if got.text:
@@ -6643,7 +6649,8 @@ class Lifter:
         And only where the text can say what was read. A field read is eight bytes. The
         general file has a convention for saying less, which `_reload` uses for a slot's
         value too: `_extended` below for a byte or a halfword, and a w register left as it
-        is because a w value reads as its low 32 bits anyway. The other file has no such
+        is because a 4-byte field read is 32 bits already (a slot's value `_reload`
+        narrows, #498). The other file has no such
         convention, so a read through it declines unless it is exactly eight bytes: a
         16-byte `q` or `v`, and a 4, 2 or 1-byte `s`, `h` or `b`. A decline is
         recoverable; a width that is not what the machine read is not.
