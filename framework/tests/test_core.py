@@ -15514,7 +15514,8 @@ def test_a_frame_address_held_in_a_register_is_the_slot_it_names():
             off = 0x10238 if build[0][0] == "movz" else 0x238
             for add in (f"x17, x17, {fr}", f"x17, {fr}, x17"):
                 for st, ld, pre in (("str x1, [x17]", f"ldr x0, [{fr}, #{off:#x}]", "x1"),
-                                    ("str w1, [x17]", f"ldr w0, [{fr}, #{off:#x}]", "x1"),
+                                    ("str w1, [x17]", f"ldr w0, [{fr}, #{off:#x}]",
+                                     "x1.toUnsigned(32)"),             # (#498)
                                     ("str x1, [x17, #8]",
                                      f"ldr x0, [{fr}, #{off + 8:#x}]", "x1")):
                     got = lift(build + [("add", add),
@@ -15526,7 +15527,8 @@ def test_a_frame_address_held_in_a_register_is_the_slot_it_names():
         got = lift([("mov", "x17, #0xf0"), ("add", "x17, x17, x15"),
                     ("stp", f"{w}1, {w}2, [x17]"), ("ldp", f"{w}3, {w}4, [x15, #0xf0]"),
                     ("add", "x0, x3, x4")])
-        assert got == ["return x1 + x2;"], got
+        want = "x1 + x2" if w == "x" else "x1.toUnsigned(32) + x2.toUnsigned(32)"  # #498
+        assert got == [f"return {want};"], got
     # Below the frame register: SP less a constant.
     assert lift([("mov", "x17, #0x80"), ("sub", "x17, x15, x17"), ("str", "x1, [x17]"),
                  ("ldur", "x0, [x15, #-0x80]")]) == ["return x1;"]
@@ -18696,15 +18698,83 @@ def test_a_reload_of_a_dropped_slot_into_the_other_file_reads_the_slot():
 
 def test_guard_a_reload_of_a_dropped_slot_at_its_own_width_keeps_the_record():
     """The width and file rules allow these, so the record still spells what was saved:
-    `stur x4; ldur x2`, `stur w4; ldur w2` and `stur d4; ldur d2`."""
+    `stur x4; ldur x2`, `stur w4; ldur w2` and `stur d4; ldur d2`. The w row cut to its
+    low 32 bits, as every w destination is (#498)."""
     for save, load, out, value, want in (
             ("x4", "x2", "x2", ("add", "x4, x1, #1"), "x1 + 1"),
-            ("w4", "w2", "w2", ("add", "x4, x1, #1"), "x1 + 1"),
+            ("w4", "w2", "w2", ("add", "x4, x1, #1"), "(x1 + 1).toUnsigned(32)"),
             ("d4", "d2", "d2", ("scvtf", "d4, x1"), "x1.toDouble()")):
         body, got, live = _narrow_past(("stur", save + ", [x29, #-8]"),
                                        ("ldur", load + ", [x29, #-8]"), out=out,
                                        value=(value,))
         assert got == want, body
+
+
+def _w_field(rows):
+    """The body of `rows` and what its store to `x3.field_0x10` prints."""
+    body = _lift_asm(rows + [("ret", "")])
+    m = re.search(r"x3\.field_0x10 = ([^;]+);", body)
+    assert m, body
+    return body, m.group(1)
+
+
+def test_a_w_reload_of_a_w_save_of_an_argument_is_cut_to_32_bits():
+    """`stur w1; ldur w2` printed `x1` for w2, all 64 bits of x1, where `mov w2, w1`
+    prints `x1.toUnsigned(32)`: the load is 4 bytes into a w register (#498)."""
+    body, got = _w_field([("stur", "w1, [x29, #-8]"), ("ldur", "w2, [x29, #-8]"),
+                          ("stur", "x2, [x3, #15]")])
+    assert got == "x1.toUnsigned(32)", body
+
+
+def test_a_w_reload_of_a_held_w_slot_is_cut_to_32_bits():
+    """`add x4, x1, #1; stur w4; ldur w2` printed `x1 + 1` with the slot held (#498)."""
+    body, got, live = _narrow_past(("stur", "w4, [x29, #-8]"), ("ldur", "w2, [x29, #-8]"))
+    assert live == "(x1 + 1).toUnsigned(32)", body
+
+
+def test_a_w_reload_of_a_dropped_w_slot_is_cut_to_32_bits():
+    """The same with `mov x1, #5` between, read from the slot's record (#498)."""
+    body, got, live = _narrow_past(("stur", "w4, [x29, #-8]"), ("ldur", "w2, [x29, #-8]"))
+    assert got == "(x1 + 1).toUnsigned(32)", body
+
+
+def test_a_w_pair_reload_is_cut_to_32_bits():
+    """`stp w4, w5; ldp w2, w6` printed `x1 + 1` and `x1 + 2` (#498)."""
+    body = _lift_asm([("add", "x4, x1, #1"), ("add", "x5, x1, #2"),
+                      ("stp", "w4, w5, [x29, #-8]"), ("ldp", "w2, w6, [x29, #-8]"),
+                      ("stur", "x2, [x3, #15]"), ("stur", "x6, [x3, #23]"), ("ret", "")])
+    assert "x3.field_0x10 = (x1 + 1).toUnsigned(32);" in body, body
+    assert "x3.field_0x18 = (x1 + 2).toUnsigned(32);" in body, body
+
+
+def test_a_w_reload_off_sp_is_cut_to_32_bits():
+    """`str w1, [x15, #8]; ldr w2, [x15, #8]` printed `x1` (#498)."""
+    body, got = _w_field([("str", "w1, [x15, #8]"), ("ldr", "w2, [x15, #8]"),
+                          ("stur", "x2, [x3, #15]")])
+    assert got == "x1.toUnsigned(32)", body
+
+
+def test_guard_a_32_bit_add_of_a_w_reload_is_cut_once():
+    """A 32-bit operation on the reload reads its 64-bit value back, so the conversion
+    prints once: `(x1 + 1).toUnsigned(32)` for `add w6, w2, #1`."""
+    body, got = _w_field([("stur", "w1, [x29, #-8]"), ("ldur", "w2, [x29, #-8]"),
+                          ("add", "w6, w2, #1"), ("stur", "x6, [x3, #15]")])
+    assert got == "(x1 + 1).toUnsigned(32)", body
+
+
+def test_guard_a_w_reload_of_a_value_that_fits_is_not_cut():
+    """A saved `x1 & 0xff` fits in 32 bits, so the reload prints it as it is."""
+    body, got = _w_field([("and", "x4, x1, #0xff"), ("stur", "w4, [x29, #-8]"),
+                          ("ldur", "w2, [x29, #-8]"), ("stur", "x2, [x3, #15]")])
+    assert got == "x1 & 255", body
+
+
+def test_guard_a_w_reload_of_a_4_byte_field_read_is_not_cut():
+    """A 4-byte field read is zero-extended already (`_known32`), so a save and reload
+    of it through w prints it as it is, without a second `.toUnsigned(32)`."""
+    body = _lift_asm([("ldur", "w4, [x20, #0xb]"), ("stur", "w4, [x29, #-0x10]"),
+                      ("ldur", "w0, [x29, #-0x10]"), ("ret", "")])
+    assert body.strip() == "return x20.field_0xc;", body
 
 
 def test_a_q_store_over_a_dropped_slot_ends_its_record():
@@ -19083,7 +19153,7 @@ def test_a_slot_or_lr_a_write_changed_out_of_sight_reads_as_changed():
                 + keep)
     assert lost(got), got
     assert lift([("stur", "w0, [x29, #-8]"), ("ldur", "w3, [x29, #-8]")]
-                + keep)[0] == "x2.field_0x8 = x0;"           # as wide as it was stored
+                + keep)[0] == "x2.field_0x8 = x0.toUnsigned(32);"   # (#498)
     # Nor does a trip's reload of a slot a byte store filled put back what was there:
     # the slot reads 5, and its 8 bytes are 0x1205.
     assert lift([("mov", "x0, #0x1234"), ("stur", "x0, [x29, #-8]"), ("mov", "x6, #5"),
@@ -19436,7 +19506,7 @@ def test_a_frame_written_out_of_sight_or_read_back_extended_reads_as_it_is():
                          ("sturb w0", "ldursb w3", "(x0 << 56 >> 56).toUnsigned(32)"),
                          ("sturh w0", "ldurh w3", "x0 & 0xffff"),
                          ("sturb w0", "ldurb w3", "x0 & 0xff"),
-                         ("stur w0", "ldur w3", "x0")):        # as `mov w3, w0`: guard
+                         ("stur w0", "ldur w3", "x0.toUnsigned(32)")):   # (#498)
         got = lift([(st.split()[0], st.split()[1] + ", [x29, #-8]"),
                     (ld.split()[0], ld.split()[1] + ", [x29, #-8]")] + keep)
         assert got[0] == "x2.field_0x8 = %s;" % want, (st, ld, got)
