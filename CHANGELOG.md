@@ -232,6 +232,32 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A register a loop wrote keeps its name through a loop with a stack check (#485).** A
+  value one loop left in x12, stored in or after a later loop that opens with a stack
+  check, printed as the bare `x12`, the value the function came in with, where the same
+  rows with no check printed the name the first loop set. The check's slow path calls
+  the stack overflow stub, which gives every register back, but the sets a loop is
+  lifted by counted that `bl` as writing every volatile register: the later loop carried
+  x12 or forgot it at its exit, and the first loop's name went with it. Those sets and
+  liveness now take what such a stub writes from the list the walk forgets there, x0 and
+  LR, and still count x16 and x17 as written, which any callee may use unsaved, and the
+  d registers at a stub that keeps no FPU register. A call to any other function on that
+  path still leaves the register unknown. That let four older loop faults through,
+  fixed with it: an inner loop's exit no longer hides the outer loop's own mark for a
+  register, the tail of a loop puts on record a read of a register an earlier loop
+  dropped, a name a loop carries on the second walk can set off one more walk where its
+  lines read such a register, and a name the hoist took above a loop is anchored there,
+  so a goto out of the loop reads it. On 21 crafted shapes the agreeing CPU states rise
+  from 305 to 586 of 840. Of 3,300 generated programs they rise
+  from 79,736 to 107,253, and the states the CPU contradicts through a bare register
+  read fall from 31,852 to 6,084. Five programs have more such states than before and
+  six agree on fewer, those six around a call to another function. The states
+  contradicted by sound values alone stay at 174 and rise in no program. Every real loop
+  has this check, so output changes: on the nine binaries 2,435 of the 273,863 ranges
+  change, 788 of them read a register bare in fewer places and 15 gain such a read, 4 of
+  them rightly and 11 where an older loop fault now shows. No error is new. Names
+  declared and read but never set fall from 1,559 in 461 ranges to 1,528 in 434.
+
 - **The answer of a subtype test cache stub is bound to its call (#490).** Compiled code
   that loads a `SubtypeTestCache` from the pool into x3, calls a stub through the pool
   and tests x7 against null printed `var t0;`, then the call on its own line, then

@@ -2152,6 +2152,40 @@ def _call_forgets(mn: str, note: str) -> frozenset:
     return _CALL_CLOBBERS | {_T.ret_int}
 
 
+def _stub_defs(note: str, defs):
+    """What a `bl` whose note names a VM runtime stub may write, where `defs` is what
+    `_def_use` gave the row: `defs`, but at a stub `_classify_stub` says gives the file
+    back. `_def_use` has no note to read and gives every `bl` the volatile set, so the
+    sets a loop is lifted by counted the stack check's slow path, `bl` to the stub and
+    `b` back, as writing every one of them, where the walk forgets x0 and LR there. A
+    register an earlier loop wrote then read bare in or after such a loop: carried by
+    it, the read was of a name and never seen as one of a register the first loop
+    dropped, or forgotten at its exit, the name the first loop gave it went too (#485).
+
+    At such a stub it is `_call_forgets`, the walk's list, and what a type-testing stub
+    does not hand back as well (`_TTS_LOSES`): the walk forgets those on some paths and
+    not on every one, and a set of what MAY be written has to hold them. It holds x16
+    and x17 too (`_STUB_SCRATCH`), and at a stub that keeps no FPU register, its name
+    says `WithoutFPURegs`, the d registers of `_CALL_CLOBBERS`. The walk itself still
+    keeps x16 and x17 across such a stub in line, which is older and filed apart. Asked
+    by `Lifter._block_defs` and by liveness, for a row whose note has `_iso_stub_`."""
+    stub = _stub_of(note)
+    if stub is None or stub[0] != "suppress":
+        return defs
+    got = _call_forgets("bl", note) | _STUB_SCRATCH
+    if "WithoutFPURegs" in note:
+        # Read here and not bound at import: arm32 rebinds it.
+        got |= {r for r in _CALL_CLOBBERS if r[0] == "d"}
+    return got | _TTS_LOSES if "TypeTest" in note else got
+
+
+def _stub_kills(note: str, de: int) -> int:
+    """`_stub_defs` as liveness asks it, of masks: a register read past a call to a
+    stub that keeps it is live before the call (#485)."""
+    got = _stub_defs(note, None)
+    return de if got is None else _reg_mask(got)
+
+
 #: `_addr_facts`' fact for a register that may hold a value arithmetic made.
 _AF_CALC = ("c",)
 
@@ -2954,6 +2988,11 @@ _CALL_CLOBBERS = _A64_CLOBBERS
 #: happen to use; the four it keeps are the claim.
 _TTS_LOSES = frozenset(r for r in _A64_CLOBBERS
                        if r[0] == "x" and r not in ("x0", "x1", "x2", "x8", "x30"))
+#: What any stub may write that the stub does not save: x16 and x17, IP0 and IP1, which
+#: the AArch64 procedure call standard lets every callee, and a veneer on the way to it,
+#: use without saving. A stub that gives the file back saves the registers Dart allocates
+#: and these are not among them.
+_STUB_SCRATCH = frozenset({"x16", "x17"})
 
 
 _NO_REGS = frozenset()
@@ -3169,8 +3208,10 @@ def _live_in_header(blocks, nodes, header, preds, reads=None):
     for b in nodes:
         u = d = 0
         more = reads.get(b, {}) if reads else {}
-        for i, (_a, mn, o, _n) in enumerate(blocks[b].insns):
+        for i, (_a, mn, o, n) in enumerate(blocks[b].insns):
             de, us = _def_use_masks(mn, o)
+            if mn == "bl" and "_iso_stub_" in n:
+                de = _stub_kills(n, de)
             u |= (us | more.get(i, 0)) & ~d
             d |= de
         use[b], dfn[b] = u, d
@@ -5687,8 +5728,10 @@ class Lifter:
             for b, blk in self.blocks.items():
                 u = d = 0
                 more = reads[b]
-                for i, (a, mn, o, _n) in enumerate(blk.insns):
+                for i, (a, mn, o, n) in enumerate(blk.insns):
                     de, us = _def_use_masks(mn, o)
+                    if mn == "bl" and "_iso_stub_" in n:
+                        de = _stub_kills(n, de)
                     if mn == "ret":
                         us = self._ret_use(a, us)
                     u |= (us | more.get(i, 0)) & ~d
@@ -11115,6 +11158,10 @@ class Lifter:
         if m:
             if not _MINTED_RE.fullmatch(m.group(1)):
                 writes = frozenset((canon(m.group(1)),))
+            elif m.group(1) in self.hoist:
+                # Its `var` is at the top of the body and this line is where it is
+                # set, which is what a `var` here says of a name the hoist left.
+                decls = frozenset((int(m.group(1)[1:]),))
         elif ln.rstrip().endswith((";", "{", "}", ":")):
             m = _LABEL_LINE_RE.match(ln)
             if m:
@@ -11946,7 +11993,10 @@ class Lifter:
         # Anchored above the loop, as a carried name is. A goto out of the loop hands its
         # target a state holding these names, and the declaration has to be visible there
         # too (#204, #205).
-        for m in map(_DECL_RE.match, out):
+        # ...and one the hoist took, whose line here is `tN = ...;` with its `var` at
+        # the top of the body: left without an anchor, the target of a goto out of the
+        # loop took it for a name some way in had not set and read the register bare.
+        for m in map(_PIN_SET_RE.match, out):
             if m:
                 self._anchor[int(m.group(2)[1:])] = self._loop_before
                 self._decl_leaned.add(int(m.group(2)[1:]))
@@ -12043,7 +12093,7 @@ class Lifter:
         marks = self._unset[header] = {}
         for r in sorted(writes - self._reloads(header, trip, st, writes)):
             loop_st.forget(r)
-            marks[r] = loop_st.reg[r]
+            marks[r] = [loop_st.reg[r]]
         # The outgoing area too, where a trip may write it or a call in it takes it: the
         # next trip starts with what the last one left there, which _loop_rewrites, over
         # FP's slots alone, did not see (#162).
@@ -12089,6 +12139,16 @@ class Lifter:
         # The back edge assigns all of these AT ONCE, so any one that another reads has to
         # be captured before the group runs. See _parallel_copy.
         tail = self._parallel_copy(st, pairs, pad + indent)
+        # Its lines are this loop's own, a level in, and no walk reads them: a register
+        # an inner loop wrote and dropped that one of them spells is on record here, as
+        # where a statement's lines spell it (`_lost_spelled`), so the next walk has the
+        # inner loop carry it and the tail reads that name.
+        lost = loop_st.opaque | loop_st.stale
+        if lost and pairs:
+            for _name, v in pairs:
+                for r in _REG_RE.findall(v.text):
+                    if canon(r) in lost:
+                        self.lost_reads.add(canon(r))
         if drop:
             # The name was minted moments ago and is unique, so a word-boundary swap reaches
             # exactly the occurrences this function created and nothing else.
@@ -12167,7 +12227,7 @@ class Lifter:
                     continue
                 for r in (written - carried) & _mask_regs(self._livein.get(s, 0)):
                     v = left.get(r)
-                    if v.text != r or (r in marks and v is marks[r]):
+                    if v.text != r or any(v is m for m in marks.get(r, ())):
                         self.exit_hazards.setdefault(header, set()).add(r)
                         # A break that leaves MORE THAN ONE loop leaves this register in
                         # the same state at each of them, so each has to carry it. Named
@@ -12193,7 +12253,7 @@ class Lifter:
                 if outer:
                     for r in sorted(hit & outer.keys()):
                         if st.get(r).text == r:
-                            outer[r] = st.reg[r]
+                            outer[r].append(st.reg[r])
         # ...except the ones that got a name, whose value after the loop is that variable.
         # That is the second half of naming it: forgetting it here would put the machine
         # register back into every line that reads the result of the loop. A register whose
@@ -12384,8 +12444,10 @@ class Lifter:
             if b not in usedef:
                 u = d = 0
                 more = reads.get(b, {}) if reads else {}
-                for i, (_a, mn, o, _n) in enumerate(blocks[b].insns):
+                for i, (_a, mn, o, n) in enumerate(blocks[b].insns):
                     de, us = _def_use_masks(mn, o)
+                    if mn == "bl" and "_iso_stub_" in n:
+                        de = _stub_kills(n, de)
                     u |= (us | more.get(i, 0)) & ~d
                     d |= de
                 usedef[b] = (u, d)
@@ -13055,8 +13117,9 @@ class Lifter:
 
     def _written(self, nodes) -> set:
         """What the instructions in `nodes` write, a call's clobbers and a frame move's
-        registers counted. Each block's worked out once, and joined by C loops and not a
-        line per block (#332)."""
+        registers counted, and a call to a stub that gives the registers back for what
+        the walk forgets there (`_stub_defs`). Each block's worked out once, and joined
+        by C loops and not a line per block (#332)."""
         defs = self._defs
         if not self._nested:
             w = set()
@@ -13075,7 +13138,8 @@ class Lifter:
         got = self._defs.get(b)
         if got is None:
             got = self._defs[b] = frozenset().union(
-                *(_def_use(mn, o)[0] for (_a, mn, o, _n) in self.blocks[b].insns),
+                *(_stub_defs(n, _def_use(mn, o)[0]) if mn == "bl" and "_iso_stub_" in n
+                  else _def_use(mn, o)[0] for (_a, mn, o, n) in self.blocks[b].insns),
                 *(self._moved_regs(a) for (a, _m, _o, _n) in self.blocks[b].insns
                   if a in self.frame_moves))
         return got
@@ -13872,6 +13936,8 @@ def detect_dispatch(dis) -> dict:
 # ── public entry point ──────────────────────────────────────────────────────
 
 _DECL_RE = re.compile(r"^(\s*)var (t\d+) = (.+);$")
+#: A name's first value, declared there or, the hoist having taken it, at the top.
+_PIN_SET_RE = re.compile(r"^(\s*)(?:var )?(t\d+) = (.+);$")
 #: A declaration with NO initialiser, `var t5;`, which is what names a value the lifter
 #: does not know: what a call left in a register it clobbered (`_clobber_call`). It has no
 #: initialiser to evaluate, so one nothing reads can always go (#176).
@@ -15489,6 +15555,22 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter = lines = None               # not held while the second walk runs
         lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist, phi_shown,
                              facts)
+        # A name a loop carries now is set by lines no walk before this one printed,
+        # the tail of its loop and the write back at a break, and one of those may
+        # read a register an earlier loop wrote and dropped: `t2 = t1 ^ x7;` in the
+        # second loop of three once it carries x10, where the first writes x7. Only
+        # this walk could see that read, so it runs once more with those carried too.
+        if carry:
+            shown = printed | lifter.lost_reads
+            more = {h: carry.get(h, frozenset())
+                    | (r & (printed if h in lifter.exit_unsure else shown))
+                    for h, r in lifter.exit_hazards.items()}
+            more = {h: r for h, r in more.items() if r - carry.get(h, frozenset())}
+            if more:
+                carry = {**carry, **more}
+                lifter = lines = None
+                lifter, lines = walk(keep, carry, join_phi, printed_prior, hoist,
+                                     phi_shown)
         # A name the code after the loop does not print, its only reader a call that
         # prints `(...)`, says nothing, and the walk goes back to the bare register.
         # Asked of the lines once for every loop's names, not once a loop: a row of

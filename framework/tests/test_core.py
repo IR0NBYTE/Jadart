@@ -28104,6 +28104,290 @@ def test_a_register_a_loop_wrote_reads_after_it_as_the_name_the_loop_set():
     assert back == ["var t0 = x4;", "if (x2 == 0) {", "t0 = 5;", "}", "return t0;"], back
 
 
+def _lift_485(src, base=0x1000):
+    """Tier 3 of `src`, a row a line as an assembler takes them: `L:` names the next
+    row and a branch to it takes its address, `bl SOVF` calls the stack overflow stub,
+    `bl TTS` a type-testing one, `bl WB` the write barrier, `bl CALL` a function, and
+    `bl THROW` and `bl RANGE` the stubs that throw."""
+    notes = {"SOVF": _STACK_424, "TTS": "  ; -> _iso_stub_DefaultTypeTestStub",
+             "WB": "  ; -> _iso_stub_WriteBarrierWrappersStub", "CALL": "  ; -> foo",
+             "THROW": "  ; -> _iso_stub_ThrowStub",
+             "RANGE": "  ; -> _iso_stub_RangeErrorSharedWithoutFPURegsStub"}
+    at, rows = {}, []
+    for ln in filter(None, (ln.strip() for ln in src.splitlines())):
+        if ln.endswith(":"):
+            at[ln[:-1]] = base + 4 * len(rows)
+        else:
+            rows.append(ln)
+    out = []
+    for ln in rows:
+        mn, _, op = ln.partition(" ")
+        head, sep, last = op.rpartition(", ")
+        if op in notes:
+            out.append((mn, "#0x9000", notes[op]))
+        else:
+            out.append((mn, f"{head}{sep}#0x{at[last]:x}" if last in at else op))
+    return _lift_noted(out, base)
+
+
+#: A loop that runs `%s` on each of its x4 & 3 trips, and where it leaves to.
+_FIRST_485 = ("and x4, x4, #3\nmov x5, #0\nL1:\ncmp x5, x4\nb.ge L2\n%s\n"
+              "add x5, x5, #1\nb L1\nL2:\n")
+#: The stack check a loop opens with, and its slow path, which stands past the `ret`.
+_CHECK_485 = "ldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls LS6\nLB7:\n"
+_SLOW_485 = "LS6:\nbl %s\nb LB7\n"
+_STORE_485 = "stur x12, [x8, #0x17]\n"
+
+
+def _second_485(inside="", after="", slow="SOVF"):
+    """A second loop of one trip that runs `inside`, then `after` and the `ret`. With
+    `slow` it opens with the stack check, whose slow path calls that."""
+    return ("mov x5, #0\nL4:\n" + (_CHECK_485 if slow else "") + "cmp x5, #1\nb.ge L5\n"
+            + inside + "add x5, x5, #1\nb L4\nL5:\n" + after + "ret\n"
+            + (_SLOW_485 % slow if slow else ""))
+
+
+def test_a_register_a_loop_wrote_is_stored_by_a_later_loop_with_a_stack_check():
+    """The rows of #485. The first loop sets x12 to 7 on each trip and the second, which
+    opens with a stack check, stores it. The check's slow path is `bl` to the stub that
+    keeps every register and `b` back, and a block's writes gave that `bl` the volatile
+    set, as any call's. So the second loop carried x12, the store read the carried name,
+    which then went back to `x12`, and nothing had seen a read of the register the first
+    loop dropped: it set no name, and the store printed the x12 the function came in
+    with, where an arm64 CPU stores 7 on each entry state the first loop runs on."""
+    got = _lift_485("mov x2, #7\nmov x7, #0\nmov x9, #5\nmov x11, #4\nand x3, x3, #3\n"
+                    + _FIRST_485 % "and x12, x2, #0xff" + _second_485(
+                        _STORE_485 + "ldur x7, [x8, #7]\n",
+                        "orr x10, x5, #0xf\nadd x0, x10, x10\n"))
+    assert got[:2] == ["var t0 = x12;", "var t1 = 0;"] and "t0 = 7 & 255;" in got, got
+    assert "x8.field_0x18 = t0;" in got and not any("x12" in ln for ln in got[1:]), got
+
+
+def test_a_register_a_loop_wrote_keeps_its_name_in_a_loop_with_a_stack_check():
+    """The same with `mov x12, #7` and nothing else: the second loop, which does not
+    write x12, reads the name the first one sets, as it does with no check (#485)."""
+    want = ["var t0 = x12;", "var t1 = 0;", "while (true) {",
+            "if (t1 >= (x4 & 3)) break;", "t0 = 7;", "t1 += 1;", "}", "var t2 = 0;",
+            "while (true) {", "if (t2 < 1) {", "x8.field_0x18 = t0;", "} else {",
+            "break;", "}", "t2 += 1;", "}", "return x0;"]
+    first = _FIRST_485 % "mov x12, #7"
+    assert _lift_485(first + _second_485(_STORE_485)) == want
+    # The write barrier's stub gives the registers back as well.
+    assert _lift_485(first + _second_485(_STORE_485, slow="WB")) == want
+    # A type-testing stub hands back x0, x1, x2 and x8 and no more: x2 keeps the name,
+    # and x12 is still one the second loop may have changed.
+    got = _lift_485(_FIRST_485 % "mov x2, #7"
+                    + _second_485("stur x2, [x8, #0x17]\n", slow="TTS"))
+    assert got == ["var t0 = x2;"] + want[1:], got
+    got = _lift_485(first + _second_485(_STORE_485, slow="TTS"))
+    assert "x8.field_0x18 = x12;" in got and "var t0 = x12;" not in got, got
+
+
+def test_a_register_a_loop_wrote_keeps_its_name_after_a_loop_with_a_stack_check():
+    """Read after the second loop, the first walk did see the read and the second gave
+    x12 its name. The exit of the loop with the check then forgot every register its
+    blocks write, the stub's call counted, so the store read a bare x12 again, the name
+    had no reader and the walk took it back (#485)."""
+    got = _lift_485(_FIRST_485 % "mov x12, #7" + _second_485(after=_STORE_485))
+    assert got[:2] == ["var t0 = x12;", "var t1 = 0;"] and "t0 = 7;" in got, got
+    assert got[-2:] == ["x8.field_0x18 = t0;", "return x0;"], got
+    # A value set before a loop with a check is the value after it.
+    got = _lift_485("mov x12, #7\n" + _second_485(after=_STORE_485))
+    assert got[-2:] == ["x8.field_0x18 = 7;", "return x0;"], got
+
+
+def test_a_register_read_past_a_stub_that_keeps_it_is_live_before_the_call():
+    """Liveness asked the same question of the same row: with the stub's call in line,
+    not on a side path, x12 was dead before it, so the first loop's exit found no reader
+    for what it dropped, and the store past the call read a bare x12 (#485)."""
+    first = _FIRST_485 % "mov x12, #7"
+    got = _lift_485(first + "bl SOVF\n" + _STORE_485 + "ret\n")
+    assert got[0] == "var t0 = x12;" and got[-2] == "x8.field_0x18 = t0;", got
+    # ...and in a loop, where the call comes before the read on every trip.
+    got = _lift_485(first + _second_485("bl SOVF\n" + _STORE_485, slow=None))
+    assert got[0] == "var t0 = x12;" and "x8.field_0x18 = t0;" in got, got
+
+
+def test_a_call_in_a_later_loop_still_takes_the_register_an_earlier_loop_wrote():
+    """A guard for what #485 leaves as it was. With no check the second loop reads the
+    name, and a value set in line reads as itself through a loop with a check. With a
+    call to a function on the slow path, the callee may leave anything in x12: the
+    store is of the bare register, not of the 7 the first loop put there (#216)."""
+    first = _FIRST_485 % "mov x12, #7"
+    got = _lift_485(first + _second_485(_STORE_485, slow=None))
+    assert got[0] == "var t0 = x12;" and "x8.field_0x18 = t0;" in got, got
+    got = _lift_485("mov x12, #7\n" + _second_485(_STORE_485))
+    assert "x8.field_0x18 = 7;" in got, got
+    for inside, after in ((_STORE_485, ""), ("", _STORE_485)):
+        got = _lift_485(first + _second_485(inside, after, slow="CALL"))
+        assert "x8.field_0x18 = x12;" in got, got
+        assert not any(ln.startswith(("var t0 = x12", "t0 = 7")) for ln in got), got
+
+
+
+def test_a_register_a_loop_sets_after_a_stub_that_keeps_it_is_live_at_its_head():
+    """The loop calls the write barrier's stub, then tests the x10 its last trip set.
+    The stub keeps x10, but the liveness a loop's head is asked by gave the `bl` the
+    volatile set, so x10 was dead at the head, the loop did not carry it, and the test
+    read the x10 the function came in with on every trip, where an arm64 CPU reads the
+    x7 + 2 of the trip before (#485)."""
+    got = _lift_485("mov x2, #7\nmov x9, #7\nmov x10, #0\nand x3, x3, #3\n"
+                    "and x4, x4, #3\nmov x5, #0\nL1:\ncmp x5, #2\nb.ge L2\nbl WB\n"
+                    "tbz x10, #0, L3\nldur x9, [x8, #15]\nL3:\nadd x10, x7, #2\n"
+                    "add x5, x5, #1\nb L1\nL2:\nmov x6, #0\nL4:\ncmp x6, x4\nb.ge L5\n"
+                    "ldur x11, [x8, #7]\nstur x9, [x8, #23]\neor x2, x2, x5\n"
+                    "add x6, x6, #1\nb L4\nL5:\nadd x0, x12, x11\nret\n")
+    assert got[1] == "var t0 = 0;" and "if (t0 & 1 != 0) {" in got, got
+    assert "t0 = x7 + 2;" in got and not any(re.search(r"\bx10\b", ln) for ln in got), got
+
+def test_a_stub_that_gives_the_registers_back_may_still_write_x17():
+    """A guard for what #485 leaves as it was. A stub saves the registers Dart allocates
+    and not x16 and x17, which any callee may use: a value set in x17 before a loop with
+    a check is not known after it, and the store is of the bare register. With no check
+    the loop has no call and the store is of the 7."""
+    got = _lift_485("mov x17, #7\n" + _second_485(after="stur x17, [x8, #0x17]\n"))
+    assert got[-2:] == ["x8.field_0x18 = x17;", "return x0;"], got
+    got = _lift_485("mov x17, #7\n"
+                    + _second_485(after="stur x17, [x8, #0x17]\n", slow=None))
+    assert got[-2:] == ["x8.field_0x18 = 7;", "return x0;"], got
+
+
+def test_a_stub_that_keeps_no_fpu_register_may_write_a_d_register():
+    """A guard for what #485 leaves as it was. The stack overflow stub the check calls
+    is the one `WithoutFPURegs`, which does not save them: a double set in d1 before a
+    loop with that check is not known after it. With no check the store is of the
+    1.0."""
+    src = "fmov d1, #1.0\n"
+    got = _lift_485(src + _second_485(after="stur d1, [x8, #0x17]\n"))
+    assert got[-2:] == ["x8.field_0x18 = d1;", "return x0;"], got
+    got = _lift_485(src + _second_485(after="stur d1, [x8, #0x17]\n", slow=None))
+    assert got[-2:] == ["x8.field_0x18 = 1.0;", "return x0;"], got
+
+def _checks_485(src, on=True):
+    """`src` with a stack check where each `CHECK` row stands, as a loop opens with one,
+    and the slow paths after its last row. With `on` false, the same rows and no check."""
+    slow = []
+
+    def one(_m):
+        n = len(slow)
+        slow.append(f"LS{n}:\nbl SOVF\nb LB{n}\n")
+        return f"ldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls LS{n}\nLB{n}:\n"
+    return re.sub(r"CHECK\n", one if on else "", src) + "".join(slow)
+
+
+def test_a_register_an_inner_loop_wrote_keeps_its_name_after_the_loop_around_it():
+    """An inner loop writes x9, no line in either loop reads it and the store after both
+    does. The second walk has the inner loop carry it, and that loop's exit then moved
+    the outer header's own mark for x9 to the value the inner loop left. The outer
+    loop's break at its head still held what the header forgot, which was no hazard
+    any more, so the outer loop did not carry x9, the store read it bare, the inner
+    name had no reader and the walk took it back: `x8.field_0x18 = x9;`, the x9 the
+    function came in with, where an arm64 CPU stores what the last inner trip left.
+    With no check the same rows printed the same before #485; with one they printed
+    it once a check's stub stopped hiding the read."""
+    src = ("and x3, x3, #3\nmov x9, #7\nmov x5, #0\nL2:\nCHECK\ncmp x5, x3\nb.ge L3\n"
+           "mov x6, #0\nL6:\nCHECK\ncmp x6, x3\nb.ge L7\nsub x9, x7, x6\n"
+           "add x6, x6, #1\nb L6\nL7:\nadd x5, x5, #1\nb L2\nL3:\n"
+           "stur x9, [x8, #0x17]\nret\n")
+    for on in (True, False):
+        got = _lift_485(_checks_485(src, on))
+        assert not any("x9" in ln for ln in got), got
+        assert "var t1 = 7;" in got and got[-2] == "x8.field_0x18 = t1;", got
+        assert "var t4 = x7 - t2;" in got and "t3 = t4;" in got and "t1 = t3;" in got, got
+
+
+def test_a_register_the_innermost_of_three_loops_writes_keeps_its_name_after_all():
+    """Three loops, each inside the last, and the innermost writes x2, which the
+    return reads. The middle loop's exit moved the outer header's mark for x2 to the
+    value the middle loop left, so the outer loop's exit took the register for one no
+    loop had touched, did not carry it, and the return read the x2 the function came
+    in with, where an arm64 CPU reads what the last inner trip left (#485)."""
+    got = _lift_485("mov x2, #4\nand x3, x3, #3\nand x4, x4, #3\nmov x5, #0\nL2:\n"
+                    "cmp x5, x4\nb.ge L3\nmov x6, #0\nL4:\ncmp x6, x3\nb.ge L5\n"
+                    "and x13, x13, #3\nL6:\ncmp x13, #4\nb.ge L7\nadd x2, x11, x5\n"
+                    "add x13, x13, #1\nb L6\nL7:\nadd x6, x6, #1\nb L4\nL5:\n"
+                    "add x5, x5, #1\nb L2\nL3:\nadd x0, x2, x2\nret\n")
+    assert re.fullmatch(r"return (t\d+) \+ \1;", got[-1]), got
+    assert not any(re.search(r"\bx2\b", ln) for ln in got), got
+
+def test_a_register_an_earlier_loop_wrote_is_read_by_the_tail_of_a_later_loop():
+    """A loop writes x2 and nothing in it reads x2; a second loop adds x2 to x9 on
+    every trip. That add is the second loop's tail, the lines that set its names for
+    the next trip, and no walk looked in them for a register an earlier loop had
+    dropped, so the first loop never carried x2 and the tail printed `t3 += x2;`, the
+    x2 the function came in with, where an arm64 CPU adds what the first loop left.
+    With a check in the first loop and without one alike (#485)."""
+    src = ("mov x10, #0\nmov x12, #0\nand x3, x3, #3\nand x4, x4, #3\nmov x5, #0\n"
+           "L1:\nCHECK\ncmp x5, x4\nb.ge L2\nadd x12, x12, #1\nand x2, x9, #255\n"
+           "add x5, x5, #1\nb L1\nL2:\nmov x6, #0\nL5:\ncmp x6, x4\nb.ge L6\n"
+           "add x9, x9, x2\nadd x6, x6, #1\nb L5\nL6:\nadd x0, x12, x9\nret\n")
+    for on in (True, False):
+        got = _lift_485(_checks_485(src, on))
+        assert [ln for ln in got if "x2" in ln] == ["var t1 = x2;"], got
+        assert "t1 = x9 & 255;" in got and "t4 += t1;" in got, got
+        assert got[-1] == "return t0 + t4;", got
+
+
+def test_a_name_a_loop_carries_on_the_second_walk_reads_what_an_earlier_loop_wrote():
+    """Three in a row: a loop writes x7, a second sets x10 from x7 and reads neither,
+    and the store after it reads x10. The first walk prints no line for x10, the
+    second has the second loop carry it and prints `t1 = t3 ^ x7;` for the first time,
+    a read of the x7 the first loop wrote and dropped. Only that walk could see the
+    read and there was no walk after it: the line shipped with the x7 the function
+    came in with, where an arm64 CPU holds 4 (#485)."""
+    src = ("and x3, x3, #3\nmov x7, #0\nmov x5, #0\nL1:\ncmp x5, #1\nb.ge L2\n"
+           "add x7, x5, #4\nadd x5, x5, #1\nb L1\nL2:\nmov x6, #0\nL3:\nCHECK\n"
+           "cmp x6, x3\nb.ge L4\neor x10, x6, x7\nadd x6, x6, #1\nb L3\nL4:\n"
+           "stur x10, [x8, #0x17]\nret\n")
+    for on in (True, False):
+        got = _lift_485(_checks_485(src, on))
+        assert not any("x7" in ln for ln in got), got
+        assert "var t2 = t0 + 4;" in got and "t1 = t2;" in got, got
+        assert "t3 = t4 ^ t1;" in got and got[-2] == "x8.field_0x18 = t3;", got
+
+
+#: A loop over the fields of x1 that leaves three ways: a `ret` in line, a block past it
+#: that returns, and one that reads x2 and x4, which the block before the loop set.
+_GOTO_485 = ("ldur x4, [x2, #7]\nL1:\nCHECK\nldur x6, [x2, #31]\ncmp x6, x4\nb.ge LX\n"
+             "cmp x3, x5\nb.ge LQ\nadd x9, x3, #1\nstur x9, [x2, #15]\n%s"
+             "add x3, x6, #8\nstur x3, [x2, #31]\nmov x3, x9\nb L1\nLQ:\n"
+             "mov x0, #0x101\nret\nLX:\nsub x5, x6, x4\nstur x5, [x2, #31]\n"
+             "add x0, x5, x4\nret\n")
+
+
+def test_a_name_set_before_a_loop_is_read_where_a_goto_out_of_the_loop_lands():
+    """A value a loop reads in a register is named before the loop, and where a line
+    outside that block reads the name its `var` goes to the top of the body, which
+    leaves `t0 = x1.field_0x8;` before the loop. With no `var` that line anchored the
+    name nowhere and did not count as declaring it, so the target of the goto out of
+    the loop took it for a name some way in had not set and read the register:
+    `return t3 + x4;`, the x4 the function came in with. With a check the same rows
+    read the name before #485 and lost it once the check's stub kept x4."""
+    src = ("mov x2, x1\nldur x3, [x2, #15]\nand x3, x3, #1\nldur x4, [x2, #39]\n"
+           "and x5, x4, #3\ncmp x3, x5\nb.lt LC\nmov x0, #0x101\nret\nLC:\n"
+           + _GOTO_485 % "")
+    for on in (False, True):
+        got = _lift_485(_checks_485(src, on))
+        assert not any("x4" in ln for ln in got), got
+        assert got[0] == "var t0;" and "t0 = x1.field_0x8;" in got, got
+        assert got[-3:] == ["var t3 = x1.field_0x20 - t0;", "x1.field_0x20 -= t0;",
+                            "return t3 + t0;"], got
+    # With a bounds check in the loop and a null check before it, the check's slow
+    # path stands between the two blocks that throw and prints as a goto back to a
+    # label in the loop. The rows under that label read the two names too, as they
+    # did before #485: the stub keeping x2 and x4 is what took the names from them.
+    got = _lift_485(
+        "stp x29, x30, [x15, #-16]!\nmov x29, x15\nmov x2, x1\nldur x3, [x2, #15]\n"
+        "and x3, x3, #1\nldur x4, [x2, #39]\ncbz x4, LT\nand x5, x4, #3\ncmp x3, x5\n"
+        "b.lt LC\nmov x0, #0x101\nmov x15, x29\nldp x29, x30, [x15], #16\nret\nLC:\n"
+        + (_GOTO_485 % "ldur x10, [x2, #47]\nand x0, x10, #7\nmov x1, x3\ncmp x1, x0\n"
+                       "b.hs LE\n").replace("CHECK\n", _CHECK_485)
+        + "LT:\nbl THROW\n" + _SLOW_485 % "SOVF" + "LE:\nbl RANGE\n")
+    assert not any(re.search(r"\bx[24]\b", ln) for ln in got), got
+    assert any(ln.startswith("return t4 + t") for ln in got), got
+    assert got[-2:] == ["L_0x10a4:", "goto L_0x1048;"], got
+
+
 def test_a_branch_on_a_register_a_loop_lost_says_so_where_no_name_is_set():
     """Where the loop sets no name, the branch after it still prints, on `?`: what it
     tests has no name there, and neither `if (x2 == 0)` nor `return x4;` on every path
