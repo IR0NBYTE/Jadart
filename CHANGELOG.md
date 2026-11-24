@@ -232,6 +232,21 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **The answer of a subtype test cache stub is bound to its call (#490).** Compiled code
+  that loads a `SubtypeTestCache` from the pool into x3, calls a stub through the pool
+  and tests x7 against null printed `var t0;`, then the call on its own line, then
+  `if (t0 != NULL) {`, a name nothing set. The stub answers in x7, so the call now reads
+  `var t0 = pool_0x28.field_0x8(...);`. It is decided from the instructions alone: the
+  callee is the entry point of a Code or of an object of the vm snapshot that a pool
+  slot holds, x3 holds a pool slot whose object is a `SubtypeTestCache`, and the next
+  instruction compares w7 with null. Any other call still answers in x0. At such a call
+  x0 is no longer the result, so a later read of x0 reads a value the lifter does not
+  know. On the nine binaries 2,232 calls fit all three, and of the calls
+  followed by that compare none fits only one of the other two. 1,702 of the 273,863
+  ranges change, every one only by that binding, and no error is new. Names declared and
+  read but never set fall from 3,791 in 2,145 ranges to 1,559 in 461, and no range gains
+  one. The ones left are other shapes, most of them read only by copies (#491).
+
 - **A 4 byte reload into a w register prints its low 32 bits (#498).** A save of
   `x1 + 1` with `stur w4` read back with `ldur w2` printed all 64 bits of `x1 + 1`, held
   slot or record, where `mov w2, w4` prints `(x1 + 1).toUnsigned(32)`: the reload handed

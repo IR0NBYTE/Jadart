@@ -8227,6 +8227,90 @@ def test_a_call_clobbers_every_volatile_register():
     assert len(_CALL_CLOBBERS) == 15 + 2 + 1 + 31 and "x30" in _CALL_CLOBBERS
 
 
+def _stc_pool_map():
+    """A pool for #490: a SubtypeTestCache at 0x18 and, far, at 0x1010, an object of
+    another class at 0x20, and a vm object, the stub's Code, in every other slot."""
+    pool = [("ref", 5)] * 0x210
+    pool[1], pool[2], pool[0x200] = ("ref", 12), ("ref", 22), ("ref", 13)
+    fr = _held_fr(pool)
+    fr.spans = [(10, 20, 38, "SubtypeTestCacheCid"), (20, 30, 600, "LoopCid")]
+    return _held_pool_map(fr)
+
+
+#: The call of a subtype test cache stub through its Code (`GenerateCallSubtypeTestStub`)
+#: and the compare `GenerateBoolToJump` makes of its answer with null, after `head`.
+_STC_CALL = [("ldr", "x30, [x27, #0x10]"), ("ldur", "x30, [x30, #7]"), ("blr", "x30")]
+
+
+def _stc_rows(head, test="w7", call=_STC_CALL, read="x7"):
+    rows = head + call + [("cmp", f"{test}, w22")]
+    rows += [("b.eq", f"#0x{(len(rows) + 3) * 4:x}"), ("mov", f"x0, {read}"),
+             ("ret", ""), ("mov", "x0, #0"), ("ret", "")]
+    return _lift_rows(rows, pool_map=_stc_pool_map())
+
+
+def test_a_subtype_test_cache_stub_answers_in_x7():
+    """A subtype test cache stub answers in R7 (TypeTestABI::
+    kSubtypeTestCacheResultReg), and the compiler compares that with null first. The
+    result was named in x0, so the name the compare read was one nothing set: `var t0;
+    pool_0x28.field_0x8(...); if (t0 != NULL) {` (#490)."""
+    want = ["var t0 = pool_0x10.field_0x8(...);", "if (t0 != NULL) {", "return t0;",
+            "} else {", "return 0;", "}"]
+    assert _stc_rows([("ldr", "x3, [x27, #0x18]")]) == want
+    # The cache in a far slot, as fluffychat's 0x4559ac has it.
+    assert _stc_rows([("add", "x3, x27, #1, lsl #12"), ("ldr", "x3, [x3, #0x10]")]) == want
+    # x0 is no result of this call: a read of it reads a value the lifter does not know.
+    assert _stc_rows([("ldr", "x3, [x27, #0x18]")], read="x0")[:3] == [
+        "var t0;", "if (pool_0x10.field_0x8(...) != NULL) {", "return t0;"]
+
+
+def test_only_a_subtype_test_cache_call_answers_in_x7():
+    """Guards for #490, which pass on main: the result stays in x0 where x3 holds an
+    object of another class, where the row after the call compares x0 and not x7, and
+    where the callee is no pool object's entry point, or the entry of a pool object
+    that is no Code and no object of the vm snapshot, and where x3 was loaded ahead of
+    another call or written again after its load. The slow path calls the same way
+    with a cache in x3 and reads x0 next, and names x0."""
+    bare = ["var t0;", "pool_0x10.field_0x8(...);", "if (t0 != NULL) {"]
+    assert _stc_rows([("ldr", "x3, [x27, #0x20]")])[:3] == bare
+    assert _stc_rows([("ldr", "x3, [x27, #0x18]")], test="w0")[:2] == [
+        "var t0;", "if (pool_0x10.field_0x8(...) != NULL) {"]
+    assert _stc_rows([("ldr", "x3, [x27, #0x18]")],
+                     call=[("ldur", "x30, [x1, #7]"), ("blr", "x30")])[:3] == [
+        "var t0;", "x1.field_0x8(...);", "if (t0 != NULL) {"]
+    for slot in ("0x20", "0x18"):       # an object of another class, and the cache
+        call = [("ldr", f"x30, [x27, #{slot}]"), ("ldur", "x30, [x30, #7]"),
+                ("blr", "x30")]
+        assert _stc_rows([("ldr", "x3, [x27, #0x18]")], call=call)[:3] == [
+            "var t0;", f"pool_{slot}.field_0x8(...);", "if (t0 != NULL) {"]
+    assert _stc_rows([("ldr", "x3, [x27, #0x18]"), ("blr", "x9")])[:4] == [
+        "(dynamic call)(...);"] + bare
+    assert _stc_rows([("ldr", "x3, [x27, #0x18]"), ("mov", "x3, x1")])[:3] == bare
+    slow = [("ldr", "x8, [x27, #0x10]"), ("ldr", "x3, [x27, #0x18]"),
+            ("ldr", "x30, [x27, #0x10]"), ("ldur", "x30, [x30, #7]"), ("blr", "x30"),
+            ("cmp", "w0, w22"), ("b.eq", "#0x24"), ("mov", "x0, #1"), ("ret", ""),
+            ("mov", "x0, #0"), ("ret", "")]
+    assert _lift_rows(slow, pool_map=_stc_pool_map())[0] == (
+        "if (pool_0x10.field_0x8(...) != NULL) {")
+
+
+def test_chain_future_names_the_answer_of_its_subtype_test():
+    """_chainFuture in the clean build calls a subtype test cache stub and tests its
+    answer in x7; the name it tests is the call's (#490)."""
+    _needs_capstone()
+    if not os.path.exists(CLEAN):
+        _skip("  SKIP test_chain_future_names_the_answer_of_its_subtype_test (no fixture)")
+    from jadart.cli import main
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert main(["lift", CLEAN, "0x20058"]) == 0
+    body = [ln.strip() for ln in buf.getvalue().splitlines()]
+    at = body.index("var t0 = pool_0x28.field_0x8(...);")
+    assert body[at + 1] == "if (t0 != NULL) {" and "var t0;" not in body
+
+
 def test_static_bit_is_calibrated_not_hardcoded():
     """StaticBit sits at ModifierBits::kNextBit, three derived widths deep, so a hardcoded
     position would silently mislabel every method if any of them moved. It is solved for

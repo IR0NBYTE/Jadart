@@ -242,6 +242,10 @@ class Target:
     #: a member of the first, and a member of the second is one more offset the class
     #: could have (`_elem_offsets`). Empty where nothing is read as an element.
     data_offsets: dict = field(default_factory=dict)
+    #: Where a subtype test cache stub leaves its answer, `TypeTestABI::
+    #: kSubtypeTestCacheResultReg`: null where the cache had no entry, else true or
+    #: false. "" where the lifter does not read the stub's answer (#490).
+    stc_result: str = ""
 
     @property
     def pairs(self) -> bool:
@@ -276,6 +280,8 @@ ARM64 = Target(
     # uncompressed iOS build uses 0x20 or 0x30 and nothing else.
     consts_base="NULL", consts={0x20: "true", 0x30: "false", 0x0: "null"},
     incoming_from_fp=0x10, word=8,
+    # R7, in constants_arm64.h from 2.19.6 to 3.15.0 (#490).
+    stc_result="x7",
     # The AOT_ offsets of the PRODUCT ARM64 blocks of runtime_offsets_extracted.h at
     # 2.19.6, 3.12.2 and 3.13.0, for the classes DataOffsetFor names there. Compressed,
     # all three: Array, OneByteString, TwoByteString and Record at 0x10, TypeArguments
@@ -377,6 +383,10 @@ _ALLOC_TYPE = {"Array": "List", "GrowableArray": "List", "Mint": "int", "Double"
 #: The register a closure allocation stub takes the closure's Function in
 #: (AllocateClosureABI::kFunctionReg, constants_arm64.h: R1 from 2.19.6 to 3.13.0).
 _CLOSURE_FN = "x1"
+#: The register a subtype test cache stub takes its cache in (TypeTestABI::
+#: kSubtypeTestCacheReg, R3 in constants_arm64.h from 2.19.6 to 3.15.0). Read only
+#: where `Target.stc_result` is set (#490).
+_STC_CACHE = "x3"
 #: The register it takes the context in, by the stub's name, which is what says which
 #: ABI the call follows (AllocateClosureABI::kContextReg). R2 through 3.12. 3.13 put
 #: the closure's length and flags in R2 and moved the context to R3, and renamed the
@@ -5132,7 +5142,7 @@ class Lifter:
         self.callees = None
         self._d0_calls = None
 
-    def _clobber_call(self, st: State):
+    def _clobber_call(self, st: State, result: str = None):
         """Forget every value a call destroys.
 
         `_CALL_CLOBBERS` already says what a call takes with it, kDartVolatileCpuRegs,
@@ -5182,8 +5192,13 @@ class Lifter:
         # Only the ones liveness says are read again, which is what keeps it to a handful
         # per call site rather than forty.
         # Not the return registers: the call's own result is `_result`'s to name, and
-        # minting here would hand out a name it overwrites one line later.
-        rets = {_T.ret_int, _T.ret_fp} - {None}
+        # minting here would hand out a name it overwrites one line later. Where the
+        # call is a subtype test cache stub, `result` is the register it answers in,
+        # R7 (TypeTestABI::kSubtypeTestCacheResultReg), and that is the one left to
+        # `_result`: x0 is then no result, and is forgotten like any other register
+        # the ABI lets a call write, and d0 is left as it is at every call whose result
+        # is in x0 (#490).
+        rets = ({result, _T.ret_fp} if result else {_T.ret_int, _T.ret_fp}) - {None}
         out = []
         for r in sorted(_CALL_CLOBBERS - rets):
             if not (self._live_after & _reg_mask((r,))):
@@ -6220,6 +6235,11 @@ class Lifter:
         d0 the function was handed reads, and two calls' results compared printed
         `if (d0 > d0)` (#134, #127). Liveness alone does not say it: a `ret` reads both
         registers, so a call followed by `return NULL;` looked like it returned d0.
+
+        `reg` says which register holds the result where the caller knows better. A
+        subtype test cache stub answers in R7 (TypeTestABI::kSubtypeTestCacheResultReg),
+        not in x0 or d0 (`_stc_result`), so its answer is named in x7 and the
+        `if (t0 != NULL)` after it reads a name the call sets (#490).
 
         `alloc` is the AllocSite of a per-class allocation stub, recorded against the name
         so a field loaded off the new object can be named (#240). Against a NAME only:
@@ -8229,13 +8249,14 @@ class Lifter:
                 return k
         return None
 
-    def _pool_load(self, reg: str):
+    def _pool_load(self, reg: str, at: int = None):
         """The pool byte offset `reg` was loaded from, where a row of this block loaded
         it whole and nothing since wrote it, or None. Both forms the compiler writes:
         `ldr xN, [x27, #off]`, and past the reach of that the pair `add xB, x27, #hi`
-        then `ldr xN, [xB, #lo]`."""
+        then `ldr xN, [xB, #lo]`. As `reg` reads at row `at`, the row in hand where
+        that is None."""
         insns = self._insns
-        k = self._last_def(reg, self._at)
+        k = self._last_def(reg, self._at if at is None else at)
         if k is None or insns[k][1] != "ldr":
             return None
         ops = _split_ops(insns[k][2])
@@ -8261,6 +8282,55 @@ class Lifter:
                 return None
             hi <<= shift
         return hi + disp
+
+    def _stc_result(self, tgt: str):
+        """The register a `blr tgt` leaves its answer in where it calls a subtype test
+        cache stub, or None for any other call.
+
+        `GenerateCallSubtypeTestStub` (flow_graph_compiler.cc) loads the cache into R3,
+        calls the stub through its Code's entry point and runs `GenerateBoolToJump`,
+        which compares the answer with null first: null where the cache had no entry,
+        else true or false. The answer is in R7 (`TypeTestABI::
+        kSubtypeTestCacheResultReg`), not in R0, so naming x0 as the result left the
+        name the compare reads unset: `var t0; pool_0x28.field_0x8(...); if (t0 !=
+        NULL)` (#490). All three are read off the rows, and each is a constant number
+        of them back to the last call: the row after the call compares the answer
+        register with the null register; the callee register is the word at 7, the
+        entry point, of a register loaded from a pool slot that holds a Code or an
+        object of the vm snapshot, which is where the stub's Code lives; and the cache
+        register was loaded from a slot, near or far, that holds an object of the VM's
+        own class SubtypeTestCache. An instance of a class the program named that way
+        is not one, and neither is a slot that holds a number, a string or null."""
+        res = _T.stc_result
+        held = self.pool_held
+        insns, at = self._insns, self._at
+        if not res or held is None or not tgt or at + 1 >= len(insns):
+            return None
+        mn, op = insns[at + 1][1], insns[at + 1][2]
+        if mn != "cmp":
+            return None
+        ops = _split_ops(op)
+        if (len(ops) != 2 or canon(ops[0]) != res
+                or _T.roles.get(canon(ops[1])) != "NULL"):
+            return None
+        k = self._last_def(tgt, at)
+        if k is None or insns[k][1] not in ("ldr", "ldur"):
+            return None
+        lops = _split_ops(insns[k][2])
+        m = _mem(lops[1]) if len(lops) == 2 and lops[0] == tgt else None
+        if m is None or m[1] != 7 or m[2] is not None or m[4]:
+            return None
+        off = self._pool_load(m[0], k)
+        code = held.slot(off) if off is not None else None
+        if code is None or not (code.get("kind") == "vm object" or (
+                code.get("kind") == "object" and code.get("class") == "Code")):
+            return None
+        off = self._pool_load(_STC_CACHE)
+        got = held.slot(off) if off is not None else None
+        if (got is None or got.get("kind") != "object"
+                or got.get("class") != "SubtypeTestCache"):
+            return None
+        return res
 
     def _await(self, st: State, future: V) -> list:
         """`await <future>`, with what it completed with named where anything reads it.
@@ -8829,14 +8899,16 @@ class Lifter:
             shown = stack_args if stack_args is not None else "..."
             # `tgt_val` was read off the state before this point, so the callee register is
             # still spelled as the thing being called and not as its post-call garbage.
+            # A subtype test cache stub answers in its own register, not x0 (#490).
+            res = self._stc_result(tgt)
             pins = self._pin_call(st)
-            pins += self._clobber_call(st)
+            pins += self._clobber_call(st, res)
             if tgt_val and tgt_val.prec >= P_POST and "DISPATCH" not in tgt_val.text:
                 callee = _wrap(tgt_val, P_POST)
                 self.called.append((callee, "indirect", None))
-                return pins + self._result(st, f"{callee}({shown})")
+                return pins + self._result(st, f"{callee}({shown})", reg=res)
             self.called.append(("(dynamic call)", "indirect", None))
-            return pins + self._result(st, f"(dynamic call)({shown})")
+            return pins + self._result(st, f"(dynamic call)({shown})", reg=res)
 
         # stores: object field (side effect) vs stack slot (tracked, no output)
         if _raw_store(mn):
