@@ -28388,6 +28388,225 @@ def test_a_name_set_before_a_loop_is_read_where_a_goto_out_of_the_loop_lands():
     assert got[-2:] == ["L_0x10a4:", "goto L_0x1048;"], got
 
 
+#: A walk down a chain that is the first statement of an `if` arm. The slow path of its
+#: stack check stands after the block that throws, as a build lays it out, so the rows
+#: it jumps back to keep a label inside the loop (#423).
+_ARM_505 = ("ldur x1, [x8, #0x4b]\ncbz x1, LT\nL1:\nCHECK\nldur x2, [x1, #0x4b]\n"
+            "cbz x2, LX\nmov x1, x2\nb L1\nLX:\nmov x0, x1\nret\nLT:\nbl THROW\n")
+
+
+def test_a_loop_first_in_an_if_arm_keeps_its_name_past_the_label_in_it():
+    """A loop that is the first statement of an `if` arm carries x1 as t0, and the slow
+    path of its stack check jumps back to a label inside the loop. The loop's name was
+    anchored at the block before the loop and there is none in the arm, so the label
+    took it for a name some way in had not set and the rows under it read the register:
+    `if (x1.field_0x4c == 0) {`, the x1 from before the loop on every trip, where an
+    arm64 CPU reads the node the last trip moved to. With any row ahead of the loop in
+    the arm, or with no check and so no label, the same rows read t0 (#505)."""
+    for on in (True, False):
+        got = _lift_485(_checks_485(_ARM_505, on))
+        assert ("L_0x1014:" in got) == on, got
+        assert "if (t0.field_0x4c == 0) break;" in got, got
+        assert "t0 = t0.field_0x4c;" in got and "return t0;" in got, got
+        assert not any(re.search(r"\bx1\b", ln) for ln in got), got
+
+
+def test_a_loop_after_a_loop_or_an_if_keeps_its_names_past_the_label_in_it():
+    """The same for a loop that stands right after another loop, right after an `if`,
+    or first in the body: no block stands before any of them, each lost its names at
+    the label its check's slow path jumps back to, and each compare read the counter
+    bare, `if (x6 >= (x3 & 7)) {`, the x6 from before the loop (#505)."""
+    count = ("L%d:\n%scmp x%d, x3\nb.ge L%d\nadd x7, x7, x%d\nadd x%d, x%d, #1\n"
+             "b L%d\n")
+    head = "and x3, x3, #7\nmov x5, #0\nmov x6, #0\n"
+    tail = "LX:\nadd x0, x7, x6\nadd x0, x0, x5\nret\nLT:\nbl THROW\n"
+    after_loop = (head + "cbz x2, LT\n" + count % (1, "", 5, 2, 5, 5, 5, 1)
+                  + count % (2, "CHECK\n", 6, 9, 6, 6, 6, 2) + "L9:\n" + tail)
+    after_if = (head + "cbz x4, LT\ncbz x2, L2\nadd x7, x7, #1\n"
+                + count % (2, "CHECK\n", 6, 9, 6, 6, 6, 2) + "L9:\n" + tail)
+    for src in (after_loop, after_if):
+        for on in (True, False):
+            got = _lift_485(_checks_485(src, on))
+            assert any(ln.startswith("L_0x") for ln in got) == on, got
+            loops = got[got.index("while (true) {"):]
+            assert not any(re.search(r"\bx[567]\b", ln) for ln in loops), got
+    first = ("L1:\nCHECK\nldur x2, [x8, #0x17]\ncmp x5, x2\nb.ge LX\nadd x5, x5, #1\n"
+             "tbz x5, #6, L1\nLX:\nmov x0, x5\ncbz x4, LT\nret\nLT:\nbl THROW\n")
+    for on in (True, False):
+        got = _lift_485(_checks_485(first, on))
+        assert got[0] == "var t0 = x5;" and ("L_0x100c:" in got) == on, got
+        assert not any(re.search(r"\bx5\b", ln) for ln in got[1:]), got
+
+
+def test_a_value_named_above_a_loop_first_in_an_if_arm_is_read_past_its_label():
+    """A field read above a loop that stores is named above the loop, and that name is
+    anchored where the loop's own are. First in an `if` arm it had no anchor, so the
+    rows under the label in the loop read the register the name stands for,
+    `x10.field_0x28 = x9 + x5;`, with x9 named t0 on the line above the loop (#505)."""
+    src = ("ldur x9, [x8, #0x17]\nand x3, x3, #7\nmov x5, #0\ncbz x2, LT\nL1:\nCHECK\n"
+           "cmp x5, x3\nb.ge LX\nstur x5, [x10, #0x1f]\nadd x6, x9, x5\n"
+           "stur x6, [x10, #0x27]\nadd x5, x5, #1\nb L1\nLX:\nadd x0, x9, x5\nret\n"
+           "LT:\nbl THROW\n")
+    for on in (True, False):
+        got = _lift_485(_checks_485(src, on))
+        assert ("L_0x101c:" in got) == on, got
+        assert got[1:3] == ["var t0 = x8.field_0x18;", "var t1 = 0;"], got
+        assert "x10.field_0x28 = t0 + t1;" in got and "return t0 + t1;" in got, got
+        assert not any(re.search(r"\bx[59]\b", ln) for ln in got), got
+
+
+#: A loop first in an `if` arm that counts a register up to x19 and adds three to x6
+#: on each trip: the counter, the loop's stack check, one more row of a trip, and the
+#: rows between the loop and the return.
+_COUNT_505 = ("mov x%d, #0\nmov x6, #0\ncbz x20, LT0\nL1:\n%scmp x%d, x19\nb.ge LX\n"
+              "add x6, x6, #3\n%sadd x%d, x%d, #1\nb L1\nLX:\n%sadd x0, x6, x%d\nret\n"
+              "LT0:\nbl THROW\n")
+
+#: Two arms that each throw, branch into the middle of the other half of themselves
+#: and meet again, with x5 set after them: an `if` arm that runs on to its end past a
+#: row that does not fall through.
+_ARMS_505 = ("tbnz w23, #4, LC\ncbz x24, LA1\ncmp x24, #5\nb.eq LT1\ncmp x5, x25\n"
+             "b.ne LB1\nLA1:\nmov x1, #0\nb LJ1\nLB1:\nsub x1, x5, #1\nLJ1:\n"
+             "add x6, x6, #1\nb LJ\nLC:\ncbz x24, LA2\ncmp x24, #5\nb.eq LT2\n"
+             "cmp x5, x25\nb.ne LB2\nLA2:\nmov x1, #0\nb LJ2\nLB2:\nlsr x1, x5, #1\n"
+             "LJ2:\nadd x6, x6, #2\nLJ:\nmov x5, x1\n")
+_THROWS_505 = "LT1:\nbl THROW\nLT2:\nbl THROW\n"
+
+
+def _count_505(reg=5, check="CHECK\n", row="", after=""):
+    return _COUNT_505 % (reg, check, reg, row, reg, reg, after, reg)
+
+
+def _named_505(got, reg=5):
+    """Whether the loop of `_COUNT_505` reads its two names under the label in it, and
+    not the registers as it did before #505. It reads one or the other."""
+    named = ["if (t0 >= x19) break;", "t0 += 1;", "t1 += 3;"]
+    bare = [f"if (x{reg} >= x19) {{", f"t0 = x{reg} + 1;", "t1 = x6 + 3;"]
+    at = got.index("while (true) {")
+    assert got[at - 2:at + 2] == ["var t0 = 0;", "var t1 = 0;", "while (true) {",
+                                  "L_0x1018:"], got
+    assert all(ln in got for ln in named) != all(ln in got for ln in bare), got
+    return named[0] in got
+
+
+def test_a_counting_loop_first_in_an_if_arm_keeps_its_names_past_the_label_in_it():
+    """The plain counting loop the guards below are built on reads its names under
+    the label its check's slow path jumps back to, and so does the same loop with
+    arms after it that all fall through or throw. Before #505 both read the
+    registers there, `if (x5 >= x19) {` and `t1 = x6 + 3;`, the x5 and x6 from before
+    the loop on every trip, and an arm64 CPU agreed in 1 and 2 of 40 states."""
+    assert _named_505(_lift_485(_checks_485(_count_505())))
+    got = _lift_485(_checks_485(_count_505(after=_ARMS_505) + _THROWS_505))
+    assert _named_505(got) and "t4 = t1 + 1;" in got and "t4 = t1 + 2;" in got, got
+
+
+def test_guard_a_loop_a_goto_enters_at_its_first_row_reads_registers_under_its_label():
+    """A guard (#505). The inner loop leaves to the first row of the outer one, so the
+    outer loop's own label is a goto target. It stands above the loop's declarations,
+    `L_0x100c:` and then `var t0 = 0;`, and the goto runs them again. Reading t0 and
+    t1 under the label in the loop then says the count starts over, where an arm64
+    CPU goes on counting: wrong in 30 of 40 states. The registers are read there as
+    before. With a block before the loop the same rows read the names today."""
+    src = ("mov x5, #0\nmov x6, #0\ncbz x20, LT0\nL1:\nCHECK\nadd x5, x5, #1\n"
+           "cmp x5, x19\nb.ge LX\nmov x9, #0\nLI:\ncmp x9, #2\nb.ge LIX\nadd x9, x9, #1\n"
+           "add x6, x6, x9\ncmp x9, x23\nb.eq L1\nb LI\nLIX:\nadd x6, x6, #3\nb L1\n"
+           "LX:\nadd x0, x6, x5\nret\nLT0:\nbl THROW\n")
+    got = _lift_485(_checks_485(src))
+    at = got.index("L_0x100c:")
+    assert got[at + 1:at + 3] == ["var t0 = 0;", "var t1 = 0;"], got
+    assert "goto L_0x100c;" in got and "L_0x1018:" in got, got
+    assert "if ((x5 + 1) < x19) {" in got and "t2 = x6;" in got, got
+    assert got.count("t0 = x5 + 1;") == 2 and "t1 = x6;" in got, got
+
+
+def test_guard_a_loop_whose_slow_path_does_more_than_call_the_stub_reads_registers():
+    """A guard (#505). The slow path of the loop's stack check holds a row of its own,
+    or calls a function and not the stub. The label it jumps back to does not count
+    what those rows write (#509), so a name read under the label is the value from
+    before them: wrong on an arm64 CPU in 33 of 40 states with the row, and a call
+    writes every register the loop counts in. The registers are read as before."""
+    check = "ldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls LS\nLB:\n"
+    for slow in ("bl SOVF\nadd x5, x5, #1\n", "bl CALL\n"):
+        got = _lift_485(_count_505(check=check) + "LS:\n" + slow + "b LB\n")
+        assert not _named_505(got), got
+        assert got[-1] == "goto L_0x1018;" and ("foo(...);" in got) == ("CALL" in slow)
+
+
+def test_guard_a_loop_past_a_stub_that_may_write_a_live_register_reads_registers():
+    """A guard (#505). The stack overflow stub may write x17, the write barrier too,
+    and a type testing stub what it does not hand back, here x5; the walk keeps what
+    it knew of all three across the call (#508, #510). Compiled code holds nothing in
+    them there. Where a function does, the loop's count, a name read under the label
+    is the value from before the stub: wrong on an arm64 CPU in 33, 39 and 38 of 40
+    states. The registers are read there as before."""
+    for reg, row in ((17, ""), (17, "bl WB\n"), (5, "bl TTS\n")):
+        got = _lift_485(_checks_485(_count_505(reg, row=row)))
+        assert not _named_505(got, reg), got
+
+
+def test_guard_a_loop_by_an_if_arm_that_runs_on_past_a_throw_reads_registers():
+    """A guard (#505). An arm of an `if` throws, and a label under the throw starts
+    rows that run on to the arm's end. The walk says such an arm does not fall
+    through, so the rows after the `if` are lifted from a state that leaves the arm's
+    way out of it out. With the `if` in the loop, a name kept at the loop's label was
+    then dropped by the loop itself, which carried nothing: `if (x19 != 0) {` and
+    `return 0 + x19;`, wrong on an arm64 CPU in 36 of 40 states. With the `if` after
+    the loop and under a label, the rows after it read the loop's name for a register
+    the arm set: wrong in 5 of 40. Either way the registers are read as before."""
+    src = ("mov x5, x19\nmov x6, #0\ncbz x20, LT0\nL1:\nCHECK\ncbz x5, LX\n" + _ARMS_505
+           + "b L1\nLX:\nadd x0, x6, x5\nret\nLT0:\nbl THROW\n" + _THROWS_505)
+    got = _lift_485(_checks_485(src))
+    assert got[1:5] == ["var t0 = x19;", "var t1 = 0;", "while (true) {",
+                        "L_0x1018:"], got
+    assert got[5] == "if (x5 != 0) {" and got.count("if (x5 == x25) {") == 2, got
+    assert got.count("t0 = x5;") == 2 and "return t1 + t0;" in got, got
+    after = "tbnz w23, #3, LK\n" + _ARMS_505 + "LK:\n"
+    got = _lift_485(_checks_485(_count_505(after=after) + _THROWS_505))
+    assert not _named_505(got) and got.count("if (t0 == x25) {") == 2, got
+
+
+def test_guard_a_loop_whose_slow_path_comes_back_elsewhere_reads_registers():
+    """A guard (#505). The slow path of the loop's stack check calls the stub and
+    branches back, but past the row after the check, which then runs once less than
+    the label in the loop says; or two checks share one slow path, which comes back
+    into the first loop from the second. A name read under the label is the value
+    the label does not count: wrong on an arm64 CPU in 33 of 40 states for each. The
+    registers are read as before, in every loop of the function."""
+    past = ("mov x5, #0\nmov x6, #0\ncbz x20, LT0\nL1:\nldr x16, [x26, #0x48]\n"
+            "cmp x15, x16\nb.ls LS0\nadd x6, x6, #3\nLB1:\ncmp x5, x19\nb.ge LX\n"
+            "add x6, x6, x5\nadd x5, x5, #1\nb L1\nLX:\nadd x0, x6, x5\nret\n"
+            "LT0:\nbl THROW\nLS0:\nbl SOVF\nb LB1\n")
+    got = _lift_485(past)
+    assert "if (x5 >= x19) {" in got and "t1 = x6 + x5;" in got, got
+    assert "if (t0 >= x19) {" not in got and "t0 += 1;" not in got, got
+    check = "ldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls LS0\n"
+    two = ("mov x5, #0\nmov x6, #0\nmov x7, #0\ncbz x20, LT0\nL1:\n" + check
+           + "LB0:\ncmp x5, x19\nb.ge LX\nadd x6, x6, x5\nadd x5, x5, #1\nb L1\nLX:\n"
+           "add x7, x7, #1\ncmp x7, #3\nb.ge LY\nmov x9, #0\nL2:\n" + check
+           + "cmp x9, #2\nb.ge LX\nadd x6, x6, #5\nadd x9, x9, #1\nb L2\nLY:\n"
+           "add x0, x6, x5\nret\nLT0:\nbl THROW\nLS0:\nbl SOVF\nb LB0\n")
+    got = _lift_485(two)
+    assert "if (x5 >= x19) {" in got and "t1 = x6 + x5;" in got, got
+    assert "if (t0 >= x19) break;" not in got and "t0 += 1;" not in got, got
+
+
+def test_guard_loops_by_a_loop_whose_first_row_a_goto_targets_read_registers():
+    """A guard (#505). The outer loop's own label is no goto target, the first row of
+    the loop in it is: the innermost loop leaves to it. The goto runs the declarations
+    under that label again, here of the names the outer loop anchored at its first
+    block, so `t3 = t0;` under it reads a count that starts over: wrong on an arm64
+    CPU in 30 of 40 states. A goto to any loop's first row leaves every loop of the
+    function reading the registers as before."""
+    src = ("mov x5, #0\nmov x6, #0\nmov x7, #0\ncbz x20, LT0\nLA:\nCHECK\n"
+           "add x7, x7, #1\ncmp x7, #3\nb.ge LXA\nL1:\nadd x5, x5, #1\ncmp x5, x19\n"
+           "b.ge LA\nmov x9, #0\nLI:\ncmp x9, #2\nb.ge LIX\nadd x9, x9, #1\n"
+           "add x6, x6, x9\ncmp x9, x23\nb.eq L1\nb LI\nLIX:\nadd x6, x6, #3\nb L1\n"
+           "LXA:\nadd x0, x6, x5\nret\nLT0:\nbl THROW\n")
+    got = _lift_485(_checks_485(src))
+    assert "if ((x7 + 1) < 3) {" in got and "t3 = x5;" in got, got
+    assert "t3 = t0;" not in got and "var t2 = 0;" not in got, got
+
+
 def test_a_branch_on_a_register_a_loop_lost_says_so_where_no_name_is_set():
     """Where the loop sets no name, the branch after it still prints, on `?`: what it
     tests has no name there, and neither `if (x2 == 0)` nor `return x4;` on every path

@@ -4948,6 +4948,10 @@ class Lifter:
         self._anchor: dict = {}
         self._last_block = None
         self._loop_before = None
+        #: The statements `walk` was first handed, the whole function's, and whether a
+        #: loop of it with no block before it may anchor its names at its own first
+        #: block (`_anchors_itself`); None until a loop asks.
+        self._tree = self._own_anchor = None
         #: Whether a frame address ever reaches a general register; see _frame_escaped.
         self._escaped = None
         #: {store: registers that may hold a frame address there}; see _frame_taint.
@@ -11575,6 +11579,8 @@ class Lifter:
         """Render a structured statement list; returns (lines, falls_through)."""
         out, falls = [], True
         pad = indent * depth
+        if self._tree is None:
+            self._tree = stmts
         # Where each statement rejoins: the entry of everything after it, or the caller's.
         joins, nxt = [None] * len(stmts), cont
         for i in range(len(stmts) - 1, -1, -1):
@@ -11786,9 +11792,13 @@ class Lifter:
                 alive = tfalls or efalls
             elif kind == "loop":
                 # Its names are declared right after the statement before it, and only a
-                # block falls straight into them; anything else anchors them nowhere.
+                # block falls straight into them. With anything else there, or nothing,
+                # the loop's own first block anchors them where the walk's state can be
+                # trusted past a label (`_anchors_itself`, #505), and nothing otherwise.
                 prev = stmts[i - 1] if i and alive else None
                 self._loop_before = prev[1] if prev and prev[0] == "asm" else None
+                if self._loop_before is None and self._anchors_itself(s[1]):
+                    self._loop_before = s[1]
                 if alive and (s[1] in self.roots or self._unjustified(s[1], st)):
                     self._reenter(s[1], st)      # the same way in, into a loop head
                 label(s[1])
@@ -11921,6 +11931,150 @@ class Lifter:
         out.append(f"{pad}}}")
         return out
 
+    def _anchors_itself(self, header) -> bool:
+        """Whether the loop at `header`, with no block before it to anchor its names
+        at, may anchor them at its own first block (#505).
+
+        Unanchored, a name is dropped at every label. A loop with a stack check prints
+        one inside itself, the row the slow path comes back to, so its body read the
+        registers bare: `x1.field_0x4c` where t13 held the node. Anchored at the first
+        block, a name is read at every label that block dominates, in the loop and
+        after it, which says the register still holds it on each way in. Four things
+        the walk does not account for make that false. With a block before the loop
+        each prints a wrong name today, which is older than this; here the names stay
+        unanchored, so the loop reads as it did before:
+
+        the label of a loop's first block is a goto target: it stands above the
+        declarations, and the goto runs them again, for a neighbouring loop's names too
+        (`_head_targeted`);
+        a stack check's slow path is anything but a call to a stub that gives the file
+        back and a branch to the row after the one check that jumps to it
+        (`_slow_exact`): rows the label it comes back to does not count (#509), a way
+        back past a row, or into another check's loop;
+        a stub may write a register that is read after it, and the walk keeps what it
+        knew of that register (`_stub_leaks`, #508, #510);
+        an `if` has an arm that runs on to its end past a row that does not fall
+        through (`_arm_cut`): the state after it leaves that way in out.
+
+        All four are asked of the whole function, once: a name kept at one label
+        reaches every row the first block dominates."""
+        if header in self.labels:
+            return False
+        if self._own_anchor is None:
+            self._own_anchor = (not self._head_targeted() and self._slow_exact()
+                                and not self._stub_leaks() and not self._arm_cut())
+        return self._own_anchor
+
+    def _head_targeted(self) -> bool:
+        """Whether the label of any loop's first block in the function is a goto
+        target. Every list of statements is read once, with no recursion."""
+        lists, k = [self._tree or ()], 0
+        while k < len(lists):
+            for s in lists[k]:
+                if s[0] == "if":
+                    lists += (s[2], s[3])
+                elif s[0] == "loop":
+                    if s[1] in self.labels:
+                        return True
+                    lists.append(s[2])
+            k += 1
+        return False
+
+    def _slow_exact(self) -> bool:
+        """Whether every stack check's slow path is a call to a `suppress` stub and a
+        branch to the row right after the one check that jumps to it. The check's
+        branch is the row strip_boilerplate made a nop, kept in `raw`; rows are four
+        bytes wide on both targets. A slow path two checks jump to, or that branches
+        anywhere else, is a no."""
+        checks: dict = {}
+        for a, (mn, op) in self.raw.items():
+            if mn in ("b.ls", "b.lo", "bls", "blo", "blls", "bllo"):
+                t = _target(op)
+                if t in self.slow_paths:
+                    checks.setdefault(t, []).append(a)
+        for b in self.slow_paths:
+            if b not in self.blocks:
+                continue
+            insns, at = self.blocks[b].insns, checks.get(b, ())
+            stub = self._quiet(b) and _stub_of(insns[0][3])
+            if (not stub or stub[0] != "suppress" or len(at) != 1
+                    or _target(insns[1][2]) != at[0] + 4):
+                return False
+        return True
+
+    def _stub_leaks(self) -> bool:
+        """Whether a register is live after a call to a stub that may write it, where
+        the walk forgets less than the stub may write: x16 and x17 at any stub that
+        gives the file back (#508), the d registers at one that keeps no FPU register,
+        and what a type testing stub loses (#510). Compiled code holds nothing in such
+        a register there, and no loop that asks in the nine binaries has one; a crafted
+        function does, and a name kept across the call reads as the value from before
+        it. The liveness is `_printed_liveness`, a block's rows walked back from its
+        end."""
+        reads, _live_in, live_out = self._printed_liveness()
+        for b, blk in self.blocks.items():
+            insns = blk.insns
+            if not any(mn == "bl" and "_iso_stub_" in n for (_a, mn, _o, n) in insns):
+                continue
+            live, more = live_out.get(b, 0), reads[b]
+            for i in range(len(insns) - 1, -1, -1):
+                a, mn, op, note = insns[i]
+                de, us = _def_use_masks(mn, op)
+                if mn == "bl" and "_iso_stub_" in note:
+                    may = _stub_defs(note, None)
+                    if may is not None and live & _reg_mask(
+                            may - _call_forgets(mn, note)):
+                        return True
+                    de = _stub_kills(note, de)
+                if mn == "ret":
+                    us = self._ret_use(a, us)
+                live = us | more.get(i, 0) | (live & ~de)
+        return False
+
+    def _arm_cut(self) -> bool:
+        """Whether an `if` of the function has an arm that `walk` will say does not
+        fall through while its last statement does. `walk` answers for a whole list and
+        its answer never goes back up: past a statement that does not fall through, a
+        label can start a block that runs on to the end of the list. For an arm the
+        `if` then takes the other arm's state, or the state from before itself where
+        neither falls, and the rows after it are lifted from a state the arm's own way
+        out never touched. Read off the statements as `walk` reads them, every list
+        once and the inner ones first, and with no recursion: the nesting can be as
+        deep as the function is long."""
+        lists, k = [(self._tree or (), False)], 0
+        while k < len(lists):
+            for s in lists[k][0]:
+                if s[0] == "if":
+                    lists += ((s[2], True), (s[3], True))
+                elif s[0] == "loop":
+                    lists.append((s[2], False))
+            k += 1
+        falls = {}
+        for stmts, arm in reversed(lists):
+            whole = alive = True
+            for s in stmts:
+                kind = s[0]
+                if kind == "asm":
+                    blk = self.blocks[s[1]]
+                    alive = not blk.ends_path and blk.term not in ("ret", "br", "bx")
+                elif kind == "if":
+                    alive = falls[id(s[2])] or falls[id(s[3])]
+                elif kind == "loop":
+                    alive = True
+                    continue
+                elif kind == "note" or (kind == "label" and s[1] in self.orphans):
+                    alive = False
+                    continue
+                elif kind == "label":
+                    continue
+                else:
+                    alive = False
+                whole = whole and alive
+            if arm and alive and not whole:
+                return True
+            falls[id(stmts)] = whole
+        return False
+
     def _pin_loop(self, st: State, header, carried) -> list:
         """Write out, above the loop at `header`, every live value a trip can make stale.
 
@@ -11996,6 +12150,8 @@ class Lifter:
         # ...and one the hoist took, whose line here is `tN = ...;` with its `var` at
         # the top of the body: left without an anchor, the target of a goto out of the
         # loop took it for a name some way in had not set and read the register bare.
+        # With no block before the loop the anchor is the loop's own first block where
+        # `_anchors_itself` allows it, as for the names the loop carries (#505).
         for m in map(_PIN_SET_RE.match, out):
             if m:
                 self._anchor[int(m.group(2)[1:])] = self._loop_before

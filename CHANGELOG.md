@@ -232,6 +232,37 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A loop keeps its names past a label inside it wherever the loop stands (#505).** A
+  loop that opens with a stack check prints a label inside itself, the row the check's
+  slow path jumps back to. Where the loop was the first statement of an `if` arm, or came
+  straight after another loop or an `if`, the rows past that label read the loop's
+  register bare: `if (x1.field_0x4c != NULL) {` and `t13 = x1.field_0x4c;` in
+  `_findGroups` of the clean fixture, where `t13` holds the node from the second trip on.
+  A name is read at a label only where the block it was declared in dominates the label,
+  and a loop's names took that block from the rows before the loop: with no rows there
+  they had none, and the label dropped them. The names a loop carries and the values it
+  names above itself are now declared at the loop's own first block in that case. Five
+  shapes are left as they were, because a name kept at a label is wrong in them, as it is
+  today where rows do stand before the loop: a goto that enters any loop of the function
+  at its first row, a stack check whose slow path does more than call its stub, a slow
+  path that two checks share or that comes back anywhere but the row after its check, a
+  stub that may write a register read after it, and an `if` anywhere in the function with
+  an arm that runs on past a row that does not fall through. On the nine binaries 64 of
+  the 273,863 ranges change, 888 lines out and 955 in. 52 read a name where they read a
+  register, 10 change shape as well, as where a walk down a list gains the `t13 =
+  t13.field_0x38;` it had lost, and 2 gain a bare read, `t3 = x1;` on a way out of the
+  loop after a call, which sets the name from what the call left and is read by nothing.
+  Typical lines: `if (x1.field_0x4c != NULL) {` is now `if (t13.field_0x4c != NULL) {`,
+  `t0 = x1.field_0x18;` is `t0 = t0.field_0x18;`, and `_addPending@5048458(x0, const
+  _DelayedDone@5048458{});` passes `t13`. 8 more ranges, the same generator body in eight
+  of the binaries, have such an arm and print as before, and 8 where the first row of
+  another loop is a goto target, one range in each of five binaries and two sorts and a
+  reader in FluffyChat. No error is new, and names read but never set stay at 1,528 in 434
+  ranges. On 20 crafted shapes the agreeing CPU states rise from 512 to 800 of 800, and on
+  49 written to break the change from 399 to 943 of 1,960 with none worse than on main. On
+  21 forms, 3,300 generated and 464 crafted programs none is worse than on main, and the
+  agreeing CPU states stay at 107,839 and 9,921 on main and on this change.
+
 - **A register a loop wrote keeps its name through a loop with a stack check (#485).** A
   value one loop left in x12, stored in or after a later loop that opens with a stack
   check, printed as the bare `x12`, the value the function came in with, where the same
