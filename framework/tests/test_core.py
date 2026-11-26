@@ -15948,9 +15948,12 @@ def test_a_stub_that_returns_a_value_is_a_call_to_the_return_rule():
     # `Await` hands one back too, and reads as the `await` it is (#462). Nothing set x0
     # before it here, so what it waits for is not said.
     assert lift("Await") == ["var t0 = await ...;", "return t0;"]
-    # A stub that does give every register back leaves the double where it was.
-    assert lift("StackOverflowSharedWithoutFPURegs") == [
+    # A stub that does give every register back leaves the double where it was. One
+    # whose name says `WithoutFPURegs` keeps no V register, so d0 is not known after it
+    # and the double is not what comes back (#508).
+    assert lift("StackOverflowSharedWithFPURegs") == [
         "return x1.field_0x10 + x1.field_0x10;"]
+    assert lift("StackOverflowSharedWithoutFPURegs") == ["var t0;", "return t0;"]
 
 
 def test_a_loop_carries_a_register_it_reads_only_as_a_call_argument():
@@ -28533,13 +28536,14 @@ def test_guard_a_loop_whose_slow_path_does_more_than_call_the_stub_reads_registe
 
 
 def test_guard_a_loop_past_a_stub_that_may_write_a_live_register_reads_registers():
-    """A guard (#505). The stack overflow stub may write x17, the write barrier too,
-    and a type testing stub what it does not hand back, here x5; the walk keeps what
-    it knew of all three across the call (#508, #510). Compiled code holds nothing in
-    them there. Where a function does, the loop's count, a name read under the label
-    is the value from before the stub: wrong on an arm64 CPU in 33, 39 and 38 of 40
-    states. The registers are read there as before."""
-    for reg, row in ((17, ""), (17, "bl WB\n"), (5, "bl TTS\n")):
+    """A guard (#505). The stack overflow stub may write x17, and a type testing stub
+    what it does not hand back, here x5. The first is on the check's slow path, which
+    the walk never walks, and the walk keeps x5 across the second (#510). Compiled code
+    holds nothing in them there. Where a function does, the loop's count, a name read
+    under the label is the value from before the stub: wrong on an arm64 CPU in 33 and
+    38 of 40 states. The registers are read there as before. The row with a write
+    barrier in line moved to its own test, since the walk forgets x17 there (#508)."""
+    for reg, row in ((17, ""), (5, "bl TTS\n")):
         got = _lift_485(_checks_485(_count_505(reg, row=row)))
         assert not _named_505(got, reg), got
 
@@ -28605,6 +28609,41 @@ def test_guard_loops_by_a_loop_whose_first_row_a_goto_targets_read_registers():
     got = _lift_485(_checks_485(src))
     assert "if ((x7 + 1) < 3) {" in got and "t3 = x5;" in got, got
     assert "t3 = t0;" not in got and "var t2 = 0;" not in got, got
+
+
+def test_x16_and_x17_do_not_live_through_a_stub_call():
+    """A stub that gives the file back need not save x16 and x17, IP0 and IP1, and the
+    stack overflow stub itself writes x17. `mov x17, #7; bl SOVF` then a store of x17
+    printed 7, where an arm64 CPU stores what the stub left. The store reads a name no
+    row sets now, at the write barrier and at a type testing stub alike (#508)."""
+    for reg in ("x16", "x17"):
+        for stub in ("SOVF", "WB", "TTS"):
+            got = _lift_485(f"mov {reg}, #7\nbl {stub}\nstur {reg}, [x20, #23]\nret\n")
+            assert got == ["var t0;", "x20.field_0x18 = t0;", "return x0;"], (reg, got)
+    # A register the stub gives back still reads what was set before it.
+    assert _lift_485("mov x17, #7\nmov x4, #9\nbl SOVF\nstur x4, [x20, #23]\nret\n") == [
+        "x20.field_0x18 = 9;", "return x0;"]
+
+
+def test_a_double_does_not_live_through_a_stub_that_keeps_no_fpu_register():
+    """A stub whose name says `WithoutFPURegs` saves no V register, so a double read
+    before it is not what d1 holds after it; it printed the field. The write barrier
+    keeps them, and there d1 still reads the field (#508)."""
+    src = "ldur d1, [x2, #7]\nbl %s\nstur d1, [x20, #23]\nret\n"
+    assert _lift_485(src % "SOVF") == ["var t0;", "x20.field_0x18 = t0;", "return x0;"]
+    assert _lift_485(src % "WB") == ["x20.field_0x18 = x2.field_0x8;", "return x0;"]
+
+
+def test_a_loop_count_in_x17_past_a_write_barrier_reads_a_name_no_row_sets():
+    """The counting loop with x17 its count and a write barrier in it. The stub may
+    write x17, so the loop still reads x17 bare under its label, and the row after the
+    stub adds 1 to a name no row sets. It printed `t0 = x17 + 1;`, the value from
+    before the stub (#508)."""
+    got = _lift_485(_checks_485(_count_505(17, row="bl WB\n")))
+    assert "if (x17 >= x19) {" in got and "if (t0 >= x19) break;" not in got, got
+    assert "t0 = t2 + 1;" in got and "t0 = x17 + 1;" not in got, got
+    assert got[0] == "var t2;" and not any(ln.startswith("t2 = ") for ln in got), got
+    assert "} else {" not in got[:got.index("L_0x1018:") + 3], got
 
 
 def test_a_branch_on_a_register_a_loop_lost_says_so_where_no_name_is_set():

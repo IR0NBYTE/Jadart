@@ -2145,10 +2145,17 @@ def _call_forgets(mn: str, note: str) -> frozenset:
     """The registers a call row leaves the walk knowing nothing about, on every path:
     the result register, which `bl` and `blr` both set, and the volatile set
     `_clobber_call` forgets, except at a stub `_classify_stub` says gives the file back,
-    where it is LR alone. A type-testing stub loses more, but only some of the time."""
+    where it is LR and what any stub may write without saving it: x16 and x17
+    (`_STUB_SCRATCH`), and the d registers of `_CALL_CLOBBERS` at a stub whose name says
+    `WithoutFPURegs`, which keeps no FPU register (#508). A type-testing stub loses
+    more, but only some of the time."""
     stub = _stub_of(note) if mn == "bl" else None
     if stub is not None and stub[0] == "suppress":
-        return frozenset({_T.ret_int, _lr()})
+        got = {_T.ret_int, _lr()} | _STUB_SCRATCH
+        if "WithoutFPURegs" in note:
+            # Read here and not bound at import: arm32 rebinds it.
+            got |= {r for r in _CALL_CLOBBERS if r[0] == "d"}
+        return frozenset(got)
     return _CALL_CLOBBERS | {_T.ret_int}
 
 
@@ -2162,20 +2169,15 @@ def _stub_defs(note: str, defs):
     it, the read was of a name and never seen as one of a register the first loop
     dropped, or forgotten at its exit, the name the first loop gave it went too (#485).
 
-    At such a stub it is `_call_forgets`, the walk's list, and what a type-testing stub
-    does not hand back as well (`_TTS_LOSES`): the walk forgets those on some paths and
-    not on every one, and a set of what MAY be written has to hold them. It holds x16
-    and x17 too (`_STUB_SCRATCH`), and at a stub that keeps no FPU register, its name
-    says `WithoutFPURegs`, the d registers of `_CALL_CLOBBERS`. The walk itself still
-    keeps x16 and x17 across such a stub in line, which is older and filed apart. Asked
-    by `Lifter._block_defs` and by liveness, for a row whose note has `_iso_stub_`."""
+    At such a stub it is `_call_forgets`, the walk's list, with x16, x17 and, at a stub
+    that keeps no FPU register, the d registers, and what a type-testing stub does not
+    hand back as well (`_TTS_LOSES`): the walk forgets those on some paths and not on
+    every one, and a set of what MAY be written has to hold them. Asked by
+    `Lifter._block_defs` and by liveness, for a row whose note has `_iso_stub_`."""
     stub = _stub_of(note)
     if stub is None or stub[0] != "suppress":
         return defs
-    got = _call_forgets("bl", note) | _STUB_SCRATCH
-    if "WithoutFPURegs" in note:
-        # Read here and not bound at import: arm32 rebinds it.
-        got |= {r for r in _CALL_CLOBBERS if r[0] == "d"}
+    got = _call_forgets("bl", note)
     return got | _TTS_LOSES if "TypeTest" in note else got
 
 
@@ -5257,6 +5259,28 @@ class Lifter:
             st.reg[r] = V(name, P_ATOM)
             st.lost.discard(r)
         return out
+
+    def _stub_clobber(self, st: State, gone) -> None:
+        """`_clobber_call` for a stub that gives the file back but for `gone`: forget
+        each register of `gone`, under every spelling of a V register, and name with a
+        fresh name each one liveness says is read again, so it reads as a value nobody
+        knows and not as the one set before the stub, nor as its entry value (#508).
+        The name is declared at the top of the body and gets no line here: the stub
+        prints nothing, and a `var` that was all an arm held left it empty once hoisted,
+        `if (x17 < x19) {` and `} else {`."""
+        touched = (set(st.reg) | set(st.elem) | set(st.poolbase) | set(st.pair)
+                   | set(st.pair.values()) | set(self.alias))
+        for r in sorted(r for r in touched if r in gone
+                        or (_fp_n(r) is not None and f"d{_fp_n(r)}" in gone)):
+            st.forget(r)
+        for r in sorted(gone):
+            if not (self._live_after & _reg_mask((r,))):
+                continue
+            name, _decl = self._mint(st)
+            self.hoisted.add(name)
+            self.raw_names.add(name)
+            st.reg[r] = V(name, P_ATOM)
+            st.lost.discard(r)
 
     def _pin_call(self, st: State, dying=None) -> list:
         """Name every live value that READS MEMORY, before a call that may rewrite it.
@@ -8829,8 +8853,15 @@ class Lifter:
                     # preserves everything but its own answer. Suppressing the CALL while
                     # clobbering as though it happened would forget the whole loop body a
                     # header stack check sits in front of, for a call that provably keeps it.
-                    # All but LR, which the `bl` itself writes (#162).
+                    # All but LR, which the `bl` itself writes (#162), and what
+                    # `_stub_defs` says any stub may write: x16 and x17, which the
+                    # stub need not save, and the d registers at one whose name says
+                    # it keeps no FPU register. Kept, `mov x17, #7; bl SOVF` printed
+                    # the 7 where the stub had left its own value (#508).
+                    # x0 is the result's, set above.
                     st.forget(_lr())
+                    self._stub_clobber(
+                        st, _call_forgets(mn, note) - {_T.ret_int, _lr()})
                     if "TypeTest" in name:
                         # ...and a type-testing stub gives back four registers, not
                         # the file: the instance, the type and the two type-argument
@@ -12003,14 +12034,16 @@ class Lifter:
         return True
 
     def _stub_leaks(self) -> bool:
-        """Whether a register is live after a call to a stub that may write it, where
-        the walk forgets less than the stub may write: x16 and x17 at any stub that
-        gives the file back (#508), the d registers at one that keeps no FPU register,
-        and what a type testing stub loses (#510). Compiled code holds nothing in such
-        a register there, and no loop that asks in the nine binaries has one; a crafted
-        function does, and a name kept across the call reads as the value from before
-        it. The liveness is `_printed_liveness`, a block's rows walked back from its
-        end."""
+        """Whether a register is live after a call to a stub that may write it, other
+        than the result register and LR: x16 and x17 at any stub that gives the file
+        back, the d registers at one that keeps no FPU register, and what a type
+        testing stub loses (#510). The walk forgets x16, x17 and those d registers at
+        a stub in line (#508), but a stack check's slow path is cut and never walked,
+        so a register its stub may write that is live after it still refuses the
+        anchor: the label the slow path comes back to would read the value from before
+        the stub. Compiled code holds nothing in such a register there, and no loop
+        that asks in the nine binaries has one; a crafted function does. The liveness
+        is `_printed_liveness`, a block's rows walked back from its end."""
         reads, _live_in, live_out = self._printed_liveness()
         for b, blk in self.blocks.items():
             insns = blk.insns
@@ -12023,7 +12056,7 @@ class Lifter:
                 if mn == "bl" and "_iso_stub_" in note:
                     may = _stub_defs(note, None)
                     if may is not None and live & _reg_mask(
-                            may - _call_forgets(mn, note)):
+                            may - {_T.ret_int, _lr()}):
                         return True
                     de = _stub_kills(note, de)
                 if mn == "ret":
