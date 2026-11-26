@@ -232,6 +232,22 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **x16, x17 and the d registers no longer live through a stub call (#508).** At a `bl`
+  to a stub that gives the register file back, the stack overflow, write barrier and
+  type test stubs, the walk forgot only LR, so `mov x17, #7; bl` to the stack overflow
+  stub, then a store of x17, printed `x20.field_0x18 = 7;` where the stub had left its
+  own value. Any stub may write x16 and x17 without saving them, and one whose name says
+  `WithoutFPURegs` keeps no d register. The walk now forgets those registers at such a
+  stub, and a read of one past it is a name no row sets, declared at the top of the
+  body: `var t0;` and `x20.field_0x18 = t0;`. A stub on a stack check's cut slow path is
+  not walked, so it is not covered by this change, and loops there read as before. On
+  the reproducer the CPU agrees on 40 of 40 states, from 0. On 15 crafted rows the
+  agreeing states rise from 266 to 453 of 600 and the disagreeing fall from 67 to 27,
+  none worse. On the 464 hunt programs agreeing states rise from 9,921 to 13,041 and
+  disagreeing fall from 1,189 to 869, 28 programs better and none worse. The 21 forms,
+  3,300 generated programs and 61 loop and label programs print as before, and no
+  range of the nine binaries changes.
+
 - **A loop keeps its names past a label inside it wherever the loop stands (#505).** A
   loop that opens with a stack check prints a label inside itself, the row the check's
   slow path jumps back to. Where the loop was the first statement of an `if` arm, or came
