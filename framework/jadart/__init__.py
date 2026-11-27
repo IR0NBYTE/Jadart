@@ -183,7 +183,7 @@ def decompile(path: str, symbol: str) -> list:
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     arity = make_arity_resolver(image)
     entry = EntryNames(image, fr, hdr.epoch, arity)
-    returns = make_return_resolver(image)
+    returns = make_return_resolver(image, fr)
     sels = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
     layout.add_accessor_names(recover_accessors(image, fr, layout))

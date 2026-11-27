@@ -11165,10 +11165,30 @@ def test_an_unreached_tangle_too_deep_to_structure_is_counted_not_a_crash():
 
 
 def _lift_rows(rows, base=0, **kw):
-    """Tier 3 of `rows`, (mnemonic, operands) laid out 4 bytes apart from `base`."""
+    """Tier 3 of `rows`, (mnemonic, operands) or (mnemonic, operands, note), laid out 4
+    bytes apart from `base`."""
     from jadart.expr import lift_function
-    ann = [(base + i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)]
-    return [ln.strip() for ln in lift_function(ann, **kw)]
+    return [ln.strip() for ln in lift_function(_noted_509(rows, base), **kw)]
+
+
+#: The note of a call to the stub that allocates a Mint, as `annotate` writes it.
+_MINT_509 = "  ; -> _iso_stub_AllocateMintSharedWithoutFPURegsStub"
+
+
+def _noted_509(rows, base=0):
+    """`rows` as `lift_function` takes them, 4 bytes apart from `base`, the third piece
+    of a row its note."""
+    return [(base + i * 4, r[0], r[1], r[2] if len(r) > 2 else "")
+            for i, r in enumerate(rows)]
+
+
+def _box_509(src="x3", into=None):
+    """The rows compiled code boxes or tags `src` with: the tag into x0, the test that
+    it fits, and where it does not the call that allocates a Mint and the store of the
+    value into it. They take five rows, and a sixth moves the result to `into`."""
+    return [("sbfiz", f"x0, {src}, #1, #0x1f"), ("cmp", f"{src}, x0, asr #1"),
+            ("b.eq", "#0x14"), ("bl", "#0x900", _MINT_509),
+            ("stur", f"{src}, [x0, #7]")] + ([("mov", f"{into}, x0")] if into else [])
 
 
 #: The layout MonomorphicCheckedEntryAOT emits (assembler_arm64.cc:1941-1962 at 3.12.2):
@@ -11643,15 +11663,14 @@ def test_tier3_leaves_out_what_strip_boilerplate_cuts_on_purpose():
     An edge does in the machine, so the note would list everything they can be but that:
     they stay out, and a slow path the step past a trap places (#157) keeps no note."""
     from jadart.cfg import UNREACHED
-    box = [("sbfiz", "x0, x1, #1, #0x1f"), ("cmp", "x1, x0, asr #1"), ("b.eq", "#0x14"),
-           ("bl", "#0x400"), ("stur", "x1, [x0, #7]"), ("ret", "")]
-    assert _lift_rows(box) == ["return x1;"]
+    assert _lift_rows(_box_509("x1") + [("ret", "")]) == ["return x1;"]
     check = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"), ("b.ls", "#0x14"),
-             ("mov", "x0, x22"), ("ret", ""), ("bl", "#0x500"), ("b", "#0xc")]
+             ("mov", "x0, x22"), ("ret", ""), ("bl", "#0x500", _STACK_424),
+             ("b", "#0xc")]
     assert _lift_rows(check) == ["return NULL;"]
     check[4] = ("brk", "#0")
     body = _lift_rows(check)
-    assert "sub_0x500(...);" in body and "// " + UNREACHED not in body, body
+    assert body == ["L_0xc:", "L_0x14:", "goto L_0xc;"] and UNREACHED not in str(body)
 
 
 def test_structure_places_a_cut_off_block_only_where_another_leads_to_it():
@@ -11681,14 +11700,15 @@ def test_cfgcheck_counts_the_blocks_tier3_leaves_out():
     import cfgcheck
     from jadart.cfg import structure
     from jadart.expr import tier3_graph
-    rows = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"), ("b.ls", "#0x20"),
-            ("sbfiz", "x0, x1, #1, #0x1f"), ("cmp", "x1, x0, asr #1"), ("b.eq", "#0x1c"),
-            ("bl", "#0x400"), ("ret", ""), ("bl", "#0x500"), ("b", "#0xc"),
+    rows = [("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"), ("b.ls", "#0x24"),
+            ("sbfiz", "x0, x1, #1, #0x1f"), ("cmp", "x1, x0, asr #1"), ("b.eq", "#0x20"),
+            ("bl", "#0x400", _MINT_509), ("stur", "x1, [x0, #7]"), ("ret", ""),
+            ("bl", "#0x500", _STACK_424), ("b", "#0xc"),
             ("sub", "x15, x29, #0x20"), ("ldur", "x0, [x1, #0xb]"), ("ret", "")]
-    g = tier3_graph([(i * 4, mn, op, "") for i, (mn, op) in enumerate(rows)])
-    assert cfgcheck.tier3_left_out(g) == (set(), {0x18}, {0x20}), g.stmts
+    g = tier3_graph(_noted_509(rows))
+    assert cfgcheck.tier3_left_out(g) == (set(), {0x18}, {0x24}), g.stmts
     main = g._replace(stmts=structure(g.blocks, g.entry))
-    assert cfgcheck.tier3_left_out(main) == ({0x28}, {0x18}, {0x20})
+    assert cfgcheck.tier3_left_out(main) == ({0x2c}, {0x18}, {0x24})
 
 
 def test_census_reads_a_note_after_a_throw_as_no_statement():
@@ -16890,7 +16910,8 @@ def test_a_goto_out_of_a_loop_hands_on_what_the_last_trip_left():
     body = lift([("add", "x7, x5, x1"), ("mov", "x9, #2"), ("ldr", "x16, [x26, #0x48]"),
                  ("cmp", "x15, x16"), ("b.ls", "#0x2c"), ("cmp", "x9, #1"),
                  ("b.eq", "#0x34"), ("sub", "x9, x9, #1"), ("tbz", "x9, #63, #0x8"),
-                 ("ret", ""), ("ret", ""), ("bl", "#0x300"), ("b", "#0x14")] + out)
+                 ("ret", ""), ("ret", ""), ("bl", "#0x300", _STACK_424),
+                 ("b", "#0x14")] + out)
     assert "x2.field_0x60 = x5 + x1;" in body, body
     # A register each trip reloads from the slot it was saved in, after a call takes
     # it, still holds its value from before the loop: `compareTo` reads x6 so.
@@ -17728,8 +17749,9 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
             return mn, op
         frame = [("stp", "x29, x30, [x15, #-0x10]!"), ("mov", "x29, x15"),
                  ("sub", "x15, x15, #0x50")]
+        # A call to 0x9200 is one to the stub of the stack check, and noted as that.
         return [ln.strip() for ln in lift_function(
-            [(i * 4, mn, op, "")
+            [(i * 4, mn, op, _STACK_424 if op == "#0x9200" else "")
              for i, (mn, op) in enumerate(frame + [moved(*r) for r in rows])])]
 
     # `_contentWidthFor`'s shape: the doubles saved, then a stack check whose slow path,
@@ -17742,7 +17764,7 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
             ("stur", "d1, [x2, #15]"), ("ldur", "x3, [x29, #-0x10]"),
             ("stur", "x3, [x2, #23]"), ("mov", "x0, #0"), ("ret", "")]
     throw = [("str", "x16, [x15]"), ("bl", "#0x300"), ("brk", "#0")]
-    slow = [("bl", "#0x200"), ("b", "#0x14")]
+    slow = [("bl", "#0x9200"), ("b", "#0x14")]
     out = lift(head + check + body + throw + slow)
     assert "x2.field_0x10 = d0;" in out, out
     # With no loop the slot is not forgotten: the reload reads the value stored, named.
@@ -17860,8 +17882,8 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
     # A loop's own stack check: its slow path, laid out after the `ret`, is a block
     # nothing reaches that jumps into the body, which could be a handler the graph has
     # no edge into. It is the check's, so its stub hands every register back and
-    # touches no field; another block in its place counts as writing what its call
-    # does, d0 among them, and as a call.
+    # touches no field; a path that does more is no cut and prints (#509), and its
+    # call writes d0 and may write a field, as any call in the loop.
     def checked(*slow, before=(("stur", "d0, [x29, #-0x20]"),), check=True):
         n = len(before)
         r = "d6" if any(op[:1] == "d" for _m, op in before if "#-0x20" in op) else "x6"
@@ -17872,8 +17894,8 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
             ("cbnz", "x9, #%#x" % (4 * (n + 1))), ("ldur", f"{r}, [x29, #-0x20]"),
             ("stur", f"{r}, [x2, #15]"), ("ret", "")]
             + [(mn, "#%#x" % (4 * (n + 4)) if mn == "b" else op) for mn, op in slow])
-    quiet, busy = [("bl", "#0x200"), ("b", "")], [("bl", "#0x200"), ("mov", "x9, #1"),
-                                                   ("b", "")]
+    quiet, busy = [("bl", "#0x9200"), ("b", "")], [("bl", "#0x200"), ("mov", "x9, #1"),
+                                                    ("b", "")]
     assert "x2.field_0x10 = d0;" in checked(*quiet)
     assert _reads_frame(checked(*busy), "x2.field_0x10")
     assert _reads_frame(checked(*quiet, check=False), "x2.field_0x10")
@@ -17886,7 +17908,9 @@ def test_a_slot_the_loop_does_not_store_to_survives_it():
         assert _reads_frame(out, "x2.field_0x10"), out
     field = (("ldur", "w4, [x20, #0xb]"), ("stur", "x4, [x29, #-0x20]"))
     assert "x2.field_0x10 = x20.field_0xc;" in checked(*quiet, before=field)
-    assert _reads_frame(checked(*busy, before=field), "x2.field_0x10")
+    out = checked(*busy, before=field)
+    assert out[0] == "var t0 = x20.field_0xc;" and "x2.field_0x10 = t0;" in out, out
+    assert any(ln.endswith("= sub_0x200(...);") for ln in out), out
 
     # And on the clean fixture.
     _needs_capstone()
@@ -22495,8 +22519,8 @@ def test_overlapping_conditionals_cost_the_same_per_instruction_at_any_length():
 def _untag_text(rows, reg="x0"):
     """The value tier 3 gives `reg` after `rows`, by the store the body ends with."""
     from jadart.expr import lift_function
-    body = lift_function([(i * 4, mn, op, "") for i, (mn, op) in enumerate(
-        list(rows) + [("stur", f"{reg}, [x9, #7]"), ("ret", "")])])
+    body = lift_function(_noted_509(
+        list(rows) + [("stur", f"{reg}, [x9, #7]"), ("ret", "")]))
     line = next(ln.strip() for ln in body if ln.strip().startswith("x9.field_0x8 = "))
     return line.split(" = ", 1)[1].rstrip(";")
 
@@ -22749,10 +22773,8 @@ def _lift_value(rows, reg="x0"):
     """The value tier 3 gives `reg` after `rows`, by the store the body ends with, and the
     declarations before it as (name, text) pairs."""
     from jadart.expr import lift_function
-    body = [ln.strip() for ln in lift_function([(i * 4, mn, op, "") for i, (mn, op) in
-                                                enumerate(list(rows) + [
-                                                    ("stur", f"{reg}, [x9, #7]"),
-                                                    ("ret", "")])])]
+    body = [ln.strip() for ln in lift_function(_noted_509(
+        list(rows) + [("stur", f"{reg}, [x9, #7]"), ("ret", "")]))]
     decl = re.compile(r"var (t\d+) = (.*);\Z")
     decls = [m.groups() for m in map(decl.match, body) if m]
     line = next(ln for ln in body if ln.startswith("x9.field_0x8 = "))
@@ -22771,9 +22793,8 @@ def test_a_smi_tag_read_by_an_untag_gives_back_its_31_bits():
     against the arm64 definition, the box on the inputs that take the Smi path."""
     tag = [("sbfiz", "x1, x2, #1, #0x1f"), ("sbfx", "x0, x1, #1, #0x1f")]
     wtag = [("sbfiz", "w1, w2, #1, #0x1f"), ("sbfx", "x0, x1, #1, #0x1f")]
-    box = [("sbfiz", "x1, x2, #1, #0x1f"), ("cmp", "x2, x1, asr #1"), ("b.eq", "#0x10"),
-           ("nop", ""), ("sbfx", "x0, x1, #1, #0x1f")]
-    unbox = box + [("tbz", "w1, #0, #0x1c"), ("ldur", "x0, [x1, #7]")]
+    box = _box_509("x2", "x1") + [("sbfx", "x0, x1, #1, #0x1f")]
+    unbox = box + [("tbz", "w1, #0, #0x24"), ("ldur", "x0, [x1, #7]")]
     # x3 is written while x1 still holds its tag, so x1's value gets a name first.
     pinned = [("sbfiz", "w1, w3, #1, #0x1f"), ("asr", "w3, w5, #0x1a"),
               ("sbfx", "x0, x1, #1, #0x1f")]
@@ -22825,9 +22846,7 @@ def test_a_smi_tag_still_prints_the_value_it_tags():
     which is every one of the 1,211 tags on the clean fixture, each a box-or-tag check
     whose result is stored or passed on (#290)."""
     assert _lift_value([("sbfiz", "x1, x2, #1, #0x1f")], "x1")[0] == "x2"
-    box = [("sbfiz", "x1, x2, #1, #0x1f"), ("cmp", "x2, x1, asr #1"), ("b.eq", "#0x10"),
-           ("nop", "")]
-    assert _lift_value(box, "x1")[0] == "x2"
+    assert _lift_value(_box_509("x2", "x1"), "x1")[0] == "x2"
 
 
 def test_an_ldp_into_its_own_base_reads_both_words_off_the_base_before_it():
@@ -26642,7 +26661,7 @@ def test_arithmetic_on_a_smi_tagged_register_reads_the_word_it_holds():
     path."""
     import random
     tag = [("sbfiz", "x1, x3, #1, #0x1f")]
-    box = tag + [("cmp", "x3, x1, asr #1"), ("b.eq", "#0x10"), ("nop", "")]
+    box = _box_509("x3", "x1")
     one = lambda rows: _untag_text(tag + rows)
     assert one([("add", "x0, x1, #2")]) == "(x3.toSigned(31) << 1) + 2"
     assert one([("mul", "x0, x1, x4")]) == "(x3.toSigned(31) << 1) * x4"
@@ -26662,11 +26681,11 @@ def test_arithmetic_on_a_smi_tagged_register_reads_the_word_it_holds():
     # Bit 0 of a boxed register says which path of the box-or-tag check filled it, the
     # Mint where the value does not fit in 31 bits; any other bit is a bit of the word.
     arms = [("mov", "x0, #1"), ("ret", ""), ("mov", "x0, #2"), ("ret", "")]
-    assert _lift_rows(box + [("tbnz", "w1, #0, #0x1c")] + arms)[0] == (
+    assert _lift_rows(box + [("tbnz", "w1, #0, #0x24")] + arms)[0] == (
         "if (x3 == x3.toSigned(31)) {")
-    assert _lift_rows(box + [("tbz", "w1, #0, #0x1c")] + arms)[0] == (
+    assert _lift_rows(box + [("tbz", "w1, #0, #0x24")] + arms)[0] == (
         "if (x3 != x3.toSigned(31)) {")
-    assert _lift_rows(box + [("tbz", "w1, #4, #0x1c")] + arms)[0] == (
+    assert _lift_rows(box + [("tbz", "w1, #4, #0x24")] + arms)[0] == (
         "if (((x3 << 1) >> 4) & 1 != 0) {")
     assert _lift_rows(tag + [("tbz", "w1, #4, #0x10")] + arms)[0] == (
         "if (((x3.toSigned(31) << 1) >> 4) & 1 != 0) {")
@@ -28107,13 +28126,19 @@ def test_a_register_a_loop_wrote_reads_after_it_as_the_name_the_loop_set():
     assert back == ["var t0 = x4;", "if (x2 == 0) {", "t0 = 5;", "}", "return t0;"], back
 
 
-def _lift_485(src, base=0x1000):
-    """Tier 3 of `src`, a row a line as an assembler takes them: `L:` names the next
-    row and a branch to it takes its address, `bl SOVF` calls the stack overflow stub,
-    `bl TTS` a type-testing one, `bl WB` the write barrier, `bl CALL` a function, and
-    `bl THROW` and `bl RANGE` the stubs that throw."""
+def _rows_485(src, base=0x1000):
+    """The rows of `src`, a row a line as an assembler takes them: `L:` names the next
+    row and a branch to it takes its address, `bl SOVF` calls the stack overflow stub
+    and `bl SOVFF` the one that keeps the FPU registers, `bl TTS` a type-testing one,
+    `bl WB` and `bl AWB` the write barriers, `bl MINT` and `bl MINT1` the stubs that
+    allocate a Mint, `bl CALL` a function, and `bl THROW` and `bl RANGE` the stubs that
+    throw."""
     notes = {"SOVF": _STACK_424, "TTS": "  ; -> _iso_stub_DefaultTypeTestStub",
+             "SOVFF": "  ; -> _iso_stub_StackOverflowSharedWithFPURegsStub",
              "WB": "  ; -> _iso_stub_WriteBarrierWrappersStub", "CALL": "  ; -> foo",
+             "AWB": "  ; -> _iso_stub_ArrayWriteBarrierStub", "MINT": _MINT_509,
+             "MINT1": "  ; -> _iso_stub_AllocateMintStub",
+             "MINTF": "  ; -> _iso_stub_AllocateMintSharedWithFPURegsStub",
              "THROW": "  ; -> _iso_stub_ThrowStub",
              "RANGE": "  ; -> _iso_stub_RangeErrorSharedWithoutFPURegsStub"}
     at, rows = {}, []
@@ -28130,7 +28155,20 @@ def _lift_485(src, base=0x1000):
             out.append((mn, "#0x9000", notes[op]))
         else:
             out.append((mn, f"{head}{sep}#0x{at[last]:x}" if last in at else op))
-    return _lift_noted(out, base)
+    return out
+
+
+def _lift_485(src, base=0x1000):
+    """Tier 3 of `src`, read as `_rows_485` reads it."""
+    return _lift_noted(_rows_485(src, base), base)
+
+
+def _cut_509(src):
+    """The mnemonics of the rows of `src` that strip_boilerplate blanks or rewrites: a
+    cut stack check gives its `b.ls`, a barrier its `tst`, a box its `b.eq`."""
+    from jadart.expr import strip_boilerplate
+    rows = _noted_509(_rows_485(src), 0x1000)
+    return [a[1] for a, b in zip(rows, strip_boilerplate(rows)) if a[1:3] != b[1:3]]
 
 
 #: A loop that runs `%s` on each of its x4 & 3 trips, and where it leaves to.
@@ -28215,7 +28253,9 @@ def test_a_call_in_a_later_loop_still_takes_the_register_an_earlier_loop_wrote()
     """A guard for what #485 leaves as it was. With no check the second loop reads the
     name, and a value set in line reads as itself through a loop with a check. With a
     call to a function on the slow path, the callee may leave anything in x12: the
-    store is of the bare register, not of the 7 the first loop put there (#216)."""
+    path is no cut, the call prints under the check (#509), and the store is of a name
+    that call's arm sets to one no row sets, not of the 7 the first loop put there
+    (#216)."""
     first = _FIRST_485 % "mov x12, #7"
     got = _lift_485(first + _second_485(_STORE_485, slow=None))
     assert got[0] == "var t0 = x12;" and "x8.field_0x18 = t0;" in got, got
@@ -28223,8 +28263,12 @@ def test_a_call_in_a_later_loop_still_takes_the_register_an_earlier_loop_wrote()
     assert "x8.field_0x18 = 7;" in got, got
     for inside, after in ((_STORE_485, ""), ("", _STORE_485)):
         got = _lift_485(first + _second_485(inside, after, slow="CALL"))
-        assert "x8.field_0x18 = x12;" in got, got
-        assert not any(ln.startswith(("var t0 = x12", "t0 = 7")) for ln in got), got
+        at = next(i for i, ln in enumerate(got) if ln.endswith(" = foo(...);"))
+        assert "if (SP u<= THR.field_0x48) {" in got[:at], got
+        lost = re.fullmatch(r"(t\d+) = (t\d+);", got[at + 1])
+        assert lost and f"var {lost.group(2)};" in got[:at], got
+        store = next(ln for ln in got if ".field_0x18 = " in ln)
+        assert not store.endswith(("= t0;", "= 7;", "= x12;")), got
 
 
 
@@ -28522,30 +28566,46 @@ def test_guard_a_loop_a_goto_enters_at_its_first_row_reads_registers_under_its_l
     assert got.count("t0 = x5 + 1;") == 2 and "t1 = x6;" in got, got
 
 
-def test_guard_a_loop_whose_slow_path_does_more_than_call_the_stub_reads_registers():
-    """A guard (#505). The slow path of the loop's stack check holds a row of its own,
-    or calls a function and not the stub. The label it jumps back to does not count
-    what those rows write (#509), so a name read under the label is the value from
-    before them: wrong on an arm64 CPU in 33 of 40 states with the row, and a call
-    writes every register the loop counts in. The registers are read as before."""
+def test_a_loop_whose_check_s_slow_path_does_more_than_call_the_stub_prints_it():
+    """The slow path of the loop's stack check holds a row of its own, or calls a
+    function and not the stub. The branch to it was cut all the same, and the #505
+    guard that stood here kept the loop reading registers, because the label the
+    path jumps back to did not count what its rows write. Such a path is code now
+    (#509): the check prints as a compare, the row or the call under it, and the
+    loop reads its names with no label in it."""
     check = "ldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls LS\nLB:\n"
-    for slow in ("bl SOVF\nadd x5, x5, #1\n", "bl CALL\n"):
-        got = _lift_485(_count_505(check=check) + "LS:\n" + slow + "b LB\n")
-        assert not _named_505(got), got
-        assert got[-1] == "goto L_0x1018;" and ("foo(...);" in got) == ("CALL" in slow)
+    got = _lift_485(_count_505(check=check) + "LS:\nbl SOVF\nadd x5, x5, #1\nb LB\n")
+    at = got.index("if (SP u<= THR.field_0x48) {")
+    assert got[at - 1:at + 3] == ["var t2 = t0;", "if (SP u<= THR.field_0x48) {",
+                                  "t2 = t0 + 1;", "}"], got
+    assert "if (t2 >= x19) {" in got and "t1 += 3;" in got, got
+    got = _lift_485(_count_505(check=check) + "LS:\nbl CALL\nb LB\n")
+    at = got.index("if (SP u<= THR.field_0x48) {")
+    assert "foo(...);" in got[at:at + 4], got
+    assert not any(ln.startswith(("L_0x", "goto ")) for ln in got), got
 
 
 def test_guard_a_loop_past_a_stub_that_may_write_a_live_register_reads_registers():
-    """A guard (#505). The stack overflow stub may write x17, and a type testing stub
-    what it does not hand back, here x5. The first is on the check's slow path, which
-    the walk never walks, and the walk keeps x5 across the second (#510). Compiled code
-    holds nothing in them there. Where a function does, the loop's count, a name read
-    under the label is the value from before the stub: wrong on an arm64 CPU in 33 and
-    38 of 40 states. The registers are read there as before. The row with a write
-    barrier in line moved to its own test, since the walk forgets x17 there (#508)."""
-    for reg, row in ((17, ""), (5, "bl TTS\n")):
-        got = _lift_485(_checks_485(_count_505(reg, row=row)))
-        assert not _named_505(got, reg), got
+    """A guard (#505). A type testing stub may write what it does not hand back, here
+    x5, and the walk keeps x5 across it (#510). Compiled code holds nothing there.
+    Where a function does, the loop's count, a name read under the label is the value
+    from before the stub: wrong on an arm64 CPU in 38 of 40 states. The registers are
+    read there as before. The rows with the count in x17 moved to their own tests,
+    since the walk forgets x17 at a write barrier in line (#508) and past a stack
+    check it cut (#509)."""
+    got = _lift_485(_checks_485(_count_505(5, row="bl TTS\n")))
+    assert not _named_505(got, 5), got
+
+
+def test_a_loop_count_in_x17_past_a_cut_stack_check_reads_a_name_no_row_sets():
+    """The counting loop with x17 its count. The stub on the slow path of its stack
+    check may write x17, and the walk never walks that path, so the rows after the
+    check read the count from before it: `if (x17 >= x19) {` and `t0 = x17 + 1;`.
+    They read a name no row sets now, as past the stub in line (#509)."""
+    got = _lift_485(_checks_485(_count_505(17)))
+    assert got[0] == "var t2;" and not any(ln.startswith("t2 = ") for ln in got), got
+    assert "if (t2 >= x19) {" in got and "t0 = t2 + 1;" in got, got
+    assert not any("x17" in ln for ln in got), got
 
 
 def test_guard_a_loop_by_an_if_arm_that_runs_on_past_a_throw_reads_registers():
@@ -28569,20 +28629,22 @@ def test_guard_a_loop_by_an_if_arm_that_runs_on_past_a_throw_reads_registers():
     assert not _named_505(got) and got.count("if (t0 == x25) {") == 2, got
 
 
-def test_guard_a_loop_whose_slow_path_comes_back_elsewhere_reads_registers():
-    """A guard (#505). The slow path of the loop's stack check calls the stub and
-    branches back, but past the row after the check, which then runs once less than
-    the label in the loop says; or two checks share one slow path, which comes back
-    into the first loop from the second. A name read under the label is the value
-    the label does not count: wrong on an arm64 CPU in 33 of 40 states for each. The
-    registers are read as before, in every loop of the function."""
+def test_a_loop_whose_slow_path_comes_back_elsewhere_prints_the_check():
+    """The slow path of the loop's stack check calls the stub and branches back, but
+    past the row after the check; or two checks share one slow path, which comes back
+    into the first loop from the second. No compiled check does either, and the
+    branch was cut all the same, so the row the first one skips read as run on every
+    trip. A check whose slow path does not come back to the row after its branch
+    stays a compare and a branch, and the path prints where it goes (#509)."""
     past = ("mov x5, #0\nmov x6, #0\ncbz x20, LT0\nL1:\nldr x16, [x26, #0x48]\n"
             "cmp x15, x16\nb.ls LS0\nadd x6, x6, #3\nLB1:\ncmp x5, x19\nb.ge LX\n"
             "add x6, x6, x5\nadd x5, x5, #1\nb L1\nLX:\nadd x0, x6, x5\nret\n"
             "LT0:\nbl THROW\nLS0:\nbl SOVF\nb LB1\n")
     got = _lift_485(past)
-    assert "if (x5 >= x19) {" in got and "t1 = x6 + x5;" in got, got
-    assert "if (t0 >= x19) {" not in got and "t0 += 1;" not in got, got
+    at = got.index("if (SP u> THR.field_0x48) {")
+    assert got[at - 1:at + 3] == ["var t2 = t1;", "if (SP u> THR.field_0x48) {",
+                                  "t2 = t1 + 3;", "}"], got
+    assert "if (t0 >= x19) {" in got and "t0 += 1;" in got, got
     check = "ldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls LS0\n"
     two = ("mov x5, #0\nmov x6, #0\nmov x7, #0\ncbz x20, LT0\nL1:\n" + check
            + "LB0:\ncmp x5, x19\nb.ge LX\nadd x6, x6, x5\nadd x5, x5, #1\nb L1\nLX:\n"
@@ -28590,7 +28652,11 @@ def test_guard_a_loop_whose_slow_path_comes_back_elsewhere_reads_registers():
            + "cmp x9, #2\nb.ge LX\nadd x6, x6, #5\nadd x9, x9, #1\nb L2\nLY:\n"
            "add x0, x6, x5\nret\nLT0:\nbl THROW\nLS0:\nbl SOVF\nb LB0\n")
     got = _lift_485(two)
-    assert "if (x5 >= x19) {" in got and "t1 = x6 + x5;" in got, got
+    assert "if (SP u> THR.field_0x48) {" in got and "goto L_0x106c;" in got, got
+    assert got[-2:] == ["L_0x106c:", "goto L_0x101c;"], got
+    # The first check is the compiled one and is cut. Its loop reads the registers
+    # under the label the shared path jumps back to, as before (#505).
+    assert "t0 = x5 + 1;" in got and "t1 = t3 + x5;" in got, got
     assert "if (t0 >= x19) break;" not in got and "t0 += 1;" not in got, got
 
 
@@ -28636,13 +28702,15 @@ def test_a_double_does_not_live_through_a_stub_that_keeps_no_fpu_register():
 
 def test_a_loop_count_in_x17_past_a_write_barrier_reads_a_name_no_row_sets():
     """The counting loop with x17 its count and a write barrier in it. The stub may
-    write x17, so the loop still reads x17 bare under its label, and the row after the
-    stub adds 1 to a name no row sets. It printed `t0 = x17 + 1;`, the value from
-    before the stub (#508)."""
+    write x17, so the row after the stub adds 1 to a name no row sets. It printed
+    `t0 = x17 + 1;`, the value from before the stub (#508). The stub of the loop's
+    stack check may write x17 as well, so the test under the label reads another such
+    name, where it read x17 bare (#509)."""
     got = _lift_485(_checks_485(_count_505(17, row="bl WB\n")))
-    assert "if (x17 >= x19) {" in got and "if (t0 >= x19) break;" not in got, got
-    assert "t0 = t2 + 1;" in got and "t0 = x17 + 1;" not in got, got
-    assert got[0] == "var t2;" and not any(ln.startswith("t2 = ") for ln in got), got
+    assert "if (t2 >= x19) {" in got and "if (t0 >= x19) break;" not in got, got
+    assert "t0 = t3 + 1;" in got and not any("x17" in ln for ln in got), got
+    assert got[:2] == ["var t2;", "var t3;"], got
+    assert not any(ln.startswith(("t2 = ", "t3 = ")) for ln in got), got
     assert "} else {" not in got[:got.index("L_0x1018:") + 3], got
 
 
@@ -28878,11 +28946,12 @@ def test_a_join_keeps_the_tag_an_arm_put_on_its_value():
         ("sbfiz", "x6, x8, #1, #0x1f")] + rows) == word + [
         "t0 = x10.field_0x8;", "}", plain] + done
     # Tagged on one arm and boxed on the other, which is tagged too.
-    rows, done = _tag_read(0x24)
+    rows, done = _tag_read(0x2c)
     assert _lift_rows(load + [
-        ("cbz", "x2, #0x14"), ("sbfiz", "x6, x8, #1, #0x1f"), ("b", "#0x24"),
-        ("sbfiz", "x6, x7, #1, #0x1f"), ("cmp", "x7, x6, asr #1"), ("b.eq", "#0x24"),
-        ("bl", "#0x3000")] + rows) == [
+        ("cbz", "x2, #0x14"), ("sbfiz", "x6, x8, #1, #0x1f"), ("b", "#0x2c"),
+        ("sbfiz", "x0, x7, #1, #0x1f"), ("cmp", "x7, x0, asr #1"), ("b.eq", "#0x28"),
+        ("bl", "#0x3000", _MINT_509), ("stur", "x7, [x0, #7]"),
+        ("mov", "x6, x0")] + rows) == [
         "var t0;", "if (x2 != 0) {", "t0 = x10.field_0x8;", "} else {", "t0 = x7;",
         "}", tagged] + done
 
@@ -30807,21 +30876,37 @@ def test_a_stack_check_that_jumps_back_to_a_throw_keeps_its_goto():
 
 
 def test_a_throw_a_branch_and_a_jump_back_reach_keeps_its_section_for_the_jump():
-    """A check in a loop branches to a block past the return that throws, and the slow
-    path of the stack check jumps back to the same block. The branch prints the throw
-    where it is, lifted from its own values, and the jump back keeps its goto, so the
-    block keeps its section and its label: nothing is printed twice from a state that
-    knows nothing, and no goto is left without its label (#424)."""
+    """A check in a loop branches to a block that throws, and the slow path of the
+    stack check that stands before that block jumps back to it. The branch prints the
+    throw where it is, lifted from its own values, and the jump back keeps its goto,
+    so the block keeps its section and its label: nothing is printed twice from a
+    state that knows nothing, and no goto is left without its label (#424)."""
+    body = _lift_noted([("mov", "x3, #0"), ("cmp", "x3, x4"), ("b.ge", "#0x1018"),
+                        ("cbz", "x2, #0x1024"), ("add", "x3, x3, #1"), ("b", "#0x1004"),
+                        ("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"),
+                        ("b.ls", "#0x102c"), ("add", "x0, x3, #1"),
+                        ("bl", "#0x9000", _THROW_424), ("bl", "#0x9200", _STACK_424),
+                        ("b", "#0x1024")])
+    at = body.index("if (x2 == 0) {")
+    assert body[at + 1:at + 3] == ["throw t0 + 1;", "}"], body
+    assert body[-4:] == ["L_0x1024:", "throw x3 + 1;", "L_0x102c:",
+                         "goto L_0x1024;"], body
+
+
+def test_a_slow_path_that_jumps_to_a_throw_is_code_and_prints_the_throw():
+    """The rows that test had before: the stack check opens the function, and its slow
+    path jumps to a block past the return that throws, not back to the row after the
+    check. No compiled check does, so the branch is not cut (#509): the check prints
+    as a compare, and the throw its path reaches after it, from the values there."""
     body = _lift_noted([("ldr", "x16, [x26, #0x48]"), ("cmp", "x15, x16"),
                         ("b.ls", "#0x1034"), ("mov", "x3, #0"), ("cmp", "x3, x4"),
                         ("b.ge", "#0x1024"), ("cbz", "x2, #0x102c"),
                         ("add", "x3, x3, #1"), ("b", "#0x1010"), ("mov", "x0, x3"),
                         ("ret", ""), ("add", "x0, x3, #1"), ("bl", "#0x9000", _THROW_424),
                         ("bl", "#0x9200", _STACK_424), ("b", "#0x102c")])
-    at = body.index("if (x2 == 0) {")
-    assert body[at + 1:at + 3] == ["throw t0 + 1;", "}"], body
-    assert body[-5:] == ["return t0;", "L_0x102c:", "throw x3 + 1;", "L_0x1034:",
-                         "goto L_0x102c;"], body
+    assert body[0] == "if (SP u> THR.field_0x48) {", body
+    assert body[-3:] == ["return t0;", "}", "throw x3 + 1;"], body
+    assert not any(ln.startswith(("L_0x", "goto ")) for ln in body), body
 
 
 def test_a_throw_whose_only_goto_jumps_back_keeps_its_section():
@@ -30838,6 +30923,606 @@ def test_a_throw_whose_only_goto_jumps_back_keeps_its_section():
                                  (0x14, "b", "#0x8", "")], succ=[8])}
     stmts = [("asm", 0), ("label", 8), ("asm", 8), ("label", 0x10), ("goto", 8)]
     assert expr._throws_in_place(blocks, list(stmts)) == stmts
+
+
+#: Rows for the tests of #509. A stack check with x12 set to 7 before it and stored
+#: after it, the slow path a test gives, and what that prints where the check is cut,
+#: or where the register stored is one the cut loses. A frame pushed and popped around
+#: a call, and a call through the thread. A write barrier's test and branch around the
+#: rows given, and LR spilled around its call. A Smi box of x2 into x0 with the rows
+#: given on its fall through.
+_CHECK_509 = "ldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls LS\nLB:\n"
+_CUT_509 = "mov x12, #7\n" + _CHECK_509 + "stur x12, [x20, #0x17]\nret\nLS:\n%sb LB\n"
+_KEPT_509 = ["x20.field_0x18 = 7;", "return x0;"]
+_LOST_509 = ["var t0;", "x20.field_0x18 = t0;", "return x0;"]
+_FRAMED_509 = ("stp x29, x30, [x15, #-0x10]!\nmov x29, x15\nbl %s\nmov x15, x29\n"
+               "ldp x29, x30, [x15], #0x10\n")
+_THREAD_509 = "ldr x30, [x26, #0x700]\nblr x30\n"
+_BARRIER_509 = "tst x16, x28, lsr #32\nb.eq LA\n%sLA:\n"
+_SPILL_509 = "str x30, [x15, #-8]!\nbl WB\nldr x30, [x15], #8\n"
+_SMI_509 = "sbfiz x0, x2, #1, #31\ncmp x2, x0, asr #1\nb.eq LE\n%sLE:\n"
+_STORE_509 = "stur x12, [x20, #0x17]\nret\n"
+
+
+def test_a_call_on_the_slow_path_of_a_stack_check_is_printed():
+    """`ldr x16, [x26, #0x48]`, `cmp x15, x16` and `b.ls LS` were taken for a stack
+    check and blanked whatever LS held. With `bl foo` and `b` back there, the call
+    was printed nowhere and the 7 set before the check read as stored after it: a
+    binary could hide a call from the reader (#509). The check is cut only where LS
+    is the stub's call and no more. Any other path is code: the check prints as a
+    compare and the path under it, a call no note names and a store beside the stub's
+    call alike."""
+    for call, text in (("CALL", "foo(...)"), ("#0x9100", "sub_0x9100(...)")):
+        got = _lift_485(_CUT_509 % f"bl {call}\n")
+        at = got.index("if (SP u<= THR.field_0x48) {")
+        assert f"var t1 = {text};" in got[at:] and _KEPT_509[0] not in got, got
+    got = _lift_485(_CUT_509 % "bl SOVF\nstur x1, [x20, #0x1f]\n")
+    assert got == ["if (SP u<= THR.field_0x48) {", "x20.field_0x20 = x1;",
+                   "}"] + _KEPT_509, got
+    # The way back is a `b` and no other row: a call of the row after the check
+    # prints, and a branch on a register, which prints nothing, is not cut either.
+    assert "var t1 = sub_0x1010(...);" in _lift_485(_CUT_509 % "bl SOVF\nbl LB\n")
+    assert "b.ls" not in _cut_509(_CUT_509 % "bl SOVF\ncbz x1, LB\n")
+    assert "b.ls" in _cut_509(_CUT_509 % "bl SOVF\n")
+
+
+def test_a_frame_around_the_call_on_a_slow_path_hides_no_other_row():
+    """A function with no frame pushes one around the stub's call on the slow path of
+    its stack check, and that path is cut as the plain one is. Its rows are read one
+    by one: with a function in the stub's place, a pop that loads x12 where FP was
+    pushed, or one more row before the branch back, the path is code (#509)."""
+    got = _lift_485(_CUT_509 % (_FRAMED_509 % "CALL"))
+    assert "var t1 = foo(...);" in got and _KEPT_509[0] not in got, got
+    got = _lift_485(_CUT_509 % (_FRAMED_509 % "SOVF").replace("ldp x29,", "ldp x12,"))
+    assert "var t0 = SP.field_0x0;" in got and "x20.field_0x18 = t1;" in got, got
+    got = _lift_485(_CUT_509 % (_FRAMED_509 % "SOVF" + "mov x12, #9\n"))
+    assert got == ["var t0 = 7;", "if (SP u<= THR.field_0x48) {", "t0 = 9;", "}",
+                   "x20.field_0x18 = t0;", "return x0;"], got
+    for old, new, text in (("mov x29, x15", "mov x12, x15", "var t0 = SP;"),
+                           ("mov x15, x29", "mov x12, x29", "var t0 = FP;"),
+                           ("bl SOVF", "b SOVF", "goto sub_0x9000;")):
+        got = _lift_485(_CUT_509 % (_FRAMED_509 % "SOVF").replace(old, new))
+        assert text in got, (old, got)
+    # A push of x12 where FP's is prints nothing, and is not the frame's all the same.
+    odd = (_FRAMED_509 % "SOVF").replace("stp x29, x30", "stp x12, x30")
+    assert "b.ls" not in _cut_509(_CUT_509 % odd)
+    assert "b.ls" in _cut_509(_CUT_509 % (_FRAMED_509 % "SOVF"))
+    # A load where the push is and a store where the pop is, of the same operands.
+    for old, new in (("stp x29, x30", "ldp x29, x30"), ("ldp x29, x30", "stp x29, x30")):
+        odd = (_FRAMED_509 % "SOVF").replace(old, new)
+        assert "b.ls" not in _cut_509(_CUT_509 % odd), old
+
+
+def test_a_stack_check_whose_slow_path_is_not_among_the_rows_is_not_cut():
+    """The slow path of a check in a function longer than the rows that are read lies
+    past them, and a branch can leave the function. What is there cannot be read, so
+    the check is not cut: it prints, with where it goes. Nor is it where the rows are
+    not four bytes apart and the row counted to is not the one the branch names
+    (#509)."""
+    from jadart.expr import strip_boilerplate
+    got = _lift_485("mov x12, #7\nldr x16, [x26, #0x48]\ncmp x15, x16\nb.ls #0x9000\n"
+                    + _STORE_509)
+    assert got == ["if (SP u<= THR.field_0x48) {", "goto sub_0x9000;", "}"] + _KEPT_509
+    rows = [(0x1000, "ldr", "x16, [x26, #0x48]", ""), (0x1004, "cmp", "x15, x16", ""),
+            (0x1008, "b.ls", "#0x1014", ""), (0x100c, "ret", "", ""),
+            (0x1014, "stur", "x1, [x20, #0x17]", ""),
+            (0x1018, "bl", "#0x9200", _STACK_424), (0x101c, "b", "#0x100c", "")]
+    assert strip_boilerplate(rows) == rows
+    # A slow path of any length is read no further than the rows a stub call has.
+    long = rows[:3] + [(0x100c + 4 * i, "mov", "x1, x2", "") for i in range(5000)]
+    long[2] = (0x1008, "b.ls", "#0x1010", "")
+    assert strip_boilerplate(long) == long
+    # The same rows with the one the branch names in its place are the check.
+    whole = rows[:4] + [(0x1010, "brk", "#0", ""), (0x1014,) + rows[5][1:],
+                        (0x1018,) + rows[6][1:]]
+    assert [r[1] for r in strip_boilerplate(whole)[:3]] == ["nop"] * 3
+
+
+def test_a_call_through_the_thread_is_cut_only_in_the_rows_a_deferred_unit_has():
+    """A deferred unit calls the stack overflow stub through the entry the thread
+    holds, `ldr x30, [x26, #N]`, `blr x30` and `b` back, and that slow path is cut.
+    The same call through another register, or of another register than the one
+    loaded, is not those rows and prints (#509). x17 is lost past it as past the stub
+    by name; which stub the entry is, no name says, and a double is kept."""
+    assert _lift_485(_CUT_509 % _THREAD_509) == _KEPT_509
+    got = _lift_485(_CUT_509 % _THREAD_509.replace("x30", "x9"))
+    assert "var t1 = THR.field_0x700(...);" in got and _KEPT_509[0] not in got, got
+    got = _lift_485(_CUT_509 % _THREAD_509.replace("blr x30", "blr x12"))
+    assert "var t1 = 7(...);" in got and _KEPT_509[0] not in got, got
+    for reg, want in (("x17", _LOST_509), ("x30", _LOST_509), ("x12", _KEPT_509)):
+        assert _lift_485(_CUT_509.replace("x12", reg) % _THREAD_509) == want, reg
+    src = "ldur d1, [x2, #7]\n" + _CHECK_509 + "stur d1, [x20, #0x17]\nret\nLS:\n%sb LB\n"
+    assert _lift_485(src % _THREAD_509) == ["x20.field_0x18 = x2.field_0x8;",
+                                            "return x0;"]
+
+
+def test_guard_the_stack_checks_compiled_code_has_are_still_cut():
+    """A guard (#509). The slow paths the nine binaries hold are cut as before: `bl`
+    to either stack overflow stub and `b` to the row after the check, and the same
+    with a frame pushed and popped around the call. Nothing of the check prints, and
+    a register the stub hands back reads as it was set."""
+    for slow in ("bl SOVF\n", "bl SOVFF\n", _FRAMED_509 % "SOVF", _FRAMED_509 % "SOVFF"):
+        assert _lift_485(_CUT_509 % slow) == _KEPT_509, slow
+
+
+def test_a_cut_stack_check_leaves_nothing_known_of_what_its_stub_may_write():
+    """The stub on a cut slow path hands the register file back but for x16 and x17.
+    The `bl` to it writes LR, and the check itself loads its limit. The walk never
+    walks that path, so `mov x17, #7`, a check and a store of x17 printed 7, where an
+    arm64 CPU stores what the stub left. Past a cut check each reads a name no row
+    sets, as it does past the stub in line (#508, #509)."""
+    slow = "LS:\nbl %s\nb LB\n"
+    for reg in ("x16", "x17", "x30"):
+        got = _lift_485(f"mov {reg}, #7\n" + _CHECK_509
+                        + f"stur {reg}, [x20, #0x17]\nret\n" + slow % "SOVF")
+        assert got == _LOST_509, (reg, got)
+    # The limit loaded into another register: it is not the 7 from before the check.
+    assert _lift_485("mov x5, #7\n" + _CHECK_509.replace("x16", "x5")
+                     + "stur x5, [x20, #0x17]\nret\n" + slow % "SOVF") == _LOST_509
+    # A d register is left as it was, whichever stub is called. Compiled code calls
+    # the one that keeps no FPU register only where none is live, and the walk takes
+    # one for live there all the same in ranges of the binaries, which would read a
+    # name no row sets.
+    src = "ldur d1, [x2, #7]\n" + _CHECK_509 + "stur d1, [x20, #0x17]\nret\n" + slow
+    for stub in ("SOVF", "SOVFF"):
+        assert _lift_485(src % stub) == ["x20.field_0x18 = x2.field_0x8;", "return x0;"]
+    # With the frame around the call the pop gives LR back; x17 is lost all the same.
+    got = _lift_485("mov x30, #7\nmov x17, #9\n" + _CHECK_509
+                    + "stur x30, [x20, #0x17]\nstur x17, [x20, #0x1f]\nret\nLS:\n"
+                    + _FRAMED_509 % "SOVF" + "b LB\n")
+    assert got == ["var t0;", "x20.field_0x18 = 7;", "x20.field_0x20 = t0;",
+                   "return x0;"], got
+    # x0 the stub hands back, as it does x12 in the tests above.
+    assert _lift_485("mov x0, #7\n" + _CHECK_509 + "ret\n" + slow % "SOVF") == [
+        "return 7;"]
+
+
+def test_a_loop_reads_x17_at_its_head_as_a_stack_check_in_it_may_leave_it():
+    """x17 is set to 7 before a loop and added at the loop's head, and the loop's
+    stack check comes after the add. On a second trip x17 is what the stub left. No
+    row of the loop writes it, so the loop carried nothing for it and printed
+    `t2 += 7;` for every trip. The walk forgets x17 at the cut check, so the loop
+    carries it and sets it there to a name no row sets (#509)."""
+    got = _lift_485("mov x17, #7\nmov x5, #0\nmov x6, #0\nand x19, x19, #3\nL1:\n"
+                    "add x6, x6, x17\ncmp x5, x19\nb.ge LX\n" + _CHECK_509
+                    + "add x5, x5, #1\nb L1\nLX:\nmov x0, x6\nret\nLS:\nbl SOVF\nb LB\n")
+    assert got[:2] == ["var t3;", "var t0 = 7;"] and "t0 = t3;" in got, got
+    assert "var t4 = t2 + t0;" in got and "t2 += t0;" in got, got
+    assert not any(ln.startswith("t3 = ") or "7;" in ln for ln in got[2:]), got
+
+
+def test_a_write_barrier_is_cut_only_where_its_rows_are_the_barrier():
+    """`tst x16, x28, lsr #32` and a conditional branch were taken for a write
+    barrier, and up to two stores, any `bl` and a load off SP after them were
+    blanked with them: a call to a function, a store to an object and a load into a
+    register were printed nowhere, and where the branch went somewhere else, nor was
+    what stood there (#509). The rows are read one by one: `b.eq` to the row after a
+    `bl` to a write barrier stub, and around that `bl` the push and the pop of LR and
+    no other. Anything else is code."""
+    test = "if ((x16 & (HEAP >>> 32)) != 0) {"
+    got = _lift_485("mov x12, #7\n" + _BARRIER_509 % "bl CALL\n" + _STORE_509)
+    assert "var t1 = foo(...);" in got[got.index(test):], got
+    assert _KEPT_509[0] not in got, got
+    got = _lift_485(_BARRIER_509 % "stur x1, [x20, #0x17]\nbl WB\n"
+                    + "ldur x0, [x20, #0x17]\nret\n")
+    assert got == [test, "x20.field_0x18 = x1;", "}", "return x20.field_0x18;"], got
+    got = _lift_485("mov x5, #7\n" + _BARRIER_509 % "bl WB\nldr x5, [x15, #8]\n"
+                    + "stur x5, [x20, #0x17]\nret\n")
+    assert "var t0 = SP.field_0x8;" in got and "x20.field_0x18 = t1;" in got, got
+    # A spill of another register than LR, popped into a third.
+    spill = _SPILL_509.replace("str x30", "str x12").replace("ldr x30", "ldr x20")
+    got = _lift_485("mov x12, #7\n" + _BARRIER_509 % spill + _STORE_509)
+    assert "var t0 = SP.field_0x0;" in got and "t1.field_0x18 = 7;" in got, got
+    # LR stored to an object where its push is, and x1 loaded where its pop is.
+    for old, new in (("str x30, [x15, #-8]!", "str x30, [x20, #8]"),
+                     ("ldr x30, [x15], #8", "ldr x1, [x15], #8")):
+        got = _cut_509(_BARRIER_509 % _SPILL_509.replace(old, new) + _STORE_509)
+        assert "tst" not in got, (old, got)
+    assert "tst" in _cut_509(_BARRIER_509 % _SPILL_509 + _STORE_509)
+    # The branch the other way round, and a jump to the stub where the call is.
+    got = _lift_485("mov x17, #7\ntst x16, x28, lsr #32\nb.ne LA\nbl WB\nLA:\n"
+                    "stur x17, [x20, #0x17]\nret\n")
+    assert "if ((x16 & (HEAP >>> 32)) == 0) {" in got, got
+    got = _lift_485("mov x12, #7\n" + _BARRIER_509 % "b WB\n" + _STORE_509)
+    assert "goto sub_0x9000;" in got, got
+    # A branch past more than the call: the rows it skips and the call there print.
+    got = _lift_485("mov x12, #7\ntst x16, x28, lsr #32\nb.eq LF\nbl WB\nLA:\n"
+                    + _STORE_509 + "LF:\nbl CALL\nb LA\n")
+    assert test in got and any(ln.endswith("= foo(...);") for ln in got), got
+
+
+def test_guard_the_write_barriers_compiled_code_has_are_still_cut():
+    """A guard (#509). A barrier by either stub's name, and with LR pushed and popped
+    around the call as a function with no frame has it, prints nothing."""
+    for rows in ("bl WB\n", "bl AWB\n", _SPILL_509, _SPILL_509.replace("WB", "AWB")):
+        got = _lift_485("mov x12, #7\n" + _BARRIER_509 % rows + _STORE_509)
+        assert got == _KEPT_509, (rows, got)
+
+
+def test_a_barrier_s_call_into_the_wrappers_stub_is_known_by_where_it_lands():
+    """The write barrier wrappers stub has an entry for each register and a name at
+    the first alone, so most barriers call an address no note names: 50,363 of the
+    74,785 in the nine binaries. `function_name_by_pc` hands the stub's range on
+    beside the names, `signatures.merge` keeps it, `annotate` marks each call that
+    lands inside the stub past its first entry, and the strip takes the mark for the
+    stub's name. A call with no mark is one to a function and prints (#509)."""
+    from jadart import disasm, signatures
+    from jadart.expr import lift_function
+    rows = [(0x1000, "mov", "x12, #7"), (0x1004, "tst", "x16, x28, lsr #32"),
+            (0x1008, "b.eq", "#0x1010"), (0x100c, "bl", "#0x9010"),
+            (0x1010, "stur", "x12, [x20, #0x17]"), (0x1014, "ret", "")]
+    kinds = [(None, None)] * 6
+    kinds[2], kinds[3] = ("cjump", 0x1010), ("call", 0x9010)
+    names = disasm.Names({0x9000: "_iso_stub_WriteBarrierWrappersStub", 0x9100: "foo"})
+    assert names.wrappers == (0, 0)
+
+    def lift(names):
+        ann = disasm.annotate(rows, names, None, kinds=kinds)
+        return ann, [ln.strip() for ln in lift_function(ann)]
+    ann, body = lift(names)
+    assert not ann.barrier and "var t1 = sub_0x9010(...);" in body, body
+    names.wrappers = (0x9000, 0x9100)
+    ann, body = lift(names)
+    assert ann.barrier == {0x100c} and ann[3][3] == "" and body == _KEPT_509, body
+    # The range is open at both ends: its first entry has the name, and its end is
+    # the next function's first row, named or not.
+    del names[0x9100]
+    for at in (0x9000, 0x9100):
+        kinds[3] = ("call", at)
+        assert not disasm.annotate(rows, names, None, kinds=kinds).barrier
+    merged, _n = signatures.merge(names, {})
+    assert merged.wrappers == (0x9000, 0x9100) and merged == names
+
+    class Range:
+        def __init__(self, pc_offset, size):
+            self.pc_offset, self.size = pc_offset, size
+
+    class Image:
+        all_ranges = [Range(0x8000, 0x40), Range(0x9000, 0x100)]
+        symbol_names = {0x9000: "_iso_stub_WriteBarrierWrappersStub", 0x8000: "foo"}
+        code_ranges, data = {}, b""
+
+    class Snapshot:
+        names, functions, end_pos = {}, [], 0
+    found = disasm.function_name_by_pc(Image(), Snapshot())
+    assert found.wrappers == (0x9000, 0x9100) and found[0x8000] == "foo", found
+
+
+def test_a_cut_write_barrier_leaves_nothing_known_of_what_its_stub_may_write():
+    """The write barrier stubs may write x16 and x17, the `bl` to one writes LR, and
+    the barrier's `tst` sets the flags. The rows are blanked and the walk steps none
+    of them, so a value set in x17 before a barrier printed as stored after it, and
+    a `csel` after one read the compare from before it. Each is unknown past a cut
+    barrier: a name no row sets, and a `csel` that prints as it is. LR pushed and
+    popped around the call is kept (#509)."""
+    got = _lift_485("mov x17, #7\nmov x16, #9\n" + _BARRIER_509 % "bl WB\n"
+                    + "stur x17, [x20, #0x17]\nstur x16, [x20, #0x1f]\nret\n")
+    assert got == ["var t0;", "var t1;", "x20.field_0x18 = t1;", "x20.field_0x20 = t0;",
+                   "return x0;"], got
+    src = ("mov x30, #7\nmov x17, #9\n" + _BARRIER_509
+           + "stur x30, [x20, #0x17]\nstur x17, [x20, #0x1f]\nret\n")
+    assert _lift_485(src % "bl WB\n") == [
+        "var t0;", "var t1;", "x20.field_0x18 = t1;", "x20.field_0x20 = t0;",
+        "return x0;"]
+    assert _lift_485(src % _SPILL_509) == [
+        "var t0;", "x20.field_0x18 = 7;", "x20.field_0x20 = t0;", "return x0;"]
+    got = _lift_485("cmp x1, x2\n" + _BARRIER_509 % "bl WB\n"
+                    + "csel x0, x3, x4, eq\nret\n")
+    assert got == ["csel x0, x3, x4, eq", "return x0;"], got
+    # What a cut may write counts as written by its block. A loop that stores x17 at
+    # its head and has the barrier after carries it; it printed 7 for every trip.
+    got = _lift_485("mov x17, #7\nmov x5, #0\nand x19, x19, #3\nL1:\ncmp x5, x19\n"
+                    "b.ge LX\nstur x17, [x20, #0x17]\n" + _BARRIER_509 % "bl WB\n"
+                    + "add x5, x5, #1\nb L1\nLX:\nret\n")
+    assert got[:2] == ["var t2;", "var t0 = 7;"] and "t0 = t2;" in got, got
+    assert "x20.field_0x18 = t0;" in got and "x20.field_0x18 = 7;" not in got, got
+
+
+def test_a_smi_box_is_cut_only_where_its_fall_through_boxes_a_mint():
+    """`sbfiz x0, x2, #1, #31`, `cmp x2, x0, asr #1` and `b.eq` or `b.ne` were taken
+    for a box-or-tag check: the branch made unconditional, and whatever it skipped
+    cut off. A call and a store on the fall through were printed nowhere, and with
+    `b.ne` it was the Smi path that went (#509). The cut is made only where the fall
+    through allocates a Mint, stores the value into it and runs into the branch's
+    target. Any other is code, and the check prints as the compare it is."""
+    test = "if (x2 != ((x2.toSigned(31) << 1) >> 1)) {"
+    got = _lift_485("mov x12, #7\n" + _SMI_509 % ("bl CALL\n" + _STORE_509[:-4])
+                    + "ret\n")
+    assert got[1] == test and "var t1 = foo(...);" in got, got
+    assert any(ln.startswith("x20.field_0x18 = ") for ln in got), got
+    got = _lift_485("mov x12, #7\nsbfiz x0, x2, #1, #31\ncmp x2, x0, asr #1\nb.ne L\n"
+                    "mov x12, #9\nL:\nstur x12, [x20, #0x17]\nmov x0, #0\nret\n")
+    assert got == ["var t0 = 7;", "if (x2 == ((x2.toSigned(31) << 1) >> 1)) {", "t0 = 9;",
+                   "}", "x20.field_0x18 = t0;", "return 0;"], got
+    # The Mint allocated and the value stored to another object, and a store more
+    # before the target.
+    got = _lift_485(_SMI_509 % "bl MINT\nstur x2, [x20, #7]\n" + "ret\n")
+    assert got[1] == test and "x20.field_0x8 = t0;" in got, got
+    got = _lift_485(_SMI_509 % "bl MINT\nstur x2, [x0, #7]\nstur x1, [x20, #0x17]\n"
+                    + "ret\n")
+    assert got[1] == test and "x20.field_0x18 = t0;" in got, got
+    # `b.ne` past the rows of a box skips them for the integer that does not fit, and
+    # a tag in x3 beside a Mint in x0 leaves the integer in two places. Neither is cut.
+    box = "bl MINT\nstur x2, [x0, #7]\n"
+    assert _cut_509(_SMI_509 % box + "ret\n") == ["cmp", "b.eq"]
+    assert _cut_509(_SMI_509.replace("b.eq", "b.ne") % box + "ret\n") == []
+    odd = _SMI_509.replace("x0, x2, #1", "x3, x2, #1").replace("cmp x2, x0", "cmp x2, x3")
+    assert _cut_509(odd % box + "ret\n") == []
+
+
+#: A Mint allocated in line into x1 for the value in x2, as a Smi box has it where it
+#: calls no stub: the bump off the thread's top, the header, the store of the value,
+#: the rows given after the box and, after the function's last row, the slow path of
+#: the bump as given. That path pushes what is live, calls the stub, moves the Mint
+#: over and pops: the value alone, or the value and more, one or two to a row.
+_INLINE_509 = ("sbfiz x1, x2, #1, #31\ncmp x2, x1, asr #1\nb.eq LE\n"
+               "ldp x1, x3, [x26, #0x50]\nadd x1, x1, #0x10\ncmp x3, x1\nb.ls LS\n"
+               "str x1, [x26, #0x50]\nsub x1, x1, #0xf\nmov x3, #0x3204\n"
+               "movk x3, #0x1, lsl #16\nstur x3, [x1, #-1]\nLK:\nstur x2, [x1, #7]\n"
+               "LE:\n%smov x0, x1\nret\nLS:\n%sb LK\n")
+_SAVE_509 = "str x2, [x15, #-8]!\nbl MINT1\nmov x1, x0\nldr x2, [x15], #8\n"
+
+
+def _saves_509(n):
+    """The slow path that pushes x4 and x2 as a pair and then `n` registers more."""
+    regs = [f"x{r}" for r in range(5, 5 + n)]
+    return ("stp x4, x2, [x15, #-0x10]!\n"
+            + "".join(f"str {r}, [x15, #-8]!\n" for r in regs) + "bl MINT1\nmov x1, x0\n"
+            + "".join(f"ldr {r}, [x15], #8\n" for r in reversed(regs))
+            + "ldp x4, x2, [x15], #0x10\n")
+
+
+_SAVES_509 = _saves_509(1)
+
+
+def test_guard_the_smi_boxes_compiled_code_has_are_still_cut():
+    """A guard (#509). The ways the nine binaries box a Mint on the fall through of
+    a box-or-tag check are cut as before, and the value reads as the integer it is:
+    the stub called, called with a frame around it, called as the Code a pool slot
+    holds, and the Mint allocated in line with a slow path of its own, which pushes
+    one register or several and widens a value of 32 bits before it stores it."""
+    pool = ("add x30, x27, #0x45, lsl #12\nldr x30, [x30, #0xef8]\n"
+            "ldur x30, [x30, #7]\nblr x30\n")
+    for call in ("bl MINT\n", "bl MINTF\n", _FRAMED_509 % "MINT", pool):
+        got = _lift_485(_SMI_509 % (call + "stur x2, [x0, #7]\n") + "ret\n")
+        assert got == ["return x2;"], (call, got)
+    for slow in (_SAVE_509, _SAVES_509):
+        assert _lift_485(_INLINE_509 % ("", slow)) == ["return x2;"], slow
+    wide = (_INLINE_509 % ("", _SAVE_509)).replace(
+        "LK:\nstur x2,", "dmb ishst\nLK:\nsxtw x3, w2\nstur x3,")
+    assert _lift_485(wide) == ["return x2;"]
+
+
+def test_a_mint_allocated_in_line_is_cut_only_with_the_rows_it_has():
+    """The Mint a box allocates in line has a slow path of its own, which pushes the
+    registers that are live, calls the stub, moves the Mint over, pops them in turn
+    and goes back to the store of the value. With a function called there, a row
+    more, a pop into another register or out of turn, the value not among what is
+    pushed or the Mint among it, more rows of pushes than compiled code has, or
+    another register stored into the Mint or widened for it, the rows are not the
+    box and print (#509)."""
+    test = "if (x2 != ((x2.toSigned(31) << 1) >> 1)) {"
+    for old, new in (("bl MINT1", "bl CALL"),
+                     ("mov x1, x0\n", "mov x1, x0\nmov x7, #1\n"),
+                     ("ldp x4, x2", "ldp x2, x4"), ("x4, x2", "x4, x6"),
+                     ("x4, x2", "x1, x2"), ("mov x1, x0", "mov x1, x4"),
+                     ("ldr x5, [x15], #8\nldp x4, x2, [x15], #0x10\n",
+                      "ldp x4, x2, [x15], #0x10\nldr x5, [x15], #8\n"),
+                     ("ldr x5, [x15], #8\n", "")):
+        got = _lift_485(_INLINE_509 % ("", _SAVES_509.replace(old, new)))
+        assert test in got, (old, got)
+    # Eight rows of pushes are the box and nine are not: no slow path is read further.
+    assert _lift_485(_INLINE_509 % ("", _saves_509(7))) == ["return x2;"]
+    assert test in _lift_485(_INLINE_509 % ("", _saves_509(8)))
+    got = _lift_485(_INLINE_509 % ("", _SAVE_509.replace("bl MINT1", "bl CALL")))
+    assert any(ln.endswith("= foo(...);") for ln in got) and test in got, got
+    for old, new in (("stur x2, [x1, #7]", "stur x4, [x1, #7]"),
+                     ("ldp x1, x3, [x26", "ldp x5, x3, [x26"), ("b LK", "b LE"),
+                     ("str x2, [x15, #-8]!", "str x2, [x20, #8]")):
+        got = _lift_485((_INLINE_509 % ("", _SAVE_509)).replace(old, new))
+        assert test in got, (old, got)
+    wide = (_INLINE_509 % ("", _SAVE_509)).replace("LK:\nstur x2,",
+                                                   "LK:\nsxtw x3, w4\nstur x3,")
+    assert test in _lift_485(wide)
+    # The Mint allocated in x5 where the tag is in x1, and moved to x1 on the slow
+    # path alone: past the box x1 is the tag on one path and the Mint on the other.
+    src = _INLINE_509 % ("", _SAVE_509)
+    a, b = src.index("ldp x1"), src.index("LE:")
+    assert test in _lift_485(src[:a] + re.sub(r"\bx1\b", "x5", src[a:b]) + src[b:])
+    # The slow path is the row its branch names: with the rows from it on four bytes
+    # further, no row stands there, and the box is not cut.
+    from jadart.expr import strip_boilerplate
+    rows = _noted_509(_rows_485(src), 0x1000)
+    at = [r[1] for r in rows].index("ret") + 1
+    gap = rows[:at] + [(r[0] + 4,) + r[1:] for r in rows[at:]]
+    assert strip_boilerplate(rows)[2][1] == "b"
+    assert strip_boilerplate(gap)[2][1] == "b.eq"
+
+
+def test_a_cut_smi_box_leaves_nothing_known_of_what_its_mint_path_may_write():
+    """The fall through of a cut Smi box calls a stub that may write x16 and x17,
+    and the `bl` writes LR. A Mint allocated in line writes its temporary, and its
+    slow path calls a stub that keeps nothing but what is pushed around the call.
+    The walk steps none of those rows, so 7 set in x17 before a box printed as
+    stored after it. Each reads a name no row sets past the box, and a register the
+    rows hand back reads as it was set (#509)."""
+    lost, kept = ["var t0;", "x20.field_0x18 = t0;"], ["x20.field_0x18 = 7;"]
+    box = _SMI_509 % "bl MINT\nstur x2, [x0, #7]\n"
+    for reg, want in (("x16", lost), ("x17", lost), ("x30", lost), ("x12", kept)):
+        got = _lift_485(f"mov {reg}, #7\n" + box + f"stur {reg}, [x20, #0x17]\nret\n")
+        assert got == want + ["return x2;"], (reg, got)
+    # A d register is left as it was, as at a cut stack check: at a shared stub, at
+    # one that is a call, and at the Mint allocated in line.
+    src = "ldur d1, [x20, #7]\n" + _SMI_509 + "stur d1, [x20, #0x17]\nret\n"
+    for stub in ("MINT", "MINTF", "MINT1"):
+        assert _lift_485(src % f"bl {stub}\nstur x2, [x0, #7]\n") == [
+            "x20.field_0x18 = x20.field_0x8;", "return x2;"], stub
+    got = _lift_485("ldur d1, [x20, #7]\n" + _INLINE_509 % (
+        "stur d1, [x20, #0x17]\n", _SAVE_509))
+    assert got == ["x20.field_0x18 = x20.field_0x8;", "return x2;"], got
+    # The frame around the call puts LR back; the call through the pool writes it.
+    src = ("mov x30, #7\nmov x17, #9\n" + _SMI_509
+           + "stur x30, [x20, #0x17]\nstur x17, [x20, #0x1f]\nret\n")
+    assert _lift_485(src % (_FRAMED_509 % "MINT" + "stur x2, [x0, #7]\n")) == [
+        "var t0;", "x20.field_0x18 = 7;", "x20.field_0x20 = t0;", "return x2;"]
+    pool = ("add x30, x27, #0x45, lsl #12\nldr x30, [x30, #0xef8]\n"
+            "ldur x30, [x30, #7]\nblr x30\nstur x2, [x0, #7]\n")
+    assert _lift_485(src % pool) == ["var t0;", "var t1;", "x20.field_0x18 = t1;",
+                                     "x20.field_0x20 = t0;", "return x2;"]
+    assert _lift_485(src.replace("x30", "x12") % pool) == [
+        "var t0;", "x20.field_0x18 = 7;", "x20.field_0x20 = t0;", "return x2;"]
+    # A stub that is not a shared one keeps nothing.
+    got = _lift_485("mov x12, #7\n" + _SMI_509 % "bl MINT1\nstur x2, [x0, #7]\n"
+                    + _STORE_509)
+    assert got == lost + ["return x2;"], got
+    # In line: the temporary, x3; x0, which the slow path's stub hands the Mint back
+    # in; and of x4 and x6 the one that slow path does not push.
+    for reg in ("x3", "x0", "x17"):
+        got = _lift_485(f"mov {reg}, #7\n" + _INLINE_509 % (
+            f"stur {reg}, [x20, #0x17]\n", _SAVE_509))
+        assert got == lost + ["return x2;"], (reg, got)
+    got = _lift_485("mov x4, #7\nmov x6, #9\n" + _INLINE_509 % (
+        "stur x4, [x20, #0x17]\nstur x6, [x20, #0x1f]\n", _SAVES_509))
+    assert got == ["var t0;", "x20.field_0x18 = 7;", "x20.field_0x20 = t0;",
+                   "return x2;"], got
+    # The temporary is written before the slow path, whatever that path pushes.
+    slow = _SAVE_509.replace("str x2, [x15, #-8]!", "stp x3, x2, [x15, #-0x10]!").replace(
+        "ldr x2, [x15], #8", "ldp x3, x2, [x15], #0x10")
+    got = _lift_485("mov x3, #7\n" + _INLINE_509 % ("stur x3, [x20, #0x17]\n", slow))
+    assert got == lost + ["return x2;"], got
+
+
+def test_a_pair_of_fp_and_lr_is_the_frame_s_only_as_its_push_or_its_pop():
+    """An `stp` or `ldp` of x29 and x30 off SP was blanked as the frame's, at any
+    offset, in either order, with or without write-back. So the pair stored over a
+    slot left the slot reading what it held, `return x1;`, and a pop into the two
+    swapped left FP reading as itself (#509). The push moves SP down by the pair's
+    size first and the pop moves it up after, and no other row is the frame's."""
+    from jadart.expr import strip_boilerplate
+    assert _lift_485("str x1, [x15, #8]\nstp x29, x30, [x15, #8]\nldr x0, [x15, #8]\n"
+                     "ret\n") == ["return FP;"]
+    assert _lift_485("str x1, [x15]\nldp x30, x29, [x15], #0x10\nmov x0, x29\n"
+                     "ret\n") == ["var t0 = SP.field_0x8;", "return t0;"]
+
+    def strip(mn, op):
+        return strip_boilerplate([(0x1000, mn, op, ""), (0x1004, "ret", "", "")])[0][1]
+    for mn, op in (("stp", "x29, x30, [x15, #-0x20]!"),
+                   ("stp", "x29, x30, [x15, #-0x10]"), ("stp", "x29, x30, [x15], #-0x10"),
+                   ("ldp", "x29, x30, [x15], #0x20"), ("ldp", "x29, x30, [x15]"),
+                   ("ldp", "x29, x30, [x15, #0x10]!"), ("ldp", "x29, x30, [x15, x1]"),
+                   ("stp", "x30, x29, [x15, #-0x10]!"),
+                   ("stp", "x29, x30, [x20, #-0x10]!"),
+                   ("ldp", "x29, x30, [x20], #0x10")):
+        assert strip(mn, op) == mn, (mn, op)
+    assert strip("stp", "x29, x30, [x15, #-0x10]!") == "nop"
+    assert strip("ldp", "x29, x30, [x15], #0x10") == "nop"
+
+
+def test_an_arm32_stack_check_is_blanked_only_where_its_call_is_to_the_stub():
+    """arm32 makes the branch of a stack check the call itself, `blls` to the stub,
+    and the three rows were blanked whatever the `blls` called (#509). They are
+    where the note names the stack overflow stub, and stay where it names anything
+    else or nothing."""
+    from jadart import expr
+
+    def strip(note):
+        rows = [(0, "ldr", "ip, [sl, #0x1c]", ""), (4, "cmp", "sp, ip", ""),
+                (8, "blls", "#0x100", note), (0xc, "bx", "lr", "")]
+        return [r[1] for r in expr.strip_boilerplate(rows)[:3]]
+    with expr.use_target(expr.ARM32):
+        assert strip(_STACK_424) == ["nop"] * 3
+        writes = {}
+        expr.strip_boilerplate([(0, "ldr", "ip, [sl, #0x1c]", ""),
+                                (4, "cmp", "sp, ip", ""),
+                                (8, "blls", "#0x100", _STACK_424)], None, writes)
+        # LR is the call's, and r12 holds the limit the check loaded.
+        assert set(writes) == {8} and writes[8] >= {"r14", "r12"}, writes
+        assert strip("  ; -> callee") == ["ldr", "cmp", "blls"]
+        assert strip("") == ["ldr", "cmp", "blls"]
+
+
+#: A function that hands back the d0 it was given, or its d1, past a stack check whose
+#: slow path calls `%s`.
+_OWN_D0_509 = (_CHECK_509 + "fcmp d1, d0\nb.lt L1\nfmov d0, d1\nL1:\nret\n"
+               "LS:\nbl %s\nb LB\n")
+
+
+def test_a_callee_hands_back_its_d0_past_a_stack_check_only_where_the_stub_is_named():
+    """`returns_in_d0` blanked a stack check by its shape, as the lift did, so a
+    function whose slow path called another read as one that hands back the d0 it was
+    given: the call was no part of what was read (#509). The check is cut where the
+    call is the stub's by its name and nowhere else, so rows that carry no notes keep
+    it, and the call there is one that may hand a result back."""
+    from jadart.expr import returns_in_d0
+
+    def rows(call):
+        return _noted_509(_rows_485(_OWN_D0_509 % call), 0x1000)
+    assert returns_in_d0(rows("SOVF")) and not returns_in_d0(rows("CALL"))
+    assert not returns_in_d0([r[:3] + ("",) for r in rows("SOVF")])
+    # The names say what is cut and no more. Past the cut a type test's stub is a
+    # call, as it was while a callee's rows had no notes, so a setter that leaves a
+    # constant in d0 across one is not said to return it.
+    kept = _CHECK_509 + ("fmov d0, #1.00000000\nbl TTS\nmov x0, x22\nret\n"
+                         "LS:\nbl SOVF\nb LB\n")
+    assert not returns_in_d0(_noted_509(_rows_485(kept), 0x1000))
+
+
+def test_the_return_resolver_knows_a_stack_check_s_stub_by_the_snapshot_s_names():
+    """`make_return_resolver` read a callee's rows with no names. Once a stack check
+    was cut by the name of its stub alone, `code_d0` took the stub's call in every
+    callee for one that may hand a result back, and two functions of the nine
+    binaries' 282,151 ranges that return the d0 they were given past a check stopped
+    being counted. Handed the snapshot it names a callee's calls as the lift does
+    (`function_name_by_pc`). Without one, or where the call is to another function,
+    the check stays code (#509)."""
+    _needs_capstone()
+    import types
+    from jadart.disasm import CodeRange
+    from jadart.expr import make_return_resolver
+    words = [0xF9402750, 0xEB1001FF, 0x540000A9,    # the check, its `b.ls` to 0x1c
+             0x1E602020, 0x5400004B, 0x1E604020,    # fcmp d1, d0; b.lt 0x18; fmov d0, d1
+             0xD65F03C0,                            # 0x18: ret
+             0x94000000 | (0x40 - 0x1c) // 4,       # 0x1c: bl 0x40
+             0x17FFFFFB]                            # 0x20: b 0xc
+    words += [0xD503201F] * 7 + [0xD65F03C0, 0xD503201F]
+
+    def image(name):
+        return types.SimpleNamespace(
+            arch=None, text=b"".join(w.to_bytes(4, "little") for w in words),
+            all_ranges=[CodeRange(0x00, 0x24, -1), CodeRange(0x40, 8, -1)],
+            symbol_names={0x40: name}, code_ranges={}, data=b"")
+    fr = types.SimpleNamespace(names={}, strings={}, functions=[], end_pos=0)
+    stub = _STACK_424[7:]
+    assert make_return_resolver(image(stub), fr).code_d0(0x00)
+    assert not make_return_resolver(image("foo"), fr).code_d0(0x00)
+    assert not make_return_resolver(image(stub)).code_d0(0x00)
+
+
+def test_every_lift_hands_the_return_resolver_the_snapshot(monkeypatch, tmp_path):
+    """`jadart.decompile`, `lift`, `ffi`, `export` and `decompile_class` each build a
+    return resolver of their own, and each has to hand it the snapshot: the callees
+    of one that did not would be read with no names (#509)."""
+    _needs_capstone()
+    from jadart import cli, expr
+    from jadart.export import export
+    from jadart.program import decompile_class
+
+    class Seen(BaseException):
+        pass
+
+    def spy(image, fr=None):
+        raise Seen(hasattr(fr, "functions"))
+    monkeypatch.setattr(expr, "make_return_resolver", spy)
+    # `ffi` lifts the functions that name a shared object, and this build names none.
+    monkeypatch.setattr(cli, "_soname_re", lambda: re.compile(""))
+    for ask in (lambda: jadart.decompile(CLEAN, "benchWithdraw"),
+                lambda: cli.main(["lift", CLEAN, "benchWithdraw"]),
+                lambda: cli.main(["ffi", CLEAN]),
+                lambda: export(CLEAN, str(tmp_path), tier=3),
+                lambda: decompile_class(CLEAN, "BenchAccount")):
+        with pytest.raises(Seen) as seen:
+            ask()
+        assert seen.value.args == (True,)
 
 
 if __name__ == "__main__":

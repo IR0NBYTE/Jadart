@@ -306,7 +306,7 @@ def export(path, outdir: str, tier: int = 3, app_only: bool = False,
     pc_to_name, signote = names_with_signatures(image, fr, sigs)
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     arity = make_arity_resolver(image) if tier >= 3 else None
-    returns = make_return_resolver(image) if tier >= 3 else None
+    returns = make_return_resolver(image, fr) if tier >= 3 else None
     selectors = recover_selectors(image, fr, hdr) if tier >= 3 else None
     from .program import EntryNames
     entry = EntryNames(image, fr, hdr.epoch, arity) if tier >= 3 else None

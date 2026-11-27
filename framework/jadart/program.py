@@ -545,7 +545,7 @@ def decompile_class(path, class_name: str, max_methods: int = 40,
     # an instance method receives `this` in x1, the first argument (receiver_for)
     arity = make_arity_resolver(image) if lvl >= 3 else None
     entry = entry_names(image, fr, hdr, arity) if lvl >= 3 else None
-    returns = make_return_resolver(image) if lvl >= 3 else None
+    returns = make_return_resolver(image, fr) if lvl >= 3 else None
     selectors = recover_selectors(image, fr, hdr) if lvl >= 3 else None
     layout, allocs, casts = (lift_tables(image, fr, False) if lvl >= 3
                              else (None, None, None))

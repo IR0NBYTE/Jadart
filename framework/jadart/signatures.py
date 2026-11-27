@@ -48,6 +48,7 @@ renderers mark matched names so a reader can see which is which.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import copy
 import os
 import re
 import stat
@@ -367,7 +368,7 @@ def merge(pc_to_name: dict, matches: dict) -> tuple:
     A name the binary carries always wins over a matched one, even when they disagree:
     the binary is evidence and the library is inference.
     """
-    merged = dict(pc_to_name)
+    merged = copy.copy(pc_to_name)      # and what a disasm.Names holds beside them
     added = 0
     for pc, m in matches.items():
         if pc in merged:

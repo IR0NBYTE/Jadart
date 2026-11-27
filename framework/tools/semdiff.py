@@ -108,7 +108,7 @@ def lift_named(path, symbol):
     pc_to_name = function_name_by_pc(image, fr)
     pool_map = build_pool_map(fr, getattr(image, "arch", None))
     arity = make_arity_resolver(image)
-    returns = make_return_resolver(image)
+    returns = make_return_resolver(image, fr)
     selectors = recover_selectors(image, fr, hdr)
     layout = recover_fields(fr, getattr(image, "arch", None))
     layout.add_accessor_names(recover_accessors(image, fr, layout))

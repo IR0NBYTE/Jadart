@@ -83,7 +83,7 @@ pc_to_name = function_name_by_pc(image, fr)
 pool_map = build_pool_map(fr, getattr(image, "arch", None))
 arity = make_arity_resolver(image)
 entry = EntryNames(image, fr, hdr.epoch, arity)
-returns = make_return_resolver(image)
+returns = make_return_resolver(image, fr)
 selectors = recover_selectors(image, fr, hdr)
 h, n, lines = hashlib.sha256(), 0, 0
 for cr in image.all_ranges:

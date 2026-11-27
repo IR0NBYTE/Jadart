@@ -2790,12 +2790,221 @@ def _regs_in_list(op: str) -> list:
     return [canon(t) for t in op.strip().strip("{}").split(",") if t.strip()]
 
 
-def strip_boilerplate(ann: list, slow: set = None) -> list:
+#: The branch a stack check ends with, on both targets: to its slow path where SP is at
+#: or below the limit. arm32 also makes the branch the call itself, `blls`.
+_CHECK_BRANCHES = frozenset(("b.ls", "b.lo", "bls", "blo", "blls", "bllo"))
+#: How a deferred unit calls a stub of the root unit, which no `bl` of its own reaches:
+#: through the entry the thread holds, and through the Code a far pool slot holds.
+_THREAD_CALL = re.compile(r"ldr x30, \[x26, #\w+\];blr x30;")
+_POOL_CALL = re.compile(
+    r"add x30, x27, #\w+, lsl #12;ldr x30, \[x30, #\w+\];ldur x30, \[x30, #7\];blr x30;")
+#: A Mint allocated in line, where a Smi box calls no stub for it: the bump off the
+#: thread's top with a slow path of its own, the header, and the value, widened first
+#: where it is 32 bits wide. The groups: the Mint, the temporary, the top's slot, the
+#: slow path, the widening and its source, and the register stored.
+_MINT_INLINE = re.compile(
+    r"ldp (x\d+), (x\d+), \[x26, (#\w+)\];add \1, \1, #0x10;cmp \2, \1;b\.ls #(\w+);"
+    r"str \1, \[x26, \3\];sub \1, \1, #0xf;mov \2, #\w+;movk \2, #\w+, lsl #16;"
+    r"stur \2, \[\1, #-1\];(?:dmb ishst;)?(sxtw \2, w(\d+);)?stur (x\d+), \[\1, #7\];")
+
+
+def _row_text(rows) -> str:
+    """Rows as the shapes above read them: mnemonic, operands and `;` for each."""
+    return "".join(f"{r[1]} {r[2]};" for r in rows)
+
+
+#: The frame's pair, FP and LR, as arm64 spells them; no other target has the pair.
+_FRAME_PAIR = ("x29", "x30")
+
+
+def _stack_op(mn: str, ops, push: bool, regs: tuple) -> bool:
+    """Whether a row pushes `regs`, a store through SP moved down by their size first,
+    or pops them, a load through SP moved up by it after: `str x30, [x15, #-8]!` and
+    `ldr x30, [x15], #8`, `stp x29, x30, [x15, #-0x10]!` and `ldp x29, x30, [x15],
+    #0x10`. On a path strip_boilerplate hides, compiled code saves a register around a
+    call in no other way, and it opens and closes a frame in no other."""
+    k = len(regs)
+    if (mn != (("ldr", "ldp"), ("str", "stp"))[push][k - 1] or ops[:k] != regs
+            or len(ops) != k + 2 - push):
+        return False
+    m, size = _mem(ops[k]), 8 * k
+    if m is None or _T.roles.get(m[0]) != "SP":
+        return False
+    return m[1] == -size and m[4] if push else _imm(ops[k + 1]) == size
+
+
+def _row_op(row, push: bool, *regs) -> bool:
+    """`_stack_op` of a row."""
+    return _stack_op(row[1], _split_ops(row[2]), push, regs)
+
+
+def _stub_base(note: str) -> str:
+    """The name of the VM runtime stub a call row's note names, as `_STUB_RE` cuts it:
+    `StackOverflow` for both stack overflow stubs, `AllocateMint`, `ArrayWriteBarrier`.
+    Empty for any other callee."""
+    name = note.split("-> ", 1)[1] if "-> " in note else ""
+    m = _STUB_RE.search(name) if "_iso_stub_" in name else None
+    return m.group(1) if m else ""
+
+
+def _stub_call(ann: list, k: int, base: str) -> int:
+    """How many rows from `ann[k]` are one call to the VM stub `base` and nothing else:
+    1 for the `bl` alone, 5 for it with a frame pushed and popped around it, which a
+    function with no frame of its own does, and 0 for any other rows. These are the two
+    ways compiled code calls a stub on a path strip_boilerplate cuts off, and the one
+    answer to whether such a path is the stub call and no more (#509)."""
+    n = len(ann)
+    if k < n and ann[k][1] == "bl":
+        return int(_stub_base(ann[k][3]) == base)
+    if k + 4 >= n or ann[k + 2][1] != "bl" or _stub_base(ann[k + 2][3]) != base:
+        return 0
+    (sp, fp), lr = _frame_regs(), _lr()
+    return 5 * (_row_op(ann[k], True, fp, lr) and _row_op(ann[k + 4], False, fp, lr)
+                and [ann[k + 1][1:3], ann[k + 3][1:3]]
+                == [("mov", f"{fp}, {sp}"), ("mov", f"{sp}, {fp}")])
+
+
+def _no_fpu(regs) -> frozenset:
+    """`regs` less the d registers: what the walk forgets of a call's writes at a cut,
+    where compiled code has saved every FPU register that is live (`_check_writes`)."""
+    return frozenset(r for r in regs if r[0] != "d")
+
+
+def _check_writes(ann: list, b: int):
+    """What the slow path of the stack check whose branch is `ann[b]` may leave other
+    than the check found it, where that path is one compiled code has; None for any
+    other, which is code and stays in the graph (#509).
+
+    The nine binaries hold three: `bl` to a stack overflow stub and `b` to the row
+    after the check (164,309 checks), the same with a frame pushed and popped around
+    the call (92), and in a deferred unit the stub's entry loaded from the thread,
+    `ldr x30, [x26, #N]; blr x30; b` (7,042). arm32 makes the branch the call. A slow
+    path that did anything else, or went back anywhere else, was cut all the same, and
+    a call or a store on it was printed nowhere. One outside the rows, past the cut of
+    a function of more than MAX_INSNS rows (216), cannot be read and is not cut.
+
+    The stub gives the file back but for x16 and x17. LR is the `bl`'s, and with the
+    frame around the call the pop puts it back. Which entry of the thread the third
+    shape calls is not known here, so it is read as the stub.
+
+    A stub named WithoutFPURegs keeps no d register either, and those are left as the
+    walk has them (`_no_fpu`). The compiler calls that stub only where no FPU register
+    is live, but what the walk takes for live is coarser: a zeroing `eor v0, v0, v0`
+    reads d0, and so does a join one way sets. Forgotten here, a d register read as a
+    name no row sets, and the text of 593 ranges in seven binaries changed for it."""
+    br, n = ann[b], len(ann)
+    if br[1] in ("blls", "bllo"):
+        return (_STUB_SCRATCH | {_lr()}
+                if _stub_base(br[3]) == "StackOverflow" else None)
+    to = _target(br[2])
+    k = b + (to - br[0]) // 4 if to is not None else -1     # rows are four bytes wide
+    if not 0 <= k < n - 1 or ann[k][0] != to:
+        return None
+    w = _stub_call(ann, k, "StackOverflow")
+    if w:
+        gone = _STUB_SCRATCH if w == 5 else _STUB_SCRATCH | {_lr()}
+    elif _THREAD_CALL.match(_row_text(ann[k:k + 2])):
+        w, gone = 2, _STUB_SCRATCH | {_lr()}
+    else:
+        return None
+    back = ann[k + w] if k + w < n else br
+    return gone if back[1] == "b" and _target(back[2]) == br[0] + 4 else None
+
+
+def _barrier_rows(ann: list, i: int) -> int:
+    """How many rows from the `tst` at `ann[i]` are a write barrier and nothing else, 0
+    where they are not one compiled code has: `b.eq` past a `bl` to a write barrier
+    stub, to the row right after it, and where the function has no frame the push of
+    LR before the call and its pop after it (816 of the 74,785 in the nine binaries).
+    The stub is the one the note names, or the call lands inside the wrappers stub,
+    which has an entry for each register and a name at the first alone
+    (`disasm.Annotated.barrier`). Any conditional branch to anywhere, two stores of
+    anything, a `bl` to anything and a load off SP were blanked before: a call, a
+    store, and the rest of the function where the branch went elsewhere (#509)."""
+    n = len(ann)
+    s = int(i + 4 < n and ann[i + 2][1] == "str" and _row_op(ann[i + 2], True, _lr())
+            and _row_op(ann[i + 4], False, _lr()))
+    j, rows = i + 2 + s, 3 + 2 * s
+    ok = (j < n and ann[i + 1][1] == "b.eq" and ann[j][1] == "bl"
+          and _target(ann[i + 1][2]) == ann[i][0] + 4 * rows
+          and ("WriteBarrier" in _stub_base(ann[j][3])
+               or ann[j][0] in getattr(ann, "barrier", ())))
+    return rows if ok else 0
+
+
+#: The most rows the slow path of a Mint allocated in line pushes what is live with,
+#: one register or two to a row.
+_SAVES = 8
+
+
+def _mint_box(ann: list, k: int, d: str, s: str):
+    """Where the rows from `ann[k]` run into and what they may write other than `d`,
+    where they box the integer in `s` as a Mint in `d` and do nothing else; None for
+    any other rows (#509). They are the fall through of a Smi box, which
+    strip_boilerplate cuts off, and in the nine binaries one of three: a call to the
+    AllocateMint stub (`_stub_call`, 27,441) or to the Code a pool slot holds
+    (`_POOL_CALL`, 683, and which Code is not read here), then `stur s, [x0, #7]`; or
+    the Mint allocated in line (`_MINT_INLINE`, 112), whose own slow path pushes the
+    registers that are live, `s` among them, calls the stub, moves the Mint to `d`,
+    pops them in turn and goes back to the row that stores the value.
+
+    What they may write is what the call may, less the d registers (`_no_fpu`): a
+    shared stub gives the register file back but for x16 and x17, any other is a call
+    (`_call_forgets`). LR is the call's but where a frame around it puts it back. In
+    line what is pushed and popped is not written, and the temporary is, pushed or
+    not: the rows before the slow path write it. The walk never walks these rows and
+    forgets those registers all the same, as it does at a cut stack check."""
+    n, x0, lr = len(ann), _T.ret_int, _lr()
+    w = _stub_call(ann, k, "AllocateMint")
+    if w:
+        note = ann[k + w // 2][3]
+        gone = (_STUB_SCRATCH | {lr} if "Shared" in note
+                else _no_fpu(_call_forgets("bl", note)))
+        gone = gone - ({x0, lr} if w == 5 else {x0})
+    elif _POOL_CALL.match(_row_text(ann[k:k + 4])):
+        w, gone = 4, _STUB_SCRATCH | {lr}
+    if w:
+        store = ann[k + w] if k + w < n else ann[k]
+        ok = d == x0 and store[1] == "stur" and _split_ops(store[2]) == (s, f"[{x0}, #7]")
+        return (store[0] + 4, gone) if ok else None
+    m = _MINT_INLINE.match(_row_text(ann[k:k + 12]))
+    if (m is None or m.group(1) != d or m.group(7) != (m.group(2) if m.group(5) else s)
+            or m.group(5) and "x" + m.group(6) != s):
+        return None
+    rows, to, mv = m.group().count(";"), int(m.group(4), 16), int(d != x0)
+    q = c = k + (to - ann[k][0]) // 4
+    if not 0 <= q < n or ann[q][0] != to:
+        return None
+    while c < min(n, q + _SAVES) and ann[c][1] in ("str", "stp"):
+        c += 1
+    saved = [_split_ops(r[2])[:1 + (r[1] == "stp")] for r in ann[q:c]]
+    kept = {r for g in saved for r in g}
+    e = 2 * c - q + 1 + mv                         # the branch back, after the pops
+    if e >= n or s not in kept or d in kept or _stub_call(ann, c, "AllocateMint") != 1:
+        return None
+    back = ann[k + rows - 1 - bool(m.group(5))][0]
+    ok = (all(_row_op(a, True, *g) and _row_op(b, False, *g)
+              for a, g, b in zip(ann[q:c], saved, reversed(ann[c + 1 + mv:e])))
+          and (not mv or ann[c + 1][1:3] == ("mov", f"{d}, {x0}"))
+          and ann[e][1] == "b" and _target(ann[e][2]) == back)
+    gone = (_no_fpu(_call_forgets("bl", ann[c][3])) - kept | {m.group(2)}) - {d}
+    return (ann[k][0] + 4 * rows, gone) if ok else None
+
+
+def strip_boilerplate(ann: list, slow: set = None, writes: dict = None) -> list:
     """Nop out the compiler-emitted prologue/epilogue and the stack-overflow check.
     They become nops rather than being dropped, so addresses stay stable and branch
     targets still resolve. The stack check's slow-path block is then unreachable and
     structure() skips it. `slow`, where given, gets the address of each such slow path:
-    one laid out after a throw still looks reached from it (#157)."""
+    one laid out after a throw still looks reached from it (#157).
+
+    A cut hides rows, so each is made only where the rows it hides are the ones
+    compiled code has there, read one by one (`_check_writes`, `_barrier_rows`,
+    `_mint_box`, `_stack_op`). Anything else stays as it is and prints: a binary shaped
+    a check, a barrier or a box in front of a call and the call was printed nowhere
+    (#509). `writes`, where given, gets what the rows hidden at a check, a barrier or
+    a box and their stub may write, by the address of the last row blanked there: the
+    walk never walks them and has to forget those registers all the same."""
     out = list(ann)
     n = len(out)
 
@@ -2816,10 +3025,12 @@ def strip_boilerplate(ann: list, slow: set = None) -> list:
         # from one, and dropping it hid that write (#294). Nor is FP taken as a base:
         # every such pair on both fixtures and FluffyChat is off x15, the push
         # pre-indexed and the pop post-indexed.
-        if (mn in ("stp", "ldp") and len(ops) >= 3
-                and {canon(ops[0]), canon(ops[1])} == {"x29", "x30"}
-                and (m := _mem(ops[2])) and _T.roles.get(m[0]) == "SP"):
-            nop(i)
+        # The push pre-indexed by the pair's size and the pop post-indexed by it, and no
+        # other: a pair at another offset or with no write-back stores FP and LR over a
+        # slot or loads them from one, and blanked, the slot read as what it held (#509).
+        if mn in ("stp", "ldp"):
+            if _stack_op(mn, ops, mn == "stp", _FRAME_PAIR):
+                nop(i)
         elif (mn in ("mov", "add") and _T.roles.get(dst0) == "FP" and len(ops) > 1
               and _T.roles.get(canon(ops[1])) == "SP"):
             nop(i)                                 # mov FP, SP
@@ -2841,42 +3052,48 @@ def strip_boilerplate(ann: list, slow: set = None) -> list:
             cmp_ops = _split_ops(ann[i + 1][2])
             br = ann[i + 2]
             if (len(cmp_ops) == 2 and _T.roles.get(canon(cmp_ops[0])) == "SP"
-                    and canon(cmp_ops[1]) == dst0
-                    and br[1] in ("b.ls", "b.lo", "bls", "blo", "blls", "bllo")):
+                    and canon(cmp_ops[1]) == dst0 and br[1] in _CHECK_BRANCHES
+                    and (gone := _check_writes(ann, i + 2)) is not None):
                 nop(i)
                 nop(i + 1)
                 nop(i + 2)                         # b.ls -> nop: slow path unreachable
                 if slow is not None:
                     slow.add(_target(br[2]))
+                if writes is not None:
+                    writes[br[0]] = gone | {dst0}
         # write barrier after a pointer store: tst TMP, x28(, lsr #32); b.cc skip; bl <stub>.
         # x28 is HEAP_BASE (reserved), so a tst against it can only be the barrier. The
         # preceding tags loads and `and` become dead, and the lifter drops them.
-        elif (mn == "tst" and len(ops) >= 2 and _T.roles.get(canon(ops[1])) == "HEAP"
-              and i + 2 < n and cond_of(ann[i + 1][1])):
+        elif mn == "tst" and len(ops) >= 2 and _T.roles.get(canon(ops[1])) == "HEAP":
             # The stub call does not always sit immediately after the branch, the
             # compiler may spill LR across it first. Requiring adjacency left those
             # barriers in the output, where they read as source-level logic rather than
-            # as the bookkeeping they are. Look through the spill for the call, and take
-            # the matching restore with it so the block empties out completely.
-            j = i + 2
-            while j < n and j <= i + 3 and ann[j][1] in _STORES:
-                j += 1
-            if j < n and ann[j][1] == "bl":
-                for k in range(i, j + 1):
-                    nop(k)
-                if (j + 1 < n and ann[j + 1][1] in _LOADS
-                        and (mm := _mem(ann[j + 1][2])) and mm[0] == "x15"):
-                    nop(j + 1)
+            # as the bookkeeping they are. `_barrier_rows` takes the spill and the
+            # matching restore with the call, so the block empties out completely.
+            rows = _barrier_rows(ann, i)
+            for k in range(i, i + rows):
+                nop(k)
+            if rows and writes is not None:
+                # LR is the `bl`'s, but for where it is pushed and popped around it.
+                writes[ann[i + rows - 1][0]] = (_STUB_SCRATCH | {_lr()} if rows == 3
+                                                else _STUB_SCRATCH)
         # Smi box-or-tag: sbfiz XD, XS, #1, #w; cmp XS, XD, asr #1; b.eq skip; <box as Mint>.
         # The value is the same integer either way, so take the fast path unconditionally and
         # let the Mint slow path fall out as unreachable.
+        # Only where the rows the cut hides are the box and run into the branch's target
+        # (`_mint_box`): `b.ne`, a target behind, or anything else on the fall through
+        # hid the Smi path, the rest of the function or a call (#509).
         elif (mn == "sbfiz" and i + 2 < n and ann[i + 1][1] == "cmp"
-              and ann[i + 2][1] in ("b.eq", "b.ne")):
+              and ann[i + 2][1] == "b.eq"):
             so, co = ops, _split_ops(ann[i + 1][2])
             if (len(so) >= 3 and _imm(so[2]) == 1 and len(co) >= 3
                     and canon(co[0]) == canon(so[1]) and canon(co[1]) == dst0
-                    and "asr" in co[2] and "#" in ann[i + 2][2]):
+                    and "asr" in co[2] and "#" in ann[i + 2][2]
+                    and (box := _mint_box(ann, i + 3, dst0, canon(so[1]))) is not None
+                    and box[0] == _target(ann[i + 2][2])):
                 nop(i + 1)
+                if writes is not None:
+                    writes[ann[i + 1][0]] = box[1]
                 tgt = ann[i + 2][2].rsplit("#", 1)[-1]
                 t = out[i + 2]
                 out[i + 2] = (t[0], "b", f"#{tgt}", t[3])
@@ -3346,12 +3563,19 @@ def _rv_call(mn: str, note: str):
 
 def returns_in_d0(ann) -> bool:
     """Whether the function `ann` hands back a double in d0 on every `ret`, by its own
-    code (_return_registers without callers' evidence). For dispatch.recover_selectors."""
+    code (_return_registers without callers' evidence). For dispatch.recover_selectors.
+
+    The notes say only what may be cut: strip_boilerplate has to know a stub by its
+    name, so in rows that carry none the call on the slow path of a stack check stays,
+    a call that may hand a result back, and a function that returns its own d0 argument
+    past one is not counted (`_callee_rows` gives a callee's rows their notes). What is
+    left is read without them, as it was while no caller had any: a type test's stub
+    after a d0 nothing reads is a call here, not a stub that keeps it (#509)."""
     with use_target(ARM64):
         # Honour traps so a `ret` only a trap's false fall-through reaches is not
         # counted as a return (#178), as the lift and entry_arity do, and a call that
         # cannot return for the same reason (#234).
-        stripped = strip_boilerplate(ann)
+        stripped = [(a, mn, op, "") for (a, mn, op, _n) in strip_boilerplate(ann)]
         blocks, entry = build_cfg(stripped, traps=TRAPS, ends=_path_ends(stripped))
         if not blocks:
             return False
@@ -4998,6 +5222,10 @@ class Lifter:
         #: The stack checks' slow paths strip_boilerplate took the branch to; see
         #: _quiet.
         self.slow_paths: frozenset = frozenset()
+        #: What the rows strip_boilerplate hid at a stack check or a write barrier, and
+        #: the stub they call, may write, by the address of the last row it blanked
+        #: there (`_check_writes`). The walk steps none of them (`_lift_block`).
+        self.cut_writes: dict = {}
         #: The frame stores that may write a slot off the other frame register
         #: (_frame_meets). _lift_function works them out; the graph alone does not show
         #: where SP is.
@@ -10848,6 +11076,14 @@ class Lifter:
                 if mn == "b" and a in self.raw:
                     self._box_cut(st, a, insns)
                 break                                          # branch is structural
+            if mn == "nop" and a in self.cut_writes:
+                # A stack check, a write barrier or a Smi box strip_boilerplate cut
+                # ends here. Its rows set the flags and its stub may write these
+                # registers, as one called in line may (`_stub_clobber`), and the walk
+                # steps neither: a value set in x17 before a check printed as kept
+                # after it (#509).
+                self._flags = None
+                self._stub_clobber(st, self.cut_writes[a])
             shift = a in shifts
             if shift:
                 lines.extend(self._frame_shift(st, a, mn, op))
@@ -12012,26 +12248,12 @@ class Lifter:
         return False
 
     def _slow_exact(self) -> bool:
-        """Whether every stack check's slow path is a call to a `suppress` stub and a
-        branch to the row right after the one check that jumps to it. The check's
-        branch is the row strip_boilerplate made a nop, kept in `raw`; rows are four
-        bytes wide on both targets. A slow path two checks jump to, or that branches
-        anywhere else, is a no."""
-        checks: dict = {}
-        for a, (mn, op) in self.raw.items():
-            if mn in ("b.ls", "b.lo", "bls", "blo", "blls", "bllo"):
-                t = _target(op)
-                if t in self.slow_paths:
-                    checks.setdefault(t, []).append(a)
-        for b in self.slow_paths:
-            if b not in self.blocks:
-                continue
-            insns, at = self.blocks[b].insns, checks.get(b, ())
-            stub = self._quiet(b) and _stub_of(insns[0][3])
-            if (not stub or stub[0] != "suppress" or len(at) != 1
-                    or _target(insns[1][2]) != at[0] + 4):
-                return False
-        return True
+        """Whether every stack check's slow path is `bl` to the stub and `b` to the row
+        right after the check (`_quiet`). strip_boilerplate cuts a check only where
+        its slow path is that, the same with a frame around the call, or the stub
+        called through the thread (`_check_writes`), so what is asked here is that
+        none is one of the other two."""
+        return all(self._quiet(b) for b in self.slow_paths if b in self.blocks)
 
     def _stub_leaks(self) -> bool:
         """Whether a register is live after a call to a stub that may write it, other
@@ -12737,7 +12959,10 @@ class Lifter:
 
     def _quiet(self, b) -> bool:
         """True for a stack check's slow path, `bl` to the stub and `b` back: the stub
-        gives back every register it is handed live and stores to no slot (#157)."""
+        gives back every register it is handed live and stores to no slot (#157).
+        That the call is to the stub and the branch to the row after the check is
+        `_check_writes`'s to say, which put the path in `slow_paths`; the two
+        mnemonics tell it from the two other shapes that does (#509)."""
         return (b in self.slow_paths
                 and [t[1] for t in self.blocks[b].insns] == ["bl", "b"])
 
@@ -13330,7 +13555,9 @@ class Lifter:
                 *(_stub_defs(n, _def_use(mn, o)[0]) if mn == "bl" and "_iso_stub_" in n
                   else _def_use(mn, o)[0] for (_a, mn, o, n) in self.blocks[b].insns),
                 *(self._moved_regs(a) for (a, _m, _o, _n) in self.blocks[b].insns
-                  if a in self.frame_moves))
+                  if a in self.frame_moves),
+                *(self.cut_writes[a] for (a, _m, _o, _n) in self.blocks[b].insns
+                  if a in self.cut_writes))
         return got
 
     def _writes_outgoing(self, nodes) -> bool:
@@ -13588,6 +13815,9 @@ def _entry_read(ann: list, cut: bool, wide: bool = False) -> tuple:
     same registers where it declines for the descriptor, which a call handed one still
     needs (Lifter._plan_desc). The V registers of a function that reads only stack
     arguments are looked at where `wide` asks, and are None otherwise."""
+    # Rows a resolver hands over carry no notes, and a cut that has to name its stub
+    # is then not made: the slow paths stay, and what is live at the entry is the same
+    # with them, in each of the nine binaries' 282,151 ranges (#509).
     stripped = strip_boilerplate(ann)
     # honours traps and calls that cannot return, like the lift
     blocks, entry = build_cfg(stripped, traps=TRAPS, ends=_path_ends(stripped))
@@ -13722,8 +13952,18 @@ def _read_after_call(rows):
     return None
 
 
+def _callee_rows(image, dis, names) -> list:
+    """The rows of a callee for `returns_in_d0`: with the notes `annotate` gives its
+    calls where `names` (function_name_by_pc) is at hand, and with none otherwise."""
+    if names is None:
+        return [(a, m, o, "") for (a, m, o) in dis]
+    from .branches import row_kinds
+    from .disasm import annotate
+    return annotate(dis, names, None, kinds=row_kinds(image, dis))
+
+
 @kept
-def make_return_resolver(image):
+def make_return_resolver(image, fr=None):
     """Build a cached `pc -> "x0" | "d0" | None` resolver over a whole instruction image:
     which register the code after a direct `bl` to the function covering `pc` reads the
     result from (#115). A value has to be read from where the callee left it, and a call
@@ -13731,13 +13971,15 @@ def make_return_resolver(image):
     reading it, is the one the callee returns in. Callers that disagree, none that read
     either, or more than _MAX_SITES of them, give None. Its `code_d0` says whether a
     function's own code hands back d0, and `by_table` what the other implementations of
-    its selector return in.
+    its selector return in. `fr` is the snapshot, whose names tell `code_d0` a call
+    to a stub from any other (`_callee_rows`): without it no call is a stub's.
 
     The index of call sites is built on the first question, one pass over the raw words
     as callgraph reads them, and a function's sites are decoded only when it is asked
     about, each site once. arm64 only, as tier 3 is."""
     from array import array
-    from .disasm import A64Words, A64_BL, CodeRange, MAX_INSNS, disassemble_range
+    from .disasm import (A64Words, A64_BL, CodeRange, MAX_INSNS, disassemble_range,
+                         function_name_by_pc)
     import bisect
     arch = getattr(image, "arch", None)
     if (arch.name if arch is not None else "arm64") != "arm64":
@@ -13809,6 +14051,7 @@ def make_return_resolver(image):
         return val
 
     own: dict = {}
+    names: list = []            # function_name_by_pc's, once `code_d0` asks for them
     spoke: set = set()          # ranges whose callers read a register, or are too many
 
     def code_d0(pc):
@@ -13818,8 +14061,11 @@ def make_return_resolver(image):
         if k is None:
             return False
         if k not in own:
+            if fr is not None and not names:
+                names.append(function_name_by_pc(image, fr))
             dis = disassemble_range(image, ranges[k])
-            own[k] = bool(dis) and returns_in_d0([(a, m, o, "") for (a, m, o) in dis])
+            own[k] = bool(dis) and returns_in_d0(
+                _callee_rows(image, dis, names[0] if names else None))
         return own[k]
 
     def by_table(pc, selectors):
@@ -14974,6 +15220,7 @@ class Tier3Graph(NamedTuple):
     """One function's graph as tier 3 lifts it, and how `structure` places it."""
     stripped: list          # the rows after strip_boilerplate
     slow: frozenset         # the stack checks' slow paths it took the branch to
+    writes: dict            # what the rows it hid at a check or a barrier may write
     blocks: dict
     entry: int
     raw: dict               # what it changed: the mnemonic and operands, by address
@@ -15028,8 +15275,8 @@ def tier3_graph(ann, cut_end=None, mono=None):
 
 
 def _tier3_graph(ann, cut_end, mono):
-    slow = set()
-    stripped = strip_boilerplate(ann, slow)
+    slow, writes = set(), {}
+    stripped = strip_boilerplate(ann, slow, writes)
     # Tier 3 honours traps, the rule tier 2 took in #57: a block ends at a `brk`/`udf`
     # with no edge past it. The false edge used to drop a join that, by accident, kept a
     # frame slot from reading as the field it was loaded from; naming frame slots across
@@ -15076,8 +15323,8 @@ def _tier3_graph(ann, cut_end, mono):
     if any(b.ends_path and not b.succ and b.insns and b.insns[-1][1] not in TRAPS
            for b in blocks.values()):
         stmts = _throws_in_place(blocks, stmts)
-    return Tier3Graph(stripped, frozenset(slow), blocks, entry, raw, cut, stmts, roots,
-                      second, trapped)
+    return Tier3Graph(stripped, frozenset(slow), writes, blocks, entry, raw, cut, stmts,
+                      roots, second, trapped)
 
 
 def _rest_sections(blocks, left, ann, cut, mono) -> tuple:
@@ -15592,6 +15839,7 @@ def _lift_function(ann, pool_map, receiver, arity, indent, depth, selectors,
         lifter.slot_more = slot_more[0]
         lifter.show = show
         lifter.slow_paths = frozenset(slow)
+        lifter.cut_writes = g.writes
         lifter.frame_meets = meets
         lifter.frame_moves = moves
         lifter.save_wrapped = save_wrapped
