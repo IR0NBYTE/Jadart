@@ -362,7 +362,7 @@ def cmd_lift(args) -> int:
     from .program import entry_names
     arity = make_arity_resolver(image)
     entry = entry_names(image, fr, hdr, arity)
-    returns = make_return_resolver(image)
+    returns = make_return_resolver(image, fr)
     selectors = recover_selectors(image, fr, hdr)
     layout, allocs, casts = lift_tables(image, fr, True)
     out = []
@@ -1155,7 +1155,7 @@ def cmd_ffi(args) -> int:
         pc_to_name, _note = names_with_signatures(image, fr, getattr(args, "sigs", None))
         arity = make_arity_resolver(image)
         entry = entry_names(image, fr, hdr, arity)
-        returns = make_return_resolver(image)
+        returns = make_return_resolver(image, fr)
         selectors = recover_selectors(image, fr, hdr)
         layout, allocs, casts = lift_tables(image, fr, True)
         lit = _literal_re()

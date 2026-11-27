@@ -753,6 +753,20 @@ def _parse_addr(text: str, image: "InstrImage | None" = None):
 
 
 @kept
+class Names(dict):
+    """What `function_name_by_pc` returns: the name at each pc, and `wrappers` beside
+    them, where the write barrier wrappers stub starts and ends, (0, 0) where nothing
+    names it.
+    The stub has an entry for each register and a name at the first alone, so a
+    barrier's `bl` lands inside it at an address with no name (#509)."""
+
+    wrappers = (0, 0)
+
+
+#: The stub of `Names.wrappers`, as the VM's own symbols spell it.
+_WRAPPERS = "_iso_stub_WriteBarrierWrappersStub"
+
+
 def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
     """Map each code's start pc_offset -> owning function name, for call-target naming.
     Snapshot names win; ELF .symtab names (image.symbol_names) backfill the gaps. That
@@ -793,7 +807,11 @@ def function_name_by_pc(image: InstrImage, fr, raw: bool = False) -> dict:
         nm = fname.get(owner_ref)
         if nm:
             pc_to_name[cr.pc_offset] = nm      # snapshot name wins over ELF backfill
-    return pc_to_name
+    names = Names(pc_to_name)
+    for cr in getattr(image, "all_ranges", None) or ():
+        if pc_to_name.get(cr.pc_offset) == _WRAPPERS:
+            names.wrappers = (cr.pc_offset, cr.pc_offset + cr.size)
+    return names
 
 
 #: How a Dart 3.13 symbol table names a stub: `stub <Name>`, with ` (#N)` appended
@@ -1308,11 +1326,15 @@ def _mem_base_disp(op: str):
 
 
 class Annotated(list):
-    """What `annotate` returns: the rows, and `pool_at` beside them."""
+    """What `annotate` returns: the rows, and `pool_at` beside them, and `barrier`,
+    the rows whose call lands inside the write barrier wrappers stub past its first
+    entry (`Names.wrappers`). The note of such a row is empty as it was: the callee
+    has no name of its own, and expr.strip_boilerplate asks here what it is (#509)."""
 
     def __init__(self, *a):
         super().__init__(*a)
         self.pool_at = {}
+        self.barrier = set()
 
 
 def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> list:
@@ -1333,6 +1355,7 @@ def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> l
     and not the slot, and several slots can name one object."""
     ann = Annotated()
     strs = getattr(pool_map, "strs", None) or ()
+    lo, hi = getattr(pc_to_name, "wrappers", (0, 0))
     far_base = {}   # reg -> pp-relative byte offset established by `add reg, x27, #hi`
     for i, (addr, mn, op) in enumerate(dis):
         note = ""
@@ -1341,6 +1364,8 @@ def annotate(dis, pc_to_name: dict, pool_map: dict | None = None, *, kinds) -> l
             nm = pc_to_name.get(target)
             if nm:
                 note = f"  ; -> {nm}"
+            elif lo < target < hi:
+                ann.barrier.add(addr)
         # A branch is never a load, so this and the callee name above cannot both apply.
         if pool_map and mn in ("ldr", "ldur"):
             off = None

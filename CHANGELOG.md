@@ -232,6 +232,47 @@ A new Dart format epoch is a minor release, because it only ever adds binaries t
 
 ### Fixed
 
+- **A slow path is cut only where its rows are the stub call (#509).** The lifter took
+  `ldr x16, [x26, #0x48]`, `cmp x15, x16`, `b.ls` for a stack check and blanked the
+  three rows without reading where the branch went. The rows there were then
+  unreachable and never printed, so `bl` to any function and `b` back hid the call, and
+  a value set before the check printed as kept after it. A crafted binary could keep a
+  call out of the text that way. A check is now cut only where its slow path is one of
+  the three sets of rows compiled code has in the nine binaries: the `bl` to the stack
+  overflow stub and the `b` back to the row after the check (164,309), the same with
+  the frame pair pushed and popped around the call (92), or the call through the
+  thread that a deferred unit makes (7,042). Any other check stays code and prints as
+  `if (SP u<= THR.field_0x48) {` with its call inside. The write barrier, the Smi box
+  and the frame pair were cut by their shape in the same way and now read the rows
+  they hide: a barrier is cut where the rows are the barrier's own and its call lands
+  in a write barrier stub, a box where its fall through allocates the Mint and stores
+  the value, through the stub or in line, and a pair of FP and LR only as the push or
+  the pop of the frame. Past a cut check or box the walk keeps nothing of what the
+  hidden rows may write, x16, x17, LR and the check's limit register: `mov x17, #7`, a
+  check and a store of x17 printed 7 and now reads a name no row sets. The loop anchor
+  check of #505 reads the same rows through the same test.
+  This is the first part of #509. Still taken as read, and each a way to hide a row on
+  crafted input: which entry of the thread a deferred unit's slow path calls, which
+  Code the pool slot of a boxing call holds, which thread slot and header a Mint
+  allocated in line uses, a d register across a check whose stub saves no FPU register
+  (read as kept, since forgetting it changed the text of 593 ranges in seven binaries
+  where the compiler holds none), a pop of the frame pair in the middle of a function,
+  a barrier's call that lands inside the wrappers stub off the start of an entry, the
+  registers and the width of a Smi box's tag test, a write back on the load of the
+  stack limit, and any `add`, `sub` or `mov` of SP, blanked as the frame's wherever it
+  stands. A stub is known by the name the snapshot gives its code, here as everywhere
+  in the lifter.
+  On 76 crafted forms the agreeing states rise from 1,222 to 2,093 and the disagreeing
+  fall from 655 to 73, 33 forms better and none worse. On the 61 loop and label
+  programs they go from 1,266 to 1,507 and from 195 to 133. On 400 generated programs
+  disagreeing states fall from 145 to 0, the other 2,900 tally as before. Of the 464
+  hunt programs 22 are better; six, a check whose slow path calls a type test or write
+  barrier stub, now print that path and agree on 13 of 40 states where the cut text
+  agreed on 40, none disagreeing. In the nine binaries 50 of 273,863 ranges change:
+  40 long functions print the 216 checks whose slow path lies past the 4,000 row cut,
+  each as an `if` with a `goto` past the cut, and 10 intrinsics print the Mint they
+  allocate in line, whose failure runs into the function's own body.
+
 - **x16, x17 and the d registers no longer live through a stub call (#508).** At a `bl`
   to a stub that gives the register file back, the stack overflow, write barrier and
   type test stubs, the walk forgot only LR, so `mov x17, #7; bl` to the stack overflow
